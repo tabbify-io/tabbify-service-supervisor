@@ -2570,7 +2570,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-fabric"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tabbify-io/tabbify-service-mesh.git?rev=afffc9d6d39cdfbd539b569b844c444442d0f742#afffc9d6d39cdfbd539b569b844c444442d0f742"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=afffc9d6d39cdfbd539b569b844c444442d0f742#afffc9d6d39cdfbd539b569b844c444442d0f742"
 dependencies = [
  "async-trait",
  "boringtun",
@@ -2587,7 +2587,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-joiner"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tabbify-io/tabbify-service-mesh.git?rev=afffc9d6d39cdfbd539b569b844c444442d0f742#afffc9d6d39cdfbd539b569b844c444442d0f742"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=afffc9d6d39cdfbd539b569b844c444442d0f742#afffc9d6d39cdfbd539b569b844c444442d0f742"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -76,15 +76,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Load the mesh deploy key into ssh-agent BEFORE the build.
-      # The supervisor's Cargo.toml references mesh-joiner via an SSH git dep
-      # and .cargo/config.toml sets net.git-fetch-with-cli=true, so cargo's
-      # git fetch is routed through the system ssh binary and requires a key
-      # that authenticates to github.com/tabbify-io/tabbify-service-mesh.
-      - name: Load mesh deploy key into ssh-agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.MESH_DEPLOY_KEY }}
+      # The mesh dependency is a PUBLIC https git dep (tabbify-service-mesh) —
+      # cargo fetches it anonymously, no SSH key / ssh-agent needed.
 
       - name: Install Rust stable toolchain
         run: |
