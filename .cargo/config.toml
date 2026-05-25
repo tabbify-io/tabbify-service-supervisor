@@ -1,0 +1,9 @@
+# Use the system `git` CLI (not libgit2) to fetch git dependencies.
+#
+# The mesh dependency is an SSH git dep
+# (`ssh://git@github.com/tabbify-io/tabbify-service-mesh.git`). Cargo's bundled
+# libgit2 ssh-agent path fails to authenticate on macOS ("no usernames
+# succeeded"), whereas the system git CLI authenticates fine with the same key.
+# This is the fix cargo itself recommends for that failure.
+[net]
+git-fetch-with-cli = true

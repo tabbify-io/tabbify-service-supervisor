@@ -1,0 +1,29 @@
+# Rust
+/target
+*.rs.bk
+Cargo.lock.bak
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Secrets / keys (never commit private keys)
+*.pem
+*.key
+!*.example.pem
+
+# Local data dir (cached apps)
+/data
+.tabbify-supervisor/
+
+# Logs
+*.log
+logs/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

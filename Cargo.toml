@@ -1,0 +1,75 @@
+[package]
+name = "tabbify-service-supervisor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Tabbify app-layer supervisor: joins the mesh, fetches WASM apps from S3 by UUID, runs them per a TOML lifecycle, serves them over the mesh."
+publish = false
+
+# Thin binary entrypoint; all logic lives in the library.
+[[bin]]
+name = "supervisord"
+path = "src/main.rs"
+
+[lib]
+name = "tabbify_supervisor"
+path = "src/lib.rs"
+
+[lints.clippy]
+# Clean clippy: warnings = errors in CI (`cargo clippy --all-targets -- -D warnings`).
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+# Mesh membership (joiner-side library). Git dep pinned to the mesh release rev;
+# `.cargo/config.toml` sets git-fetch-with-cli so the SSH remote authenticates.
+mesh-joiner = { git = "ssh://git@github.com/tabbify-io/tabbify-service-mesh.git", package = "tabbify-mesh-joiner", rev = "5dccb67" }
+
+# HTTP server
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# WASM runtime (wasmtime 26, wasi:http/proxy world). See §8 of the contract.
+wasmtime = { version = "26", features = ["component-model", "async"] }
+wasmtime-wasi = "26"
+wasmtime-wasi-http = "26"
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# S3 fetch (anonymous HTTPS GET). rustls so musl static builds don't pull openssl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+# Identifiers / hashing / encoding
+uuid = { version = "1.10", features = ["v7", "serde"] }
+blake3 = "1"
+
+# Serde + TOML (manifest)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Concurrency
+dashmap = "6"
+
+# Config
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
+http-body-util = "0.1"
+# Local mock HTTP server to stand in for S3 in fetcher tests.
+wiremock = "0.6"
+tempfile = "3"
