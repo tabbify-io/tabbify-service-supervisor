@@ -10,6 +10,7 @@ use anyhow::Context;
 use tabbify_supervisor::api::{SupervisorState, router};
 use tabbify_supervisor::config::Config;
 use tabbify_supervisor::fetcher::S3Fetcher;
+use tabbify_supervisor::firecracker::kvm_available;
 use tabbify_supervisor::host::AppHost;
 use tabbify_supervisor::mesh::MeshMembership;
 use tabbify_supervisor::registry::AppRegistry;
@@ -33,6 +34,18 @@ async fn main() -> anyhow::Result<()> {
 
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
 
+    // KVM capability gate: a host with /dev/kvm can run firecracker microVMs and
+    // advertises the `firecracker` mesh tag so the coordinator/node route
+    // firecracker apps here; a host without it serves WASM only.
+    let kvm = kvm_available();
+    let fc_tags: Vec<String> = if kvm {
+        tracing::info!("KVM available (/dev/kvm) — advertising `firecracker` capability");
+        vec!["firecracker".to_owned()]
+    } else {
+        tracing::info!("no /dev/kvm — firecracker apps unsupported on this host (WASM only)");
+        vec![]
+    };
+
     // Join the mesh (unless --no-mesh). The membership is held for the process
     // lifetime so the TUN device + WG background tasks stay up. The CONTROL API
     // binds the peer-ULA; each hosted app binds its OWN app-ULA via `app_host`.
@@ -53,9 +66,10 @@ async fn main() -> anyhow::Result<()> {
             None,
         )
     } else {
-        let membership = MeshMembership::join(&config.coordinator_url, &config.display_name)
-            .await
-            .context("join mesh")?;
+        let membership =
+            MeshMembership::join(&config.coordinator_url, &config.display_name, &fc_tags)
+                .await
+                .context("join mesh")?;
         let my_ula = membership.my_ula();
         // Bind the CONTROL listener on the peer-ULA unless an explicit --bind
         // override is set.
@@ -69,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         (addr, id, my_ula.to_string(), app_host, Some(membership))
     };
 
-    let registry = AppRegistry::new(fetcher, app_host);
+    let registry = AppRegistry::with_fc_config(fetcher, app_host, config.firecracker.clone());
 
     // Pre-register configured apps (fetch metadata; always_on spawns now).
     for uuid in &config.apps {

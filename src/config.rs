@@ -64,6 +64,69 @@ pub struct Config {
     /// immediately; `on_request` apps are fetched lazily on first request.
     #[arg(long = "app", value_name = "UUID")]
     pub apps: Vec<Uuid>,
+
+    /// Firecracker microVM runtime configuration (only consulted when hosting a
+    /// `firecracker` app on a KVM-capable Linux host).
+    #[command(flatten)]
+    pub firecracker: FcConfig,
+}
+
+/// Default firecracker binary (looked up on `$PATH`).
+pub const DEFAULT_FC_BIN: &str = "firecracker";
+
+/// Default guest kernel image (operator-provisioned on the host).
+pub const DEFAULT_FC_KERNEL: &str = "/opt/tabbify/vmlinux";
+
+/// Default per-VM tap subnet; each VM is carved a /30 out of this range.
+pub const DEFAULT_FC_TAP_SUBNET: &str = "172.31.0.0/16";
+
+/// Firecracker microVM runtime configuration. Only consulted when the supervisor
+/// is asked to host an app whose `runtime.type == "firecracker"` on a host with
+/// `/dev/kvm`; ignored everywhere else (so a WASM-only supervisor never needs
+/// any of these).
+#[derive(Debug, Clone, Parser)]
+pub struct FcConfig {
+    /// Path to the `firecracker` binary.
+    #[arg(long = "firecracker-bin", env = "SUPERVISOR_FC_BIN", default_value = DEFAULT_FC_BIN)]
+    pub bin: String,
+
+    /// Guest kernel image used when a manifest omits `runtime.kernel`.
+    #[arg(long = "firecracker-kernel", env = "SUPERVISOR_FC_KERNEL", default_value = DEFAULT_FC_KERNEL)]
+    pub kernel: String,
+
+    /// vCPU count for each microVM.
+    #[arg(
+        long = "firecracker-vcpus",
+        env = "SUPERVISOR_FC_VCPUS",
+        default_value_t = 1
+    )]
+    pub vcpus: u32,
+
+    /// Subnet from which per-VM /30 tap links are allocated (CIDR).
+    #[arg(long = "firecracker-tap-subnet", env = "SUPERVISOR_FC_TAP_SUBNET", default_value = DEFAULT_FC_TAP_SUBNET)]
+    pub tap_subnet: String,
+
+    /// Port the app's HTTP server listens on inside the guest.
+    #[arg(
+        long = "firecracker-app-port",
+        env = "SUPERVISOR_FC_APP_PORT",
+        default_value_t = 8080
+    )]
+    pub app_port: u16,
+}
+
+impl Default for FcConfig {
+    /// The same defaults clap bakes — handy for tests + for an
+    /// [`crate::registry::AppRegistry`] that has no firecracker apps.
+    fn default() -> Self {
+        Self {
+            bin: DEFAULT_FC_BIN.to_owned(),
+            kernel: DEFAULT_FC_KERNEL.to_owned(),
+            vcpus: 1,
+            tap_subnet: DEFAULT_FC_TAP_SUBNET.to_owned(),
+            app_port: 8080,
+        }
+    }
 }
 
 impl Config {
@@ -77,8 +140,9 @@ impl Config {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use clap::CommandFactory;
+
+    use super::*;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -95,6 +159,50 @@ mod tests {
         assert!(cfg.bind.is_none());
         assert!(cfg.apps.is_empty());
         assert_eq!(cfg.data_dir, PathBuf::from("./data"));
+    }
+
+    #[test]
+    fn firecracker_defaults_apply() {
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert_eq!(cfg.firecracker.bin, DEFAULT_FC_BIN);
+        assert_eq!(cfg.firecracker.kernel, DEFAULT_FC_KERNEL);
+        assert_eq!(cfg.firecracker.vcpus, 1);
+        assert_eq!(cfg.firecracker.tap_subnet, DEFAULT_FC_TAP_SUBNET);
+        assert_eq!(cfg.firecracker.app_port, 8080);
+    }
+
+    #[test]
+    fn firecracker_default_impl_matches_clap_defaults() {
+        let parsed = Config::try_parse_from(["supervisord"]).unwrap().firecracker;
+        let dflt = FcConfig::default();
+        assert_eq!(parsed.bin, dflt.bin);
+        assert_eq!(parsed.kernel, dflt.kernel);
+        assert_eq!(parsed.vcpus, dflt.vcpus);
+        assert_eq!(parsed.tap_subnet, dflt.tap_subnet);
+        assert_eq!(parsed.app_port, dflt.app_port);
+    }
+
+    #[test]
+    fn firecracker_overrides_parse() {
+        let cfg = Config::try_parse_from([
+            "supervisord",
+            "--firecracker-bin",
+            "/usr/local/bin/firecracker",
+            "--firecracker-kernel",
+            "/srv/vmlinux-6.1",
+            "--firecracker-vcpus",
+            "4",
+            "--firecracker-tap-subnet",
+            "10.200.0.0/16",
+            "--firecracker-app-port",
+            "3000",
+        ])
+        .unwrap();
+        assert_eq!(cfg.firecracker.bin, "/usr/local/bin/firecracker");
+        assert_eq!(cfg.firecracker.kernel, "/srv/vmlinux-6.1");
+        assert_eq!(cfg.firecracker.vcpus, 4);
+        assert_eq!(cfg.firecracker.tap_subnet, "10.200.0.0/16");
+        assert_eq!(cfg.firecracker.app_port, 3000);
     }
 
     #[test]

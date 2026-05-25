@@ -7,8 +7,9 @@
 //!    ([`mesh_joiner::Joiner::host_app_ula`]) so inbound packets reach a local
 //!    listener — skipped in `--no-mesh`/loopback mode (no TUN to alias);
 //! 3. binds a DEDICATED axum listener on `[app_ula]:8730` whose WHOLE request
-//!    path is dispatched to the app's [`WasmRuntime`] — there is NO
-//!    `/apps/<uuid>` prefix, the ULA itself is the app identity.
+//!    path is dispatched to the app's [`crate::runtime::AppRuntime`] (WASM or
+//!    Firecracker) — there is NO `/apps/<uuid>` prefix, the ULA itself is the
+//!    app identity.
 //!
 //! On stop / idle-reap the listener is aborted and the app-ULA is unhosted.
 //!
@@ -37,7 +38,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::runtime::WasmRuntime;
+use crate::runtime::AppRuntime;
 
 /// A boxed, `Send` future — the `dyn`-compatible return shape for the async
 /// [`MeshHost`] methods (avoids pulling in `async-trait`). The per-app listener
@@ -180,12 +181,14 @@ impl AppHost {
     }
 }
 
-/// Per-request state for a hosted app's listener: the compiled runtime plus an
-/// activity callback (so the idle reaper sees per-app-listener traffic).
+/// Per-request state for a hosted app's listener: the app runtime (WASM or
+/// firecracker, behind the [`AppRuntime`] trait) plus an activity callback (so
+/// the idle reaper sees per-app-listener traffic).
 #[derive(Clone)]
 pub struct AppServe {
-    /// The app's compiled WASM runtime (cheap to clone — refcounted).
-    runtime: WasmRuntime,
+    /// The app's runtime as a trait object — either the in-process WASM runtime
+    /// or the Firecracker microVM runtime. `Arc` so the listener can share it.
+    runtime: Arc<dyn AppRuntime>,
     /// Called on every request so the registry can bump `last_activity`.
     on_request: Arc<dyn Fn() + Send + Sync>,
 }
@@ -193,7 +196,7 @@ pub struct AppServe {
 impl AppServe {
     /// Build serve state from a runtime + an activity callback.
     #[must_use]
-    pub fn new(runtime: WasmRuntime, on_request: Arc<dyn Fn() + Send + Sync>) -> Self {
+    pub fn new(runtime: Arc<dyn AppRuntime>, on_request: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             runtime,
             on_request,
@@ -276,6 +279,7 @@ mod tests {
 
     use super::*;
     use crate::app_ula::derive_app_ula;
+    use crate::runtime::WasmRuntime;
 
     const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
     const HELLO_WASM: &[u8] = include_bytes!("../tests/fixtures/hello.wasm");
@@ -302,8 +306,8 @@ mod tests {
         }
     }
 
-    fn fixture_runtime() -> WasmRuntime {
-        WasmRuntime::load(HELLO_WASM).expect("load fixture")
+    fn fixture_runtime() -> Arc<dyn AppRuntime> {
+        Arc::new(WasmRuntime::load(HELLO_WASM).expect("load fixture"))
     }
 
     fn noop_serve() -> AppServe {

@@ -10,7 +10,10 @@
 //! - [`config`] — configuration (env + clap).
 //! - [`manifest`] — vendored `manifest.toml` schema (contract §3).
 //! - [`app_ula`] — vendored deterministic app-ULA (contract §4).
-//! - [`runtime`] — minimal wasmtime `wasi:http/proxy` runtime (contract §8).
+//! - [`runtime`] — the [`runtime::AppRuntime`] seam + the minimal wasmtime
+//!   `wasi:http/proxy` runtime (contract §8).
+//! - [`firecracker`] — the second [`runtime::AppRuntime`]: a KVM-gated
+//!   Firecracker microVM runtime (real on Linux, stub elsewhere).
 //! - [`fetcher`] — anonymous S3 artifact fetch + local cache (contract §2).
 //! - [`host`] — per-app-ULA hosting: one listener per app on its own ULA
 //!   (contract §5, Component 3).
@@ -22,6 +25,7 @@ pub mod api;
 pub mod app_ula;
 pub mod config;
 pub mod fetcher;
+pub mod firecracker;
 pub mod host;
 pub mod manifest;
 pub mod mesh;

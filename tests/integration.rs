@@ -73,6 +73,33 @@ idle_timeout_sec = 0
 [runtime]
 "#;
 
+/// A `firecracker`-runtime manifest. Its entry is a rootfs image (not wasm).
+const FIRECRACKER_MANIFEST: &str = r#"
+[app]
+name = "vm-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type      = "firecracker"
+entry     = "rootfs.ext4"
+memory_mb = 256
+"#;
+
+/// A manifest naming an unknown runtime type — must be rejected.
+const UNKNOWN_RUNTIME_MANIFEST: &str = r#"
+[app]
+name = "weird"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type  = "quantum-vm"
+entry = "app.bin"
+"#;
+
 /// Stand up a wiremock S3 that serves `latest`, `manifest.toml`, `app.wasm`
 /// for `APP_UUID` at version 1, with the given manifest body.
 async fn mock_s3(manifest: &str) -> MockServer {
@@ -90,6 +117,29 @@ async fn mock_s3(manifest: &str) -> MockServer {
     Mock::given(method("GET"))
         .and(path(format!("/apps/{APP_UUID}/v1/app.wasm")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(HELLO_WASM.to_vec()))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Like [`mock_s3`] but serves an arbitrary entry filename with arbitrary
+/// bytes (used to stand up a `firecracker`/unknown manifest whose entry is a
+/// rootfs image rather than `app.wasm`).
+async fn mock_s3_entry(manifest: &str, entry: &str, bytes: &[u8]) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/apps/{APP_UUID}/latest")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("1"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/apps/{APP_UUID}/v1/manifest.toml")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(manifest))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/apps/{APP_UUID}/v1/{entry}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
         .mount(&server)
         .await;
     server
@@ -455,6 +505,85 @@ async fn idle_reap_unhosts_unpinned_on_request_app() {
         .send()
         .await;
     assert!(dial.is_err(), "listener still answered after reap");
+}
+
+// ---------------------------------------------------------------------------
+// Runtime SELECTION branch (manifest.runtime.type → which AppRuntime)
+// ---------------------------------------------------------------------------
+
+/// A `wasm-http` manifest selects the WASM runtime and serves the fixture (the
+/// happy-path arm of the selection branch).
+#[tokio::test]
+async fn runtime_selection_wasm_http_hosts_and_serves() {
+    let server = mock_s3(ALWAYS_ON_MANIFEST).await; // type defaults to wasm-http
+    let (registry, _dir) = temp_registry(&server.uri());
+
+    let state = registry
+        .register(APP_UUID)
+        .await
+        .expect("register wasm app");
+    assert_eq!(state, AppState::Running);
+    let (status, body) = dial_app(&registry, APP_UUID, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Hello, Tabbify!");
+}
+
+/// A `firecracker` manifest selects the firecracker runtime; on this (macOS /
+/// no-KVM) host the launch must fail with a CLEAR Linux/KVM error rather than
+/// silently falling back. The cached rootfs path still resolves (fetcher fix).
+#[tokio::test]
+async fn runtime_selection_firecracker_without_kvm_errors_clearly() {
+    let server = mock_s3_entry(FIRECRACKER_MANIFEST, "rootfs.ext4", b"fake-rootfs-bytes").await;
+    let (registry, _dir) = temp_registry(&server.uri());
+
+    let err = registry
+        .register(APP_UUID)
+        .await
+        .expect_err("firecracker must fail without KVM / on non-Linux");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("firecracker") && (msg.contains("kvm") || msg.contains("linux")),
+        "error should clearly mention firecracker + KVM/Linux, got: {err}"
+    );
+}
+
+/// An unknown `runtime.type` is a hard error (no silent default).
+#[tokio::test]
+async fn runtime_selection_unknown_type_is_rejected() {
+    let server = mock_s3_entry(UNKNOWN_RUNTIME_MANIFEST, "app.bin", b"bytes").await;
+    let (registry, _dir) = temp_registry(&server.uri());
+
+    let err = registry
+        .register(APP_UUID)
+        .await
+        .expect_err("unknown runtime type must be rejected");
+    assert!(
+        err.to_string().contains("unknown runtime type"),
+        "got: {err}"
+    );
+}
+
+/// The fetcher caches the entry file under its manifest name (`rootfs.ext4`),
+/// NOT a hardcoded `app.wasm`, and reports that path as `cached_path`.
+#[tokio::test]
+async fn fetcher_caches_entry_under_manifest_name() {
+    let server = mock_s3_entry(FIRECRACKER_MANIFEST, "rootfs.ext4", b"rootfs-data").await;
+    let dir = tempfile::tempdir().unwrap();
+    let fetcher = S3Fetcher::new(server.uri(), dir.path());
+
+    let fetched = fetcher.fetch(APP_UUID).await.expect("fetch");
+    let cache = fetcher.cache_dir(APP_UUID, 1);
+    assert!(
+        cache.join("rootfs.ext4").is_file(),
+        "entry must be cached under its manifest name"
+    );
+    assert!(
+        !cache.join("app.wasm").exists(),
+        "must NOT hardcode app.wasm"
+    );
+    assert_eq!(fetched.cached_path, cache.join("rootfs.ext4"));
+    // firecracker entry is NOT loaded into memory.
+    assert!(fetched.wasm.is_empty(), "rootfs must not be read into RAM");
 }
 
 // ---------------------------------------------------------------------------

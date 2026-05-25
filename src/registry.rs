@@ -28,10 +28,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::app_ula::derive_app_ula;
-use crate::fetcher::{FetchError, S3Fetcher};
+use crate::config::FcConfig;
+use crate::fetcher::{FetchError, FetchedApp, S3Fetcher};
+use crate::firecracker::FirecrackerRuntime;
 use crate::host::{AppHost, AppServe, HostedApp};
 use crate::manifest::{AppManifest, LifecycleMode};
-use crate::runtime::WasmRuntime;
+use crate::runtime::{AppRuntime, WasmRuntime};
 
 /// Externally-visible lifecycle state of an app (contract §5 `state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +156,8 @@ pub struct AppRegistry {
     fetcher: S3Fetcher,
     /// Per-app-ULA hosting (mesh-backed or loopback for `--no-mesh`/tests).
     app_host: AppHost,
+    /// Firecracker runtime config (only consulted for `firecracker` apps).
+    fc_config: FcConfig,
     /// Per-uuid spawn lock so concurrent first-requests don't double-host.
     spawn_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
@@ -179,13 +183,24 @@ pub struct AppSummary {
 }
 
 impl AppRegistry {
-    /// Build a registry backed by `fetcher`, hosting apps via `app_host`.
+    /// Build a registry backed by `fetcher`, hosting apps via `app_host`, with
+    /// default firecracker config (firecracker apps use the baked-in defaults).
+    /// Use [`AppRegistry::with_fc_config`] to supply operator config.
     #[must_use]
     pub fn new(fetcher: S3Fetcher, app_host: AppHost) -> Self {
+        Self::with_fc_config(fetcher, app_host, FcConfig::default())
+    }
+
+    /// Build a registry with an explicit [`FcConfig`] (the main binary passes
+    /// the parsed CLI config so firecracker apps boot with the operator's
+    /// kernel / vcpus / tap subnet / app port).
+    #[must_use]
+    pub fn with_fc_config(fetcher: S3Fetcher, app_host: AppHost, fc_config: FcConfig) -> Self {
         Self {
             apps: Arc::new(DashMap::new()),
             fetcher,
             app_host,
+            fc_config,
             spawn_locks: Arc::new(DashMap::new()),
         }
     }
@@ -225,10 +240,7 @@ impl AppRegistry {
         let mode = fetched.manifest.lifecycle.mode;
 
         let (state, hosted) = if spawn_on_register(mode) {
-            let rt = WasmRuntime::load_with_fuel(
-                &fetched.wasm,
-                fetched.manifest.runtime.fuel_per_request,
-            )?;
+            let rt = self.build_runtime(&fetched).await?;
             let hosted = self.host_app(uuid, app_ula, rt).await?;
             (AppState::Running, Some(hosted))
         } else {
@@ -291,8 +303,7 @@ impl AppRegistry {
             Some(version) => self.fetcher.fetch_version(uuid, version).await?,
             None => self.fetcher.fetch(uuid).await?,
         };
-        let rt =
-            WasmRuntime::load_with_fuel(&fetched.wasm, fetched.manifest.runtime.fuel_per_request)?;
+        let rt = self.build_runtime(&fetched).await?;
 
         // Host BEFORE touching the map: hosting awaits (joiner route + bind), so
         // we must not hold a DashMap guard across it.
@@ -365,6 +376,32 @@ impl AppRegistry {
         reaped
     }
 
+    /// Build the [`AppRuntime`] for a fetched app from `manifest.runtime.type`:
+    /// `wasm-http` → the in-process [`WasmRuntime`]; `firecracker` → a booted
+    /// [`FirecrackerRuntime`] microVM (the launch returns a clear `Err` if this
+    /// host lacks `/dev/kvm` or isn't Linux, so a WASM-only supervisor refuses
+    /// firecracker apps loudly without affecting WASM apps); anything else is a
+    /// hard error.
+    ///
+    /// # Errors
+    /// A wasm compile failure, a firecracker launch failure (no KVM / non-Linux
+    /// / boot failure), or an unknown runtime type.
+    async fn build_runtime(&self, fetched: &FetchedApp) -> anyhow::Result<Arc<dyn AppRuntime>> {
+        let rt = &fetched.manifest.runtime;
+        match rt.r#type.as_str() {
+            "wasm-http" => {
+                let wasm = WasmRuntime::load_with_fuel(&fetched.wasm, rt.fuel_per_request)?;
+                Ok(Arc::new(wasm))
+            }
+            "firecracker" => {
+                let vm =
+                    FirecrackerRuntime::launch(&fetched.cached_path, rt, &self.fc_config).await?;
+                Ok(Arc::new(vm))
+            }
+            other => anyhow::bail!("unknown runtime type: {other}"),
+        }
+    }
+
     /// Host an app on its per-app-ULA: build the per-app serve state (runtime +
     /// activity callback into this registry) and delegate to [`AppHost::host`].
     ///
@@ -377,7 +414,7 @@ impl AppRegistry {
         &self,
         uuid: &str,
         app_ula: Ipv6Addr,
-        rt: WasmRuntime,
+        rt: Arc<dyn AppRuntime>,
     ) -> anyhow::Result<HostedApp> {
         let registry = self.clone();
         let uuid_owned = uuid.to_owned();

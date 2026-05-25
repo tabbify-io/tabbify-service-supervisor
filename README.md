@@ -33,8 +33,9 @@ node ──mesh──▶ supervisor [my_ula]:8730
 | `src/config.rs` | clap+env config: bind addr, coordinator URL, data dir, S3 base URL, repeatable `--app <uuid>`, `--no-mesh`. Defaults bake the prod EIP + bucket. |
 | `src/manifest.rs` | Vendored `manifest.toml` schema (contract §3) — **byte-identical** to the cli's copy. No `deny_unknown_fields` (forward-compat). |
 | `src/app_ula.rs` | Vendored `derive_app_ula` (contract §4) + golden test. Reported in the API but **not used for binding** in Phase-1. |
-| `src/runtime.rs` | Minimal wasmtime-26 `wasi:http/proxy` runtime (contract §8), stripped of any custom host import. `WasmRuntime::load` compiles once; `handle` runs one request on a fresh `Store` with its own fuel budget. Normalizes path-only server URIs to satisfy `wasi:http`'s authority requirement. |
-| `src/fetcher.rs` | `S3Fetcher`: anonymous HTTPS GET `latest → v<N>/manifest.toml + v<N>/app.wasm`, cached on disk. Base URL is injectable (tests point it at a wiremock server). |
+| `src/runtime.rs` | The `AppRuntime` trait (the runtime seam the per-app listener dispatches to, boxed-future / object-safe) + the minimal wasmtime-26 `wasi:http/proxy` runtime (contract §8), stripped of any custom host import. `WasmRuntime::load` compiles once; `handle` runs one request on a fresh `Store` with its own fuel budget. Normalizes path-only server URIs to satisfy `wasi:http`'s authority requirement. |
+| `src/firecracker.rs` | The second `AppRuntime`: a **KVM-gated Firecracker microVM** runtime. Real impl on Linux (`#[cfg(target_os="linux")]`: per-VM tap + `/30`, spawns `firecracker`, configures via a hand-rolled unix-socket HTTP/1.1 REST client, boots the VM, proxies HTTP to the guest app, tears down on `Drop`); a stub elsewhere so the supervisor still builds + serves WASM on macOS. `kvm_available()` gates it + drives the `firecracker` mesh tag. |
+| `src/fetcher.rs` | `S3Fetcher`: anonymous HTTPS GET `latest → v<N>/manifest.toml + v<N>/<runtime.entry>`, cached on disk under the entry's real name (`app.wasm` for wasm-http, `rootfs.ext4` for firecracker). `FetchedApp.cached_path` is the on-disk entry path (firecracker uses it directly — a rootfs is never read into RAM). Base URL is injectable (tests point it at a wiremock server). |
 | `src/registry.rs` | `AppRegistry` + the lifecycle state machine. Policy is expressed as pure functions (`spawn_on_register`, `should_reap`) for unit-testing; the registry wires them to a `DashMap` + the fetcher + runtime. Per-uuid spawn lock prevents double-compile on concurrent first-requests. |
 | `src/mesh.rs` | `MeshMembership`: wraps `Joiner::join` with `tags=["supervisor"]`, `insecure_no_mtls=true`, the env/baked coordinator URL; surfaces `my_ula` + `peer_id`. |
 | `src/api.rs` | axum 0.7 router: `GET /health`, `GET /v1/apps`, `GET /v1/apps/:uuid`, `POST /v1/apps/:uuid/{start,stop}`, `ANY /apps/:uuid/*rest` (+ bare root). |
@@ -179,6 +180,47 @@ fixture at `tests/fixtures/hello.wasm`). Highlights:
 - `integration::always_on_app_spawns_on_register` — eager spawn.
 - `integration::get_app_present_when_fetchable_from_s3` / `…_absent_…` — discovery.
 - `integration::fetcher_*` — `latest`→manifest→wasm fetch + disk cache, 404, bad `latest`.
+
+## Firecracker microVM runtime (KVM-gated, Linux)
+
+A second runtime behind the `AppRuntime` trait, selected by
+`manifest.runtime.type = "firecracker"` (vs `"wasm-http"`). Served identically
+on the per-app-ULA endpoint — the node/coordinator route by app-ULA and need no
+change. **WASM runs on any host; Firecracker runs only on Linux with `/dev/kvm`.**
+
+A firecracker-capable supervisor host needs:
+
+- **Linux** + **`/dev/kvm`** (bare-metal, a nested-virt VPS, or Lima/UTM Ubuntu);
+- the **`firecracker`** binary on `$PATH` (or `--firecracker-bin`);
+- a guest **`vmlinux`** kernel (default `/opt/tabbify/vmlinux`, or
+  `--firecracker-kernel` / per-app `manifest.runtime.kernel`);
+- **`iproute2`** (`ip tuntap/addr/link`) and the privilege to create taps.
+
+The app's S3 artifact is a **rootfs image** (e.g. `rootfs.ext4`) named per
+`manifest.runtime.entry`, with an HTTP server inside the guest on
+`--firecracker-app-port` (default 8080). At startup `kvm_available()` adds the
+`firecracker` mesh tag on a KVM host (and logs the capability either way); a
+no-KVM host serves WASM and refuses firecracker apps with a clear error. WASM
+supervisors run anywhere and route firecracker apps to a KVM box over the mesh.
+
+Config (all `--flag` / `ENV`): `--firecracker-bin` (`SUPERVISOR_FC_BIN`),
+`--firecracker-kernel` (`SUPERVISOR_FC_KERNEL`), `--firecracker-vcpus`
+(`SUPERVISOR_FC_VCPUS`), `--firecracker-tap-subnet` (`SUPERVISOR_FC_TAP_SUBNET`,
+per-VM `/30`), `--firecracker-app-port` (`SUPERVISOR_FC_APP_PORT`).
+
+A REAL VM boot is exercised by `firecracker::linux::tests::real_vm_boots_and_serves`
+(`#[cfg(target_os="linux")] #[ignore]`) — run it on a KVM box:
+
+```sh
+# Lima Ubuntu, as root: /opt/tabbify/vmlinux + /tmp/rootfs.ext4 (app on :8080)
+sudo -E cargo test real_vm_boots_and_serves -- --ignored --nocapture
+```
+
+The cross-platform tests (runtime selection, the firecracker REST request
+bodies, the unix-socket status parsing, the proxy via a wiremock "fake VM",
+manifest + config parsing) run on the macOS dev host with no KVM. (tcli rootfs
+packaging is a follow-up; the supervisor already fetches the entry file
+generically.)
 
 ## Notes / Phase-1 deviations
 

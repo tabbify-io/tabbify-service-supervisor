@@ -23,18 +23,25 @@ pub struct MeshMembership {
 }
 
 impl MeshMembership {
-    /// Join the mesh tagged `["supervisor"]` against `coordinator_url`,
+    /// Join the mesh tagged `["supervisor"]` (plus any `extra_tags`, e.g.
+    /// `"firecracker"` on a KVM-capable host) against `coordinator_url`,
     /// plaintext (no mTLS) per Phase-1.
     ///
     /// # Errors
     /// Propagates the broad `Joiner::join` failure surface (HTTP, TUN setup,
     /// UDP bind, sudo). On a host without root / TUN this fails — callers that
     /// want to run without the mesh should use `--no-mesh` and skip this.
-    pub async fn join(coordinator_url: &str, display_name: &str) -> anyhow::Result<Self> {
+    pub async fn join(
+        coordinator_url: &str,
+        display_name: &str,
+        extra_tags: &[String],
+    ) -> anyhow::Result<Self> {
+        let mut tags = vec!["supervisor".to_owned()];
+        tags.extend_from_slice(extra_tags);
         let joiner = Joiner::join(JoinConfig {
             coordinator_url: coordinator_url.to_owned(),
             display_name: display_name.to_owned(),
-            tags: vec!["supervisor".to_owned()],
+            tags,
             insecure_no_mtls: true,
             ..Default::default()
         })

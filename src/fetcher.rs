@@ -23,9 +23,13 @@ pub struct FetchedApp {
     pub version: u64,
     /// Parsed manifest.
     pub manifest: AppManifest,
-    /// Raw `app.wasm` bytes (named per `manifest.runtime.entry`, canonical
-    /// `app.wasm`).
+    /// Raw entry-file bytes (the wasm component for `wasm-http`). Loaded into
+    /// memory for WASM; firecracker uses [`Self::cached_path`] instead and never
+    /// reads a multi-hundred-MB rootfs into RAM here.
     pub wasm: Bytes,
+    /// On-disk path of the cached entry file (`<cache_dir>/<runtime.entry>`).
+    /// The firecracker runtime hands this rootfs path straight to the VM.
+    pub cached_path: PathBuf,
 }
 
 /// Errors from the S3 fetch path.
@@ -118,46 +122,64 @@ impl S3Fetcher {
         self.fetch_version(uuid, version).await
     }
 
-    /// Fetch a specific version (manifest + wasm) with on-disk caching.
+    /// Fetch a specific version (manifest + entry file) with on-disk caching.
+    ///
+    /// The entry filename is taken from `manifest.runtime.entry` (NOT hardcoded
+    /// `app.wasm`), so the cache write + cache-hit check, and the returned
+    /// [`FetchedApp::cached_path`], all reference the real artifact (e.g.
+    /// `app.wasm` for wasm-http, `rootfs.ext4` for firecracker). The manifest is
+    /// always at the fixed `manifest.toml` path, so it is resolved first and
+    /// then drives the entry path.
+    ///
+    /// For `firecracker` the (potentially large) rootfs is NOT read into memory:
+    /// only [`FetchedApp::cached_path`] is populated and `wasm` is left empty.
     ///
     /// # Errors
     /// See [`FetchError`].
     pub async fn fetch_version(&self, uuid: &str, version: u64) -> Result<FetchedApp, FetchError> {
         let dir = self.cache_dir(uuid, version);
         let manifest_path = dir.join("manifest.toml");
-        let wasm_path = dir.join("app.wasm");
 
-        // Cache hit: both artifacts present on disk.
-        if manifest_path.is_file() && wasm_path.is_file() {
+        // The manifest is always at the fixed path. Resolve it first (cache or
+        // network) so we know the entry filename + runtime type.
+        let manifest = if manifest_path.is_file() {
             let manifest_text = read_file(&manifest_path)?;
-            let manifest: AppManifest =
-                toml::from_str(&manifest_text).map_err(|e| FetchError::Manifest(e.to_string()))?;
-            let wasm = Bytes::from(read_file_bytes(&wasm_path)?);
-            return Ok(FetchedApp {
-                version,
-                manifest,
-                wasm,
-            });
-        }
-
-        // Cache miss: fetch over HTTP and persist.
-        let base = format!("{}/apps/{uuid}/v{version}", self.base_url);
-        let manifest_text = self
-            .get_text(&format!("{base}/manifest.toml"), uuid)
-            .await?;
-        let manifest: AppManifest =
-            toml::from_str(&manifest_text).map_err(|e| FetchError::Manifest(e.to_string()))?;
+            parse_manifest(&manifest_text)?
+        } else {
+            let base = format!("{}/apps/{uuid}/v{version}", self.base_url);
+            let manifest_text = self
+                .get_text(&format!("{base}/manifest.toml"), uuid)
+                .await?;
+            let manifest = parse_manifest(&manifest_text)?;
+            write_cache(&dir, &manifest_path, manifest_text.as_bytes())?;
+            manifest
+        };
 
         let entry = manifest.runtime.entry.clone();
-        let wasm = self.get_bytes(&format!("{base}/{entry}"), uuid).await?;
+        let entry_path = dir.join(&entry);
+        let is_firecracker = manifest.runtime.r#type == "firecracker";
 
-        write_cache(&dir, &manifest_path, manifest_text.as_bytes())?;
-        write_file(&wasm_path, &wasm)?;
+        // Ensure the entry file is present on disk (fetch + persist on miss). We
+        // stream it to disk and only load it into memory for wasm.
+        if !entry_path.is_file() {
+            let base = format!("{}/apps/{uuid}/v{version}", self.base_url);
+            let bytes = self.get_bytes(&format!("{base}/{entry}"), uuid).await?;
+            write_file(&entry_path, &bytes)?;
+        }
+
+        // wasm-http needs the bytes in memory; firecracker only needs the path
+        // (don't read a multi-hundred-MB rootfs into RAM).
+        let wasm = if is_firecracker {
+            Bytes::new()
+        } else {
+            Bytes::from(read_file_bytes(&entry_path)?)
+        };
 
         Ok(FetchedApp {
             version,
             manifest,
             wasm,
+            cached_path: entry_path,
         })
     }
 
@@ -192,6 +214,10 @@ impl S3Fetcher {
             other => Err(FetchError::Transport(format!("unexpected status {other}"))),
         }
     }
+}
+
+fn parse_manifest(text: &str) -> Result<AppManifest, FetchError> {
+    toml::from_str(text).map_err(|e| FetchError::Manifest(e.to_string()))
 }
 
 fn read_file(path: &Path) -> Result<String, FetchError> {

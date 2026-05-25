@@ -17,6 +17,9 @@
 //! - [`WasmRuntime::load`] — compile a component once.
 //! - [`WasmRuntime::handle`] — run one request, return its response.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use http::{Request, Response};
@@ -32,6 +35,32 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 /// Default per-request fuel budget when a manifest omits it (mirrors §3).
 pub const DEFAULT_FUEL_PER_REQUEST: u64 = 1_000_000_000;
+
+/// A boxed, `Send` future — the object-safe return shape for [`AppRuntime`]
+/// (avoids the `async-trait` dependency, mirroring [`crate::host::MeshHost`]).
+pub type BoxRespFut<'a> = Pin<Box<dyn Future<Output = Result<Response<Bytes>>> + Send + 'a>>;
+
+/// The runtime seam the per-app listener ([`crate::host`]) dispatches to. Both
+/// the in-process WASM runtime ([`WasmRuntime`]) and the Firecracker microVM
+/// runtime ([`crate::firecracker::FirecrackerRuntime`]) implement it, so the
+/// hosting/serving code is identical regardless of how an app actually runs.
+///
+/// Object-safe (`Arc<dyn AppRuntime>`): the registry picks the concrete runtime
+/// from `manifest.runtime.type` and hands the listener a trait object.
+pub trait AppRuntime: Send + Sync {
+    /// Drive one HTTP request through the app and return its response.
+    ///
+    /// # Errors
+    /// Runtime-specific: a wasm trap / fuel exhaustion, or (firecracker) a proxy
+    /// failure talking to the guest.
+    fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a>;
+}
+
+impl AppRuntime for WasmRuntime {
+    fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a> {
+        Box::pin(WasmRuntime::handle(self, request))
+    }
+}
 
 /// Per-`Store` context required by `wasmtime-wasi` (Preview 2) and
 /// `wasmtime-wasi-http`. Intentionally minimal: empty stdio/env/fs — apps run
@@ -279,6 +308,26 @@ mod tests {
             .body(Bytes::new())
             .unwrap();
         let resp = rt.handle(req).await.expect("handle request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
+    }
+
+    /// The fixture must serve a 200 + body when driven THROUGH the
+    /// `AppRuntime` trait object (the seam the per-app listener uses), not just
+    /// via the inherent `WasmRuntime::handle`.
+    #[tokio::test]
+    async fn serves_fixture_through_appruntime_trait() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt: std::sync::Arc<dyn AppRuntime> =
+            std::sync::Arc::new(WasmRuntime::load(wasm).expect("load fixture"));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/api/hello")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = rt.handle(req).await.expect("handle via trait");
+
         assert_eq!(resp.status(), 200);
         assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
     }

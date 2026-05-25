@@ -69,18 +69,24 @@ pub enum LifecycleMode {
 /// `[runtime]` table.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Runtime {
-    /// Runtime type ("wasm-http" — Phase-1 only).
+    /// Runtime type: `"wasm-http"` (any host) or `"firecracker"` (Linux + KVM).
     #[serde(rename = "type", default = "default_rt")]
     pub r#type: String,
-    /// Entry wasm filename ("app.wasm").
+    /// Entry filename: the wasm component for `wasm-http`, the rootfs image
+    /// (e.g. `rootfs.ext4`) for `firecracker`.
     #[serde(default = "default_entry")]
     pub entry: String,
-    /// Per-request fuel budget.
+    /// Per-request fuel budget (wasm-http only).
     #[serde(default = "default_fuel")]
     pub fuel_per_request: u64,
-    /// Memory cap (MB) — advisory in Phase-1.
+    /// Memory cap (MB). Advisory for wasm-http; the guest RAM size for
+    /// firecracker.
     #[serde(default = "default_mem")]
     pub memory_mb: u32,
+    /// Guest kernel image path/name (firecracker only). `None` → the
+    /// supervisor's configured default kernel.
+    #[serde(default)]
+    pub kernel: Option<String>,
 }
 fn default_rt() -> String {
     "wasm-http".into()
@@ -185,6 +191,67 @@ whatever = 1
 "#;
         let m: AppManifest = toml::from_str(src).unwrap();
         assert_eq!(m.app.name, "future");
+    }
+
+    /// A firecracker-runtime manifest parses its type, the rootfs `entry`, and
+    /// the optional `kernel` override.
+    #[test]
+    fn parses_firecracker_runtime_with_kernel() {
+        let src = r#"
+[app]
+name = "vm-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type      = "firecracker"
+entry     = "rootfs.ext4"
+kernel    = "vmlinux-6.1"
+memory_mb = 512
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.runtime.r#type, "firecracker");
+        assert_eq!(m.runtime.entry, "rootfs.ext4");
+        assert_eq!(m.runtime.kernel.as_deref(), Some("vmlinux-6.1"));
+        assert_eq!(m.runtime.memory_mb, 512);
+    }
+
+    /// A firecracker manifest without an explicit `kernel` leaves it `None`
+    /// (supervisor falls back to its configured default kernel).
+    #[test]
+    fn firecracker_kernel_defaults_to_none() {
+        let src = r#"
+[app]
+name = "vm-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type  = "firecracker"
+entry = "rootfs.ext4"
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.runtime.r#type, "firecracker");
+        assert!(m.runtime.kernel.is_none());
+    }
+
+    /// The wasm-http default still leaves `kernel` `None`.
+    #[test]
+    fn wasm_runtime_has_no_kernel() {
+        let src = r#"
+[app]
+name = "w"
+
+[lifecycle]
+mode = "on_request"
+
+[runtime]
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.runtime.r#type, "wasm-http");
+        assert!(m.runtime.kernel.is_none());
     }
 
     /// A stamped id must round-trip through (de)serialization.
