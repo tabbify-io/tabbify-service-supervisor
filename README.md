@@ -111,6 +111,37 @@ and `cross build --release --target x86_64-unknown-linux-musl`, or build on a
 Linux box). The `just build-musl` recipe is the cargo invocation; supply the
 linker for your environment.
 
+### CI release — musl binary published to S3
+
+`.github/workflows/release.yml` builds a static `supervisord` (musl) on every
+push to `main`, on tags `v*`, and on manual `workflow_dispatch`, then uploads it
+to S3. No ECR, no SSM — just the binary.
+
+**Published path:**
+
+```
+s3://<RELEASE_S3_BUCKET>/supervisor/supervisord
+```
+
+**Fetch and run on a Kamatera (or any Linux) host:**
+
+```bash
+curl -fsSL \
+  "https://<RELEASE_S3_BUCKET>.s3.eu-central-1.amazonaws.com/supervisor/supervisord" \
+  -o supervisord
+chmod +x supervisord
+sudo ./supervisord --name sup-kamatera --app <UUID>
+```
+
+**Required repo configuration** (Settings → Secrets and variables → Actions):
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `MESH_DEPLOY_KEY` | Read-only SSH private key for `tabbify-io/tabbify-service-mesh`. Add the matching public key as a deploy key on that repo (read-only). Needed because the supervisor's `Cargo.toml` pulls `mesh-joiner` via `ssh://git@github.com/tabbify-io/tabbify-service-mesh.git` and `.cargo/config.toml` routes git fetches through the system SSH binary. |
+| Secret | `AWS_ROLE_ARN` | ARN of the IAM role to assume via GitHub OIDC. Trust policy must allow this repo; permission policy must grant `s3:PutObject` on `<bucket>/supervisor/*`. |
+| Variable | `AWS_REGION` | AWS region of the bucket, e.g. `eu-central-1`. |
+| Variable | `RELEASE_S3_BUCKET` | Bucket name (no `s3://` prefix), e.g. `tabbify-releases`. |
+
 ### Docker
 
 `Dockerfile` wraps the **prebuilt** static musl binary (see above) in
