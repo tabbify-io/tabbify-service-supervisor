@@ -1,18 +1,23 @@
 //! Mesh membership wiring (contract §5).
 //!
 //! Wraps [`mesh_joiner::Joiner::join`] with the supervisor's tag + the prod
-//! coordinator default, and surfaces the assigned ULA + peer id used to bind
-//! the control/serve listener.
+//! coordinator default, surfaces the assigned peer-ULA + peer id used to bind
+//! the CONTROL listener, and hands out an [`Arc<dyn MeshHost>`] the per-app-ULA
+//! hosting layer ([`crate::host::AppHost`]) uses to route app-ULAs.
 
 use std::net::Ipv6Addr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use mesh_joiner::{JoinConfig, Joiner};
 
-/// A joined mesh membership: holds the [`Joiner`] (kept alive so the TUN device
-/// + background tasks stay up) and the addressing info the API server needs.
+use crate::host::MeshHost;
+
+/// A joined mesh membership: holds the [`Joiner`] (kept alive for the process
+/// so the TUN device + WG background tasks stay up) and the addressing info the
+/// control API server needs.
 pub struct MeshMembership {
-    joiner: Joiner,
+    joiner: Arc<Joiner>,
     my_ula: Ipv6Addr,
     peer_id: String,
 }
@@ -39,13 +44,13 @@ impl MeshMembership {
         let my_ula = joiner.my_ula();
         let peer_id = joiner.my_peer_id().to_string();
         Ok(Self {
-            joiner,
+            joiner: Arc::new(joiner),
             my_ula,
             peer_id,
         })
     }
 
-    /// Our assigned ULA (bind the listener on `[my_ula]:port`).
+    /// Our assigned peer-ULA (bind the CONTROL listener on `[my_ula]:port`).
     #[must_use]
     pub const fn my_ula(&self) -> Ipv6Addr {
         self.my_ula
@@ -57,11 +62,11 @@ impl MeshMembership {
         &self.peer_id
     }
 
-    /// Gracefully deregister + tear down. Best-effort.
-    ///
-    /// # Errors
-    /// Propagates [`Joiner::leave`] errors (best-effort teardown still runs).
-    pub async fn leave(self) -> anyhow::Result<()> {
-        self.joiner.leave().await
+    /// A handle the [`crate::host::AppHost`] uses to host/unhost app-ULAs on the
+    /// joiner. Cloned out of the shared joiner (which stays alive as long as the
+    /// membership is held).
+    #[must_use]
+    pub fn mesh_host(&self) -> Arc<dyn MeshHost> {
+        self.joiner.clone()
     }
 }

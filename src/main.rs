@@ -10,6 +10,7 @@ use anyhow::Context;
 use tabbify_supervisor::api::{SupervisorState, router};
 use tabbify_supervisor::config::Config;
 use tabbify_supervisor::fetcher::S3Fetcher;
+use tabbify_supervisor::host::AppHost;
 use tabbify_supervisor::mesh::MeshMembership;
 use tabbify_supervisor::registry::AppRegistry;
 use tokio::net::TcpListener;
@@ -31,29 +32,44 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
-    let registry = AppRegistry::new(fetcher);
 
     // Join the mesh (unless --no-mesh). The membership is held for the process
-    // lifetime so the TUN device + WG background tasks stay up.
-    let (bind_addr, supervisor_id, ula_str, _membership) = if config.no_mesh {
+    // lifetime so the TUN device + WG background tasks stay up. The CONTROL API
+    // binds the peer-ULA; each hosted app binds its OWN app-ULA via `app_host`.
+    let (bind_addr, supervisor_id, ula_str, app_host, _membership) = if config.no_mesh {
         let addr = config
             .bind
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], config.port)));
-        tracing::warn!(%addr, "running WITHOUT mesh (--no-mesh): binding plain addr");
-        (addr, "local".to_owned(), addr.ip().to_string(), None)
+        tracing::warn!(
+            %addr,
+            "running WITHOUT mesh (--no-mesh): control on plain addr, apps on loopback"
+        );
+        // No TUN → apps can't bind app-ULAs; host them on loopback instead.
+        (
+            addr,
+            "local".to_owned(),
+            addr.ip().to_string(),
+            AppHost::loopback(),
+            None,
+        )
     } else {
         let membership = MeshMembership::join(&config.coordinator_url, &config.display_name)
             .await
             .context("join mesh")?;
         let my_ula = membership.my_ula();
-        // Bind the mesh ULA unless an explicit --bind override is set.
+        // Bind the CONTROL listener on the peer-ULA unless an explicit --bind
+        // override is set.
         let addr = config
             .bind
             .unwrap_or_else(|| SocketAddr::new(my_ula.into(), config.port));
         tracing::info!(%my_ula, peer_id = %membership.peer_id(), %addr, "joined mesh");
         let id = membership.peer_id().to_owned();
-        (addr, id, my_ula.to_string(), Some(membership))
+        // App listeners bind `[app_ula]:port` and advertise via the joiner.
+        let app_host = AppHost::mesh(membership.mesh_host(), config.port);
+        (addr, id, my_ula.to_string(), app_host, Some(membership))
     };
+
+    let registry = AppRegistry::new(fetcher, app_host);
 
     // Pre-register configured apps (fetch metadata; always_on spawns now).
     for uuid in &config.apps {
@@ -92,7 +108,7 @@ fn spawn_reaper(registry: AppRegistry) {
         let mut tick = tokio::time::interval(REAP_INTERVAL);
         loop {
             tick.tick().await;
-            let reaped = registry.reap_idle();
+            let reaped = registry.reap_idle().await;
             if !reaped.is_empty() {
                 tracing::info!(?reaped, "reaped idle on_request instances");
             }

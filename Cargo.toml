@@ -23,7 +23,7 @@ all = { level = "warn", priority = -1 }
 [dependencies]
 # Mesh membership (joiner-side library). Git dep pinned to the mesh release rev;
 # `.cargo/config.toml` sets git-fetch-with-cli so the SSH remote authenticates.
-mesh-joiner = { git = "ssh://git@github.com/tabbify-io/tabbify-service-mesh.git", package = "tabbify-mesh-joiner", rev = "5dccb67" }
+mesh-joiner = { git = "ssh://git@github.com/tabbify-io/tabbify-service-mesh.git", package = "tabbify-mesh-joiner", rev = "afffc9d6d39cdfbd539b569b844c444442d0f742" }
 
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }

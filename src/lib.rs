@@ -12,14 +12,17 @@
 //! - [`app_ula`] — vendored deterministic app-ULA (contract §4).
 //! - [`runtime`] — minimal wasmtime `wasi:http/proxy` runtime (contract §8).
 //! - [`fetcher`] — anonymous S3 artifact fetch + local cache (contract §2).
+//! - [`host`] — per-app-ULA hosting: one listener per app on its own ULA
+//!   (contract §5, Component 3).
 //! - [`registry`] — app registry + lifecycle state machine (contract §5).
 //! - [`mesh`] — mesh join wiring (contract §5).
-//! - [`api`] — axum control/serve HTTP API (contract §5).
+//! - [`api`] — axum control HTTP API (contract §5).
 
 pub mod api;
 pub mod app_ula;
 pub mod config;
 pub mod fetcher;
+pub mod host;
 pub mod manifest;
 pub mod mesh;
 pub mod registry;

@@ -1,24 +1,35 @@
 //! App registry + lifecycle state machine (contract §5).
 //!
-//! Tracks every app this supervisor knows about and the running WASM instances.
-//! The *policy* (when to spawn, when to reap) is expressed as small pure
-//! functions ([`spawn_on_register`], [`should_reap`]) so it is unit-testable
-//! without a clock or a real wasm runtime; [`AppRegistry`] wires those policies
-//! to a [`DashMap`] of records + the [`S3Fetcher`] + [`WasmRuntime`].
+//! Tracks every app this supervisor knows about, its running WASM instance, and
+//! its per-app-ULA listener. The *policy* (when to spawn, when to reap) is
+//! expressed as small pure functions ([`spawn_on_register`], [`should_reap`]) so
+//! it is unit-testable without a clock or a real wasm runtime; [`AppRegistry`]
+//! wires those policies to a [`DashMap`] of records + the [`S3Fetcher`] +
+//! [`WasmRuntime`] + the [`AppHost`].
 //!
 //! Lifecycle rules:
-//! - `always_on`: spawn as soon as the app is registered/known; never reaped.
-//! - `on_request`: spawn on the first `/apps/<uuid>/…` request; an idle reaper
-//!   stops it after `idle_timeout_sec` of no requests, UNLESS pinned.
-//! - API `start` pins (sticky — reaper skips it); API `stop` unpins.
+//! - `always_on`: hosted as soon as the app is registered/known; never reaped.
+//! - `on_request`: hosted on the first reference (API `start` or the first dial
+//!   that reaches it through the node); an idle reaper unhosts it after
+//!   `idle_timeout_sec` of no requests to its per-app listener, UNLESS pinned.
+//! - API `start` pins (sticky — reaper skips it); API `stop` unpins + unhosts.
+//!
+//! Hosting an app means: compute `app_ula = derive_app_ula(uuid)`, ask the
+//! joiner to route it here (mesh mode), and bind a dedicated listener on
+//! `[app_ula]:8730` whose whole path goes to the app's [`WasmRuntime`]. See
+//! [`crate::host`].
 
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
+use crate::app_ula::derive_app_ula;
 use crate::fetcher::{FetchError, S3Fetcher};
+use crate::host::{AppHost, AppServe, HostedApp};
 use crate::manifest::{AppManifest, LifecycleMode};
 use crate::runtime::WasmRuntime;
 
@@ -45,16 +56,16 @@ impl AppState {
     }
 }
 
-/// A single known app + its (optional) live instance.
+/// A single known app + its (optional) live per-app-ULA listener.
 ///
-/// `runtime` is kept behind an [`Arc`] so a request handler can clone it out
-/// and run the wasm without holding the registry map lock for the request
-/// duration. `instance_lock` serializes spawn so two concurrent first-requests
-/// don't both compile the component.
-#[derive(Clone)]
+/// `hosted` holds the live listener (which owns the compiled [`WasmRuntime`]
+/// and the app-ULA route) iff `state == Running`. The record is NOT `Clone`
+/// because `hosted` owns a task handle; the map is mutated in place.
 pub struct AppRecord {
-    /// App UUID (string form, as used in URLs / S3 keys).
+    /// App UUID (string form, as used in S3 keys).
     pub uuid: String,
+    /// The app's deterministic ULA (`derive_app_ula(uuid)`).
+    pub app_ula: Ipv6Addr,
     /// Resolved version.
     pub version: u64,
     /// Manifest (lifecycle, runtime, name, …).
@@ -63,10 +74,10 @@ pub struct AppRecord {
     pub state: AppState,
     /// Sticky pin set by API `start`; reaper never stops a pinned app.
     pub pinned: bool,
-    /// Last time a request was served (for the idle reaper).
+    /// Last time a request reached the per-app listener (for the idle reaper).
     pub last_activity: Instant,
-    /// Live runtime, present iff `state == Running`.
-    pub runtime: Option<WasmRuntime>,
+    /// Live per-app-ULA listener, present iff `state == Running`.
+    pub hosted: Option<HostedApp>,
 }
 
 impl AppRecord {
@@ -87,6 +98,27 @@ impl AppRecord {
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_secs(self.manifest.lifecycle.idle_timeout_sec)
     }
+}
+
+/// Build an [`AppSummary`] snapshot row from a record.
+fn summarize(r: &AppRecord) -> AppSummary {
+    AppSummary {
+        uuid: r.uuid.clone(),
+        app_ula: r.app_ula,
+        version: r.version,
+        name: r.name().to_owned(),
+        lifecycle: r.lifecycle(),
+        state: r.state,
+        bound_addr: r.hosted.as_ref().map(|h| h.addr),
+    }
+}
+
+/// Parse `uuid` and derive its app-ULA, or error if malformed (we can't host an
+/// app on a deterministic ULA without a valid uuid).
+fn require_app_ula(uuid: &str) -> anyhow::Result<Ipv6Addr> {
+    let parsed =
+        Uuid::parse_str(uuid).map_err(|e| anyhow::anyhow!("invalid app uuid {uuid:?}: {e}"))?;
+    Ok(derive_app_ula(parsed))
 }
 
 /// PURE policy: should an app be spawned immediately on registration?
@@ -115,12 +147,14 @@ pub fn should_reap(
         && idle >= idle_timeout
 }
 
-/// Registry of known apps + their running instances.
+/// Registry of known apps + their running instances + per-app-ULA hosting.
 #[derive(Clone)]
 pub struct AppRegistry {
     apps: Arc<DashMap<String, AppRecord>>,
     fetcher: S3Fetcher,
-    /// Per-uuid spawn lock so concurrent first-requests don't double-compile.
+    /// Per-app-ULA hosting (mesh-backed or loopback for `--no-mesh`/tests).
+    app_host: AppHost,
+    /// Per-uuid spawn lock so concurrent first-requests don't double-host.
     spawn_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -129,6 +163,8 @@ pub struct AppRegistry {
 pub struct AppSummary {
     /// App UUID.
     pub uuid: String,
+    /// The app's deterministic ULA.
+    pub app_ula: Ipv6Addr,
     /// Resolved version.
     pub version: u64,
     /// Display name.
@@ -137,15 +173,19 @@ pub struct AppSummary {
     pub lifecycle: LifecycleMode,
     /// Current state.
     pub state: AppState,
+    /// The address the per-app listener is bound on, iff hosted (the app-ULA
+    /// in mesh mode; a loopback ephemeral addr in `--no-mesh`/tests).
+    pub bound_addr: Option<std::net::SocketAddr>,
 }
 
 impl AppRegistry {
-    /// Build a registry backed by `fetcher`.
+    /// Build a registry backed by `fetcher`, hosting apps via `app_host`.
     #[must_use]
-    pub fn new(fetcher: S3Fetcher) -> Self {
+    pub fn new(fetcher: S3Fetcher, app_host: AppHost) -> Self {
         Self {
             apps: Arc::new(DashMap::new()),
             fetcher,
+            app_host,
             spawn_locks: Arc::new(DashMap::new()),
         }
     }
@@ -153,34 +193,13 @@ impl AppRegistry {
     /// Snapshot all known apps for the listing endpoint.
     #[must_use]
     pub fn list(&self) -> Vec<AppSummary> {
-        self.apps
-            .iter()
-            .map(|kv| {
-                let r = kv.value();
-                AppSummary {
-                    uuid: r.uuid.clone(),
-                    version: r.version,
-                    name: r.name().to_owned(),
-                    lifecycle: r.lifecycle(),
-                    state: r.state,
-                }
-            })
-            .collect()
+        self.apps.iter().map(|kv| summarize(kv.value())).collect()
     }
 
     /// Look up a known app's summary (state-only, no fetch).
     #[must_use]
     pub fn get(&self, uuid: &str) -> Option<AppSummary> {
-        self.apps.get(uuid).map(|kv| {
-            let r = kv.value();
-            AppSummary {
-                uuid: r.uuid.clone(),
-                version: r.version,
-                name: r.name().to_owned(),
-                lifecycle: r.lifecycle(),
-                state: r.state,
-            }
-        })
+        self.apps.get(uuid).map(|kv| summarize(kv.value()))
     }
 
     /// Is the app in the known set already?
@@ -189,47 +208,39 @@ impl AppRegistry {
         self.apps.contains_key(uuid)
     }
 
-    /// Register an app from S3: fetch metadata + (for `always_on`) spawn.
+    /// Register an app from S3: fetch metadata + (for `always_on`) host it on
+    /// its per-app-ULA right away.
     ///
     /// Idempotent-ish: re-registering refreshes the record to the latest
-    /// version. For `always_on` the runtime is compiled and the state set to
-    /// `Running`; for `on_request` the state is `Available` (lazy spawn).
+    /// version. For `always_on` the runtime is compiled, the app-ULA hosted
+    /// (listener bound + joiner route), and the state set to `Running`; for
+    /// `on_request` the state is `Available` (lazy host on first reference).
     ///
     /// # Errors
-    /// Propagates [`FetchError`] from the S3 path, or a runtime-compile error
-    /// (as [`FetchError::Manifest`] is unsuitable, compile errors surface as a
-    /// generic transport-style string via [`anyhow`]).
+    /// Propagates [`FetchError`] from the S3 path, a runtime-compile error, an
+    /// invalid uuid, or a hosting failure (listener bind / joiner route).
     pub async fn register(&self, uuid: &str) -> anyhow::Result<AppState> {
+        let app_ula = require_app_ula(uuid)?;
         let fetched = self.fetcher.fetch(uuid).await?;
         let mode = fetched.manifest.lifecycle.mode;
 
-        let (state, runtime) = if spawn_on_register(mode) {
+        let (state, hosted) = if spawn_on_register(mode) {
             let rt = WasmRuntime::load_with_fuel(
                 &fetched.wasm,
                 fetched.manifest.runtime.fuel_per_request,
             )?;
-            (AppState::Running, Some(rt))
+            let hosted = self.host_app(uuid, app_ula, rt).await?;
+            (AppState::Running, Some(hosted))
         } else {
             (AppState::Available, None)
         };
 
-        self.apps.insert(
-            uuid.to_owned(),
-            AppRecord {
-                uuid: uuid.to_owned(),
-                version: fetched.version,
-                manifest: fetched.manifest,
-                state,
-                pinned: false,
-                last_activity: Instant::now(),
-                runtime,
-            },
-        );
+        self.insert_record(uuid, app_ula, &fetched, state, false, hosted);
         Ok(state)
     }
 
     /// Ensure metadata is known (fetch + register if not), without forcing a
-    /// spawn for `on_request`. Returns the resulting summary. Used by discovery
+    /// host for `on_request`. Returns the resulting summary. Used by discovery
     /// (`GET /v1/apps/<uuid>`): present iff known OR fetchable from S3.
     ///
     /// # Errors
@@ -243,16 +254,19 @@ impl AppRegistry {
             .ok_or_else(|| anyhow::anyhow!("app vanished after register"))
     }
 
-    /// Spawn (compile + mark Running) an app, fetching it first if unknown.
-    /// Used by `start` and by the lazy-spawn-on-request path. `pin` makes it
-    /// sticky (API `start`); the request path passes `pin = false`.
+    /// Host (compile + bind the per-app-ULA listener + mark Running) an app,
+    /// fetching it first if unknown. Used by `start` and by the lazy-host on
+    /// first reference. `pin` makes it sticky (API `start`); the request path
+    /// passes `pin = false`.
     ///
     /// # Errors
-    /// Propagates fetch / compile errors.
+    /// Propagates fetch / compile / hosting / invalid-uuid errors.
     pub async fn ensure_running(&self, uuid: &str, pin: bool) -> anyhow::Result<AppState> {
-        // Serialize per-uuid so two concurrent first-requests don't both
-        // fetch+compile. We hold a dedicated lock, NOT the DashMap entry, so
-        // unrelated apps stay concurrent.
+        let app_ula = require_app_ula(uuid)?;
+
+        // Serialize per-uuid so two concurrent first-references don't both
+        // fetch+compile+bind. We hold a dedicated lock, NOT the DashMap entry,
+        // so unrelated apps stay concurrent.
         let lock = self
             .spawn_locks
             .entry(uuid.to_owned())
@@ -260,9 +274,9 @@ impl AppRegistry {
             .clone();
         let _guard = lock.lock().await;
 
-        // Re-check under the lock: another task may have just spawned it.
+        // Re-check under the lock: another task may have just hosted it.
         if let Some(mut rec) = self.apps.get_mut(uuid) {
-            if rec.state == AppState::Running && rec.runtime.is_some() {
+            if rec.state == AppState::Running && rec.hosted.is_some() {
                 rec.last_activity = Instant::now();
                 if pin {
                     rec.pinned = true;
@@ -280,64 +294,52 @@ impl AppRegistry {
         let rt =
             WasmRuntime::load_with_fuel(&fetched.wasm, fetched.manifest.runtime.fuel_per_request)?;
 
-        match self.apps.get_mut(uuid) {
-            Some(mut rec) => {
-                rec.version = fetched.version;
-                rec.manifest = fetched.manifest;
-                rec.state = AppState::Running;
-                rec.runtime = Some(rt);
-                rec.last_activity = Instant::now();
-                if pin {
-                    rec.pinned = true;
-                }
-            }
-            None => {
-                self.apps.insert(
-                    uuid.to_owned(),
-                    AppRecord {
-                        uuid: uuid.to_owned(),
-                        version: fetched.version,
-                        manifest: fetched.manifest,
-                        state: AppState::Running,
-                        pinned: pin,
-                        last_activity: Instant::now(),
-                        runtime: Some(rt),
-                    },
-                );
-            }
-        }
+        // Host BEFORE touching the map: hosting awaits (joiner route + bind), so
+        // we must not hold a DashMap guard across it.
+        let hosted = self.host_app(uuid, app_ula, rt).await?;
+        self.insert_record(
+            uuid,
+            app_ula,
+            &fetched,
+            AppState::Running,
+            pin,
+            Some(hosted),
+        );
         Ok(AppState::Running)
     }
 
-    /// Stop + unpin an app. Drops its runtime; state becomes `Stopped`.
-    /// No-op (returns `Stopped`) if the app is unknown.
-    pub fn stop(&self, uuid: &str) -> AppState {
-        if let Some(mut rec) = self.apps.get_mut(uuid) {
+    /// Stop + unpin an app: tear down its per-app-ULA listener + unhost the
+    /// app-ULA on the joiner; state becomes `Stopped`. No-op (returns
+    /// `Stopped`) if the app is unknown.
+    pub async fn stop(&self, uuid: &str) -> AppState {
+        // Take the listener out under a brief sync borrow, then unhost it
+        // (awaits the joiner) WITHOUT holding the DashMap guard.
+        let hosted = self.apps.get_mut(uuid).and_then(|mut rec| {
             rec.state = AppState::Stopped;
             rec.pinned = false;
-            rec.runtime = None;
+            rec.hosted.take()
+        });
+        if let Some(hosted) = hosted {
+            self.app_host.unhost(hosted).await;
         }
         AppState::Stopped
     }
 
-    /// Clone out the live runtime for a request, bumping `last_activity`.
-    /// Returns `None` if the app isn't currently running.
-    #[must_use]
-    pub fn take_runtime_for_request(&self, uuid: &str) -> Option<WasmRuntime> {
-        let mut rec = self.apps.get_mut(uuid)?;
-        if rec.state == AppState::Running {
+    /// Bump `last_activity` for an app (called from its per-app listener so the
+    /// idle reaper sees live traffic).
+    pub fn touch(&self, uuid: &str) {
+        if let Some(mut rec) = self.apps.get_mut(uuid) {
             rec.last_activity = Instant::now();
-            rec.runtime.clone()
-        } else {
-            None
         }
     }
 
-    /// Run one reaping pass: stop every app that [`should_reap`] flags as idle.
-    /// Returns the uuids that were reaped (handy for logging + tests).
-    pub fn reap_idle(&self) -> Vec<String> {
+    /// Run one reaping pass: unhost every app that [`should_reap`] flags as
+    /// idle. Returns the uuids that were reaped (handy for logging + tests).
+    pub async fn reap_idle(&self) -> Vec<String> {
         let now = Instant::now();
-        let mut reaped = Vec::new();
+        // First pass (sync): flip state + take the listeners out of the records
+        // so we never await while holding a DashMap guard.
+        let mut to_unhost: Vec<(String, HostedApp)> = Vec::new();
         for mut kv in self.apps.iter_mut() {
             let rec = kv.value_mut();
             let idle = now.saturating_duration_since(rec.last_activity);
@@ -349,11 +351,79 @@ impl AppRegistry {
                 rec.idle_timeout(),
             ) {
                 rec.state = AppState::Stopped;
-                rec.runtime = None;
-                reaped.push(rec.uuid.clone());
+                if let Some(hosted) = rec.hosted.take() {
+                    to_unhost.push((rec.uuid.clone(), hosted));
+                }
             }
         }
+        // Second pass (async): unhost each reaped app's listener + app-ULA.
+        let mut reaped = Vec::with_capacity(to_unhost.len());
+        for (uuid, hosted) in to_unhost {
+            self.app_host.unhost(hosted).await;
+            reaped.push(uuid);
+        }
         reaped
+    }
+
+    /// Host an app on its per-app-ULA: build the per-app serve state (runtime +
+    /// activity callback into this registry) and delegate to [`AppHost::host`].
+    ///
+    /// The activity callback captures a registry clone, so while an app is
+    /// hosted there is a strong reference cycle (registry → record → listener
+    /// task → callback → registry). It is intentional and bounded: unhosting
+    /// (stop / idle-reap / drop) aborts the listener task and `take`s the
+    /// record's handle, dropping the callback and breaking the cycle.
+    async fn host_app(
+        &self,
+        uuid: &str,
+        app_ula: Ipv6Addr,
+        rt: WasmRuntime,
+    ) -> anyhow::Result<HostedApp> {
+        let registry = self.clone();
+        let uuid_owned = uuid.to_owned();
+        let on_request: Arc<dyn Fn() + Send + Sync> = Arc::new(move || registry.touch(&uuid_owned));
+        self.app_host
+            .host(app_ula, AppServe::new(rt, on_request))
+            .await
+    }
+
+    /// Insert/replace a record after a (possibly hosting) lifecycle transition.
+    fn insert_record(
+        &self,
+        uuid: &str,
+        app_ula: Ipv6Addr,
+        fetched: &crate::fetcher::FetchedApp,
+        state: AppState,
+        pin: bool,
+        hosted: Option<HostedApp>,
+    ) {
+        match self.apps.get_mut(uuid) {
+            Some(mut rec) => {
+                rec.version = fetched.version;
+                rec.manifest = fetched.manifest.clone();
+                rec.state = state;
+                rec.hosted = hosted;
+                rec.last_activity = Instant::now();
+                if pin {
+                    rec.pinned = true;
+                }
+            }
+            None => {
+                self.apps.insert(
+                    uuid.to_owned(),
+                    AppRecord {
+                        uuid: uuid.to_owned(),
+                        app_ula,
+                        version: fetched.version,
+                        manifest: fetched.manifest.clone(),
+                        state,
+                        pinned: pin,
+                        last_activity: Instant::now(),
+                        hosted,
+                    },
+                );
+            }
+        }
     }
 
     /// Fetcher handle (used by the discovery path to probe S3 for unknown apps).
