@@ -46,6 +46,57 @@ fn default_docker_check(docker_bin: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Best-effort FULL image teardown for app `id` — the disk-reclaiming half of a
+/// purge. `stop` / [`DockerRuntime`]'s `Drop` remove only the *container*,
+/// leaving the built image on disk so a restart is fast; purge removes it.
+///
+/// Removes any containers created from the app's image FIRST (so the image is
+/// not "in use" — independent of when the runtime's `Drop` removes its own
+/// container), then force-removes the image. Best-effort: it logs but never
+/// errors, so a purge still forgets the app + clears the cache even if Docker is
+/// unreachable or already clean.
+pub async fn purge_image(docker_bin: &str, id: &str) {
+    use tokio::process::Command;
+    let tag = protocol::image_tag(id);
+
+    // Remove containers built from this image (running or stopped) so `rmi`
+    // isn't blocked by an in-use image.
+    if let Ok(out) = Command::new(docker_bin)
+        .args(["ps", "-aq", "--filter", &format!("ancestor={tag}")])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        let ids: Vec<&str> = std::str::from_utf8(&out.stdout)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        if !ids.is_empty() {
+            let mut rm = vec!["rm", "-f"];
+            rm.extend(ids);
+            let _ = Command::new(docker_bin)
+                .args(rm)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
+    }
+
+    // Force-remove the image itself.
+    if let Err(e) = Command::new(docker_bin)
+        .args(protocol::rmi_args(&tag))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        tracing::warn!(image = %tag, error = %e, "docker rmi -f failed during purge (continuing)");
+    }
+}
+
 /// Cross-platform docker helpers: the `docker` CLI argument builders, the
 /// availability-probe seam, the deterministic image tag, and the hop-by-hop
 /// header filter + proxy core. Pure functions so they're unit-testable without
@@ -142,6 +193,13 @@ mod protocol {
     /// `Drop`).
     pub fn rm_args(name: &str) -> Vec<String> {
         vec!["rm".to_owned(), "-f".to_owned(), name.to_owned()]
+    }
+
+    /// `docker rmi -f <tag>` argv (sans the leading binary): force-remove the
+    /// built image. Used on PURGE — `Drop` removes only the container, leaving
+    /// the image on disk for a fast restart; purge reclaims it.
+    pub fn rmi_args(tag: &str) -> Vec<String> {
+        vec!["rmi".to_owned(), "-f".to_owned(), tag.to_owned()]
     }
 
     /// Is `name` a hop-by-hop header (case-insensitive)?
@@ -554,7 +612,7 @@ pub use runtime_impl::DockerRuntime;
 mod tests {
     use super::protocol::{
         build_args, container_name, copy_filtered_headers, docker_available_with, image_tag,
-        is_hop_by_hop, proxy_request, rm_args, run_args,
+        is_hop_by_hop, proxy_request, rm_args, rmi_args, run_args,
     };
 
     #[test]
@@ -607,6 +665,14 @@ mod tests {
     #[test]
     fn rm_args_force_remove_by_name() {
         assert_eq!(rm_args("tbf-x-0"), vec!["rm", "-f", "tbf-x-0"]);
+    }
+
+    #[test]
+    fn rmi_args_force_remove_image_by_tag() {
+        assert_eq!(
+            rmi_args("tabbify-app-x"),
+            vec!["rmi", "-f", "tabbify-app-x"]
+        );
     }
 
     #[test]

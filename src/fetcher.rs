@@ -93,6 +93,21 @@ impl S3Fetcher {
             .join(format!("v{version}"))
     }
 
+    /// Remove the entire on-disk cache for `uuid` (`<data_dir>/apps/<uuid>/` —
+    /// every cached version: manifest + entry file). The disk-reclaiming half of
+    /// a registry purge. Idempotent: a missing directory is success.
+    ///
+    /// # Errors
+    /// A filesystem error other than "not found".
+    pub async fn purge_cache(&self, uuid: &str) -> Result<(), FetchError> {
+        let dir = self.data_dir.join("apps").join(uuid);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(FetchError::CacheIo { path: dir, source }),
+        }
+    }
+
     /// Resolve the current version by GETting `apps/<uuid>/latest`.
     ///
     /// # Errors

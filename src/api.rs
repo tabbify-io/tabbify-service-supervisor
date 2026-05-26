@@ -12,6 +12,7 @@
 //! - `GET  /v1/apps/:uuid`
 //! - `POST /v1/apps/:uuid/start`  (fetch + host on the app-ULA + PIN)
 //! - `POST /v1/apps/:uuid/stop`   (unhost + unpin)
+//! - `POST /v1/apps/:uuid/purge`  (stop + remove docker image/cache + forget)
 
 use std::sync::Arc;
 
@@ -80,6 +81,7 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid", get(get_app))
         .route("/v1/apps/:uuid/start", post(start_app))
         .route("/v1/apps/:uuid/stop", post(stop_app))
+        .route("/v1/apps/:uuid/purge", post(purge_app))
         .with_state(Arc::new(state))
 }
 
@@ -147,6 +149,16 @@ async fn start_app(State(state): State<SharedState>, Path(uuid): Path<String>) -
 async fn stop_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     let _ = state.registry.stop(&uuid).await;
     axum::Json(json!({ "state": "stopped" })).into_response()
+}
+
+/// `POST /v1/apps/:uuid/purge` — full teardown: stop + reclaim disk (remove the
+/// built docker image + the on-disk artifact cache) + forget the app. The
+/// disk-reclaiming counterpart to `stop` (which only frees memory).
+async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+    match state.registry.purge(&uuid).await {
+        Ok(()) => axum::Json(json!({ "state": "purged", "uuid": uuid })).into_response(),
+        Err(e) => anyhow_to_response(&e),
+    }
 }
 
 fn summary_json(s: AppSummary) -> serde_json::Value {

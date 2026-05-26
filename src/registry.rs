@@ -359,6 +359,44 @@ impl AppRegistry {
         AppState::Stopped
     }
 
+    /// Purge an app COMPLETELY: stop it (tear down the listener + its
+    /// container/VM), reclaim the on-disk artifact cache, remove the built docker
+    /// image (docker apps only), and forget the app from the registry. The
+    /// disk-reclaiming counterpart to [`Self::stop`], which only frees memory (it
+    /// deliberately leaves the cached artifact + the built docker image so a
+    /// restart is fast).
+    ///
+    /// # Errors
+    /// Propagates a cache-removal IO error. Docker image removal is best-effort
+    /// (logged, never fatal), so a purge still forgets the app + clears the cache
+    /// even if the Docker daemon is unreachable.
+    pub async fn purge(&self, uuid: &str) -> anyhow::Result<()> {
+        // Capture the runtime type before we forget the record — it drives the
+        // docker image cleanup below.
+        let runtime_type = self
+            .apps
+            .get(uuid)
+            .map(|r| r.manifest.runtime.r#type.clone());
+
+        // Stop: unhost the listener + drop the runtime (container/VM torn down).
+        self.stop(uuid).await;
+
+        // Docker apps: also remove the built image (stop/Drop removed only the
+        // container, leaving the image on disk).
+        if runtime_type.as_deref() == Some("docker") {
+            crate::docker::purge_image(&self.docker_config.docker_bin, uuid).await;
+        }
+
+        // Reclaim the on-disk artifact cache (manifest + rootfs.ext4 / app.wasm /
+        // context.tar.gz).
+        self.fetcher.purge_cache(uuid).await?;
+
+        // Forget the app entirely.
+        self.apps.remove(uuid);
+        self.spawn_locks.remove(uuid);
+        Ok(())
+    }
+
     /// Bump `last_activity` for an app (called from its per-app listener so the
     /// idle reaper sees live traffic).
     pub fn touch(&self, uuid: &str) {

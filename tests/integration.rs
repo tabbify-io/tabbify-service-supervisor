@@ -487,6 +487,66 @@ async fn stop_unhosts_and_tears_down_the_listener() {
 }
 
 // ---------------------------------------------------------------------------
+// CONTROL API purge: full cleanup — stop + reclaim on-disk cache + forget
+// ---------------------------------------------------------------------------
+
+/// `purge` (unlike `stop`, which only frees memory) reclaims the on-disk
+/// artifact cache AND forgets the app from the registry.
+#[tokio::test]
+async fn purge_forgets_app_and_clears_disk_cache() {
+    let server = mock_s3(ON_REQUEST_MANIFEST).await;
+    let (registry, _dir) = temp_registry(&server.uri());
+
+    // Host it: caches the artifact on disk + binds the per-app listener.
+    registry.ensure_running(APP_UUID, true).await.expect("host");
+    let cache = registry.fetcher().cache_dir(APP_UUID, 1);
+    assert!(
+        cache.join("app.wasm").is_file(),
+        "artifact must be cached before purge"
+    );
+    assert!(registry.is_known(APP_UUID));
+
+    registry.purge(APP_UUID).await.expect("purge");
+
+    assert!(
+        !registry.is_known(APP_UUID),
+        "app must be forgotten after purge"
+    );
+    assert!(registry.get(APP_UUID).is_none());
+    assert!(
+        !cache.exists(),
+        "on-disk artifact cache must be removed by purge"
+    );
+}
+
+/// `POST /v1/apps/:uuid/purge` stops + purges + forgets, returning `purged`.
+#[tokio::test]
+async fn purge_endpoint_stops_and_forgets() {
+    let server = mock_s3(ON_REQUEST_MANIFEST).await;
+    let (registry, _dir) = temp_registry(&server.uri());
+    registry.ensure_running(APP_UUID, true).await.expect("host");
+
+    let app = router(test_state(registry.clone()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/apps/{APP_UUID}/purge"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = json_body(resp).await;
+    assert_eq!(body["state"], "purged");
+    assert!(
+        !registry.is_known(APP_UUID),
+        "purge endpoint must forget the app"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // idle-reap: unhosts an idle, unpinned on_request app + tears down its listener
 // ---------------------------------------------------------------------------
 
@@ -687,16 +747,20 @@ async fn runtime_selection_docker_builds_runs_and_serves() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "hello from docker");
 
-    // Teardown: stop (aborts the listener; DockerRuntime::Drop removes the
-    // container), then drop the registry, then remove the built image.
-    let _ = registry.stop(APP_UUID).await;
-    drop(registry);
-    // Give Drop a moment to force-remove the container before removing the image.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Teardown via PURGE: stops, removes the container, removes the BUILT IMAGE,
+    // and clears the on-disk cache — reclaiming the disk that `stop` alone leaves
+    // behind. Assert the image is actually gone afterwards.
+    registry.purge(APP_UUID).await.expect("purge docker app");
     let image = format!("tabbify-app-{APP_UUID}");
-    let _ = std::process::Command::new("docker")
-        .args(["rmi", "-f", &image])
-        .status();
+    let out = std::process::Command::new("docker")
+        .args(["images", "-q", &image])
+        .output()
+        .expect("docker images");
+    assert!(
+        out.stdout.is_empty(),
+        "purge must remove the built image, but it lingers: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 // ---------------------------------------------------------------------------
