@@ -1,0 +1,54 @@
+//! Shared runtime construction — the `build_runtime` free function used by both
+//! the [`crate::registry::AppRegistry`] and the per-app runner
+//! ([`crate::runner::serve`]).
+//!
+//! Keeping the match in one place guarantees the registry and the runner build
+//! runtimes identically (DRY) and avoids duplicating the
+//! `wasm-http` / `firecracker` / `docker` selection logic.
+
+use std::sync::Arc;
+
+use crate::config::{DockerConfig, FcConfig};
+use crate::docker::DockerRuntime;
+use crate::fetcher::FetchedApp;
+use crate::firecracker::FirecrackerRuntime;
+use crate::runtime::{AppRuntime, WasmRuntime};
+
+/// Build the [`AppRuntime`] for a fetched app from `manifest.runtime.type`:
+/// - `wasm-http`   → in-process [`WasmRuntime`]
+/// - `firecracker` → KVM-gated [`FirecrackerRuntime`] microVM (errors clearly on
+///   non-Linux / no `/dev/kvm`)
+/// - `docker`      → [`DockerRuntime`] container built from the cached context
+///   tarball (errors if no Docker daemon)
+/// - anything else → hard error (no silent fallback)
+///
+/// `uuid` makes the docker image tag + container name deterministic.
+///
+/// # Errors
+/// A wasm compile failure, a firecracker launch failure (no KVM / non-Linux /
+/// boot failure), a docker launch failure (no daemon / build / run failure),
+/// or an unknown runtime type.
+pub async fn build_runtime(
+    uuid: &str,
+    fetched: &FetchedApp,
+    fc: &FcConfig,
+    docker: &DockerConfig,
+) -> anyhow::Result<Arc<dyn AppRuntime>> {
+    let rt = &fetched.manifest.runtime;
+    match rt.r#type.as_str() {
+        "wasm-http" => {
+            let wasm = WasmRuntime::load_with_fuel(&fetched.wasm, rt.fuel_per_request)?;
+            Ok(Arc::new(wasm))
+        }
+        "firecracker" => {
+            let vm = FirecrackerRuntime::launch(&fetched.cached_path, rt, fc).await?;
+            Ok(Arc::new(vm))
+        }
+        "docker" => {
+            let container =
+                DockerRuntime::launch_with_id(&fetched.cached_path, rt, docker, uuid).await?;
+            Ok(Arc::new(container))
+        }
+        other => anyhow::bail!("unknown runtime type: {other}"),
+    }
+}

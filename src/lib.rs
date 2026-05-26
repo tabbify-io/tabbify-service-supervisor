@@ -25,6 +25,7 @@
 
 pub mod api;
 pub mod app_ula;
+pub mod build;
 pub mod config;
 pub mod docker;
 pub mod fetcher;

@@ -28,13 +28,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::app_ula::derive_app_ula;
+use crate::build::build_runtime as build_runtime_free;
 use crate::config::{DockerConfig, FcConfig};
-use crate::docker::DockerRuntime;
 use crate::fetcher::{FetchError, FetchedApp, S3Fetcher};
-use crate::firecracker::FirecrackerRuntime;
 use crate::host::{AppHost, AppServe, HostedApp};
 use crate::manifest::{AppManifest, LifecycleMode};
-use crate::runtime::{AppRuntime, WasmRuntime};
+use crate::runtime::AppRuntime;
 
 /// Externally-visible lifecycle state of an app (contract §5 `state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,29 +455,7 @@ impl AppRegistry {
         uuid: &str,
         fetched: &FetchedApp,
     ) -> anyhow::Result<Arc<dyn AppRuntime>> {
-        let rt = &fetched.manifest.runtime;
-        match rt.r#type.as_str() {
-            "wasm-http" => {
-                let wasm = WasmRuntime::load_with_fuel(&fetched.wasm, rt.fuel_per_request)?;
-                Ok(Arc::new(wasm))
-            }
-            "firecracker" => {
-                let vm =
-                    FirecrackerRuntime::launch(&fetched.cached_path, rt, &self.fc_config).await?;
-                Ok(Arc::new(vm))
-            }
-            "docker" => {
-                let container = DockerRuntime::launch_with_id(
-                    &fetched.cached_path,
-                    rt,
-                    &self.docker_config,
-                    uuid,
-                )
-                .await?;
-                Ok(Arc::new(container))
-            }
-            other => anyhow::bail!("unknown runtime type: {other}"),
-        }
+        build_runtime_free(uuid, fetched, &self.fc_config, &self.docker_config).await
     }
 
     /// Host an app on its per-app-ULA: build the per-app serve state (runtime +
