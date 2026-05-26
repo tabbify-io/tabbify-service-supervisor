@@ -130,6 +130,54 @@ mod protocol {
         json!({ "action_type": "InstanceStart" })
     }
 
+    /// Build the `PATCH /vm` body that pauses the running VM.
+    ///
+    /// Used before taking a snapshot: the VM state must be quiescent so
+    /// the memory dump is consistent.
+    pub fn pause_body() -> Value {
+        json!({ "state": "Paused" })
+    }
+
+    /// Build the `PATCH /vm` body that resumes a paused VM.
+    ///
+    /// Called after snapshot creation completes to return the VM to serving.
+    pub fn resume_body() -> Value {
+        json!({ "state": "Resumed" })
+    }
+
+    /// Build the `PUT /snapshot/create` body.
+    ///
+    /// `snapshot_path` — destination path for the vmstate file (small, metadata).
+    /// `mem_file_path`  — destination path for the guest RAM dump (large).
+    ///
+    /// Firecracker API: `PUT /snapshot/create` with `"snapshot_type": "Full"`.
+    pub fn snapshot_create_body(snapshot_path: &str, mem_file_path: &str) -> Value {
+        json!({
+            "snapshot_type": "Full",
+            "snapshot_path": snapshot_path,
+            "mem_file_path": mem_file_path,
+        })
+    }
+
+    /// Build the `PUT /snapshot/load` body.
+    ///
+    /// `snapshot_path` — path to the previously-saved vmstate file.
+    /// `mem_file_path`  — path to the previously-saved RAM dump.
+    /// `resume`         — when `true`, the guest resumes execution immediately
+    ///                    after the snapshot is loaded (skip an extra PATCH /vm).
+    ///
+    /// Firecracker API: `PUT /snapshot/load`.
+    pub fn snapshot_load_body(snapshot_path: &str, mem_file_path: &str, resume: bool) -> Value {
+        json!({
+            "snapshot_path": snapshot_path,
+            "mem_backend": {
+                "backend_path": mem_file_path,
+                "backend_type": "File",
+            },
+            "resume_vm": resume,
+        })
+    }
+
     /// Is `name` a hop-by-hop header (case-insensitive)?
     pub fn is_hop_by_hop(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
@@ -233,6 +281,87 @@ mod protocol {
             }
         }
         parse_status_line(&buf)
+    }
+}
+
+/// Snapshot file paths derived from an app's cache directory.
+///
+/// Both files must exist for a warm start to be possible:
+/// - `snap.vmstate` — Firecracker vmstate (small, ~KB).
+/// - `snap.mem`     — guest RAM dump (large, equals `mem_size_mib`).
+///
+/// # Notes
+/// Snapshots are host-kernel + CPU-template specific. Because the supervisor
+/// only creates and consumes snapshots on the same host (same kernel, same CPU),
+/// this is safe. Cross-host snapshot reuse (e.g. migrating an app to a new
+/// supervisor) must NOT be attempted without verifying CPU/kernel compatibility —
+/// that is future work and out of scope here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod snapshot {
+    use std::path::{Path, PathBuf};
+
+    /// Path to the vmstate file in `cache_dir`.
+    pub fn vmstate_path(cache_dir: &Path) -> PathBuf {
+        cache_dir.join("snap.vmstate")
+    }
+
+    /// Path to the RAM dump file in `cache_dir`.
+    pub fn mem_path(cache_dir: &Path) -> PathBuf {
+        cache_dir.join("snap.mem")
+    }
+
+    /// Returns `true` iff both snapshot files exist in `cache_dir`, meaning a
+    /// warm load is possible. The cached-vs-cold launch decision is made here so
+    /// it can be unit-tested on macOS without a real VM or KVM.
+    pub fn files_present(cache_dir: &Path) -> bool {
+        vmstate_path(cache_dir).is_file() && mem_path(cache_dir).is_file()
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn files_present_false_when_dir_is_empty() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(!files_present(dir.path()));
+        }
+
+        #[test]
+        fn files_present_false_when_only_vmstate_exists() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(vmstate_path(dir.path()), b"vmstate").unwrap();
+            assert!(!files_present(dir.path()));
+        }
+
+        #[test]
+        fn files_present_false_when_only_mem_exists() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(mem_path(dir.path()), b"mem").unwrap();
+            assert!(!files_present(dir.path()));
+        }
+
+        #[test]
+        fn files_present_true_when_both_files_exist() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(vmstate_path(dir.path()), b"vmstate").unwrap();
+            std::fs::write(mem_path(dir.path()), b"mem").unwrap();
+            assert!(files_present(dir.path()));
+        }
+
+        #[test]
+        fn vmstate_and_mem_paths_are_deterministic() {
+            let base = Path::new("/data/apps/abc/cache");
+            assert_eq!(
+                vmstate_path(base),
+                PathBuf::from("/data/apps/abc/cache/snap.vmstate")
+            );
+            assert_eq!(
+                mem_path(base),
+                PathBuf::from("/data/apps/abc/cache/snap.mem")
+            );
+        }
     }
 }
 
@@ -518,9 +647,11 @@ mod linux {
 
     use super::pidfile;
     use super::protocol::{
-        boot_source_body, instance_start_body, machine_config_body, network_iface_body,
-        proxy_request, read_http_status, rootfs_drive_body,
+        boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
+        proxy_request, read_http_status, resume_body, rootfs_drive_body, snapshot_create_body,
+        snapshot_load_body,
     };
+    use super::snapshot;
     use super::{FcConfig, kvm_available};
     use crate::manifest::Runtime;
     use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
@@ -562,6 +693,17 @@ mod linux {
         /// REST configuration call failing, or the guest app not answering
         /// within [`READY_TIMEOUT`].
         pub async fn launch(rootfs: &Path, rt: &Runtime, cfg: &FcConfig) -> Result<Self> {
+            Self::cold_boot(rootfs, rt, cfg, None).await
+        }
+
+        /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
+        /// after first boot (best-effort) and stored there for future warm starts.
+        async fn cold_boot(
+            rootfs: &Path,
+            rt: &Runtime,
+            cfg: &FcConfig,
+            cache_dir: Option<&Path>,
+        ) -> Result<Self> {
             if !kvm_available() {
                 bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
             }
@@ -605,21 +747,34 @@ mod linux {
             me.configure_and_boot(rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac)
                 .await?;
             me.wait_until_ready().await?;
+
+            // Best-effort snapshot after first boot. A failure is logged and
+            // does NOT fail the launch — the VM continues to serve cold.
+            if let Some(dir) = cache_dir {
+                if !snapshot::files_present(dir) {
+                    me.try_create_snapshot(dir).await;
+                }
+            }
+
             Ok(me)
         }
 
-        /// [`Self::launch`] with per-uuid pidfile reconciliation: before spawning,
-        /// any stale firecracker process recorded in `<data_dir>/tabbify-fc-<uuid>.pid`
-        /// is killed; after a successful spawn the new PID is written there.
+        /// [`Self::launch`] with per-uuid pidfile reconciliation and snapshot
+        /// warm-start.
         ///
-        /// Call this instead of [`Self::launch`] when the caller knows the app uuid
-        /// and data dir — the registry and runner use this path so a respawned runner
-        /// never leaves a duplicate VM alive.
+        /// Decision flow:
+        /// 1. Kill any stale VM recorded in `<data_dir>/tabbify-fc-<uuid>.pid`.
+        /// 2. If `<data_dir>/apps/<uuid>/cache/snap.vmstate` + `snap.mem` both
+        ///    exist → attempt a warm start via [`Self::launch_from_snapshot`].
+        ///    If the load fails (corrupt snapshot, kernel mismatch, etc.) → fall
+        ///    back to cold boot automatically.
+        /// 3. On the first (cold) boot, a snapshot is created in the cache dir
+        ///    after the guest app is ready. Subsequent restarts will be warm.
         ///
-        /// # Future work (deferred)
-        /// Zero-downtime live-adopt: reconnect to a running VM's tap/socket rather
-        /// than killing it. Requires saving guest_ip + api_sock path alongside the
-        /// pid and verifying the VM is still healthy before adopting.
+        /// # Notes
+        /// Snapshots are host-kernel + CPU-template specific. This supervisor
+        /// creates and consumes them on the same host, so they are always
+        /// compatible. Cross-host snapshot reuse is NOT supported.
         ///
         /// # Errors
         /// See [`Self::launch`].
@@ -635,13 +790,112 @@ mod linux {
                 pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
             }
 
-            let vm = Self::launch(rootfs, rt, cfg).await?;
+            // Per-app snapshot cache: <data_dir>/apps/<uuid>/cache/
+            // (mirrors the wasm .cwasm cache directory layout)
+            let cache_dir = data_dir.join("apps").join(uuid).join("cache");
+
+            let vm = if snapshot::files_present(&cache_dir) {
+                // Warm path: try to restore from a previously-taken snapshot.
+                // Fall back to cold boot on any failure (corrupt files, kernel
+                // mismatch, etc.) so the app always comes up eventually.
+                match Self::launch_from_snapshot(&cache_dir, cfg).await {
+                    Ok(warm_vm) => {
+                        tracing::info!(uuid, "warm start from snapshot");
+                        warm_vm
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            uuid,
+                            error = %e,
+                            "snapshot load failed; falling back to cold boot"
+                        );
+                        Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir)).await?
+                    }
+                }
+            } else {
+                // Cold path: first boot — take a snapshot on the way out.
+                Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir)).await?
+            };
 
             // Record the new child PID so a future restart can clean it up.
             if let Some(pid) = vm.child.as_ref().and_then(|c| c.id()) {
                 pidfile::write(data_dir, uuid, pid);
             }
             Ok(vm)
+        }
+
+        /// Restore a previously-snapshotted VM from `cache_dir`.
+        ///
+        /// Flow: `setup_tap` (new tap/IP, derived by VM_SEQ) → spawn
+        /// `firecracker --api-sock` → `PUT /snapshot/load` (resume_vm=true) →
+        /// `wait_until_ready` (should be ~ms not seconds).
+        ///
+        /// The machine-config / boot-source / drives / network-interfaces sequence
+        /// from `configure_and_boot` is intentionally SKIPPED here — the snapshot
+        /// embeds all that state. The only networking re-wiring needed is the host
+        /// tap; the guest MAC and IP are baked into the snapshot.
+        ///
+        /// # Errors
+        /// Tap setup failure, firecracker spawn failure, snapshot load API failure,
+        /// or the guest app failing to answer within [`READY_TIMEOUT`].
+        async fn launch_from_snapshot(cache_dir: &Path, cfg: &FcConfig) -> Result<Self> {
+            if !kvm_available() {
+                bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
+            }
+
+            let vmstate = snapshot::vmstate_path(cache_dir);
+            let mem = snapshot::mem_path(cache_dir);
+
+            let vmstate_str = vmstate
+                .to_str()
+                .ok_or_else(|| anyhow!("snapshot vmstate path is not valid UTF-8"))?;
+            let mem_str = mem
+                .to_str()
+                .ok_or_else(|| anyhow!("snapshot mem path is not valid UTF-8"))?;
+
+            // Allocate a fresh tap + /30 for this restored VM.
+            let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
+            let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
+                .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
+            let tap_name = format!("fc-tap{seq}");
+
+            let _ = run_ip(&["link", "del", &tap_name]).await;
+            setup_tap(&tap_name, host_ip).await?;
+
+            let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
+            let _ = std::fs::remove_file(&api_sock);
+            let child = Command::new(&cfg.bin)
+                .arg("--api-sock")
+                .arg(&api_sock)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
+
+            let me = Self {
+                child: Some(child),
+                tap_name,
+                api_sock: api_sock.clone(),
+                guest_base: format!("http://{guest_ip}:{}", cfg.app_port),
+                client: reqwest::Client::new(),
+            };
+
+            // Wait for the API socket, then load the snapshot (resume_vm=true).
+            // This replaces the full configure_and_boot sequence.
+            wait_for_socket(&me.api_sock).await?;
+            me.api_put(
+                "/snapshot/load",
+                &snapshot_load_body(vmstate_str, mem_str, true),
+            )
+            .await
+            .context("PUT /snapshot/load")?;
+
+            // After a snapshot load the guest resumes immediately; wait_until_ready
+            // should return within milliseconds (app was already initialised when
+            // the snapshot was taken).
+            me.wait_until_ready().await?;
+            Ok(me)
         }
 
         /// Push the full firecracker REST configuration, then start the VM.
@@ -702,6 +956,79 @@ mod linux {
             if !(200..300).contains(&status) {
                 bail!("firecracker API PUT {path} returned HTTP {status}");
             }
+            Ok(())
+        }
+
+        /// One firecracker REST `PATCH` over the API unix socket.
+        ///
+        /// Used for VM state transitions (`/vm`): pause before snapshot, resume
+        /// after. The Firecracker API uses PATCH (not PUT) for state changes.
+        async fn api_patch(&self, path: &str, body: &serde_json::Value) -> Result<()> {
+            let payload = serde_json::to_vec(body)?;
+            let status =
+                tokio::time::timeout(API_TIMEOUT, unix_http_patch(&self.api_sock, path, &payload))
+                    .await
+                    .map_err(|_| anyhow!("firecracker API timed out on PATCH {path}"))??;
+            if !(200..300).contains(&status) {
+                bail!("firecracker API PATCH {path} returned HTTP {status}");
+            }
+            Ok(())
+        }
+
+        /// Take a snapshot of a running VM into `cache_dir/snap.vmstate` +
+        /// `cache_dir/snap.mem`. Called once after the first cold boot.
+        ///
+        /// Flow: PATCH /vm Paused → PUT /snapshot/create → PATCH /vm Resumed.
+        ///
+        /// This is best-effort: any error is logged and the VM continues serving
+        /// cold (the caller must NOT fail the launch on snapshot errors).
+        async fn try_create_snapshot(&self, cache_dir: &std::path::Path) {
+            if let Err(e) = self.create_snapshot_inner(cache_dir).await {
+                tracing::warn!(
+                    cache_dir = %cache_dir.display(),
+                    error = %e,
+                    "snapshot create failed (best-effort; VM continues serving cold)"
+                );
+                // Attempt to resume in case we paused but failed after that.
+                if let Err(re) = self.api_patch("/vm", &resume_body()).await {
+                    tracing::warn!(error = %re, "PATCH /vm Resumed failed during snapshot error recovery");
+                }
+            }
+        }
+
+        async fn create_snapshot_inner(&self, cache_dir: &std::path::Path) -> Result<()> {
+            // Ensure the cache directory exists so snapshot files can be written.
+            std::fs::create_dir_all(cache_dir)
+                .with_context(|| format!("create snapshot cache dir {}", cache_dir.display()))?;
+
+            let vmstate = snapshot::vmstate_path(cache_dir);
+            let mem = snapshot::mem_path(cache_dir);
+
+            let vmstate_str = vmstate
+                .to_str()
+                .ok_or_else(|| anyhow!("snapshot vmstate path is not valid UTF-8"))?;
+            let mem_str = mem
+                .to_str()
+                .ok_or_else(|| anyhow!("snapshot mem path is not valid UTF-8"))?;
+
+            self.api_patch("/vm", &pause_body())
+                .await
+                .context("PATCH /vm Paused before snapshot")?;
+            self.api_put(
+                "/snapshot/create",
+                &snapshot_create_body(vmstate_str, mem_str),
+            )
+            .await
+            .context("PUT /snapshot/create")?;
+            self.api_patch("/vm", &resume_body())
+                .await
+                .context("PATCH /vm Resumed after snapshot")?;
+
+            tracing::info!(
+                vmstate = %vmstate.display(),
+                mem = %mem.display(),
+                "snapshot created; subsequent launches will warm-start"
+            );
             Ok(())
         }
 
@@ -905,12 +1232,25 @@ mod linux {
     /// `Content-Length` and read just enough of the reply to learn the status
     /// (firecracker responds 204/200 on success).
     async fn unix_http_put(sock: &Path, path: &str, body: &[u8]) -> Result<u16> {
+        unix_http_verb(sock, "PUT", path, body).await
+    }
+
+    /// Hand-rolled HTTP/1.1 `PATCH` over a unix socket. Same framing as PUT;
+    /// used for the `/vm` state transitions (pause/resume) which the Firecracker
+    /// API exposes as PATCH, not PUT.
+    async fn unix_http_patch(sock: &Path, path: &str, body: &[u8]) -> Result<u16> {
+        unix_http_verb(sock, "PATCH", path, body).await
+    }
+
+    /// Shared HTTP/1.1 request writer for PUT and PATCH. Both methods carry a
+    /// JSON body and expect a 2xx status; the difference is just the verb string.
+    async fn unix_http_verb(sock: &Path, verb: &str, path: &str, body: &[u8]) -> Result<u16> {
         let mut stream = UnixStream::connect(sock)
             .await
             .with_context(|| format!("connect firecracker socket {}", sock.display()))?;
 
         let head = format!(
-            "PUT {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
+            "{verb} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
@@ -994,8 +1334,8 @@ mod linux {
 mod tests {
     use super::protocol::{
         boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
-        kvm_available_with, machine_config_body, network_iface_body, parse_status_line,
-        read_http_status, rootfs_drive_body,
+        kvm_available_with, machine_config_body, network_iface_body, parse_status_line, pause_body,
+        read_http_status, resume_body, rootfs_drive_body, snapshot_create_body, snapshot_load_body,
     };
 
     #[test]
@@ -1041,6 +1381,55 @@ mod tests {
     #[test]
     fn instance_start_body_is_instance_start() {
         assert_eq!(instance_start_body()["action_type"], "InstanceStart");
+    }
+
+    #[test]
+    fn pause_body_has_paused_state() {
+        let b = pause_body();
+        assert_eq!(b["state"], "Paused");
+    }
+
+    #[test]
+    fn resume_body_has_resumed_state() {
+        let b = resume_body();
+        assert_eq!(b["state"], "Resumed");
+    }
+
+    #[test]
+    fn snapshot_create_body_has_full_type_and_paths() {
+        let b = snapshot_create_body(
+            "/data/apps/abc/cache/snap.vmstate",
+            "/data/apps/abc/cache/snap.mem",
+        );
+        assert_eq!(b["snapshot_type"], "Full");
+        assert_eq!(b["snapshot_path"], "/data/apps/abc/cache/snap.vmstate");
+        assert_eq!(b["mem_file_path"], "/data/apps/abc/cache/snap.mem");
+        // snapshot_type must be exactly "Full" — Firecracker rejects other values.
+        assert_eq!(b["snapshot_type"].as_str().unwrap(), "Full");
+    }
+
+    #[test]
+    fn snapshot_load_body_resume_true_sets_resume_vm() {
+        let b = snapshot_load_body(
+            "/data/apps/abc/cache/snap.vmstate",
+            "/data/apps/abc/cache/snap.mem",
+            true,
+        );
+        assert_eq!(b["snapshot_path"], "/data/apps/abc/cache/snap.vmstate");
+        assert_eq!(
+            b["mem_backend"]["backend_path"],
+            "/data/apps/abc/cache/snap.mem"
+        );
+        assert_eq!(b["mem_backend"]["backend_type"], "File");
+        assert_eq!(b["resume_vm"], true);
+    }
+
+    #[test]
+    fn snapshot_load_body_resume_false_does_not_resume() {
+        let b = snapshot_load_body("/snap.vmstate", "/snap.mem", false);
+        assert_eq!(b["resume_vm"], false);
+        // mem_backend structure must be present regardless of resume flag.
+        assert_eq!(b["mem_backend"]["backend_type"], "File");
     }
 
     #[test]
