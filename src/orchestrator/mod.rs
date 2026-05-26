@@ -26,6 +26,7 @@ pub mod api;
 pub mod client;
 pub mod handle;
 pub mod monitor;
+pub mod restart;
 pub mod spawn;
 
 use std::path::PathBuf;
