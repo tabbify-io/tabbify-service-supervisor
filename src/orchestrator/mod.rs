@@ -32,7 +32,23 @@ use std::time::Duration;
 
 pub use client::ControlClient;
 pub use handle::RunnerHandle;
+use monitor::RecordOutcome;
 pub use spawn::{SpawnSpec, spawn_runner};
+
+/// What a startup [`readopt`](Orchestrator::readopt) did to the recorded fleet.
+///
+/// Each runner found on disk lands in exactly one bucket: it was either
+/// **adopted** (still alive — left running, pid unchanged) or **respawned**
+/// (dead — a fresh process was started). Returned for logging and for tests to
+/// assert the headline guarantee that a living runner is adopted, not killed and
+/// recreated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadoptSummary {
+    /// UUIDs of living runners that were adopted untouched.
+    pub adopted: Vec<String>,
+    /// UUIDs of dead runners that were respawned.
+    pub respawned: Vec<String>,
+}
 
 /// supervisord-level configuration shared by EVERY runner this orchestrator
 /// manages.
@@ -112,14 +128,67 @@ impl Orchestrator {
         &self.runner_dir
     }
 
-    /// Run the periodic monitor loop forever: every [`MONITOR_INTERVAL`], run
-    /// one [`tick`](Self::tick) (probe + respawn dead runners).
+    /// Re-adopt the recorded fleet on supervisor startup.
+    ///
+    /// This is what makes the headline crash-survival property work: when the
+    /// supervisor is SIGKILLed its detached runners keep running, and a freshly
+    /// started supervisor — which never spawned them and holds no in-memory
+    /// table — must RE-DISCOVER them from the on-disk records and ADOPT the
+    /// living ones rather than respawn them.
+    ///
+    /// Mechanically it is one reconcile pass: every recorded runner is checked
+    /// via [`reconcile_record`](Self::reconcile_record) (the SAME decision the
+    /// periodic [`tick`](Self::tick) makes), so a living runner is left running
+    /// untouched (its pid is NOT disturbed) and only a dead one is respawned.
+    /// The difference from `tick` is purely that this is the explicit startup
+    /// entry point and it returns + logs a [`ReadoptSummary`] of what it adopted
+    /// versus respawned.
+    ///
+    /// # Errors
+    /// Returns an [`anyhow::Error`] only if the runner directory cannot be
+    /// listed. Per-runner respawn failures are logged and counted as neither
+    /// adopted nor respawned (the next [`tick`] retries), never propagated.
+    pub async fn readopt(&self) -> anyhow::Result<ReadoptSummary> {
+        let records = RunnerHandle::list(&self.runner_dir)?;
+        let mut summary = ReadoptSummary::default();
+
+        for record in records {
+            match self.reconcile_record(&record).await {
+                RecordOutcome::Adopted => summary.adopted.push(record.uuid),
+                RecordOutcome::Respawned => summary.respawned.push(record.uuid),
+                // A failed respawn is left out of both buckets; it was logged in
+                // reconcile_record and the periodic monitor will retry it.
+                RecordOutcome::RespawnFailed => {}
+            }
+        }
+
+        tracing::info!(
+            adopted = summary.adopted.len(),
+            respawned = summary.respawned.len(),
+            adopted_uuids = ?summary.adopted,
+            respawned_uuids = ?summary.respawned,
+            "re-adopted runner fleet on startup"
+        );
+
+        Ok(summary)
+    }
+
+    /// Run the periodic monitor loop forever: re-adopt the existing fleet once
+    /// at startup (Task 2.5), then every [`MONITOR_INTERVAL`] run one
+    /// [`tick`](Self::tick) (probe + respawn dead runners).
     ///
     /// Mirrors the idle-reaper loop in `main.rs`: a [`tokio::time::interval`]
     /// drives one pass per tick. Spawn this on a background task at startup.
     /// A failure to enumerate records in a single pass is logged and the loop
     /// continues — a transient FS error must not silently kill self-healing.
     pub async fn run_monitor(self) {
+        // Re-adopt living runners (and respawn any already-dead ones) before the
+        // steady-state loop, so a restarted supervisor reclaims its fleet
+        // immediately instead of waiting a full interval.
+        if let Err(e) = self.readopt().await {
+            tracing::error!(error = %e, "startup re-adopt failed (continuing into monitor loop)");
+        }
+
         let mut ticker = tokio::time::interval(MONITOR_INTERVAL);
         loop {
             ticker.tick().await;

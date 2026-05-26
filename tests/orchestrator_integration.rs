@@ -10,11 +10,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+use tabbify_supervisor::app_ula::derive_app_ula;
 use tabbify_supervisor::control_proto::Reply;
 use tabbify_supervisor::orchestrator::client::ControlClient;
 use tabbify_supervisor::orchestrator::handle::{RunnerHandle, record_path};
 use tabbify_supervisor::orchestrator::spawn::{SpawnSpec, spawn_runner};
 use tabbify_supervisor::orchestrator::{Orchestrator, SharedRunnerConfig};
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -48,25 +50,31 @@ memory_mb        = 64
 dynamic_prefixes = ["/"]
 "#;
 
+/// Mount `latest`, `manifest.toml`, and `app.wasm` routes for `uuid` (version 1)
+/// onto an already-running mock S3 server.
+async fn mount_app(server: &MockServer, uuid: &str, manifest: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/apps/{uuid}/latest")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("1"))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/apps/{uuid}/v1/manifest.toml")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(manifest))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/apps/{uuid}/v1/app.wasm")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(HELLO_WASM.to_vec()))
+        .mount(server)
+        .await;
+}
+
 /// Stand up a wiremock S3 serving `latest`, `manifest.toml`, and `app.wasm`
 /// for `APP_UUID` at version 1 with the given manifest body.
 async fn mock_s3(manifest: &str) -> MockServer {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/apps/{APP_UUID}/latest")))
-        .respond_with(ResponseTemplate::new(200).set_body_string("1"))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/apps/{APP_UUID}/v1/manifest.toml")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(manifest))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/apps/{APP_UUID}/v1/app.wasm")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(HELLO_WASM.to_vec()))
-        .mount(&server)
-        .await;
+    mount_app(&server, APP_UUID, manifest).await;
     server
 }
 
@@ -552,4 +560,163 @@ async fn monitor_tick_respawns_dead_runner() {
     // Clean up: shut the respawned runner down.
     client.shutdown().await.ok();
     wait_unreachable(&client, Duration::from_secs(5)).await;
+}
+
+// ── Task 2.5: re-adopt living runners on supervisor restart ──────────────────
+
+/// A second app UUID, used for the runner whose record is pre-seeded dead so
+/// re-adopt must respawn it (distinct from the living `APP_UUID` runner).
+const DEAD_UUID: &str = "0191e7c2-2222-7222-8333-444455556666";
+
+/// THE re-adopt test: model "supervisor A died, supervisor B started".
+///
+/// Orchestrator A (here: the spawn harness) launches a real detached runner and
+/// it becomes reachable. Then a FRESH Orchestrator B is constructed over the
+/// SAME `runner_dir` — B never spawned anything, the on-disk records are its
+/// only knowledge of the fleet. Additionally, a record with a DEAD pid is
+/// pre-seeded.
+///
+/// `B.readopt()` must:
+/// - ADOPT the living runner — its record pid is UNCHANGED and it is still the
+///   same reachable process (re-spawning a healthy runner would kill+recreate
+///   it, defeating the whole crash-survival property);
+/// - RESPAWN the dead runner — a new pid, reachable on its socket.
+#[tokio::test]
+async fn readopt_adopts_living_runner_and_respawns_dead_one() {
+    // One mock S3 serving BOTH apps.
+    let s3 = MockServer::start().await;
+    mount_app(&s3, APP_UUID, ON_REQUEST_MANIFEST).await;
+    mount_app(&s3, DEAD_UUID, ON_REQUEST_MANIFEST).await;
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let runner_dir = tempfile::tempdir().expect("runner dir");
+    let sock_dir = tempfile::tempdir().expect("sock dir");
+
+    let live_sock = sock_dir.path().join(format!("{APP_UUID}.sock"));
+    let dead_sock = sock_dir.path().join(format!("{DEAD_UUID}.sock"));
+
+    // --- Orchestrator A: spawn the LIVING runner (real, detached). ---
+    let spec = make_spec(&s3, &live_sock, data_dir.path());
+    let (live_handle, live_child) = spawn_runner(&spec, runner_dir.path())
+        .await
+        .expect("spawn_runner (living)");
+    let live_pid = live_handle.pid;
+
+    // Cleanup guard: SIGKILL the living runner, the dead runner's bogus pid is
+    // never alive, and whatever B respawns for DEAD_UUID (read from the record).
+    let runner_dir_path = runner_dir.path().to_path_buf();
+    let _guard = scopeguard(move || {
+        force_kill(live_pid);
+        if let Ok(Some(h)) = RunnerHandle::load(&runner_dir_path, DEAD_UUID) {
+            force_kill(h.pid);
+        }
+    });
+
+    let live_client = ControlClient::new(&live_sock);
+    let dead_client = ControlClient::new(&dead_sock);
+
+    // The living runner is reachable.
+    let reply = wait_health(&live_client, Duration::from_secs(20)).await;
+    assert!(
+        matches!(reply, Reply::Health { ref state, .. } if state == "running"),
+        "living runner should be running, got {reply:?}"
+    );
+
+    // --- Pre-seed a DEAD record: a bogus pid that is not a live process. ---
+    // Drop the spawner's child for the living runner (B does not retain a Child;
+    // it reconciles purely from the on-disk records + liveness probes).
+    drop(live_child);
+    let dead_handle = RunnerHandle {
+        uuid: DEAD_UUID.to_owned(),
+        // A pid that is essentially never alive in the test window. `readopt`
+        // must treat the process as dead and respawn.
+        pid: 2,
+        control_sock: dead_sock.clone(),
+        app_ula: derive_app_ula(Uuid::parse_str(DEAD_UUID).unwrap()).to_string(),
+        parent: Some("fd5a:1f00:1::1".to_owned()),
+    };
+    dead_handle
+        .save(runner_dir.path())
+        .expect("seed dead record");
+    let dead_seed_pid = dead_handle.pid;
+
+    // --- Orchestrator B: FRESH, over the SAME runner_dir. Never spawned. ---
+    let orch_b = Orchestrator::new(
+        make_shared(&s3, data_dir.path()),
+        runner_dir.path().to_path_buf(),
+    );
+    let summary = orch_b.readopt().await.expect("readopt");
+
+    // --- The living runner is ADOPTED: pid UNCHANGED, still reachable. ---
+    assert!(
+        summary.adopted.contains(&APP_UUID.to_owned()),
+        "living runner must be in the adopted set, got {summary:?}"
+    );
+    assert!(
+        !summary.respawned.contains(&APP_UUID.to_owned()),
+        "living runner must NOT be respawned, got {summary:?}"
+    );
+    let live_after = RunnerHandle::load(runner_dir.path(), APP_UUID)
+        .expect("load living record")
+        .expect("living record present");
+    assert_eq!(
+        live_after.pid, live_pid,
+        "ADOPTED living runner must keep its ORIGINAL pid (not respawned)"
+    );
+    // And it is still the same reachable process reporting that same pid.
+    let reply = live_client.health().await.expect("living runner reachable");
+    match reply {
+        Reply::Health { state, pid, .. } => {
+            assert_eq!(state, "running", "adopted runner should still be running");
+            assert_eq!(pid, live_pid, "adopted runner reports its original pid");
+        }
+        other => panic!("expected Health from adopted runner, got {other:?}"),
+    }
+
+    // --- The dead runner is RESPAWNED: new pid, reachable. ---
+    assert!(
+        summary.respawned.contains(&DEAD_UUID.to_owned()),
+        "dead runner must be in the respawned set, got {summary:?}"
+    );
+    assert!(
+        !summary.adopted.contains(&DEAD_UUID.to_owned()),
+        "dead runner must NOT be adopted, got {summary:?}"
+    );
+    let dead_after = wait_pid_changed(
+        runner_dir.path(),
+        DEAD_UUID,
+        dead_seed_pid,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_ne!(
+        dead_after.pid, dead_seed_pid,
+        "respawned dead runner must have a NEW pid"
+    );
+    assert_eq!(dead_after.uuid, DEAD_UUID, "uuid preserved across respawn");
+
+    // The respawned runner is reachable on its own control socket.
+    let reply = wait_health(&dead_client, Duration::from_secs(20)).await;
+    match reply {
+        Reply::Health {
+            state,
+            app_uuid,
+            pid,
+            ..
+        } => {
+            assert_eq!(state, "running", "respawned runner should be running");
+            assert_eq!(app_uuid, DEAD_UUID);
+            assert_eq!(
+                pid, dead_after.pid,
+                "runner-reported pid must equal the respawned record's pid"
+            );
+        }
+        other => panic!("expected Health from respawned runner, got {other:?}"),
+    }
+
+    // --- Clean up both runners. ---
+    live_client.shutdown().await.ok();
+    dead_client.shutdown().await.ok();
+    wait_unreachable(&live_client, Duration::from_secs(5)).await;
+    wait_unreachable(&dead_client, Duration::from_secs(5)).await;
 }
