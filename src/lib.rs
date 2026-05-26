@@ -33,6 +33,8 @@ pub mod host;
 pub mod manifest;
 pub mod mesh;
 pub mod registry;
+pub mod runner;
 pub mod runtime;
 
 pub use config::Config;
+pub use runner::RunnerConfig;
