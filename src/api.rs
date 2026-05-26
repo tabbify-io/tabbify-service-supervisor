@@ -179,6 +179,9 @@ fn summary_json(s: &AppSummary) -> serde_json::Value {
         "state": s.state.as_str(),
         // The app's address IS its app-ULA in the orchestrator model.
         "bound_addr": s.app_ula,
+        "restart_status": s.restart_status,
+        "restart_count": s.restart_count,
+        "next_retry_at": s.next_retry_at,
     })
 }
 
@@ -200,6 +203,9 @@ fn present_json(s: &AppSummary) -> axum::Json<serde_json::Value> {
         "state": s.state.as_str(),
         "app_ula": s.app_ula,
         "bound_addr": s.app_ula,
+        "restart_status": s.restart_status,
+        "restart_count": s.restart_count,
+        "next_retry_at": s.next_retry_at,
     }))
 }
 

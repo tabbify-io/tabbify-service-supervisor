@@ -31,6 +31,7 @@ use crate::app_ula::derive_app_ula;
 use crate::control_proto::Reply;
 use crate::orchestrator::client::ControlClient;
 use crate::orchestrator::handle::RunnerHandle;
+use crate::orchestrator::restart::{BackoffParams, RestartStatus};
 use crate::orchestrator::spawn::{SpawnSpec, spawn_runner};
 use crate::orchestrator::{MONITOR_INTERVAL, Orchestrator};
 
@@ -72,6 +73,13 @@ pub struct AppSummary {
     pub app_ula: String,
     /// Live state from a control-socket health probe.
     pub state: AppState,
+    /// Coarse restart lifecycle status (`running` / `backoff` / `crashloop`).
+    pub restart_status: String,
+    /// Number of consecutive failures without a stable window in between.
+    pub restart_count: u32,
+    /// Earliest Unix timestamp (seconds) at which the runner is eligible to be
+    /// respawned again. `0` means "immediately eligible" (no backoff pending).
+    pub next_retry_at: u64,
 }
 
 impl Orchestrator {
@@ -150,6 +158,9 @@ impl Orchestrator {
                 uuid: uuid.to_owned(),
                 app_ula: app_ula.to_string(),
                 state: AppState::Running,
+                restart_status: restart_status_str(RestartStatus::Running),
+                restart_count: 0,
+                next_retry_at: 0,
             });
         }
 
@@ -172,6 +183,9 @@ impl Orchestrator {
             uuid: uuid.to_owned(),
             app_ula: app_ula.to_string(),
             state: AppState::Running,
+            restart_status: restart_status_str(RestartStatus::Running),
+            restart_count: 0,
+            next_retry_at: 0,
         })
     }
 
@@ -247,6 +261,10 @@ impl Orchestrator {
     /// Returns an error only if the runner directory cannot be listed.
     pub async fn app_summaries(&self) -> Result<Vec<AppSummary>> {
         let records = RunnerHandle::list(self.runner_dir())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut out = Vec::with_capacity(records.len());
         for rec in records {
             let state = if ControlClient::new(&rec.control_sock).health().await.is_ok() {
@@ -254,10 +272,16 @@ impl Orchestrator {
             } else {
                 AppState::Stopped
             };
+            let rs =
+                crate::orchestrator::restart::status(rec.restart, BackoffParams::default(), now);
+            let restart_status = restart_status_str(rs);
             out.push(AppSummary {
                 uuid: rec.uuid,
                 app_ula: rec.app_ula,
                 state,
+                restart_status,
+                restart_count: rec.restart.consecutive_failures,
+                next_retry_at: rec.restart.next_retry_at,
             });
         }
         Ok(out)
@@ -276,15 +300,24 @@ impl Orchestrator {
         else {
             return Ok(None);
         };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let state = if ControlClient::new(&rec.control_sock).health().await.is_ok() {
             AppState::Running
         } else {
             AppState::Stopped
         };
+        let rs = crate::orchestrator::restart::status(rec.restart, BackoffParams::default(), now);
+        let restart_status = restart_status_str(rs);
         Ok(Some(AppSummary {
             uuid: rec.uuid,
             app_ula: rec.app_ula,
             state,
+            restart_status,
+            restart_count: rec.restart.consecutive_failures,
+            next_retry_at: rec.restart.next_retry_at,
         }))
     }
 
@@ -298,6 +331,19 @@ impl Orchestrator {
             }
         }
     }
+}
+
+/// Map a [`RestartStatus`] to its snake_case wire string.
+///
+/// Mirrors the `#[serde(rename_all = "snake_case")]` derivation on `RestartStatus`
+/// so callers that need an owned `String` do not have to serialize the whole enum.
+fn restart_status_str(rs: RestartStatus) -> String {
+    match rs {
+        RestartStatus::Running => "running",
+        RestartStatus::Backoff => "backoff",
+        RestartStatus::CrashLoop => "crashloop",
+    }
+    .to_owned()
 }
 
 /// Poll `client.health()` until it succeeds or `timeout` elapses. Returns the
@@ -385,5 +431,87 @@ mod tests {
     async fn app_state_rejects_bad_uuid() {
         let o = orch(PathBuf::from("/run/tabbify/runners"));
         assert!(o.app_state("not-a-uuid").await.is_err());
+    }
+
+    // ── restart_status_str ────────────────────────────────────────────────────
+
+    #[test]
+    fn restart_status_str_running() {
+        assert_eq!(restart_status_str(RestartStatus::Running), "running");
+    }
+
+    #[test]
+    fn restart_status_str_backoff() {
+        assert_eq!(restart_status_str(RestartStatus::Backoff), "backoff");
+    }
+
+    #[test]
+    fn restart_status_str_crashloop() {
+        assert_eq!(restart_status_str(RestartStatus::CrashLoop), "crashloop");
+    }
+
+    // ── AppSummary restart fields ─────────────────────────────────────────────
+
+    /// Construct a RunnerHandle with `consecutive_failures = 5`, build an
+    /// AppSummary from the record fields (mirroring what app_summaries does),
+    /// and assert restart_status == "crashloop" and restart_count == 5.
+    #[test]
+    fn app_summary_fields_crashloop() {
+        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+
+        let restart = RestartState {
+            consecutive_failures: 5,
+            last_exit_at: 1_700_000_000,
+            next_retry_at: 1_700_000_160,
+            last_healthy_at: 0,
+        };
+
+        // Persist a record so we can load it back (mirrors real data path).
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 1,
+            control_sock: PathBuf::from("/tmp/test.sock"),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart,
+        };
+        rec.save(dir.path()).unwrap();
+        let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
+
+        // Reproduce what app_summaries/app_summary does.
+        let now = 1_700_001_000u64;
+        let rs = status(loaded.restart, BackoffParams::default(), now);
+        let summary = AppSummary {
+            uuid: loaded.uuid.clone(),
+            app_ula: loaded.app_ula.clone(),
+            state: AppState::Stopped,
+            restart_status: restart_status_str(rs),
+            restart_count: loaded.restart.consecutive_failures,
+            next_retry_at: loaded.restart.next_retry_at,
+        };
+
+        assert_eq!(summary.restart_status, "crashloop");
+        assert_eq!(summary.restart_count, 5);
+        assert_eq!(summary.next_retry_at, 1_700_000_160);
+    }
+
+    /// A fresh (never-failed) record produces restart_status == "running" and
+    /// restart_count == 0.
+    #[test]
+    fn app_summary_fields_default_is_running() {
+        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
+
+        let restart = RestartState::default();
+        let now = 1_700_001_000u64;
+        let rs = status(restart, BackoffParams::default(), now);
+        let restart_status = restart_status_str(rs);
+
+        assert_eq!(restart_status, "running");
+        assert_eq!(restart.consecutive_failures, 0);
+        assert_eq!(restart.next_retry_at, 0);
     }
 }
