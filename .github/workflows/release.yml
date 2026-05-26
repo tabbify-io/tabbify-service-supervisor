@@ -119,11 +119,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-zig-${{ matrix.target }}-
 
-      - name: Build static supervisord binary (cross-compiled via zig)
+      - name: Build static supervisord + tabbify-runner (cross-compiled via zig)
         # cargo-zigbuild uses `zig cc` as the linker, cross-linking the musl C
-        # runtime for BOTH targets from one x86_64 runner (verified locally for
-        # x86_64-musl + aarch64-musl — both static, both run).
-        run: cargo zigbuild --release --target "${{ matrix.target }}" --bin supervisord
+        # runtime for BOTH targets from one x86_64 runner. Builds the
+        # orchestrator (supervisord) AND the per-app runner (tabbify-runner).
+        run: cargo zigbuild --release --target "${{ matrix.target }}" --bin supervisord --bin tabbify-runner
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -139,6 +139,15 @@ jobs:
           aws s3 cp \
             "target/${{ matrix.target }}/release/supervisord" \
             "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/${{ matrix.arch }}/supervisord"
+
+      - name: Upload tabbify-runner to S3 (per-arch key)
+        # The per-app runner binary the orchestrator spawns. Same per-arch
+        # scheme as supervisord; an operator host fetches both.
+        run: |
+          set -euo pipefail
+          aws s3 cp \
+            "target/${{ matrix.target }}/release/tabbify-runner" \
+            "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/${{ matrix.arch }}/tabbify-runner"
 
       - name: Upload supervisord to S3 (legacy un-prefixed key)
         # Only x86_64 sets legacy_key. Keeps the pre-existing
