@@ -40,7 +40,15 @@ fmt-fix:
 # All pre-commit gates in one shot.
 check: build test lint fmt
 
-# Cross-build a static musl binary (for scp to a Linux host, e.g. Kamatera).
-# Requires the musl target: `rustup target add x86_64-unknown-linux-musl`.
+# Cross-build static musl binaries via cargo-zigbuild (matches CI). zig supplies
+# the cross-linker + C toolchain, so BOTH arches build from ANY host (macOS or
+# Linux, x86_64 or arm64) — no native ARM runner, no container, no QEMU.
+# One-time setup: install zig (`brew install zig`) + `cargo install
+# cargo-zigbuild`, and `rustup target add <triple>`.
 build-musl:
-    cargo build --release --target x86_64-unknown-linux-musl
+    cargo zigbuild --release --target x86_64-unknown-linux-musl --bin supervisord
+
+# aarch64 static musl (for an ARM Linux host, e.g. the aarch64 Lima VM used for
+# Firecracker testing). Output: target/aarch64-unknown-linux-musl/release/supervisord
+build-musl-aarch64:
+    cargo zigbuild --release --target aarch64-unknown-linux-musl --bin supervisord
