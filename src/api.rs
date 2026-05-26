@@ -34,17 +34,29 @@ pub struct SupervisorState {
     pub supervisor_id: String,
     /// Our control ULA (peer-ULA), or the bind addr's host when running w/o mesh.
     pub ula: String,
+    /// Whether this host can run Firecracker microVMs (/dev/kvm present). Surfaced
+    /// on `/health` so an operator can see at a glance what this supervisor can run.
+    pub firecracker: bool,
 }
 
 impl SupervisorState {
-    /// Construct shared state.
+    /// Construct shared state. Firecracker capability defaults off; set it with
+    /// [`Self::with_firecracker`].
     #[must_use]
     pub fn new(registry: AppRegistry, supervisor_id: String, ula: String) -> Self {
         Self {
             registry,
             supervisor_id,
             ula,
+            firecracker: false,
         }
+    }
+
+    /// Set the Firecracker (KVM) capability reported on `/health`.
+    #[must_use]
+    pub fn with_firecracker(mut self, firecracker: bool) -> Self {
+        self.firecracker = firecracker;
+        self
     }
 }
 
@@ -67,6 +79,7 @@ async fn health(State(state): State<SharedState>) -> Response {
         "status": "ok",
         "supervisor_id": state.supervisor_id,
         "ula": state.ula,
+        "firecracker": state.firecracker,
     }))
     .into_response()
 }

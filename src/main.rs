@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     // Idle reaper: periodically stop idle on_request instances.
     spawn_reaper(registry.clone());
 
-    let state = SupervisorState::new(registry, supervisor_id, ula_str);
+    let state = SupervisorState::new(registry, supervisor_id, ula_str).with_firecracker(kvm);
     let app = router(state);
 
     let listener = TcpListener::bind(bind_addr)
