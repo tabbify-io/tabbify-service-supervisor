@@ -636,6 +636,7 @@ async fn readopt_adopts_living_runner_and_respawns_dead_one() {
         app_ula: derive_app_ula(Uuid::parse_str(DEAD_UUID).unwrap()).to_string(),
         parent: Some("fd5a:1f00:1::1".to_owned()),
         spawned_at: 0,
+        restart: Default::default(),
     };
     dead_handle
         .save(runner_dir.path())
@@ -783,6 +784,7 @@ async fn monitor_tick_does_not_respawn_within_grace_window() {
         app_ula: handle.app_ula.clone(),
         parent: handle.parent.clone(),
         spawned_at: now_secs, // within grace window
+        restart: Default::default(),
     };
     grace_record
         .save(runner_dir.path())
@@ -894,6 +896,7 @@ async fn monitor_tick_kills_hung_runner_before_respawn() {
         app_ula: hung_ula,
         parent: Some("fd5a:1f00:1::1".to_owned()),
         spawned_at: old_secs,
+        restart: Default::default(),
     };
     hung_record
         .save(runner_dir.path())
@@ -920,6 +923,7 @@ async fn monitor_tick_kills_hung_runner_before_respawn() {
         app_ula: hung_ula2,
         parent: Some("fd5a:1f00:1::1".to_owned()),
         spawned_at: old_secs,
+        restart: Default::default(),
     };
     hung_record2
         .save(runner_dir.path())

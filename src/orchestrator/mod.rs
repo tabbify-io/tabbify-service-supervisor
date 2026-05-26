@@ -242,6 +242,7 @@ mod tests {
             app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
             parent: Some("fd5a:1f00:1::1".to_owned()),
             spawned_at: 0,
+            restart: Default::default(),
         }
     }
 

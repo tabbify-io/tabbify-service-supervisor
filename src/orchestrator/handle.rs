@@ -40,6 +40,13 @@ pub struct RunnerHandle {
     /// the grace window has long expired".
     #[serde(default)]
     pub spawned_at: u64,
+    /// Per-runner restart / backoff state persisted across supervisor restarts.
+    ///
+    /// `#[serde(default)]` ensures old on-disk records (written before this
+    /// field existed) still deserialize correctly — they get
+    /// [`RestartState::default()`], which is the clean "never failed" sentinel.
+    #[serde(default)]
+    pub restart: crate::orchestrator::restart::RestartState,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -141,6 +148,7 @@ mod tests {
             app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
             parent: Some("fd5a:1f00:0:3::1".to_owned()),
             spawned_at: 1_700_000_000,
+            restart: Default::default(),
         }
     }
 
@@ -152,6 +160,7 @@ mod tests {
             app_ula: "fd5a:1f02:dead:beef:cafe::1".to_owned(),
             parent: None,
             spawned_at: 0,
+            restart: Default::default(),
         }
     }
 
@@ -201,6 +210,56 @@ mod tests {
         }"#;
         let h: RunnerHandle = serde_json::from_str(json).unwrap();
         assert_eq!(h.spawned_at, 0, "missing spawned_at must default to 0");
+    }
+
+    // ── restart field ────────────────────────────────────────────────────────
+
+    /// A handle with a non-default `restart` state must round-trip through
+    /// `save` → `load` with all fields intact.
+    #[test]
+    fn restart_state_round_trips_via_save_load() {
+        use crate::orchestrator::restart::RestartState;
+
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.restart = RestartState {
+            consecutive_failures: 3,
+            last_exit_at: 1_700_001_000,
+            next_retry_at: 1_700_001_040,
+            last_healthy_at: 1_700_000_900,
+        };
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded.restart, h.restart,
+            "restart state must survive save/load"
+        );
+    }
+
+    /// JSON written before the `restart` field was added (no `"restart"` key)
+    /// must deserialize with `RestartState::default()` so old records are not
+    /// rejected.
+    #[test]
+    fn restart_defaults_to_clean_state_for_old_records() {
+        use crate::orchestrator::restart::RestartState;
+
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            h.restart,
+            RestartState::default(),
+            "missing restart key must deserialize as RestartState::default()"
+        );
     }
 
     // ── save / load ──────────────────────────────────────────────────────────

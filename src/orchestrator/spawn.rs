@@ -183,6 +183,7 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         app_ula: app_ula.to_string(),
         parent: spec.parent.clone(),
         spawned_at,
+        restart: Default::default(),
     };
 
     handle
