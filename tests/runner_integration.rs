@@ -1,4 +1,4 @@
-//! Integration tests for the per-app runner serve core (Tasks 1.2 + 1.4).
+//! Integration tests for the per-app runner serve core (Tasks 1.2 + 1.4 + 1.6).
 //!
 //! Mirrors the patterns in `tests/integration.rs`: a wiremock S3 serves the
 //! `hello.wasm` fixture; the runner serve core binds a loopback listener in
@@ -7,9 +7,14 @@
 //!
 //! Task 1.4 adds control-socket tests: Health / Stop / Purge via the unix-
 //! domain socket server.
+//!
+//! Task 1.6 adds a binary-wiring test: `RunnerConfig` → `ServeConfig` →
+//! `RunnerServe::start` → `control::serve` → `Health` reply, proving the
+//! entrypoint wires config→serve→control correctly without spawning a process.
 
 use std::time::Duration;
 
+use clap::Parser;
 use tabbify_supervisor::config::{DockerConfig, FcConfig};
 use tabbify_supervisor::control_proto::{Cmd, Reply};
 use tabbify_supervisor::runner::serve::{RunnerServe, ServeConfig};
@@ -115,10 +120,7 @@ async fn runner_serves_fixture_on_root_and_deep_path_loopback() {
 // ── Task 1.4: control-socket tests ─────────────────────────────────────────
 
 /// Send one [`Cmd`] over a unix socket and read back one [`Reply`].
-async fn ctrl_send(
-    sock: &std::path::Path,
-    cmd: Cmd,
-) -> Reply {
+async fn ctrl_send(sock: &std::path::Path, cmd: Cmd) -> Reply {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -126,10 +128,7 @@ async fn ctrl_send(
         .await
         .expect("connect control socket");
     let line = serde_json::to_string(&cmd).expect("serialize cmd") + "\n";
-    stream
-        .write_all(line.as_bytes())
-        .await
-        .expect("write cmd");
+    stream.write_all(line.as_bytes()).await.expect("write cmd");
     let mut reader = BufReader::new(stream);
     let mut buf = String::new();
     reader.read_line(&mut buf).await.expect("read reply");
@@ -200,7 +199,10 @@ async fn control_socket_health_stop_purge() {
 
     // --- Stop: tears down the listener ---
     let reply = ctrl_send(&sock_path, Cmd::Stop).await;
-    assert!(matches!(reply, Reply::Ok), "expected Ok from Stop, got: {reply:?}");
+    assert!(
+        matches!(reply, Reply::Ok),
+        "expected Ok from Stop, got: {reply:?}"
+    );
 
     // Give the listener task a moment to be aborted.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -215,10 +217,7 @@ async fn control_socket_health_stop_purge() {
         .timeout(Duration::from_millis(300))
         .send()
         .await;
-    assert!(
-        post_stop.is_err(),
-        "app listener should be down after Stop"
-    );
+    assert!(post_stop.is_err(), "app listener should be down after Stop");
 
     // Health after stop reports `stopped`.
     let reply = ctrl_send(&sock_path, Cmd::Health).await;
@@ -232,12 +231,75 @@ async fn control_socket_health_stop_purge() {
     assert!(cache_dir.exists(), "cache should exist before purge");
 
     let reply = ctrl_send(&sock_path, Cmd::Purge).await;
-    assert!(matches!(reply, Reply::Ok), "expected Ok from Purge, got: {reply:?}");
+    assert!(
+        matches!(reply, Reply::Ok),
+        "expected Ok from Purge, got: {reply:?}"
+    );
 
     // Give the async removal a moment.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !cache_dir.exists(),
-        "cache dir should be gone after Purge"
-    );
+    assert!(!cache_dir.exists(), "cache dir should be gone after Purge");
+}
+
+// ── Task 1.6: binary entrypoint wiring test ────────────────────────────────
+
+/// Prove the binary's config→serve→control wiring without spawning a process.
+///
+/// Constructs a [`tabbify_supervisor::RunnerConfig`] (the clap struct the binary
+/// parses) and passes it through [`tabbify_supervisor::runner::wire::serve_config_from`]
+/// (the mapping the entrypoint uses) to obtain a [`ServeConfig`]; then starts
+/// [`RunnerServe`] + [`tabbify_supervisor::runner::control::serve`] in-process
+/// and asserts that a `Health` command returns `state = "running"` with the
+/// correct `app_uuid`.
+#[tokio::test]
+async fn runner_binary_wiring_config_to_control_health() {
+    let s3 = mock_s3(ON_REQUEST_MANIFEST).await;
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let sock_dir = tempfile::tempdir().expect("sock dir");
+    let sock_path = sock_dir.path().join("runner_wire.sock");
+
+    // Build a RunnerConfig the same way the binary does (clap parse_from).
+    let cfg = tabbify_supervisor::RunnerConfig::try_parse_from([
+        "tabbify-runner",
+        "--uuid",
+        APP_UUID,
+        "--no-mesh",
+        "--s3-base-url",
+        &s3.uri(),
+        "--data-dir",
+        data_dir.path().to_str().unwrap(),
+        "--control-sock",
+        sock_path.to_str().unwrap(),
+    ])
+    .expect("parse RunnerConfig");
+
+    // Map RunnerConfig → ServeConfig using the entrypoint's wiring helper.
+    let serve_cfg = tabbify_supervisor::runner::wire::serve_config_from(&cfg);
+
+    // Start the runner serve core (same as the binary does).
+    let runner = RunnerServe::start(serve_cfg).await.expect("runner start");
+
+    // Spawn the control server (same as the binary does).
+    let lifecycle = runner.lifecycle();
+    let sock_path2 = sock_path.clone();
+    tokio::spawn(async move {
+        tabbify_supervisor::runner::control::serve(sock_path2, lifecycle)
+            .await
+            .expect("control server");
+    });
+
+    // Allow the socket to appear.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send Health and assert the wiring is correct.
+    let reply = ctrl_send(&sock_path, Cmd::Health).await;
+    match reply {
+        Reply::Health {
+            state, app_uuid, ..
+        } => {
+            assert_eq!(state, "running", "expected running after wire start");
+            assert_eq!(app_uuid, APP_UUID, "app_uuid mismatch");
+        }
+        other => panic!("expected Health reply, got: {other:?}"),
+    }
 }

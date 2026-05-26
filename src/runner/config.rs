@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::config::{
-    DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL, DockerConfig, FcConfig,
-};
+use crate::config::{DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL, DockerConfig, FcConfig};
 
 /// `tabbify-runner` configuration — one runner per app instance.
 #[derive(Debug, Clone, Parser)]
@@ -32,7 +30,11 @@ pub struct RunnerConfig {
     pub parent: Option<String>,
 
     /// Unix-domain socket path for the parent control channel.
-    #[arg(long, env = "RUNNER_CONTROL_SOCK", default_value = "/run/tabbify/runners/runner.sock")]
+    #[arg(
+        long,
+        env = "RUNNER_CONTROL_SOCK",
+        default_value = "/run/tabbify/runners/runner.sock"
+    )]
     pub control_sock: PathBuf,
 
     /// Skip mesh join; bind plain loopback/`--bind`. Used for local

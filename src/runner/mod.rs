@@ -3,5 +3,6 @@
 pub mod config;
 pub mod control;
 pub mod serve;
+pub mod wire;
 
 pub use config::RunnerConfig;
