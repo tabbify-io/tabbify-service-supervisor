@@ -31,7 +31,7 @@ use crate::app_ula::derive_app_ula;
 use crate::control_proto::Reply;
 use crate::orchestrator::client::ControlClient;
 use crate::orchestrator::handle::RunnerHandle;
-use crate::orchestrator::restart::{BackoffParams, RestartStatus};
+use crate::orchestrator::restart::{self, BackoffParams, RestartStatus};
 use crate::orchestrator::spawn::{SpawnSpec, spawn_runner};
 use crate::orchestrator::{MONITOR_INTERVAL, Orchestrator};
 
@@ -321,6 +321,66 @@ impl Orchestrator {
         }))
     }
 
+    /// Reset `uuid`'s crash-loop / backoff state and retry immediately.
+    ///
+    /// This is the `systemctl reset-failed` analog: it zeroes the
+    /// `consecutive_failures` counter and clears `next_retry_at` so that a dead
+    /// runner becomes immediately eligible for a respawn. Unlike [`purge_app`] it
+    /// does NOT delete the artifact cache — the runner's cached image is kept for
+    /// a fast cold start.
+    ///
+    /// After the state is cleared the record is persisted and
+    /// [`reconcile_record`](crate::orchestrator::monitor) is called so the
+    /// respawn fires NOW rather than waiting for the next monitor tick.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - `uuid` is not a valid UUID;
+    /// - no on-disk record exists for `uuid` (i.e. the app was never started).
+    pub async fn reset_app(&self, uuid: &str) -> Result<AppSummary> {
+        let _ = self.app_ula_for(uuid)?;
+
+        // Load the record — a missing record means "never started" → 404.
+        let mut record = RunnerHandle::load(self.runner_dir(), uuid)
+            .with_context(|| format!("load runner record for {uuid}"))?
+            .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
+
+        // Clear the crash-loop / backoff state so the runner is immediately
+        // eligible for a respawn (next_retry_at is zeroed by reset()).
+        record.restart = restart::reset(record.restart);
+
+        // Persist the cleared state BEFORE triggering reconcile so a concurrent
+        // monitor tick also sees the clean state.
+        record
+            .save(self.runner_dir())
+            .with_context(|| format!("save runner record for {uuid} after reset"))?;
+
+        // Fire an immediate reconcile: if the runner is dead it will be
+        // respawned right now; if it is alive it is adopted untouched.
+        self.reconcile_record(&record).await;
+
+        // Re-derive the summary from the (now-clean) on-disk record.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let state = if self.client_for(uuid).health().await.is_ok() {
+            AppState::Running
+        } else {
+            AppState::Stopped
+        };
+        let rs =
+            crate::orchestrator::restart::status(record.restart, BackoffParams::default(), now);
+        Ok(AppSummary {
+            uuid: record.uuid,
+            app_ula: record.app_ula,
+            state,
+            restart_status: restart_status_str(rs),
+            restart_count: record.restart.consecutive_failures,
+            next_retry_at: record.restart.next_retry_at,
+        })
+    }
+
     /// Remove `uuid`'s on-disk runner record (best-effort; a missing file is
     /// success). After this the monitor will not respawn the runner.
     fn forget_record(&self, uuid: &str) {
@@ -513,5 +573,93 @@ mod tests {
         assert_eq!(restart_status, "running");
         assert_eq!(restart.consecutive_failures, 0);
         assert_eq!(restart.next_retry_at, 0);
+    }
+
+    // ── reset_app state clearing ──────────────────────────────────────────────
+
+    /// reset_app clears the crash-loop state on the persisted record: after the
+    /// call, loading the record shows consecutive_failures == 0 and
+    /// next_retry_at == 0, so should_respawn is true for any `now`.
+    ///
+    /// The reconcile_record call inside reset_app will try (and fail) to spawn
+    /// a real runner process — that failure is tolerated (logged, not
+    /// propagated). We verify the state-clearing effect on the persisted record,
+    /// which is the core guarantee of reset.
+    #[tokio::test]
+    async fn reset_app_clears_restart_state_on_disk() {
+        use crate::orchestrator::restart::{RestartState, should_respawn};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let o = orch(dir.path().to_path_buf());
+
+        // Write a record with a crash-loop restart state.
+        let crashed_restart = RestartState {
+            consecutive_failures: 5,
+            last_exit_at: 1_700_000_000,
+            next_retry_at: 1_700_000_160,
+            last_healthy_at: 0,
+        };
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 99_999_999, // deliberately non-existent pid
+            control_sock: dir.path().join(format!("{APP_UUID}.sock")),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: crashed_restart,
+        };
+        rec.save(dir.path()).unwrap();
+
+        // reset_app should clear the state regardless of reconcile outcome.
+        let _ = o.reset_app(APP_UUID).await;
+
+        // Load the record back and assert the crash state is cleared.
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must still exist after reset");
+        assert_eq!(
+            updated.restart,
+            RestartState::default(),
+            "reset must zero the restart state on disk"
+        );
+        // should_respawn must be true for any `now` after the reset.
+        assert!(
+            should_respawn(updated.restart, 1_700_001_000),
+            "after reset, runner must be immediately eligible for respawn"
+        );
+    }
+
+    /// reset_app returns an error for an unknown uuid (no on-disk record), so
+    /// the HTTP handler can return 404.
+    #[tokio::test]
+    async fn reset_app_errors_for_unknown_uuid() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let o = orch(dir.path().to_path_buf());
+
+        let result = o.reset_app(APP_UUID).await;
+        assert!(
+            result.is_err(),
+            "reset_app for an unknown uuid must return an error"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no runner record found"),
+            "error message must mention 'no runner record found'"
+        );
+    }
+
+    /// reset_app rejects malformed uuids before touching any on-disk state.
+    #[tokio::test]
+    async fn reset_app_rejects_bad_uuid() {
+        let o = orch(PathBuf::from("/run/tabbify/runners"));
+        assert!(
+            o.reset_app("not-a-uuid").await.is_err(),
+            "malformed uuid must be rejected"
+        );
     }
 }

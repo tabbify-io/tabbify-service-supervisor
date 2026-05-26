@@ -18,6 +18,7 @@
 //! - `POST /v1/apps/:uuid/start`  (spawn a runner + wait healthy)
 //! - `POST /v1/apps/:uuid/stop`   (shutdown the runner + forget)
 //! - `POST /v1/apps/:uuid/purge`  (purge + shutdown the runner + forget + clear cache)
+//! - `POST /v1/apps/:uuid/reset`  (clear crash-loop/backoff state + retry immediately)
 
 use std::sync::Arc;
 
@@ -98,6 +99,7 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/start", post(start_app))
         .route("/v1/apps/:uuid/stop", post(stop_app))
         .route("/v1/apps/:uuid/purge", post(purge_app))
+        .route("/v1/apps/:uuid/reset", post(reset_app))
         .with_state(Arc::new(state))
 }
 
@@ -168,6 +170,20 @@ async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -
     match state.orchestrator.purge_app(&uuid).await {
         Ok(()) => axum::Json(json!({ "state": "purged", "uuid": uuid })).into_response(),
         Err(e) => anyhow_to_response(&e),
+    }
+}
+
+/// `POST /v1/apps/:uuid/reset` — clear the crash-loop / backoff state and retry
+/// immediately. This is the `systemctl reset-failed` analog: it zeroes the
+/// consecutive-failure counter so a dead runner is eligible for an immediate
+/// respawn. Unlike `purge` it does NOT delete the artifact cache.
+///
+/// Returns the app's current status JSON (same shape as `start`). Returns `404`
+/// when no runner record exists (the app was never started).
+async fn reset_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+    match state.orchestrator.reset_app(&uuid).await {
+        Ok(s) => running_json(&s).into_response(),
+        Err(e) => anyhow_to_not_found_or_error(&e),
     }
 }
 
@@ -252,6 +268,153 @@ fn anyhow_to_response(e: &anyhow::Error) -> Response {
     error_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
 }
 
+/// Like [`anyhow_to_response`] but also maps "no runner record found" messages
+/// to 404. Used by [`reset_app`] so a reset of an unknown uuid returns 404
+/// rather than 500.
+fn anyhow_to_not_found_or_error(e: &anyhow::Error) -> Response {
+    let msg = e.to_string();
+    if msg.contains("no runner record found") {
+        return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": msg }))).into_response();
+    }
+    anyhow_to_response(e)
+}
+
 fn error_json(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(json!({ "error": msg }))).into_response()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt as _;
+    use tempfile::TempDir;
+    use tower::ServiceExt as _;
+
+    use super::*;
+    use crate::fetcher::S3Fetcher;
+    use crate::orchestrator::handle::RunnerHandle;
+    use crate::orchestrator::restart::RestartState;
+    use crate::orchestrator::{Orchestrator, SharedRunnerConfig};
+
+    const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
+    const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
+
+    fn make_state(runner_dir: PathBuf) -> SupervisorState {
+        let orchestrator = Orchestrator::new(
+            SharedRunnerConfig {
+                runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
+                s3_base_url: "http://s3.invalid".to_owned(),
+                data_dir: PathBuf::from("/var/lib/tabbify/data"),
+                parent: None,
+                no_mesh: true,
+            },
+            runner_dir.clone(),
+        );
+        let fetcher = S3Fetcher::new("http://s3.invalid", PathBuf::from("/var/lib/tabbify/data"));
+        SupervisorState::new(
+            orchestrator,
+            fetcher,
+            "test-supervisor".to_owned(),
+            "::1".to_owned(),
+        )
+    }
+
+    fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
+        RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 99_999_999, // non-existent
+            control_sock: runner_dir.join(format!("{APP_UUID}.sock")),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: RestartState {
+                consecutive_failures: 5,
+                last_exit_at: 1_700_000_000,
+                next_retry_at: 1_700_001_000,
+                last_healthy_at: 0,
+            },
+        }
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> bytes::Bytes {
+        resp.into_body()
+            .collect()
+            .await
+            .expect("body collection failed")
+            .to_bytes()
+    }
+
+    // ── POST /v1/apps/:uuid/reset — 200 for known uuid ────────────────────────
+
+    /// Posting reset for a uuid that has an on-disk runner record returns 200
+    /// with a JSON body containing restart fields.
+    #[tokio::test]
+    async fn reset_known_uuid_returns_200() {
+        let dir = TempDir::new().unwrap();
+        let rec = crashed_record(dir.path());
+        rec.save(dir.path()).unwrap();
+
+        let state = make_state(dir.path().to_path_buf());
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_UUID}/reset"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The response mirrors running_json: state, app_ula, bound_addr.
+        assert!(json.get("state").is_some(), "response must contain 'state'");
+        assert!(
+            json.get("app_ula").is_some(),
+            "response must contain 'app_ula'"
+        );
+    }
+
+    // ── POST /v1/apps/:uuid/reset — 404 for unknown uuid ─────────────────────
+
+    /// Posting reset for a uuid that has NO on-disk runner record returns 404.
+    #[tokio::test]
+    async fn reset_unknown_uuid_returns_404() {
+        let dir = TempDir::new().unwrap();
+        // No record written → uuid is unknown.
+        let state = make_state(dir.path().to_path_buf());
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_UUID}/reset"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── anyhow_to_not_found_or_error ─────────────────────────────────────────
+
+    /// An error whose message contains "no runner record found" maps to 404.
+    #[test]
+    fn not_found_error_maps_to_404() {
+        let e = anyhow::anyhow!("no runner record found for abc-123");
+        let resp = anyhow_to_not_found_or_error(&e);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Any other error maps to 500.
+    #[test]
+    fn generic_error_maps_to_500() {
+        let e = anyhow::anyhow!("something went wrong");
+        let resp = anyhow_to_not_found_or_error(&e);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
