@@ -57,6 +57,12 @@ scope here, but every decision below keeps it cheap to add later.
 - **node data path UNCHANGED**: node still dials `derive_app_ula(uuid)`; now a
   runner answers instead of the supervisor. (This is the payoff of the
   deterministic app-ULA design.)
+- **Persistent peer identity (peers remember their IP).** A peer keeps the same
+  mesh ULA across restarts. **Runners get this for free** — `app_ula =
+  derive_app_ula(uuid)` is deterministic, recomputed from the uuid (no persist).
+  **Supervisors persist** their (keypair + assigned ULA) to disk and **re-claim
+  the same ULA on rejoin** via `requested_ula` (Phase 0), instead of churning
+  idx-assigned ULAs. Same mechanism, both stable.
 
 ## 3. Architecture
 

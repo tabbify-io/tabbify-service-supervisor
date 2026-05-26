@@ -49,7 +49,15 @@
 - [ ] **Implement:** add the fields to `JoinConfig` (all `Option`/defaulted, backward-compatible); include them in the outgoing join request; when `requested_ula` is set, use it as `my_ula`.
 - [ ] **Run → pass.** Commit `feat: JoinConfig requested_ula + peer metadata`. Tag a new mesh rev for the git-dep bump in Phase 1.
 
-**Phase 0 acceptance:** mesh + coordinator tests green; a peer can join with a chosen `app_ula` + metadata; roster exposes it. Existing supervisor (old `host_app_ula` path) still works (additive). Merge + note the mesh rev.
+### Task 0.4: Persistent peer identity (peers remember their ULA across restarts)
+**Files:** Modify `tabbify-mesh-joiner` `JoinConfig`/`Joiner::join` + an identity-persistence helper (check how the keypair is currently persisted — Wave-2 "persistent keypair" may already exist; this adds ULA stickiness); Test: joiner tests.
+
+- [ ] **Write failing test:** a joiner built with `identity_path = <tmp>/id.json` and NO prior state joins a fake coordinator → gets assigned ULA `X`, and `<tmp>/id.json` now holds `{keypair, ula: X}`. A SECOND joiner with the same `identity_path` (simulating a restart) joins → it sends `requested_ula = X` + reuses the persisted keypair → `my_ula() == X` again (stable across restart). (Runners don't need this — they pass `requested_ula = derive_app_ula(uuid)` explicitly, deterministic; this is for supervisors/long-lived peers.)
+- [ ] **Run → fail.**
+- [ ] **Implement:** `JoinConfig` gains `identity_path: Option<PathBuf>`. On `join`: if the file exists, load `{keypair, ula}` → reuse the keypair + set `requested_ula = ula`; else join fresh, then persist `{keypair, assigned_ula}` to the path (0600). Reuse the existing keypair-persistence if present; only add the ULA field + re-request.
+- [ ] **Run → pass.** Commit `feat: persistent peer identity (sticky ULA via identity_path)`.
+
+**Phase 0 acceptance:** mesh + coordinator tests green; a peer can join with a chosen `app_ula` + metadata; a peer with an `identity_path` keeps the same ULA across restarts; roster exposes metadata. Existing supervisor (old `host_app_ula` path) still works (additive). Merge + note the mesh rev. (Supervisor wires `identity_path` in Phase 2; runners pass `requested_ula = derive_app_ula(uuid)` in Phase 1.)
 
 ---
 
