@@ -1,0 +1,3 @@
+# Binaries staged into the build context at build time (from CI artifacts /
+# `cargo zigbuild`); never committed.
+bin/
