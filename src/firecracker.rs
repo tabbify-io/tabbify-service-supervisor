@@ -330,7 +330,9 @@ mod linux {
     /// A booted Firecracker microVM hosting one app. Owns the firecracker child
     /// process + the host tap device; [`Drop`] tears both down.
     pub struct FirecrackerRuntime {
-        child: Child,
+        /// The firecracker child. `Option` so [`Drop`] can take it and spawn a
+        /// kill+reap (so no `<defunct>` zombie lingers). `Some` while alive.
+        child: Option<Child>,
         tap_name: String,
         api_sock: PathBuf,
         /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
@@ -382,7 +384,7 @@ mod linux {
                 .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
 
             let me = Self {
-                child,
+                child: Some(child),
                 tap_name,
                 api_sock: api_sock.clone(),
                 guest_base: format!("http://{guest_ip}:{}", cfg.app_port),
@@ -491,11 +493,24 @@ mod linux {
 
     impl Drop for FirecrackerRuntime {
         fn drop(&mut self) {
-            // Kill the VM and delete its tap. `start_kill` is non-blocking
-            // (we're likely in an async drop context); the tap delete is a
-            // quick synchronous spawn. Best-effort — log on failure.
-            if let Err(e) = self.child.start_kill() {
-                tracing::warn!(error = %e, "failed to kill firecracker child");
+            // Kill AND REAP the firecracker child. `start_kill` alone SIGKILLs but
+            // leaves a zombie until tokio's orphan reaper runs (seconds later);
+            // spawning `kill()` (SIGKILL + `wait`) reaps it immediately so no
+            // `<defunct>` lingers in the process table. We're normally inside the
+            // tokio runtime here; if not (e.g. a sync drop in a test), fall back
+            // to a best-effort non-reaping kill. The tap delete stays synchronous
+            // (quick) so it happens even if there's no runtime to spawn on.
+            if let Some(mut child) = self.child.take() {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            let _ = child.kill().await;
+                        });
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                    }
+                }
             }
             let _ = std::fs::remove_file(&self.api_sock);
             let tap = self.tap_name.clone();
