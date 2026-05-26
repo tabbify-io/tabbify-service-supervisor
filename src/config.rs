@@ -194,6 +194,16 @@ impl Config {
     pub fn from_env() -> Self {
         Config::parse()
     }
+
+    /// Path to the persistent mesh identity file (`{private_key, ula}`), placed
+    /// under the data dir so it survives container/process restarts when
+    /// `data_dir` is a mounted volume — giving the supervisor a STABLE ULA
+    /// across restarts (sticky identity) instead of the joiner's `$HOME`
+    /// fallback (which is ephemeral inside a container).
+    #[must_use]
+    pub fn mesh_identity_path(&self) -> PathBuf {
+        self.data_dir.join("mesh-identity.json")
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +309,15 @@ mod tests {
         assert_eq!(cfg.docker.docker_bin, "/usr/local/bin/docker");
         assert_eq!(cfg.docker.app_port, 3000);
         assert_eq!(cfg.docker.build_timeout_secs, 600);
+    }
+
+    #[test]
+    fn mesh_identity_path_is_under_data_dir() {
+        let cfg = Config::try_parse_from(["supervisord", "--data-dir", "/var/lib/tabbify"]).unwrap();
+        assert_eq!(
+            cfg.mesh_identity_path(),
+            PathBuf::from("/var/lib/tabbify/mesh-identity.json")
+        );
     }
 
     #[test]

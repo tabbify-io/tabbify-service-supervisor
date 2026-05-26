@@ -65,9 +65,10 @@ async fn main() -> anyhow::Result<()> {
     //
     // The supervisor's own ULA (when joined) is passed to newly-spawned runners
     // as their `--parent` so the node can build the supervisor → runners
-    // topology. NOTE: wiring the supervisor's sticky-identity peer join (so it
-    // appears with a stable ULA + the runners declare it as parent) is a
-    // Phase-4 follow-up; for now `--no-mesh` runs pass `parent = None`.
+    // topology. The supervisor joins with a sticky identity persisted under
+    // `data_dir` (`mesh_identity_path`), so it keeps a STABLE ULA across
+    // restarts when `data_dir` is a mounted volume. `--no-mesh` runs pass
+    // `parent = None` (no ULA to declare).
     let (bind_addr, supervisor_id, ula_str, parent, _membership) = if config.no_mesh {
         let addr = config
             .bind
@@ -82,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
             &config.coordinator_url,
             &config.display_name,
             &capability_tags,
-            tabbify_supervisor::mesh::JoinMetadata::default(),
+            tabbify_supervisor::mesh::JoinMetadata {
+                identity_path: Some(config.mesh_identity_path()),
+                ..Default::default()
+            },
         )
         .await
         .context("join mesh")?;

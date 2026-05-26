@@ -52,9 +52,11 @@ it via the coordinator roster and routes apps to it. No config required.
   `docker_available()` (runs `docker info`) → `docker`; wasm always. Each lights
   a mesh tag + shows in `GET /health` (`{firecracker,docker}`). → "figures out
   what it can do" needs nothing.
-- **Sticky identity**: the joiner persists keypair+ULA via `identity_path`
-  (Phase 0). → the node keeps its ULA across restarts if `/var/lib/tabbify` is a
-  volume.
+- **Sticky identity** (wired + verified): the supervisor passes
+  `identity_path = <data_dir>/mesh-identity.json` (`Config::mesh_identity_path`)
+  so the joiner persists keypair+ULA on the mounted volume → STABLE ULA across
+  restarts. Verified locally: `docker restart` re-claims the same
+  `fd5a:1f00:0:2::1`.
 - **Orchestrator**: spawns detached `tabbify-runner`s, survives its own crash,
   re-adopts on restart. → resilient by design.
 
@@ -76,7 +78,7 @@ it via the coordinator roster and routes apps to it. No config required.
 The container runs `supervisord` directly (it already does the right thing):
 1. init tracing; read config from env (coordinator baked, overridable).
 2. detect capabilities (kvm/docker) → log them + set the mesh tags.
-3. join the mesh with `identity_path=/var/lib/tabbify/node-id.json` (sticky ULA),
+3. join the mesh with `identity_path=<data_dir>/mesh-identity.json` (sticky ULA),
    `display_name` from `--name`/env or the hostname.
 4. spawn `run_monitor` (re-adopt living runners from `/var/lib/tabbify/runners`,
    then the monitor loop).
@@ -175,10 +177,39 @@ docker apps to untrusted tenants**. Until then: untrusted code → firecracker/w
 - Auto-scaling / a control plane that launches nodes from `node.toml` fleets.
 
 ## 13. Testing
-- **Local (no CI needed)**: `docker build` the image on the Mac; `docker run` it
-  `--no-mesh`? no — run it pointed at a local/real coordinator; assert `/health`
-  reports the detected caps; with `--device /dev/kvm` (Linux/Lima) assert a fc
-  app runs through the orchestrated runner; with the socket mounted assert a
-  docker app runs. Reuse the `kvmcheck` Lima VM for the KVM path.
-- **CI**: build + push the per-arch image (extends the release workflow).
-- The crash-survival + orchestration are already proven (per-app-runner E2E).
+**Verified locally (Mac, Docker Desktop, 2026-05-26):**
+- ✅ Image builds; `supervisord` is the entrypoint and boots.
+- ✅ Capability self-detection in-container: no flags → `{firecracker:false,
+  docker:false}`; `-v /var/run/docker.sock` → `{docker:true}`.
+- ✅ Turnkey mesh join in-container: `docker run --device /dev/net/tun --cap-add
+  NET_ADMIN -e TABBIFY_MESH_COORDINATOR=… tabbify-supervisor` → opens `tun0`,
+  registers, gets ULA `fd5a:1f00:0:2::1`, serves control on `[ULA]:8730`, and
+  appears in the coordinator roster tagged `supervisor`. (Run against a LOCAL
+  `--insecure-no-mtls` coordinator; the baked prod EIP left untouched.)
+- ✅ Sticky identity: `docker restart` → reloads
+  `/var/lib/tabbify/mesh-identity.json` → re-claims the SAME ULA.
+
+**Remaining (Lima / later):**
+- Firecracker in-container (needs `/dev/kvm`, absent on Docker Desktop Mac) —
+  run in the `kvmcheck` Lima VM with `--device /dev/kvm`.
+- A docker app through the orchestrator while the supervisor itself runs in a
+  container — mind the DooD caveat (§14).
+- Full data plane (curl an app over the mesh from another peer) — already proven
+  for the supervisor-on-host path (per-app-runner E2E); reconfirm in-container.
+- Per-arch image build + push in CI (blocked on GitHub Actions org minutes).
+
+## 14. Notes uncovered by local testing
+- **Coordinator credential ("finds the coordinator" precondition):** the
+  coordinator refuses plaintext unless launched `--insecure-no-mtls` +
+  `TABBIFY_ALLOW_INSECURE=1` (double opt-in). The supervisor joins plaintext
+  (`mesh.rs`: `insecure_no_mtls = true`). So out-of-box join works against an
+  E1/dev (insecure) coordinator today. Prod-grade = mTLS client cert / join
+  token via the auth-service (pending) — the turnkey `docker run` would then add
+  `-e TABBIFY_JOIN_TOKEN=…`.
+- **DooD docker-app caveat:** with `-v docker.sock` the supervisor's app
+  containers are siblings on the HOST daemon, so their published ports land on
+  the host — not in the supervisor's netns. The runner proxies an app on
+  `127.0.0.1:<port>`, which is the container's loopback, not the host's. A
+  socket-mount docker app therefore needs `--network host` for the supervisor
+  (or DinD). Validate before relying on socket-mount docker in-container;
+  firecracker/wasm are unaffected (in-process / per-VM tap).
