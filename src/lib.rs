@@ -34,6 +34,7 @@ pub mod firecracker;
 pub mod host;
 pub mod manifest;
 pub mod mesh;
+pub mod orchestrator;
 pub mod registry;
 pub mod runner;
 pub mod runtime;
