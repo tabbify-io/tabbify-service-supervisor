@@ -62,13 +62,20 @@ async fn main() -> anyhow::Result<()> {
     // Fail-fast loop: select between the runtime dying (crash) and a clean
     // shutdown signal from the control server.
     let runtime = runner.runtime();
-    match run_until_exit(runtime, shutdown_rx).await {
+    match run_until_exit(runtime.clone(), shutdown_rx).await {
         RunnerExit::Crashed(reason) => {
+            // The runtime already died; Drop + the L2 kill-before-respawn
+            // handle remnants. Do NOT call shutdown() here.
             tracing::error!(reason = %reason, "app runtime died unexpectedly; exiting(1) for respawn");
             std::process::exit(1);
         }
         RunnerExit::CleanShutdown => {
-            tracing::info!("clean shutdown requested; exiting(0)");
+            // Graceful stop: release the runtime's external resources (stop the
+            // container / VM) before the process exits. shutdown() is idempotent
+            // so Drop's best-effort cleanup is harmless if it also runs.
+            tracing::info!("clean shutdown requested; shutting down runtime");
+            runtime.shutdown().await;
+            tracing::info!("runtime shutdown complete; exiting(0)");
             std::process::exit(0);
         }
     }

@@ -188,6 +188,14 @@ mod protocol {
         ]
     }
 
+    /// `docker stop <name>` argv (sans the leading binary): ask the container to
+    /// stop gracefully (SIGTERM, then SIGKILL after the default 10-second grace
+    /// period). Used as the first step of the graceful [`super::DockerRuntime::shutdown`]
+    /// before `docker rm` removes the container record.
+    pub fn stop_args(name: &str) -> Vec<String> {
+        vec!["stop".to_owned(), name.to_owned()]
+    }
+
     /// `docker rm -f <name>` argv (sans the leading binary): force-remove the
     /// container (kills it if running). Used on teardown ([`super::DockerRuntime`]'s
     /// `Drop`).
@@ -282,7 +290,7 @@ mod runtime_impl {
     use tokio::process::Command;
 
     use super::protocol::{
-        build_args, container_name, image_tag, proxy_request, rm_args, run_args,
+        build_args, container_name, image_tag, proxy_request, rm_args, run_args, stop_args,
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
@@ -312,6 +320,39 @@ mod runtime_impl {
     /// future can be polled from multiple locations (both `watch_for_exit` calls
     /// on a cloned `Arc<dyn AppRuntime>` share the same underlying signal).
     type ExitWatcher = Arc<dyn Fn() -> BoxFut<'static, ExitReason> + Send + Sync>;
+
+    /// Command-runner seam for [`DockerRuntime::shutdown`]: given a list of
+    /// `docker` sub-command arguments (e.g. `["stop", "tbf-abc-0"]`), run the
+    /// command and return whether it succeeded.
+    ///
+    /// Production: the real `docker` binary via [`tokio::process::Command`].
+    /// Tests: an injected closure that records which commands were issued without
+    /// invoking a real Docker daemon — the same injection pattern used by
+    /// [`TcpProbe`] and [`ExitWatcher`].
+    type CommandRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
+
+    /// Build the production [`CommandRunner`]: spawns `<docker_bin> <args>` and
+    /// returns `true` iff the process exits 0. Best-effort: a spawn failure or
+    /// non-zero exit both yield `false` (the shutdown path logs and continues).
+    fn production_command_runner(docker_bin: String) -> CommandRunner {
+        Arc::new(move |args: Vec<String>| {
+            let docker_bin = docker_bin.clone();
+            let fut: BoxFut<'static, bool> = Box::pin(async move {
+                match Command::new(&docker_bin)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                {
+                    Ok(s) => s.success(),
+                    Err(_) => false,
+                }
+            });
+            fut
+        })
+    }
 
     /// Build a production exit watcher for `container`: runs `docker wait
     /// <container>` asynchronously and resolves to `ExitReason::Died(detail)`
@@ -375,6 +416,10 @@ mod runtime_impl {
         /// [`container_exit_watcher`]; tests inject a factory that returns a
         /// pre-resolved future so no real Docker daemon is needed.
         exit_watcher: ExitWatcher,
+        /// Command-runner seam for graceful shutdown. Production uses
+        /// [`production_command_runner`]; tests inject a recording closure so
+        /// no real Docker daemon is needed.
+        shutdown_runner: CommandRunner,
     }
 
     impl DockerRuntime {
@@ -435,6 +480,7 @@ mod runtime_impl {
                 client: reqwest::Client::new(),
                 probe: Arc::new(tcp_connect_probe),
                 exit_watcher: container_exit_watcher(cfg.docker_bin.clone(), container),
+                shutdown_runner: production_command_runner(cfg.docker_bin.clone()),
             };
 
             // On any readiness failure `me` drops → container force-removed.
@@ -454,6 +500,8 @@ mod runtime_impl {
             // Default exit watcher: never resolves (pending), so existing health
             // tests that only care about the probe are unaffected.
             let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
+            // Default shutdown runner: no-op (records nothing, returns true).
+            let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -461,6 +509,7 @@ mod runtime_impl {
                 client: reqwest::Client::new(),
                 probe,
                 exit_watcher,
+                shutdown_runner,
             }
         }
 
@@ -475,6 +524,7 @@ mod runtime_impl {
             probe: TcpProbe,
             exit_watcher: ExitWatcher,
         ) -> Self {
+            let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -482,6 +532,33 @@ mod runtime_impl {
                 client: reqwest::Client::new(),
                 probe,
                 exit_watcher,
+                shutdown_runner,
+            }
+        }
+
+        /// Build a `DockerRuntime` with an injectable command runner for testing
+        /// [`AppRuntime::shutdown`]. The `shutdown_runner` closure is called with
+        /// the argument list of each `docker` sub-command issued during shutdown
+        /// (first `["stop", <name>]`, then `["rm", "-f", <name>]`), so tests can
+        /// record which commands were issued without invoking a real Docker daemon.
+        ///
+        /// This constructor is `#[cfg(test)]`-only.
+        #[cfg(test)]
+        pub fn with_shutdown_for_test(
+            container_base: &str,
+            container: &str,
+            shutdown_runner: CommandRunner,
+        ) -> Self {
+            let probe: TcpProbe = Arc::new(|_addr: &str| true);
+            let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
+            Self {
+                container: container.to_owned(),
+                docker_bin: "docker".to_owned(),
+                container_base: container_base.to_owned(),
+                client: reqwest::Client::new(),
+                probe,
+                exit_watcher,
+                shutdown_runner,
             }
         }
 
@@ -552,6 +629,37 @@ mod runtime_impl {
         fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
             // Invoke the factory to get a fresh future for this watch session.
             (self.exit_watcher)()
+        }
+
+        /// Graceful container teardown: `docker stop <container>` (SIGTERM →
+        /// SIGKILL after grace period) then `docker rm <container>` (remove the
+        /// stopped record). Both steps are best-effort and idempotent — a "no
+        /// such container" error from either is silently ignored, so a second
+        /// call (or a call after the container already stopped) is harmless.
+        ///
+        /// Uses the injected [`CommandRunner`] so unit tests can verify the
+        /// exact commands issued without a real Docker daemon.
+        fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
+            let container = self.container.clone();
+            let runner = self.shutdown_runner.clone();
+            Box::pin(async move {
+                // Step 1: graceful stop (SIGTERM → SIGKILL). Best-effort.
+                let stop_ok = (runner)(stop_args(&container)).await;
+                if !stop_ok {
+                    tracing::warn!(
+                        container = %container,
+                        "docker stop returned non-zero or failed (container may already be gone)"
+                    );
+                }
+                // Step 2: remove the container record. Best-effort.
+                let rm_ok = (runner)(rm_args(&container)).await;
+                if !rm_ok {
+                    tracing::warn!(
+                        container = %container,
+                        "docker rm failed during shutdown (container may already be removed)"
+                    );
+                }
+            })
         }
     }
 
@@ -764,7 +872,7 @@ pub use runtime_impl::DockerRuntime;
 mod tests {
     use super::protocol::{
         build_args, container_name, copy_filtered_headers, docker_available_with, image_tag,
-        is_hop_by_hop, proxy_request, rm_args, rmi_args, run_args,
+        is_hop_by_hop, proxy_request, rm_args, rmi_args, run_args, stop_args,
     };
 
     #[test]
@@ -812,6 +920,11 @@ mod tests {
                 "tabbify-app-x",
             ]
         );
+    }
+
+    #[test]
+    fn stop_args_graceful_stop_by_name() {
+        assert_eq!(stop_args("tbf-x-0"), vec!["stop", "tbf-x-0"]);
     }
 
     #[test]
@@ -995,5 +1108,125 @@ mod tests {
             result.is_err(),
             "default exit watcher for tests must be pending"
         );
+    }
+
+    // ---- shutdown() contract for DockerRuntime --------------------------------
+
+    /// DockerRuntime::shutdown must issue `docker stop <container>` followed by
+    /// `docker rm <container>` — in that order — via the injected command runner.
+    /// No real Docker daemon required.
+    #[tokio::test]
+    async fn docker_shutdown_issues_stop_then_rm() {
+        use crate::runtime::{AppRuntime, BoxFut};
+        use std::sync::{Arc, Mutex};
+
+        let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued2 = issued.clone();
+
+        let shutdown_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |args: Vec<String>| {
+                issued2.lock().unwrap().push(args);
+                let fut: BoxFut<'static, bool> = Box::pin(async { true });
+                fut
+            });
+
+        let rt = super::runtime_impl::DockerRuntime::with_shutdown_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-shutdown-0",
+            shutdown_runner,
+        );
+
+        rt.shutdown().await;
+
+        let cmds = issued.lock().unwrap();
+        assert_eq!(cmds.len(), 2, "must issue exactly 2 commands (stop + rm)");
+        assert_eq!(
+            cmds[0],
+            vec!["stop".to_owned(), "tbf-shutdown-0".to_owned()],
+            "first command must be docker stop <container>"
+        );
+        assert_eq!(
+            cmds[1],
+            vec![
+                "rm".to_owned(),
+                "-f".to_owned(),
+                "tbf-shutdown-0".to_owned()
+            ],
+            "second command must be docker rm -f <container>"
+        );
+    }
+
+    /// Calling shutdown twice is idempotent: the second call still issues
+    /// stop + rm without panicking (the container may already be gone; the
+    /// runner records both calls as best-effort).
+    #[tokio::test]
+    async fn docker_shutdown_is_idempotent() {
+        use crate::runtime::{AppRuntime, BoxFut};
+        use std::sync::{Arc, Mutex};
+
+        let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cc = call_count.clone();
+
+        let shutdown_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |_args: Vec<String>| {
+                *cc.lock().unwrap() += 1;
+                // Simulate "no such container" on the second pass by returning false.
+                let fut: BoxFut<'static, bool> = Box::pin(async { false });
+                fut
+            });
+
+        let rt = super::runtime_impl::DockerRuntime::with_shutdown_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-shutdown-1",
+            shutdown_runner,
+        );
+
+        // First call.
+        rt.shutdown().await;
+        // Second call — must not panic even if commands return false.
+        rt.shutdown().await;
+
+        // 2 commands per call × 2 calls = 4 total.
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            4,
+            "two shutdown calls must each issue 2 commands (stop + rm)"
+        );
+    }
+
+    /// DockerRuntime::shutdown via the AppRuntime trait object also issues the
+    /// two commands (confirms the override is dispatched through dyn dispatch).
+    #[tokio::test]
+    async fn docker_shutdown_via_trait_object_issues_stop_then_rm() {
+        use crate::runtime::{AppRuntime, BoxFut};
+        use std::sync::{Arc, Mutex};
+
+        let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued2 = issued.clone();
+
+        let shutdown_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |args: Vec<String>| {
+                issued2.lock().unwrap().push(args);
+                let fut: BoxFut<'static, bool> = Box::pin(async { true });
+                fut
+            });
+
+        let rt: Arc<dyn AppRuntime> =
+            Arc::new(super::runtime_impl::DockerRuntime::with_shutdown_for_test(
+                "http://127.0.0.1:49999",
+                "tbf-shutdown-2",
+                shutdown_runner,
+            ));
+
+        rt.shutdown().await;
+
+        let cmds = issued.lock().unwrap();
+        assert_eq!(
+            cmds.len(),
+            2,
+            "must issue exactly 2 commands via trait object"
+        );
+        assert_eq!(cmds[0][0], "stop", "first command must be stop");
+        assert_eq!(cmds[1][0], "rm", "second command must be rm");
     }
 }

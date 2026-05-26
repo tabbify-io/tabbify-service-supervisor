@@ -106,6 +106,24 @@ pub trait AppRuntime: Send + Sync {
     fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
         Box::pin(std::future::pending())
     }
+
+    /// Graceful teardown of the runtime's resources. Idempotent. Default: no-op.
+    ///
+    /// Called by the runner on the [`RunnerExit::CleanShutdown`] path — BEFORE
+    /// `process::exit(0)` — so the runtime can release its external resources
+    /// (stop a container, kill a VM + tear down the tap) cleanly. NOT called on
+    /// [`RunnerExit::Crashed`]: the runtime already died; [`Drop`] + the L2
+    /// kill-before-respawn handle remnants instead.
+    ///
+    /// Implementations MUST be idempotent: a second call must be a no-op (the
+    /// container / VM may already be gone by the time `Drop` runs its own
+    /// best-effort cleanup).
+    ///
+    /// Default: **no-op** — a WASM runtime drops cleanly with no external
+    /// resources to release; `WasmRuntime` uses this default.
+    fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 impl AppRuntime for WasmRuntime {
@@ -451,5 +469,31 @@ mod tests {
             result.is_err(),
             "watch_for_exit via trait object must be pending"
         );
+    }
+
+    // ---- shutdown() contract -------------------------------------------------
+
+    /// WasmRuntime uses the default shutdown() which is a no-op: it must
+    /// complete immediately (no external resources to release).
+    #[tokio::test]
+    async fn wasm_shutdown_is_noop_and_completes() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt = WasmRuntime::load(wasm).expect("load fixture");
+        // Must complete without hanging (no external resources to release).
+        tokio::time::timeout(std::time::Duration::from_millis(50), rt.shutdown())
+            .await
+            .expect("shutdown must complete immediately for WasmRuntime");
+    }
+
+    /// WasmRuntime shutdown() via the AppRuntime trait object is also a no-op
+    /// (confirms the default is visible through dyn dispatch).
+    #[tokio::test]
+    async fn wasm_shutdown_via_trait_object_is_noop() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt: std::sync::Arc<dyn AppRuntime> =
+            std::sync::Arc::new(WasmRuntime::load(wasm).expect("load fixture"));
+        tokio::time::timeout(std::time::Duration::from_millis(50), rt.shutdown())
+            .await
+            .expect("shutdown via trait object must complete immediately for WasmRuntime");
     }
 }
