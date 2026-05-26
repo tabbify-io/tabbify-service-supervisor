@@ -87,6 +87,10 @@ async fn runner_serves_fixture_on_root_and_deep_path_loopback() {
         s3_base_url: server.uri(),
         data_dir: data_dir.path().to_path_buf(),
         no_mesh: true,
+        coordinator_url: "http://127.0.0.1:8888".to_owned(),
+        display_name: "runner-test".to_owned(),
+        parent: None,
+        port: 8730,
         fc: FcConfig::default(),
         docker: DockerConfig::default(),
     };
@@ -153,6 +157,10 @@ async fn control_socket_health_stop_purge() {
         s3_base_url: s3.uri(),
         data_dir: data_dir.path().to_path_buf(),
         no_mesh: true,
+        coordinator_url: "http://127.0.0.1:8888".to_owned(),
+        display_name: "runner-test".to_owned(),
+        parent: None,
+        port: 8730,
         fc: FcConfig::default(),
         docker: DockerConfig::default(),
     };
@@ -448,6 +456,10 @@ async fn docker_runner_removes_stale_container_before_starting_fresh() {
         s3_base_url: s3.uri(),
         data_dir: data_dir.path().to_path_buf(),
         no_mesh: true,
+        coordinator_url: "http://127.0.0.1:8888".to_owned(),
+        display_name: "runner-test".to_owned(),
+        parent: None,
+        port: 8730,
         fc: FcConfig::default(),
         docker: DockerConfig::default(),
     };

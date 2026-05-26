@@ -83,10 +83,13 @@ async fn main() -> anyhow::Result<()> {
             None,
         )
     } else {
+        // The supervisor's own sticky-identity join (requested_ula / kind /
+        // parent / app_uuid) is Phase 2; pass the default (all `None`) for now.
         let membership = MeshMembership::join(
             &config.coordinator_url,
             &config.display_name,
             &capability_tags,
+            tabbify_supervisor::mesh::JoinMetadata::default(),
         )
         .await
         .context("join mesh")?;

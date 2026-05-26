@@ -73,8 +73,15 @@ impl MeshHost for mesh_joiner::Joiner {
 /// Where per-app listeners bind.
 #[derive(Debug, Clone, Copy)]
 pub enum HostBind {
-    /// Mesh mode: bind `[app_ula]:port` — one listener per app on its own ULA.
+    /// Old multi-app supervisor mode: bind `[app_ula]:port` for an app-ULA that
+    /// is advertised through the joiner's `host_app_ula` app-route layer
+    /// (distinct from the peer's own ULA).
     AppUla(u16),
+    /// Runner mode: bind the runner's OWN mesh ULA `[my_ula]:port`. The runner
+    /// joined claiming `requested_ula = derive_app_ula(uuid)`, so the
+    /// coordinator already routes this ULA straight to it — no `host_app_ula`
+    /// app-route layer is needed (and the bound app-ULA == the peer-ULA).
+    OwnUla(u16),
     /// No-mesh / test mode: bind on `ip` with an ephemeral port (no TUN, so we
     /// can't bind an app-ULA — tests/loopback dial the returned addr instead).
     Loopback(IpAddr),
@@ -91,13 +98,35 @@ pub struct AppHost {
 }
 
 impl AppHost {
-    /// Mesh-backed host: bind each app on its own ULA and advertise it via the
-    /// joiner so peers route to us.
+    /// Old multi-app supervisor host: bind each app on its own app-ULA and
+    /// advertise it via the joiner (`host_app_ula`) so peers route to us. Kept
+    /// for the supervisor path until Phase 2 rewires it; the runner uses
+    /// [`Self::mesh_self`] instead.
     #[must_use]
     pub fn mesh(joiner: Arc<dyn MeshHost>, port: u16) -> Self {
         Self {
             mesh: Some(joiner),
             bind: HostBind::AppUla(port),
+        }
+    }
+
+    /// Runner host: bind the runner's OWN mesh ULA `[my_ula]:port`.
+    ///
+    /// The runner joined the mesh claiming `requested_ula = derive_app_ula(uuid)`
+    /// (see [`crate::runner::serve::build_runner_join_config`]), so the
+    /// coordinator already routes `my_ula` straight to this peer. We therefore
+    /// bind it directly and carry NO [`MeshHost`] joiner — the separate
+    /// `host_app_ula` app-route layer (used by [`Self::mesh`] to advertise
+    /// app-ULAs distinct from a peer's own ULA) is not needed here.
+    ///
+    /// The `my_ula` passed to [`Self::host`] as `app_ula` is this same address
+    /// (the runner's ULA *is* the app-ULA), so the bound listener address is
+    /// `[my_ula]:port`.
+    #[must_use]
+    pub const fn mesh_self(_my_ula: Ipv6Addr, port: u16) -> Self {
+        Self {
+            mesh: None,
+            bind: HostBind::OwnUla(port),
         }
     }
 
@@ -119,14 +148,40 @@ impl AppHost {
         }
     }
 
-    /// Is this host backed by a real mesh joiner?
+    /// Is this host backed by the `host_app_ula` app-route layer (a real mesh
+    /// joiner)? `false` for loopback AND for [`Self::mesh_self`] (the runner
+    /// binds its own already-routed ULA, no app-route needed).
     #[must_use]
     pub const fn is_mesh(&self) -> bool {
         self.mesh.is_some()
     }
 
-    /// Start hosting `app_ula`: route it through the joiner (mesh mode) and
-    /// bind a per-app listener that serves `serve`'s WASM on the WHOLE path.
+    /// The configured bind mode. Exposed so the runner can assert it selects
+    /// the right addressing without a live join.
+    #[must_use]
+    pub const fn bind(&self) -> HostBind {
+        self.bind
+    }
+
+    /// The socket address a listener would bind for `app_ula` under this host's
+    /// [`HostBind`] mode. For `AppUla`/`OwnUla` it's `[app_ula]:port`; for
+    /// `Loopback` it's the loopback IP with an ephemeral (`0`) port. Pure (no
+    /// I/O) so the bind-address selection is unit-testable.
+    #[must_use]
+    pub fn bind_addr_for(&self, app_ula: Ipv6Addr) -> SocketAddr {
+        match self.bind {
+            HostBind::AppUla(port) | HostBind::OwnUla(port) => {
+                SocketAddr::new(IpAddr::V6(app_ula), port)
+            }
+            HostBind::Loopback(ip) => SocketAddr::new(ip, 0),
+        }
+    }
+
+    /// Start hosting `app_ula`: in the old multi-app supervisor mode
+    /// ([`Self::mesh`]) route it through the joiner's `host_app_ula` app-route
+    /// layer; in [`Self::mesh_self`]/[`Self::loopback`] there is no joiner to
+    /// call (the runner's ULA is already routed; loopback has no TUN). Then bind
+    /// a per-app listener that serves `serve`'s WASM on the WHOLE path.
     ///
     /// # Errors
     /// - the joiner refuses to host the app-ULA (mesh mode; e.g. no TUN);
@@ -141,10 +196,7 @@ impl AppHost {
                 .with_context(|| format!("joiner host_app_ula({app_ula})"))?;
         }
 
-        let bind_addr = match self.bind {
-            HostBind::AppUla(port) => SocketAddr::new(IpAddr::V6(app_ula), port),
-            HostBind::Loopback(ip) => SocketAddr::new(ip, 0),
-        };
+        let bind_addr = self.bind_addr_for(app_ula);
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("bind per-app listener {bind_addr}"))?;
