@@ -206,7 +206,12 @@ docker apps to untrusted tenants**. Until then: untrusted code → firecracker/w
   container — mind the DooD caveat (§14).
 - Full data plane (curl an app over the mesh from another peer) — already proven
   for the supervisor-on-host path (per-app-runner E2E); reconfirm in-container.
-- Per-arch image build + push in CI (blocked on GitHub Actions org minutes).
+- **CI image publish — WRITTEN, pending first run.** `release.yml` now builds the
+  LEAN image per-arch (`docker/build-push-action`) → `ghcr.io/tabbify-io/tabbify-supervisor:{x86_64,aarch64}` + a multi-arch `:latest` manifest. Unverified until
+  GitHub Actions billing is restored (same gate as the binary publish). First run
+  creates a PRIVATE ghcr package → owner makes it public for anonymous pulls.
+  The **firecracker-capable** image (bundling firecracker + a kernel) is a
+  follow-up (stage those into `deploy/bin` before buildx).
 
 ## 14. Notes uncovered by local testing
 - **Coordinator credential ("finds the coordinator" precondition):** the

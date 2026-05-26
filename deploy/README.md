@@ -27,6 +27,12 @@ gateway routes apps to it. No config file, no flags beyond what you choose to ex
 
 ## 1. Build the image
 
+> **Published image:** the release CI builds + pushes the lean image to
+> `ghcr.io/tabbify-io/tabbify-supervisor` (`:x86_64`, `:aarch64`, and a
+> multi-arch `:latest`) on every push to `main`. Once it has run you can
+> `docker run ghcr.io/tabbify-io/tabbify-supervisor` directly. Build locally
+> (below) for dev iteration or the firecracker-capable image.
+
 The image consumes prebuilt **static-musl** binaries staged into `deploy/bin/`
 (gitignored). Stage them, then build:
 

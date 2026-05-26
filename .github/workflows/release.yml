@@ -66,6 +66,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      packages: write
 
     strategy:
       fail-fast: false
@@ -77,12 +78,15 @@ jobs:
           # private repos.
           - target: x86_64-unknown-linux-musl
             arch: x86_64
+            # Docker platform for the per-arch image build (buildx).
+            platform: linux/amd64
             # Back-compat: x86_64 also publishes to the legacy un-prefixed key
             # (consumed by the Phase-1 runbook + README curl examples). Leave
             # empty for the other arch.
             legacy_key: supervisor/supervisord
           - target: aarch64-unknown-linux-musl
             arch: aarch64
+            platform: linux/arm64
             legacy_key: ""
 
     runs-on: ubuntu-latest
@@ -159,3 +163,62 @@ jobs:
           aws s3 cp \
             "target/${{ matrix.target }}/release/supervisord" \
             "s3://${{ vars.RELEASE_S3_BUCKET }}/${{ matrix.legacy_key }}"
+
+      # --- Turnkey Docker image (per-arch -> ghcr.io) --------------------------
+      # Publishes the LEAN supervisor image (wasm + docker-via-socket). The
+      # firecracker-capable image additionally bundles firecracker + a guest
+      # kernel — a follow-up that stages those into deploy/bin before buildx
+      # (see deploy/Dockerfile + deploy/README.md). First publish creates a
+      # PRIVATE ghcr package; the owner makes it public for anonymous pulls.
+      - name: Set up QEMU (cross-arch image build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Stage binaries into the image build context
+        run: |
+          set -euo pipefail
+          mkdir -p deploy/bin
+          cp "target/${{ matrix.target }}/release/supervisord"    deploy/bin/supervisord
+          cp "target/${{ matrix.target }}/release/tabbify-runner" deploy/bin/tabbify-runner
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the per-arch supervisor image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./deploy
+          file: ./deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: DOCKER_ARCH=${{ matrix.arch }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/tabbify-supervisor:${{ matrix.arch }}
+
+  # After both per-arch images are pushed, stitch them into one multi-arch
+  # `:latest` manifest so `docker run ghcr.io/tabbify-io/tabbify-supervisor`
+  # pulls the right arch automatically.
+  publish-image-manifest:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the multi-arch :latest manifest
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/${{ github.repository_owner }}/tabbify-supervisor"
+          docker buildx imagetools create -t "$IMG:latest" \
+            "$IMG:x86_64" "$IMG:aarch64"
