@@ -1,18 +1,20 @@
-//! Integration tests for the orchestrator — detached runner spawn (Task 2.2)
-//! and the control client (Task 2.3).
+//! Integration tests for the orchestrator — detached runner spawn (Task 2.2),
+//! the control client (Task 2.3), and the monitor loop (Task 2.4).
 //!
 //! The Task 2.2 test (`spawn_runner_detaches_…`) is refactored to use the new
 //! [`ControlClient`] everywhere instead of the hand-rolled socket helpers.
 //! The Task 2.3 tests drive `health`, `stop`, and `purge` against a real spawned
-//! runner through the client.
+//! runner through the client. The Task 2.4 test spawns a real runner, `kill -9`s
+//! it, runs one monitor `tick`, and proves the orchestrator respawned it.
 
 use std::path::Path;
 use std::time::Duration;
 
 use tabbify_supervisor::control_proto::Reply;
 use tabbify_supervisor::orchestrator::client::ControlClient;
-use tabbify_supervisor::orchestrator::handle::record_path;
+use tabbify_supervisor::orchestrator::handle::{RunnerHandle, record_path};
 use tabbify_supervisor::orchestrator::spawn::{SpawnSpec, spawn_runner};
+use tabbify_supervisor::orchestrator::{Orchestrator, SharedRunnerConfig};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -406,4 +408,148 @@ async fn client_dead_socket_returns_err() {
         result.is_err(),
         "dead socket must return Err, got: {result:?}"
     );
+}
+
+// ── Task 2.4: monitor loop + restart dead runners ───────────────────────────
+
+/// Build the [`SharedRunnerConfig`] mirroring [`make_spec`]'s shared fields, so
+/// the monitor reconstructs the exact same `SpawnSpec` from a record.
+fn make_shared(s3: &MockServer, data_dir: &Path) -> SharedRunnerConfig {
+    SharedRunnerConfig {
+        runner_bin: env!("CARGO_BIN_EXE_tabbify-runner").into(),
+        s3_base_url: s3.uri(),
+        data_dir: data_dir.to_path_buf(),
+        no_mesh: true,
+    }
+}
+
+/// Wait until the runner record for `uuid` reports a pid OTHER than `old_pid`
+/// (i.e. the monitor respawned it). Returns the new handle.
+async fn wait_pid_changed(
+    runner_dir: &Path,
+    uuid: &str,
+    old_pid: u32,
+    timeout: Duration,
+) -> RunnerHandle {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(h)) = RunnerHandle::load(runner_dir, uuid) {
+            if h.pid != old_pid {
+                return h;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("runner record pid never changed from {old_pid} (no respawn)");
+}
+
+/// THE self-healing test: spawn a real runner, `kill -9` it (simulate a crash),
+/// run ONE monitor tick → the orchestrator detects it dead and RESPAWNS it: a
+/// NEW process (different pid) on the SAME uuid + app_ula, reachable again on
+/// its control socket. The updated record reflects the new pid.
+#[tokio::test]
+async fn monitor_tick_respawns_dead_runner() {
+    let s3 = mock_s3(ON_REQUEST_MANIFEST).await;
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let runner_dir = tempfile::tempdir().expect("runner dir");
+    let sock_dir = tempfile::tempdir().expect("sock dir");
+    let sock_path = sock_dir.path().join(format!("{APP_UUID}.sock"));
+
+    // Spawn the original runner via the existing harness (same shared fields as
+    // the SharedRunnerConfig below, so the monitor reconstructs an equal spec).
+    let spec = make_spec(&s3, &sock_path, data_dir.path());
+    let (handle, child) = spawn_runner(&spec, runner_dir.path())
+        .await
+        .expect("spawn_runner");
+    let original_pid = handle.pid;
+
+    // Cleanup guard: kill BOTH the original and whatever the monitor respawns
+    // (the respawned pid is recorded in the on-disk handle).
+    let runner_dir_path = runner_dir.path().to_path_buf();
+    let uuid = APP_UUID.to_owned();
+    let _guard = scopeguard(move || {
+        force_kill(original_pid);
+        if let Ok(Some(h)) = RunnerHandle::load(&runner_dir_path, &uuid) {
+            if h.pid != original_pid {
+                force_kill(h.pid);
+            }
+        }
+    });
+
+    let client = ControlClient::new(&sock_path);
+
+    // The original runner becomes reachable.
+    let reply = wait_health(&client, Duration::from_secs(20)).await;
+    assert!(
+        matches!(reply, Reply::Health { ref state, .. } if state == "running"),
+        "original runner should be running, got {reply:?}"
+    );
+
+    // --- SIMULATE A CRASH: kill -9 the runner and wait for it to disappear. ---
+    // Drop the spawner's child handle first (the orchestrator does not retain
+    // the `Child`; it monitors by pid + socket only). Then SIGKILL the pid.
+    drop(child);
+    force_kill(original_pid);
+    let gone = wait_unreachable(&client, Duration::from_secs(10)).await;
+    assert!(gone, "killed runner should become unreachable");
+
+    // --- ONE MONITOR TICK → detect dead + respawn. ---
+    let orch = Orchestrator::new(
+        make_shared(&s3, data_dir.path()),
+        runner_dir.path().to_path_buf(),
+    );
+    orch.tick().await.expect("monitor tick");
+
+    // The record now reflects a NEW pid (different process).
+    let new_handle = wait_pid_changed(
+        runner_dir.path(),
+        APP_UUID,
+        original_pid,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_ne!(
+        new_handle.pid, original_pid,
+        "respawned runner must have a different pid"
+    );
+    assert_eq!(new_handle.uuid, APP_UUID, "uuid must be preserved");
+    assert_eq!(
+        new_handle.app_ula, APP_ULA,
+        "respawned runner must keep the same deterministic app_ula"
+    );
+    assert_eq!(
+        new_handle.control_sock, sock_path,
+        "respawned runner must reuse the same control socket"
+    );
+    assert_eq!(
+        new_handle.parent.as_deref(),
+        Some("fd5a:1f00:1::1"),
+        "respawned runner must keep the same parent"
+    );
+
+    // The respawned runner is reachable again on the SAME control socket, and
+    // reports the new pid.
+    let reply = wait_health(&client, Duration::from_secs(20)).await;
+    match reply {
+        Reply::Health {
+            state,
+            app_uuid,
+            app_ula,
+            pid,
+        } => {
+            assert_eq!(state, "running", "respawned runner should be running");
+            assert_eq!(app_uuid, APP_UUID);
+            assert_eq!(app_ula, APP_ULA);
+            assert_eq!(
+                pid, new_handle.pid,
+                "runner-reported pid must equal the respawned record's pid"
+            );
+            assert_ne!(pid, original_pid, "must be a genuinely new process");
+        }
+        other => panic!("expected Health after respawn, got {other:?}"),
+    }
+
+    // Clean up: shut the respawned runner down.
+    client.shutdown().await.ok();
+    wait_unreachable(&client, Duration::from_secs(5)).await;
 }
