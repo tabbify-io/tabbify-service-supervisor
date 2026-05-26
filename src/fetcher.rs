@@ -200,6 +200,13 @@ impl S3Fetcher {
             Bytes::new()
         };
 
+        // For docker apps: opportunistically fetch the prebuilt image tar so
+        // the supervisor can `docker load` it (warm start) instead of building
+        // from source.  A 404 (source-only app) is silently ignored.
+        if manifest.runtime.r#type == "docker" {
+            self.fetch_image_tar(uuid, version, &dir).await?;
+        }
+
         Ok(FetchedApp {
             version,
             manifest,
@@ -238,6 +245,66 @@ impl S3Fetcher {
             }
             other => Err(FetchError::Transport(format!("unexpected status {other}"))),
         }
+    }
+
+    /// GET `url`, returning `Ok(Some(bytes))` on 200, `Ok(None)` on 404/403
+    /// (object absent — not an error), or `Err` on any other failure.
+    ///
+    /// Used for optional artifacts (e.g. `image.tar.gz`) that may not exist for
+    /// older apps that only have a source build-context.
+    async fn get_optional_bytes(&self, url: &str) -> Result<Option<Bytes>, FetchError> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| FetchError::Transport(e.to_string()))?;
+        match resp.status() {
+            StatusCode::OK => {
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| FetchError::Transport(e.to_string()))?;
+                Ok(Some(bytes))
+            }
+            // S3 returns 403 for a missing object under some bucket policies.
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Ok(None),
+            other => Err(FetchError::Transport(format!("unexpected status {other}"))),
+        }
+    }
+
+    /// For a `docker` app: fetch `apps/<uuid>/v<N>/image.tar.gz` (the prebuilt
+    /// image tar uploaded by `tcli`) and save it to `<dir>/image.tar.gz`.
+    ///
+    /// Best-effort: a 404 (source-only app — no prebuilt tar) is NOT an error.
+    /// Already-cached: if `<dir>/image.tar.gz` already exists on disk, skip the
+    /// network request (same cache-hit logic as the entry file).
+    ///
+    /// # Errors
+    /// Only hard transport / filesystem failures — a missing object is `Ok(())`.
+    async fn fetch_image_tar(
+        &self,
+        uuid: &str,
+        version: u64,
+        dir: &std::path::Path,
+    ) -> Result<(), FetchError> {
+        let tar_path = dir.join("image.tar.gz");
+        if tar_path.is_file() {
+            // Already cached — nothing to do.
+            return Ok(());
+        }
+        let url = format!("{}/apps/{uuid}/v{version}/image.tar.gz", self.base_url);
+        match self.get_optional_bytes(&url).await? {
+            Some(bytes) => {
+                tracing::debug!(uuid, version, "fetched prebuilt image.tar.gz");
+                write_file(&tar_path, &bytes)?;
+            }
+            None => {
+                // No prebuilt tar available (source-only app) — skip silently.
+                tracing::debug!(uuid, version, "no image.tar.gz available (source-only app)");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -278,4 +345,174 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), FetchError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    // ---- get_optional_bytes: 404 is Ok(None), not an error -------------------
+
+    /// `get_optional_bytes` on a 200 response returns `Ok(Some(bytes))`.
+    #[tokio::test]
+    async fn get_optional_bytes_200_returns_some() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/optional-file"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let fetcher = S3Fetcher::new(server.uri(), "/tmp");
+        let url = format!("{}/optional-file", server.uri());
+        let result = fetcher.get_optional_bytes(&url).await.unwrap();
+        assert_eq!(result, Some(bytes::Bytes::from_static(b"hello")));
+    }
+
+    /// `get_optional_bytes` on a 404 returns `Ok(None)` — not an error. This is
+    /// the source-only-app path: no `image.tar.gz` uploaded yet.
+    #[tokio::test]
+    async fn get_optional_bytes_404_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/missing-file"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let fetcher = S3Fetcher::new(server.uri(), "/tmp");
+        let url = format!("{}/missing-file", server.uri());
+        let result = fetcher.get_optional_bytes(&url).await.unwrap();
+        assert_eq!(result, None, "404 must be Ok(None), not an error");
+    }
+
+    /// `get_optional_bytes` on a 403 (S3's "missing object" under some bucket
+    /// policies) returns `Ok(None)` — same as 404.
+    #[tokio::test]
+    async fn get_optional_bytes_403_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/forbidden-file"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let fetcher = S3Fetcher::new(server.uri(), "/tmp");
+        let url = format!("{}/forbidden-file", server.uri());
+        let result = fetcher.get_optional_bytes(&url).await.unwrap();
+        assert_eq!(result, None, "403 must be Ok(None), not an error");
+    }
+
+    // ---- fetch_image_tar: 404 does not fail fetch, writes file on 200 --------
+
+    /// When the server returns 200 with tar bytes, `fetch_image_tar` writes
+    /// `image.tar.gz` to the given directory and returns `Ok(())`.
+    #[tokio::test]
+    async fn fetch_image_tar_200_writes_file_to_dir() {
+        let server = MockServer::start().await;
+        let uuid = "test-uuid-warm";
+        let version = 2u64;
+        Mock::given(method("GET"))
+            .and(path(format!("/apps/{uuid}/v{version}/image.tar.gz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-tar".to_vec()))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fetcher = S3Fetcher::new(server.uri(), tmp.path());
+        let dir = tmp
+            .path()
+            .join("apps")
+            .join(uuid)
+            .join(format!("v{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        fetcher
+            .fetch_image_tar(uuid, version, &dir)
+            .await
+            .expect("fetch_image_tar must succeed");
+
+        let tar_path = dir.join("image.tar.gz");
+        assert!(tar_path.is_file(), "image.tar.gz must be written to dir");
+        assert_eq!(
+            std::fs::read(&tar_path).unwrap(),
+            b"fake-image-tar",
+            "written bytes must match the server response"
+        );
+    }
+
+    /// When the server returns 404 (source-only app, no prebuilt tar),
+    /// `fetch_image_tar` returns `Ok(())` without creating any file.
+    #[tokio::test]
+    async fn fetch_image_tar_404_does_not_fail() {
+        let server = MockServer::start().await;
+        let uuid = "test-uuid-source";
+        let version = 1u64;
+        Mock::given(method("GET"))
+            .and(path(format!("/apps/{uuid}/v{version}/image.tar.gz")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fetcher = S3Fetcher::new(server.uri(), tmp.path());
+        let dir = tmp
+            .path()
+            .join("apps")
+            .join(uuid)
+            .join(format!("v{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Must NOT return an error.
+        fetcher
+            .fetch_image_tar(uuid, version, &dir)
+            .await
+            .expect("404 must not fail fetch_image_tar");
+
+        // Must NOT write a file.
+        assert!(
+            !dir.join("image.tar.gz").exists(),
+            "no file must be written when server returns 404"
+        );
+    }
+
+    /// When `image.tar.gz` is already cached on disk, `fetch_image_tar` skips
+    /// the network request entirely (the mock server has no route for this call).
+    #[tokio::test]
+    async fn fetch_image_tar_cached_skips_network() {
+        // Server has NO route for image.tar.gz — if the fetcher makes a request
+        // it gets an unexpected 404 which would still be Ok(None), but we verify
+        // no request at all is made by checking the mock server received 0 calls.
+        let server = MockServer::start().await;
+        let uuid = "test-uuid-cached";
+        let version = 5u64;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fetcher = S3Fetcher::new(server.uri(), tmp.path());
+        let dir = tmp
+            .path()
+            .join("apps")
+            .join(uuid)
+            .join(format!("v{version}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-create the cached file.
+        std::fs::write(dir.join("image.tar.gz"), b"cached").unwrap();
+
+        fetcher
+            .fetch_image_tar(uuid, version, &dir)
+            .await
+            .expect("cached path must succeed");
+
+        // Verify the server received NO requests.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "no network request must be made when image.tar.gz is already cached"
+        );
+    }
 }

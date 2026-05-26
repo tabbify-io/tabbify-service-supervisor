@@ -191,6 +191,13 @@ mod protocol {
         vec!["rmi".to_owned(), "-f".to_owned(), tag.to_owned()]
     }
 
+    /// `docker load -i <tar_path>` argv (sans the leading binary): load a
+    /// pre-built image tar into the local daemon. Docker auto-detects gzip so
+    /// both plain and gzipped tars work. Used for the W3 warm-start path.
+    pub fn load_args(tar_path: &str) -> Vec<String> {
+        vec!["load".to_owned(), "-i".to_owned(), tar_path.to_owned()]
+    }
+
     /// Content-stable image tag keyed by uuid + version: `tbf-img-<uuid>-v<N>`.
     /// DISTINCT from the per-run container name `tbf-<uuid>-<seq>`. The tag
     /// changes when the app version changes, so a new push never reuses a stale
@@ -318,7 +325,7 @@ mod runtime_impl {
 
     use super::protocol::{
         ImageCacheDecision, build_args, container_name, image_cache_decision, inspect_args,
-        proxy_request, rm_args, run_args, stop_args, versioned_image_tag,
+        load_args, proxy_request, rm_args, run_args, stop_args, versioned_image_tag,
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
@@ -364,6 +371,13 @@ mod runtime_impl {
     /// the image is present (exit 0). Production: the real `docker` CLI.
     /// Tests: an injected closure so no real daemon is needed.
     type InspectRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
+
+    /// Tar-load runner seam for the W3 warm-start path: given a list of
+    /// `docker load` arguments (e.g. `["load", "-i", "/path/to/image.tar.gz"]`),
+    /// run the command and return `true` iff it exits 0 (load succeeded).
+    /// Production: the real `docker` CLI via [`production_command_runner`].
+    /// Tests: an injected closure that records calls without a real daemon.
+    type TarLoadRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
 
     /// Build the production [`CommandRunner`]: spawns `<docker_bin> <args>` and
     /// returns `true` iff the process exits 0. Best-effort: a spawn failure or
@@ -460,6 +474,10 @@ mod runtime_impl {
         /// Image-inspect runner seam for the W2 build-cache check. Production
         /// uses the real `docker image inspect`; tests inject a recording closure.
         inspect_runner: InspectRunner,
+        /// Tar-load runner seam for the W3 warm-start path. Production uses the
+        /// real `docker load -i <path>`; tests inject a recording closure so no
+        /// real daemon or tar file is needed.
+        tar_load_runner: TarLoadRunner,
     }
 
     impl DockerRuntime {
@@ -501,16 +519,35 @@ mod runtime_impl {
 
             let vtag = versioned_image_tag(id, version);
 
-            // W2 build-cache: skip `docker build` if the image is already present.
+            // W3 warm-start: if the app dir contains a prebuilt image tar, load
+            // it before the W2 cache check. After a successful load the image
+            // `tbf-img-<uuid>-v<N>` exists, so W2's inspect returns Skip and the
+            // build step is bypassed entirely.
+            let tar_load_runner =
+                production_command_runner(cfg.docker_bin.clone()) as TarLoadRunner;
+            let app_dir = context.parent().unwrap_or(context);
+            let tar_path = app_dir.join("image.tar.gz");
+            if tar_path.is_file() {
+                let tar_str = tar_path.to_string_lossy().into_owned();
+                let loaded = (tar_load_runner)(load_args(&tar_str)).await;
+                if loaded {
+                    tracing::info!(tag = %vtag, path = %tar_str, "docker image loaded from prebuilt tar (warm start)");
+                } else {
+                    tracing::warn!(tag = %vtag, path = %tar_str, "docker load failed — falling through to W2 build path");
+                }
+            }
+
+            // W2 build-cache: skip `docker build` if the image is already present
+            // (either loaded from the tar above, or left over from a prior run).
             let image_exists = run_docker_check(&cfg.docker_bin, &inspect_args(&vtag)).await;
             match image_cache_decision(image_exists) {
                 ImageCacheDecision::Build => {
-                    tracing::debug!(tag = %vtag, "docker image not cached — building");
+                    tracing::debug!(tag = %vtag, "docker image not cached — building from source");
                     self::build_image(&cfg.docker_bin, &vtag, context, cfg.build_timeout_secs)
                         .await?;
                 }
                 ImageCacheDecision::Skip => {
-                    tracing::debug!(tag = %vtag, "docker image cached — skipping build");
+                    tracing::debug!(tag = %vtag, "docker image present — skipping build");
                 }
             }
 
@@ -542,6 +579,7 @@ mod runtime_impl {
                 shutdown_runner: production_command_runner(cfg.docker_bin.clone()),
                 versioned_image_tag: vtag,
                 inspect_runner,
+                tar_load_runner,
             };
 
             // On any readiness failure `me` drops → container force-removed.
@@ -565,6 +603,8 @@ mod runtime_impl {
             let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
             // Default inspect runner: no-op (image absent by default, won't be called in health tests).
             let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
+            // Default tar-load runner: no-op (no tar in health tests).
+            let tar_load_runner: TarLoadRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -575,6 +615,7 @@ mod runtime_impl {
                 shutdown_runner,
                 versioned_image_tag: "tbf-img-test-v0".to_owned(),
                 inspect_runner,
+                tar_load_runner,
             }
         }
 
@@ -591,6 +632,7 @@ mod runtime_impl {
         ) -> Self {
             let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
             let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
+            let tar_load_runner: TarLoadRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -601,6 +643,7 @@ mod runtime_impl {
                 shutdown_runner,
                 versioned_image_tag: "tbf-img-test-v0".to_owned(),
                 inspect_runner,
+                tar_load_runner,
             }
         }
 
@@ -620,6 +663,7 @@ mod runtime_impl {
             let probe: TcpProbe = Arc::new(|_addr: &str| true);
             let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
             let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
+            let tar_load_runner: TarLoadRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -630,6 +674,7 @@ mod runtime_impl {
                 shutdown_runner,
                 versioned_image_tag: "tbf-img-test-v0".to_owned(),
                 inspect_runner,
+                tar_load_runner,
             }
         }
 
@@ -651,6 +696,7 @@ mod runtime_impl {
             let probe: TcpProbe = Arc::new(|_addr: &str| true);
             let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
             let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+            let tar_load_runner: TarLoadRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -661,6 +707,39 @@ mod runtime_impl {
                 shutdown_runner,
                 versioned_image_tag: versioned_image_tag(uuid, version),
                 inspect_runner,
+                tar_load_runner,
+            }
+        }
+
+        /// Build a `DockerRuntime` with an injectable tar-load runner for testing
+        /// the W3 warm-start path. `tar_load_runner` is called with
+        /// `["load", "-i", "<tar_path>"]` when `load_image_tar` is invoked.
+        /// `uuid` + `version` set the versioned image tag (used in log messages).
+        ///
+        /// This constructor is `#[cfg(test)]`-only.
+        #[cfg(test)]
+        pub fn with_tar_load_for_test(
+            container_base: &str,
+            container: &str,
+            uuid: &str,
+            version: u64,
+            tar_load_runner: TarLoadRunner,
+        ) -> Self {
+            let probe: TcpProbe = Arc::new(|_addr: &str| true);
+            let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
+            let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+            let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
+            Self {
+                container: container.to_owned(),
+                docker_bin: "docker".to_owned(),
+                container_base: container_base.to_owned(),
+                client: reqwest::Client::new(),
+                probe,
+                exit_watcher,
+                shutdown_runner,
+                versioned_image_tag: versioned_image_tag(uuid, version),
+                inspect_runner,
+                tar_load_runner,
             }
         }
 
@@ -674,6 +753,25 @@ mod runtime_impl {
         pub async fn should_skip_build(&self) -> bool {
             let exists = (self.inspect_runner)(inspect_args(&self.versioned_image_tag)).await;
             matches!(image_cache_decision(exists), ImageCacheDecision::Skip)
+        }
+
+        /// W3 warm-start: if `<app_dir>/image.tar.gz` exists, call `docker load
+        /// -i <path>` via the injected tar-load runner.
+        ///
+        /// Returns `true` if the tar was present AND the load succeeded (the
+        /// image is now in the daemon store so W2's inspect will return Skip).
+        /// Returns `false` if the tar is absent (source-only app) OR the load
+        /// failed (falls through to the W2 build/cache path).
+        ///
+        /// Exposed as a method so tests can drive it via
+        /// [`Self::with_tar_load_for_test`] without a real Docker daemon or tar.
+        pub async fn load_image_tar(&self, app_dir: &std::path::Path) -> bool {
+            let tar_path = app_dir.join("image.tar.gz");
+            if !tar_path.is_file() {
+                return false;
+            }
+            let tar_str = tar_path.to_string_lossy().into_owned();
+            (self.tar_load_runner)(load_args(&tar_str)).await
         }
 
         /// Extract the `host:port` from `container_base` (e.g.
@@ -1502,5 +1600,126 @@ mod tests {
 
         let skip = rt.should_skip_build().await;
         assert!(!skip, "image absent → must NOT skip build");
+    }
+
+    // ---- load_args (W3 tar-load argv) ----------------------------------------
+
+    #[test]
+    fn load_args_returns_correct_argv() {
+        assert_eq!(
+            super::protocol::load_args("/cache/apps/abc/v3/image.tar.gz"),
+            vec!["load", "-i", "/cache/apps/abc/v3/image.tar.gz"]
+        );
+    }
+
+    // ---- W3 warm-start: load_image_tar seam ----------------------------------
+
+    /// When `image.tar.gz` is present in the app dir, `load_image_tar` must call
+    /// the tar-load runner with `["load", "-i", "<path>"]` and return `true` on
+    /// a successful load.
+    #[tokio::test]
+    async fn docker_load_image_tar_invokes_runner_with_tar_path() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a (dummy) image.tar.gz in the temp dir.
+        let tar_path = tmp.path().join("image.tar.gz");
+        std::fs::write(&tar_path, b"fake-tar").unwrap();
+
+        let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued2 = issued.clone();
+
+        let tar_load_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |args: Vec<String>| {
+                issued2.lock().unwrap().push(args);
+                Box::pin(async { true }) // simulate successful load
+            });
+
+        let rt = super::runtime_impl::DockerRuntime::with_tar_load_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-tarload-0",
+            "uuid-warm",
+            3,
+            tar_load_runner,
+        );
+
+        let loaded = rt.load_image_tar(tmp.path()).await;
+        assert!(loaded, "tar present + load succeeded → must return true");
+
+        let cmds = issued.lock().unwrap();
+        assert_eq!(cmds.len(), 1, "must issue exactly one docker load call");
+        assert_eq!(cmds[0][0], "load", "first arg must be 'load'");
+        assert_eq!(cmds[0][1], "-i", "second arg must be '-i'");
+        assert!(
+            cmds[0][2].ends_with("image.tar.gz"),
+            "third arg must be the tar path; got {:?}",
+            cmds[0][2]
+        );
+    }
+
+    /// When the app dir does NOT contain `image.tar.gz` (source-only app),
+    /// `load_image_tar` must return `false` WITHOUT calling the tar-load runner.
+    #[tokio::test]
+    async fn docker_load_image_tar_no_tar_returns_false_without_invoking_runner() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No image.tar.gz in the dir.
+
+        let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cc = call_count.clone();
+
+        let tar_load_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |_args: Vec<String>| {
+                *cc.lock().unwrap() += 1;
+                Box::pin(async { false })
+            });
+
+        let rt = super::runtime_impl::DockerRuntime::with_tar_load_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-tarload-1",
+            "uuid-source",
+            1,
+            tar_load_runner,
+        );
+
+        let loaded = rt.load_image_tar(tmp.path()).await;
+        assert!(!loaded, "no tar → must return false");
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            0,
+            "runner must NOT be called when no tar is present"
+        );
+    }
+
+    /// When `image.tar.gz` is present but `docker load` fails (runner returns
+    /// false), `load_image_tar` must return `false` so the caller falls through
+    /// to the W2 build/cache path.
+    #[tokio::test]
+    async fn docker_load_image_tar_failed_load_returns_false() {
+        use crate::runtime::BoxFut;
+        use std::sync::Arc;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("image.tar.gz"), b"bad-tar").unwrap();
+
+        let tar_load_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(|_args| Box::pin(async { false })); // simulate load failure
+
+        let rt = super::runtime_impl::DockerRuntime::with_tar_load_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-tarload-2",
+            "uuid-fail",
+            2,
+            tar_load_runner,
+        );
+
+        let loaded = rt.load_image_tar(tmp.path()).await;
+        assert!(
+            !loaded,
+            "failed load → must return false (fall through to W2)"
+        );
     }
 }
