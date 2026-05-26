@@ -112,23 +112,32 @@ and `cross build --release --target x86_64-unknown-linux-musl`, or build on a
 Linux box). The `just build-musl` recipe is the cargo invocation; supply the
 linker for your environment.
 
-### CI release — musl binary published to S3
+### CI release — musl binaries published to S3
 
-`.github/workflows/release.yml` builds a static `supervisord` (musl) on every
-push to `main`, on tags `v*`, and on manual `workflow_dispatch`, then uploads it
-to S3. No ECR, no SSM — just the binary.
+`.github/workflows/release.yml` builds a static `supervisord` (musl) for BOTH
+CPU architectures on every push to `main`, on tags `v*`, and on manual
+`workflow_dispatch`, then uploads each to a per-arch S3 key. Each arch builds on
+a native runner (`x86_64` on `ubuntu-latest`, `aarch64` on `ubuntu-24.04-arm`),
+so no cross-linker is involved. No ECR, no SSM — just the binaries.
 
-**Published path:**
+**Published paths:**
 
 ```
-s3://<RELEASE_S3_BUCKET>/supervisor/supervisord
+s3://<RELEASE_S3_BUCKET>/supervisor/x86_64/supervisord    # Intel/AMD hosts
+s3://<RELEASE_S3_BUCKET>/supervisor/aarch64/supervisord   # ARM hosts (e.g. aarch64 Lima)
+s3://<RELEASE_S3_BUCKET>/supervisor/supervisord           # legacy alias == x86_64 (kept for back-compat)
 ```
+
+The un-prefixed `supervisor/supervisord` key is still published (a copy of the
+x86_64 binary) so pre-existing consumers (the Phase-1 runbook, older curl
+snippets) keep working; new consumers should use the per-arch key.
 
 **Fetch and run on a Kamatera (or any Linux) host:**
 
 ```bash
+ARCH=$(uname -m)   # x86_64 | aarch64
 curl -fsSL \
-  "https://<RELEASE_S3_BUCKET>.s3.eu-central-1.amazonaws.com/supervisor/supervisord" \
+  "https://<RELEASE_S3_BUCKET>.s3.eu-central-1.amazonaws.com/supervisor/${ARCH}/supervisord" \
   -o supervisord
 chmod +x supervisord
 sudo ./supervisord --name sup-kamatera --app <UUID>
@@ -138,10 +147,12 @@ sudo ./supervisord --name sup-kamatera --app <UUID>
 
 | Kind | Name | Value |
 |---|---|---|
-| Secret | `MESH_DEPLOY_KEY` | Read-only SSH private key for `tabbify-io/tabbify-service-mesh`. Add the matching public key as a deploy key on that repo (read-only). Needed because the supervisor's `Cargo.toml` pulls `mesh-joiner` via `ssh://git@github.com/tabbify-io/tabbify-service-mesh.git` and `.cargo/config.toml` routes git fetches through the system SSH binary. |
-| Secret | `AWS_ROLE_ARN` | ARN of the IAM role to assume via GitHub OIDC. Trust policy must allow this repo; permission policy must grant `s3:PutObject` on `<bucket>/supervisor/*`. |
+| Secret | `AWS_ROLE_ARN` | ARN of the IAM role to assume via GitHub OIDC. Trust policy must allow this repo; permission policy must grant `s3:PutObject` on `<bucket>/supervisor/*` (covers the per-arch keys and the legacy key). |
 | Variable | `AWS_REGION` | AWS region of the bucket, e.g. `eu-central-1`. |
 | Variable | `RELEASE_S3_BUCKET` | Bucket name (no `s3://` prefix), e.g. `tabbify-releases`. |
+
+The `mesh-joiner` dependency is fetched anonymously over public HTTPS, so no
+deploy key / ssh-agent is needed in CI.
 
 ### Docker
 

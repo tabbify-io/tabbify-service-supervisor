@@ -44,3 +44,20 @@ check: build test lint fmt
 # Requires the musl target: `rustup target add x86_64-unknown-linux-musl`.
 build-musl:
     cargo build --release --target x86_64-unknown-linux-musl
+
+# Cross-build a static aarch64 musl binary (for an ARM Linux host, e.g. an
+# aarch64 Lima VM for Firecracker testing). On an Apple Silicon Mac the cleanest
+# path is a native arm64 Linux container (no cross-linker, no emulation):
+#     docker run --rm --platform linux/arm64 \
+#       -v "$PWD":/work -w /work \
+#       -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
+#       -v "$HOME/.cargo/git":/usr/local/cargo/git \
+#       rust:bookworm bash -c \
+#       'rustup target add aarch64-unknown-linux-musl && \
+#        apt-get update -qq && apt-get install -y -qq musl-tools && \
+#        cargo build --release --target aarch64-unknown-linux-musl --bin supervisord'
+# Output: target/aarch64-unknown-linux-musl/release/supervisord
+# On an aarch64 Linux host the bare cargo invocation below is enough (after
+# `rustup target add aarch64-unknown-linux-musl` + installing musl-tools).
+build-musl-aarch64:
+    cargo build --release --target aarch64-unknown-linux-musl

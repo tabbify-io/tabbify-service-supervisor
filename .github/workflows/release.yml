@@ -1,24 +1,24 @@
 # Release pipeline for tabbify-service-supervisor.
 #
-# Builds the supervisord binary as a fully static Linux executable
-# (x86_64-unknown-linux-musl) and uploads it to S3, so a fresh Ubuntu
-# Kamatera host can fetch and run it with a single curl invocation.
+# Builds the supervisord binary as a fully static Linux executable for BOTH
+# CPU architectures and uploads each to a per-arch S3 key, so a fresh Ubuntu
+# host (Kamatera x86_64, an aarch64 Lima VM, an ARM box, ...) can fetch and run
+# the matching binary with a single curl invocation.
 #
-# The supervisor's Cargo.toml depends on mesh-joiner via an SSH git dep
-# (ssh://git@github.com/tabbify-io/tabbify-service-mesh.git). Because
-# .cargo/config.toml sets net.git-fetch-with-cli=true, cargo's git fetch
-# runs through the system SSH binary. A deploy key (read-only SSH key for
-# tabbify-service-mesh) must therefore be loaded into ssh-agent BEFORE
-# the build step.
+# Targets:
+#   x86_64-unknown-linux-musl    (Intel/AMD hosts)
+#   aarch64-unknown-linux-musl   (ARM hosts, e.g. an aarch64 Lima VM for
+#                                 Firecracker testing)
+# Each builds on a NATIVE runner for its arch (no cross-linker), so the build
+# is identical to the other arch: rustup target add + musl-tools + cargo build.
+#
+# The mesh dependency (tabbify-service-mesh) is a PUBLIC https git dep, fetched
+# anonymously by cargo — no deploy key / ssh-agent needed.
 #
 # ---------------------------------------------------------------------------
 # REQUIRED REPO CONFIGURATION (Settings -> Secrets and variables -> Actions)
 # ---------------------------------------------------------------------------
 # Secrets:
-#   MESH_DEPLOY_KEY   Read-only SSH private key for tabbify-service-mesh.
-#                     The corresponding public key must be added as a deploy
-#                     key on the tabbify-service-mesh repo (read-only access).
-#
 #   AWS_ROLE_ARN      IAM role to assume via GitHub OIDC. The role's trust
 #                     policy must allow this repo's GitHub OIDC provider,
 #                     and its permission policy must grant s3:PutObject on
@@ -35,7 +35,8 @@
 #   2. Create an IAM role whose trust policy federates that provider and
 #      restricts `token.actions.githubusercontent.com:sub` to this repo.
 #   3. Attach a permission policy granting s3:PutObject on the bucket's
-#      supervisor/ prefix.
+#      supervisor/ prefix (covers supervisor/<arch>/supervisord and the
+#      legacy supervisor/supervisord key).
 #   4. Put the role ARN in the AWS_ROLE_ARN secret and the bucket/region
 #      in the variables above.
 #
@@ -56,21 +57,36 @@ on:
       - "v*"
 
 env:
-  # musl gives us a static binary that runs on any modern Linux without a
-  # matching libc. reqwest uses rustls (no OpenSSL C linkage), so musl
-  # builds cleanly.
-  TARGET: x86_64-unknown-linux-musl
   CARGO_TERM_COLOR: always
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
-
     # `id-token: write` is required for the OIDC handshake with AWS STS.
     # `contents: read` is the minimum needed to check out the repo.
     permissions:
       id-token: write
       contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64: native Intel runner.
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+            arch: x86_64
+            # Back-compat: x86_64 also publishes to the legacy un-prefixed key
+            # (consumed by the Phase-1 runbook + README curl examples). Leave
+            # empty for the other arch.
+            legacy_key: supervisor/supervisord
+          # aarch64: native ARM runner (GitHub-hosted ubuntu arm64), so the
+          # build mirrors x86_64 exactly — no cross-linker, just musl-tools.
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+            arch: aarch64
+            legacy_key: ""
+
+    runs-on: ${{ matrix.runs-on }}
 
     steps:
       - name: Check out repository
@@ -83,7 +99,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add "${TARGET}"
+          rustup target add "${{ matrix.target }}"
 
       - name: Install musl build tools
         # musl-gcc is needed to link the static C runtime for the musl target.
@@ -98,12 +114,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ env.TARGET }}-
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
 
       - name: Build static supervisord binary
-        run: cargo build --release --target "${TARGET}" --bin supervisord
+        run: cargo build --release --target "${{ matrix.target }}" --bin supervisord
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -113,9 +129,20 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Upload supervisord to S3
+      - name: Upload supervisord to S3 (per-arch key)
         run: |
           set -euo pipefail
           aws s3 cp \
-            "target/${TARGET}/release/supervisord" \
-            "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/supervisord"
+            "target/${{ matrix.target }}/release/supervisord" \
+            "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/${{ matrix.arch }}/supervisord"
+
+      - name: Upload supervisord to S3 (legacy un-prefixed key)
+        # Only x86_64 sets legacy_key. Keeps the pre-existing
+        # supervisor/supervisord key working for the Phase-1 runbook + any
+        # other consumer that hasn't moved to the per-arch path yet.
+        if: matrix.legacy_key != ''
+        run: |
+          set -euo pipefail
+          aws s3 cp \
+            "target/${{ matrix.target }}/release/supervisord" \
+            "s3://${{ vars.RELEASE_S3_BUCKET }}/${{ matrix.legacy_key }}"
