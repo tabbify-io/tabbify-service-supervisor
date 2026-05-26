@@ -755,21 +755,30 @@ mod linux {
         }
 
         fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
-            // The runner is the firecracker child's parent; poll its liveness via
-            // the zombie-aware `process_is_alive` (waitpid-based) so this stays
-            // `&self` (`Child::wait` needs `&mut`, which `Drop` owns). When the VM
-            // process exits the app is gone → fail-fast → the runner exits → L2
-            // respawns it.
+            // The firecracker child is OUR child, so a dead VM becomes a ZOMBIE
+            // until we reap it. `kill(pid, 0)` (`process_is_alive`) reports a
+            // zombie as "alive" forever — the live Lima test proved that hangs
+            // fail-fast — so we poll with `waitpid(WNOHANG)`, which REAPS the
+            // zombie AND detects the exit. Polling keeps this `&self` (tokio
+            // `Child::wait` needs `&mut`, which `Drop` owns). When the VM exits
+            // the app is gone → the runner exits → L2 respawns it.
             let pid = self.child.as_ref().and_then(|c| c.id());
             Box::pin(async move {
                 match pid {
                     None => std::future::pending().await,
-                    Some(pid) => {
-                        while pidfile::process_is_alive(pid) {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                    Some(pid) => loop {
+                        // SAFETY: waitpid is a POSIX syscall; WNOHANG is
+                        // non-blocking. Returns the pid (and reaps) once it has
+                        // exited, 0 while still running, <0 (ECHILD) if already
+                        // reaped — any non-zero result means the child is gone.
+                        let r = unsafe {
+                            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
+                        };
+                        if r != 0 {
+                            return ExitReason::Died(format!("firecracker child pid {pid} exited"));
                         }
-                        ExitReason::Died(format!("firecracker child pid {pid} exited"))
-                    }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    },
                 }
             })
         }
