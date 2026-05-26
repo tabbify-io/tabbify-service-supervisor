@@ -168,9 +168,9 @@ impl Orchestrator {
             match self.reconcile_record(&record).await {
                 RecordOutcome::Adopted => summary.adopted.push(record.uuid),
                 RecordOutcome::Respawned => summary.respawned.push(record.uuid),
-                // A failed respawn is left out of both buckets; it was logged in
-                // reconcile_record and the periodic monitor will retry it.
-                RecordOutcome::RespawnFailed => {}
+                // A failed respawn or a backoff-gated skip are left out of both
+                // buckets; the periodic monitor will retry on the next tick.
+                RecordOutcome::RespawnFailed | RecordOutcome::Backoff => {}
             }
         }
 

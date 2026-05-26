@@ -39,6 +39,9 @@ use std::time::Duration;
 use crate::orchestrator::Orchestrator;
 use crate::orchestrator::client::ControlClient;
 use crate::orchestrator::handle::RunnerHandle;
+use crate::orchestrator::restart::{
+    BackoffParams, RestartState, on_exit, on_healthy, should_respawn,
+};
 use crate::orchestrator::spawn::spawn_runner;
 
 /// Liveness probe for runner processes: returns `true` iff `pid` is a live,
@@ -91,6 +94,35 @@ pub(crate) enum RecordOutcome {
     Respawned,
     /// The runner was dead but spawning a replacement failed (logged, skipped).
     RespawnFailed,
+    /// The runner is dead but its backoff window has not yet elapsed — no
+    /// respawn this tick; the monitor will retry on the next pass.
+    Backoff,
+}
+
+/// Result of the pure backoff gate check.
+///
+/// This is what [`backoff_action`] returns. It answers "is this the right
+/// moment to fire a respawn?" without touching any I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackoffAction {
+    /// The backoff window has elapsed (or no failure has been recorded yet) —
+    /// a respawn attempt is warranted.
+    RespawnNow,
+    /// The backoff window has not yet elapsed — skip this tick and wait.
+    Wait,
+}
+
+/// Pure backoff gate: wraps [`should_respawn`] in the monitor's vocabulary.
+///
+/// # Parameters
+/// - `restart` — the current per-runner restart state.
+/// - `now` — current unix timestamp in seconds (injected for determinism).
+pub(crate) fn backoff_action(restart: RestartState, now: u64) -> BackoffAction {
+    if should_respawn(restart, now) {
+        BackoffAction::RespawnNow
+    } else {
+        BackoffAction::Wait
+    }
 }
 
 /// Result of the pure pid+grace decision step (first half of reconciliation).
@@ -179,6 +211,10 @@ impl Orchestrator {
     /// This is the single source of truth shared by [`tick`](Self::tick) and
     /// [`readopt`](Self::readopt). A respawn failure is logged and reported as
     /// [`RecordOutcome::RespawnFailed`] — never propagated.
+    ///
+    /// Backoff is gated via [`backoff_action`]: if the runner is dead but its
+    /// next-retry window has not yet elapsed, the function returns
+    /// [`RecordOutcome::Backoff`] without touching the process table.
     pub(crate) async fn reconcile_record(&self, record: &RunnerHandle) -> RecordOutcome {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -187,13 +223,23 @@ impl Orchestrator {
 
         match decide_pid_grace(record.pid, record.spawned_at, now_secs, runner_is_alive) {
             PidDecision::RespawnDead => {
+                // Gate the actual respawn behind the backoff policy.
+                if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
+                    tracing::debug!(
+                        uuid = %record.uuid,
+                        next_retry_at = record.restart.next_retry_at,
+                        "runner dead but backoff window not elapsed — skipping this tick"
+                    );
+                    return RecordOutcome::Backoff;
+                }
                 tracing::warn!(
                     uuid = %record.uuid,
                     pid = record.pid,
                     control_sock = %record.control_sock.display(),
                     "runner is dead — respawning"
                 );
-                self.do_respawn(record, None).await
+                let new_restart = on_exit(record.restart, BackoffParams::default(), now_secs);
+                self.do_respawn(record, None, new_restart).await
             }
 
             PidDecision::AdoptInGrace => {
@@ -202,6 +248,9 @@ impl Orchestrator {
                     pid = record.pid,
                     "runner alive within grace window — adopted (socket check skipped)"
                 );
+                // Update healthy timestamp but do not reset failures yet — the
+                // runner is still within its startup window.
+                self.persist_healthy_if_changed(record, now_secs);
                 RecordOutcome::Adopted
             }
 
@@ -218,8 +267,20 @@ impl Orchestrator {
                         pid = record.pid,
                         "runner alive and socket healthy — adopted"
                     );
+                    // Runner is healthy: advance state (may reset failure count
+                    // once stable_secs have elapsed since last exit).
+                    self.persist_healthy_if_changed(record, now_secs);
                     RecordOutcome::Adopted
                 } else {
+                    // Gate kill-then-respawn behind the backoff policy too.
+                    if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
+                        tracing::debug!(
+                            uuid = %record.uuid,
+                            next_retry_at = record.restart.next_retry_at,
+                            "hung runner socket unhealthy but backoff window not elapsed — skipping"
+                        );
+                        return RecordOutcome::Backoff;
+                    }
                     tracing::warn!(
                         uuid = %record.uuid,
                         pid = record.pid,
@@ -227,19 +288,58 @@ impl Orchestrator {
                         "runner alive but socket unhealthy past grace window — killing before respawn"
                     );
                     kill_pid(record.pid);
-                    self.do_respawn(record, Some(record.pid)).await
+                    let new_restart = on_exit(record.restart, BackoffParams::default(), now_secs);
+                    self.do_respawn(record, Some(record.pid), new_restart).await
                 }
             }
         }
     }
 
-    /// Spawn a replacement runner and update the on-disk record. `killed_pid` is
-    /// provided when the caller already sent SIGKILL to an old process (logged
-    /// for traceability).
-    async fn do_respawn(&self, record: &RunnerHandle, killed_pid: Option<u32>) -> RecordOutcome {
+    /// Compute the `on_healthy` state for `record` and, if it differs from the
+    /// current state, persist the updated record to disk. No-op when the state
+    /// is already up-to-date (so a healthy steady-state runner costs only one
+    /// cheap comparison per tick once it is stable).
+    fn persist_healthy_if_changed(&self, record: &RunnerHandle, now_secs: u64) {
+        let new_restart = on_healthy(record.restart, BackoffParams::default(), now_secs);
+        if new_restart != record.restart {
+            let mut updated = record.clone();
+            updated.restart = new_restart;
+            if let Err(e) = updated.save(&self.runner_dir) {
+                tracing::warn!(
+                    uuid = %record.uuid,
+                    error = %e,
+                    "failed to persist updated healthy restart state"
+                );
+            }
+        }
+    }
+
+    /// Spawn a replacement runner, stamp the bumped `new_restart` state onto
+    /// the freshly written record, and return the outcome.
+    ///
+    /// `killed_pid` is provided when the caller already sent SIGKILL to an old
+    /// process (logged for traceability). `new_restart` is the result of
+    /// [`on_exit`] computed by the caller (it is merged into the new record so
+    /// consecutive-failure counts survive a supervisor restart).
+    async fn do_respawn(
+        &self,
+        record: &RunnerHandle,
+        killed_pid: Option<u32>,
+        new_restart: RestartState,
+    ) -> RecordOutcome {
         let spec = self.shared.spawn_spec_for(record);
         match spawn_runner(&spec, &self.runner_dir).await {
-            Ok((new_handle, _child)) => {
+            Ok((mut new_handle, _child)) => {
+                // Merge the bumped restart state into the fresh record before
+                // persisting it, so the failure count is not lost on the next tick.
+                new_handle.restart = new_restart;
+                if let Err(e) = new_handle.save(&self.runner_dir) {
+                    tracing::warn!(
+                        uuid = %new_handle.uuid,
+                        error = %e,
+                        "failed to persist restart state after respawn (will recover on next tick)"
+                    );
+                }
                 if let Some(old) = killed_pid {
                     tracing::info!(
                         uuid = %new_handle.uuid,
@@ -278,6 +378,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::orchestrator::restart::RestartState;
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -423,6 +524,71 @@ mod tests {
         assert!(
             !probed.load(Ordering::SeqCst),
             "socket must not be checked within grace window"
+        );
+    }
+
+    // ── backoff_action ────────────────────────────────────────────────────────
+
+    /// Default (no failures, next_retry_at=0) → backoff window is already past
+    /// → RespawnNow.
+    #[test]
+    fn backoff_action_default_state_is_respawn_now() {
+        let state = RestartState::default();
+        assert_eq!(
+            backoff_action(state, 1_700_000_000),
+            BackoffAction::RespawnNow,
+            "a never-failed runner must always be RespawnNow"
+        );
+    }
+
+    /// next_retry_at is in the FUTURE → Wait (reconcile_record must yield Backoff).
+    #[test]
+    fn backoff_action_future_retry_is_wait() {
+        let state = RestartState {
+            consecutive_failures: 2,
+            last_exit_at: 1_700_000_000,
+            next_retry_at: 1_700_000_030, // 30 s in the future
+            last_healthy_at: 0,
+        };
+        let now = 1_700_000_010u64; // 10 s after exit, before retry window
+        assert_eq!(
+            backoff_action(state, now),
+            BackoffAction::Wait,
+            "next_retry_at in the future must be Wait"
+        );
+    }
+
+    /// next_retry_at is in the PAST (window elapsed) → RespawnNow.
+    #[test]
+    fn backoff_action_past_retry_is_respawn_now() {
+        let state = RestartState {
+            consecutive_failures: 2,
+            last_exit_at: 1_700_000_000,
+            next_retry_at: 1_700_000_030,
+            last_healthy_at: 0,
+        };
+        let now = 1_700_000_031u64; // 1 s past the retry window
+        assert_eq!(
+            backoff_action(state, now),
+            BackoffAction::RespawnNow,
+            "next_retry_at in the past must be RespawnNow"
+        );
+    }
+
+    /// next_retry_at exactly equals now → RespawnNow (boundary is inclusive).
+    #[test]
+    fn backoff_action_at_retry_boundary_is_respawn_now() {
+        let state = RestartState {
+            consecutive_failures: 1,
+            last_exit_at: 1_700_000_000,
+            next_retry_at: 1_700_000_010,
+            last_healthy_at: 0,
+        };
+        let now = 1_700_000_010u64;
+        assert_eq!(
+            backoff_action(state, now),
+            BackoffAction::RespawnNow,
+            "at the exact retry boundary, RespawnNow must fire"
         );
     }
 }
