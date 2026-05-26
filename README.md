@@ -239,6 +239,10 @@ mesh-joiner = { git = "ssh://git@github.com/tabbify-io/tabbify-service-mesh.git"
 
 ## Build / run / test
 
+> **Running it as a Docker container?** See [`deploy/README.md`](deploy/README.md) —
+> turnkey `docker run`, capability flags (`/dev/kvm`, docker socket), verifying the
+> mesh join, running an app, and operating it.
+
 ```bash
 just build                    # cargo build --workspace
 just test                     # all tests, no network
