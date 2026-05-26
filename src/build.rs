@@ -1,10 +1,8 @@
-//! Shared runtime construction — the `build_runtime` free function used by both
-//! the [`crate::registry::AppRegistry`] and the per-app runner
-//! ([`crate::runner::serve`]).
+//! Shared runtime construction — the `build_runtime` free function used by the
+//! per-app runner serve core ([`crate::runner::serve`]).
 //!
-//! Keeping the match in one place guarantees the registry and the runner build
-//! runtimes identically (DRY) and avoids duplicating the
-//! `wasm-http` / `firecracker` / `docker` selection logic.
+//! Keeping the `wasm-http` / `firecracker` / `docker` runtime-selection match in
+//! one place keeps it DRY and unit-testable independent of the serve wiring.
 
 use std::sync::Arc;
 

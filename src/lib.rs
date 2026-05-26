@@ -17,9 +17,12 @@
 //! - [`docker`] — the third [`runtime::AppRuntime`]: a cross-platform Docker
 //!   container runtime that builds the app image from source on the supervisor.
 //! - [`fetcher`] — anonymous S3 artifact fetch + local cache (contract §2).
-//! - [`host`] — per-app-ULA hosting: one listener per app on its own ULA
-//!   (contract §5, Component 3).
-//! - [`registry`] — app registry + lifecycle state machine (contract §5).
+//! - [`host`] — per-app-ULA hosting: one listener per app on its own ULA, used
+//!   by the per-app [`runner`] (contract §5, Component 3).
+//! - [`orchestrator`] — spawns / monitors / re-adopts the per-app runner fleet
+//!   and drives the control-API lifecycle (start / stop / purge / list).
+//! - [`runner`] — the per-app `tabbify-runner`: hosts exactly one app on its
+//!   own ULA + a unix-socket control plane.
 //! - [`mesh`] — mesh join wiring (contract §5).
 //! - [`api`] — axum control HTTP API (contract §5).
 
@@ -35,7 +38,6 @@ pub mod host;
 pub mod manifest;
 pub mod mesh;
 pub mod orchestrator;
-pub mod registry;
 pub mod runner;
 pub mod runtime;
 

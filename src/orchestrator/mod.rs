@@ -22,6 +22,7 @@
 //! - Task 2.5 — re-adopt runners on supervisor restart.
 //! - Task 2.6 — API rewire.
 
+pub mod api;
 pub mod client;
 pub mod handle;
 pub mod monitor;
@@ -30,6 +31,7 @@ pub mod spawn;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use api::{AppState, AppSummary};
 pub use client::ControlClient;
 pub use handle::RunnerHandle;
 use monitor::RecordOutcome;
@@ -66,6 +68,15 @@ pub struct SharedRunnerConfig {
     pub s3_base_url: String,
     /// Local data dir runners cache artifacts under.
     pub data_dir: PathBuf,
+    /// This supervisor's own mesh ULA, forwarded to NEWLY-spawned runners as
+    /// their `--parent` so the node can build the supervisor → runners topology.
+    /// `None` in `--no-mesh` mode (and acceptable as a Phase-4 follow-up to wire
+    /// the supervisor's real ULA here once it joins the mesh as a peer).
+    ///
+    /// NOTE: a *respawn* reuses the parent stored in the runner's own
+    /// [`RunnerHandle`] record (see [`Self::spawn_spec_for`]); this field only
+    /// seeds the parent for a brand-new runner started via the control API.
+    pub parent: Option<String>,
     /// Skip mesh join; bind plain loopback. Used for local runs / tests without
     /// root + TUN.
     pub no_mesh: bool,
@@ -217,6 +228,7 @@ mod tests {
             runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
             s3_base_url: "http://s3.invalid".to_owned(),
             data_dir: PathBuf::from("/var/lib/tabbify/data"),
+            parent: None,
             no_mesh: true,
         }
     }

@@ -2,17 +2,22 @@
 //! in prod; tests bind a loopback addr and drive the router directly via
 //! `tower::ServiceExt::oneshot`.
 //!
-//! This is the CONTROL plane only — app traffic is served by the per-app-ULA
-//! listeners ([`crate::host`]), NOT here. There is no `/apps/<uuid>/*` route on
-//! the control port any more; an app's ULA IS its address.
+//! Since the per-app-runner refactor (Task 2.6) the control plane drives the
+//! runner [`Orchestrator`] instead of hosting apps in-process: `start` spawns a
+//! detached `tabbify-runner` and waits until it is healthy; `stop` / `purge`
+//! shut the runner down (and `purge` reclaims its cache) and forget it; `list` /
+//! `get` read the live runner fleet (records + a quick control-socket health
+//! probe). App traffic is served by the per-app runners on their own app-ULAs,
+//! NOT here — there is no `/apps/<uuid>/*` route on the control port; an app's
+//! ULA IS its address.
 //!
 //! Endpoints:
 //! - `GET  /health`
 //! - `GET  /v1/apps`
 //! - `GET  /v1/apps/:uuid`
-//! - `POST /v1/apps/:uuid/start`  (fetch + host on the app-ULA + PIN)
-//! - `POST /v1/apps/:uuid/stop`   (unhost + unpin)
-//! - `POST /v1/apps/:uuid/purge`  (stop + remove docker image/cache + forget)
+//! - `POST /v1/apps/:uuid/start`  (spawn a runner + wait healthy)
+//! - `POST /v1/apps/:uuid/stop`   (shutdown the runner + forget)
+//! - `POST /v1/apps/:uuid/purge`  (purge + shutdown the runner + forget + clear cache)
 
 use std::sync::Arc;
 
@@ -23,14 +28,18 @@ use axum::routing::{get, post};
 use http::StatusCode;
 use serde_json::json;
 
-use crate::fetcher::FetchError;
-use crate::registry::{AppRegistry, AppSummary};
+use crate::fetcher::{FetchError, S3Fetcher};
+use crate::orchestrator::{AppState, AppSummary, Orchestrator};
 
 /// Shared handler state.
 #[derive(Clone)]
 pub struct SupervisorState {
-    /// App registry + lifecycle + per-app-ULA hosting.
-    pub registry: AppRegistry,
+    /// Runner orchestrator — spawns / monitors / re-adopts per-app runners.
+    pub orchestrator: Orchestrator,
+    /// S3 fetcher, used ONLY by the discovery path (`GET /v1/apps/:uuid` for an
+    /// app the orchestrator has no runner for): probe whether the artifact is
+    /// fetchable so the endpoint can report `present: true/false`.
+    pub fetcher: S3Fetcher,
     /// Stable-ish supervisor id (peer id, or a local placeholder w/o mesh).
     pub supervisor_id: String,
     /// Our control ULA (peer-ULA), or the bind addr's host when running w/o mesh.
@@ -44,12 +53,19 @@ pub struct SupervisorState {
 }
 
 impl SupervisorState {
-    /// Construct shared state. Firecracker + docker capabilities default off;
-    /// set them with [`Self::with_firecracker`] / [`Self::with_docker`].
+    /// Construct shared state over the runner `orchestrator` + a `fetcher` for
+    /// the discovery path. Firecracker + docker capabilities default off; set
+    /// them with [`Self::with_firecracker`] / [`Self::with_docker`].
     #[must_use]
-    pub fn new(registry: AppRegistry, supervisor_id: String, ula: String) -> Self {
+    pub fn new(
+        orchestrator: Orchestrator,
+        fetcher: S3Fetcher,
+        supervisor_id: String,
+        ula: String,
+    ) -> Self {
         Self {
-            registry,
+            orchestrator,
+            fetcher,
             supervisor_id,
             ula,
             firecracker: false,
@@ -73,7 +89,7 @@ impl SupervisorState {
 }
 
 /// Build the axum [`Router`] with the supervisor CONTROL endpoints (no app
-/// serving — that lives on the per-app-ULA listeners).
+/// serving — that lives on the per-app runners' own ULAs).
 pub fn router(state: SupervisorState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -99,89 +115,110 @@ async fn health(State(state): State<SharedState>) -> Response {
 }
 
 async fn list_apps(State(state): State<SharedState>) -> Response {
-    let apps: Vec<_> = state
-        .registry
-        .list()
-        .into_iter()
-        .map(summary_json)
-        .collect();
-    axum::Json(json!({ "apps": apps })).into_response()
+    match state.orchestrator.app_summaries().await {
+        Ok(apps) => {
+            let apps: Vec<_> = apps.iter().map(summary_json).collect();
+            axum::Json(json!({ "apps": apps })).into_response()
+        }
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 async fn get_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
-    // Known already? Report its live state + app_ula.
-    if let Some(s) = state.registry.get(&uuid) {
-        return present_json(&s).into_response();
+    // Does the orchestrator have a runner record for it? Report its live state.
+    match state.orchestrator.app_summary(&uuid).await {
+        Ok(Some(s)) => return present_json(&s).into_response(),
+        Ok(None) => {}
+        Err(e) => return error_json(StatusCode::BAD_REQUEST, &e.to_string()),
     }
-    // Not known: probe S3 (discovery — present iff fetchable). We do NOT host
-    // here, just confirm the artifact exists + learn metadata.
-    match state.registry.is_fetchable(&uuid).await {
-        Ok(true) => match state.registry.ensure_known(&uuid).await {
-            Ok(s) => present_json(&s).into_response(),
-            Err(_) => not_present(&uuid),
-        },
-        Ok(false) => not_present(&uuid),
+    // No runner: probe S3 (discovery — present iff fetchable) so a client can
+    // learn the app exists before starting it. We do NOT spawn here.
+    match state.fetcher.latest_version(&uuid).await {
+        Ok(_) => present_discovered(&state, &uuid),
+        Err(FetchError::NotFound(_)) => not_present(&uuid),
         Err(e) => fetch_error_response(&e),
     }
 }
 
-/// `POST /v1/apps/:uuid/start` — fetch + host on the app-ULA + PIN (sticky).
+/// `POST /v1/apps/:uuid/start` — spawn a detached runner (if none live) + wait
+/// until it is healthy. Idempotent: an already-running app returns its current
+/// state. Returns `{state, app_ula, bound_addr}` where `bound_addr` is the
+/// app-ULA (the runner serves on its own ULA — there is no in-supervisor
+/// listener address any more).
 async fn start_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
-    match state.registry.ensure_running(&uuid, /* pin */ true).await {
-        Ok(_) => match state.registry.get(&uuid) {
-            Some(s) => axum::Json(json!({
-                "state": "running",
-                "app_ula": s.app_ula.to_string(),
-                "bound_addr": s.bound_addr.map(|a| a.to_string()),
-            }))
-            .into_response(),
-            None => error_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "app vanished after start",
-            ),
-        },
+    match state.orchestrator.start_app(&uuid).await {
+        Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_response(&e),
     }
 }
 
-/// `POST /v1/apps/:uuid/stop` — unhost the app-ULA (abort listener + joiner
-/// unhost) + unpin.
+/// `POST /v1/apps/:uuid/stop` — shut the runner down (it exits, KEEPING its
+/// on-disk artifacts + docker image for a fast restart) + forget its record.
 async fn stop_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
-    let _ = state.registry.stop(&uuid).await;
-    axum::Json(json!({ "state": "stopped" })).into_response()
+    match state.orchestrator.stop_app(&uuid).await {
+        Ok(()) => axum::Json(json!({ "state": "stopped" })).into_response(),
+        Err(e) => anyhow_to_response(&e),
+    }
 }
 
-/// `POST /v1/apps/:uuid/purge` — full teardown: stop + reclaim disk (remove the
-/// built docker image + the on-disk artifact cache) + forget the app. The
-/// disk-reclaiming counterpart to `stop` (which only frees memory).
+/// `POST /v1/apps/:uuid/purge` — full teardown: purge the runner (it clears its
+/// cache + removes its docker image) then shut it down, forget its record, and
+/// reclaim the on-disk cache. The disk-reclaiming counterpart to `stop`.
 async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
-    match state.registry.purge(&uuid).await {
+    match state.orchestrator.purge_app(&uuid).await {
         Ok(()) => axum::Json(json!({ "state": "purged", "uuid": uuid })).into_response(),
         Err(e) => anyhow_to_response(&e),
     }
 }
 
-fn summary_json(s: AppSummary) -> serde_json::Value {
+/// JSON row for `GET /v1/apps` (the live runner fleet).
+fn summary_json(s: &AppSummary) -> serde_json::Value {
     json!({
         "uuid": s.uuid,
-        "app_ula": s.app_ula.to_string(),
-        "version": s.version,
-        "name": s.name,
-        "lifecycle": lifecycle_str(s.lifecycle),
+        "app_ula": s.app_ula,
         "state": s.state.as_str(),
-        "bound_addr": s.bound_addr.map(|a| a.to_string()),
+        // The app's address IS its app-ULA in the orchestrator model.
+        "bound_addr": s.app_ula,
     })
 }
 
+/// JSON for `POST /v1/apps/:uuid/start`.
+fn running_json(s: &AppSummary) -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "state": s.state.as_str(),
+        "app_ula": s.app_ula,
+        // The runner serves on its OWN ULA, so the bound address is the app-ULA.
+        "bound_addr": s.app_ula,
+    }))
+}
+
+/// JSON for `GET /v1/apps/:uuid` when the orchestrator has a runner record.
 fn present_json(s: &AppSummary) -> axum::Json<serde_json::Value> {
     axum::Json(json!({
         "uuid": s.uuid,
         "present": true,
-        "version": s.version,
         "state": s.state.as_str(),
-        "app_ula": s.app_ula.to_string(),
-        "bound_addr": s.bound_addr.map(|a| a.to_string()),
+        "app_ula": s.app_ula,
+        "bound_addr": s.app_ula,
     }))
+}
+
+/// JSON for `GET /v1/apps/:uuid` when there is no runner but the artifact is
+/// fetchable from S3 (discovery). State is `stopped` (no live runner); the
+/// app-ULA is still deterministic from the uuid.
+fn present_discovered(state: &SupervisorState, uuid: &str) -> Response {
+    let app_ula = match state.orchestrator.app_ula_for(uuid) {
+        Ok(u) => u.to_string(),
+        Err(e) => return error_json(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    axum::Json(json!({
+        "uuid": uuid,
+        "present": true,
+        "state": AppState::Stopped.as_str(),
+        "app_ula": app_ula,
+        "bound_addr": null,
+    }))
+    .into_response()
 }
 
 fn not_present(uuid: &str) -> Response {
@@ -192,13 +229,6 @@ fn not_present(uuid: &str) -> Response {
         .into_response()
 }
 
-fn lifecycle_str(mode: crate::manifest::LifecycleMode) -> &'static str {
-    match mode {
-        crate::manifest::LifecycleMode::AlwaysOn => "always_on",
-        crate::manifest::LifecycleMode::OnRequest => "on_request",
-    }
-}
-
 fn fetch_error_response(e: &FetchError) -> Response {
     match e {
         FetchError::NotFound(uuid) => not_present(uuid),
@@ -206,8 +236,9 @@ fn fetch_error_response(e: &FetchError) -> Response {
     }
 }
 
-/// Map an `anyhow::Error` from the registry to an HTTP response. A NotFound
-/// underneath becomes 404; everything else is 502 (upstream/S3 problem) or 500.
+/// Map an `anyhow::Error` from the orchestrator to an HTTP response. A
+/// [`FetchError`] underneath maps via [`fetch_error_response`]; everything else
+/// is 500.
 fn anyhow_to_response(e: &anyhow::Error) -> Response {
     if let Some(fe) = e.downcast_ref::<FetchError>() {
         return fetch_error_response(fe);

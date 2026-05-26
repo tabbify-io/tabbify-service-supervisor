@@ -427,6 +427,7 @@ fn make_shared(s3: &MockServer, data_dir: &Path) -> SharedRunnerConfig {
         runner_bin: env!("CARGO_BIN_EXE_tabbify-runner").into(),
         s3_base_url: s3.uri(),
         data_dir: data_dir.to_path_buf(),
+        parent: Some("fd5a:1f00:1::1".to_owned()),
         no_mesh: true,
     }
 }

@@ -1,14 +1,22 @@
-//! Integration tests (contract §5, §6, §10): the S3 fetcher against a wiremock
-//! stand-in for S3, the axum CONTROL API driven via `tower::ServiceExt::oneshot`,
-//! and — the core of Component 3 — per-app-ULA HOSTING: registering / starting
-//! an app binds a dedicated listener (loopback in tests, since no TUN) whose
-//! WHOLE path serves the WASM fixture; stop / idle-reap tears it down.
+//! Control-API integration tests (contract §5, §6, §10): the S3 fetcher against
+//! a wiremock stand-in for S3, and the axum CONTROL API driven via
+//! `tower::ServiceExt::oneshot` — now backed by the runner ORCHESTRATOR.
 //!
-//! These use real behavior with minimal mocks: the only mock is the HTTP object
-//! store (wiremock); the registry, lifecycle, WASM runtime, and the per-app
-//! listeners are exercised for real against `tests/fixtures/hello.wasm` over an
-//! actual loopback TCP socket.
+//! Since Task 2.6 the control API no longer hosts apps in-process; it drives the
+//! orchestrator, which spawns a DETACHED `tabbify-runner` process per app. So
+//! these tests spawn real runner subprocesses (no-mesh / loopback) and assert:
+//! - `POST /v1/apps/:uuid/start` spawns a runner that becomes healthy + reports
+//!   `state: running` and the app's deterministic ULA;
+//! - `POST /v1/apps/:uuid/stop` shuts the runner down + forgets it;
+//! - `POST /v1/apps/:uuid/purge` purges + shuts down + forgets it;
+//! - `GET /v1/apps` and `GET /v1/apps/:uuid` reflect the live runner fleet.
+//!
+//! The only mock is the HTTP object store (wiremock); the orchestrator, the
+//! spawned runners, the WASM runtime, and the per-app listeners are all real.
+//! Each test force-kills any runner it spawned on teardown so no detached
+//! process leaks.
 
+use std::path::Path;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -16,15 +24,17 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tabbify_supervisor::api::{SupervisorState, router};
-use tabbify_supervisor::docker::docker_available;
 use tabbify_supervisor::fetcher::{FetchError, S3Fetcher};
-use tabbify_supervisor::host::AppHost;
-use tabbify_supervisor::registry::{AppRegistry, AppState};
+use tabbify_supervisor::orchestrator::handle::RunnerHandle;
+use tabbify_supervisor::orchestrator::{Orchestrator, SharedRunnerConfig};
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
+
+/// The deterministic per-app ULA for `APP_UUID` (golden value, see `app_ula`).
+const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
 
 /// The committed pure-proxy fixture (compiled wasi:http/proxy component).
 const HELLO_WASM: &[u8] = include_bytes!("fixtures/hello.wasm");
@@ -50,71 +60,6 @@ memory_mb        = 64
 dynamic_prefixes = ["/"]
 "#;
 
-/// `always_on` manifest variant.
-const ALWAYS_ON_MANIFEST: &str = r#"
-[app]
-name = "hello-always"
-
-[lifecycle]
-mode = "always_on"
-
-[runtime]
-"#;
-
-/// `on_request` manifest with a near-zero idle timeout so the reaper fires
-/// without waiting in real time.
-const FAST_REAP_MANIFEST: &str = r#"
-[app]
-name = "hello-fastreap"
-
-[lifecycle]
-mode             = "on_request"
-idle_timeout_sec = 0
-
-[runtime]
-"#;
-
-/// A `firecracker`-runtime manifest. Its entry is a rootfs image (not wasm).
-const FIRECRACKER_MANIFEST: &str = r#"
-[app]
-name = "vm-app"
-
-[lifecycle]
-mode = "always_on"
-
-[runtime]
-type      = "firecracker"
-entry     = "rootfs.ext4"
-memory_mb = 256
-"#;
-
-/// A `docker`-runtime manifest. Its entry is a build-context tarball (the app
-/// dir + a `Dockerfile`), NOT wasm.
-const DOCKER_MANIFEST: &str = r#"
-[app]
-name = "container-app"
-
-[lifecycle]
-mode = "always_on"
-
-[runtime]
-type  = "docker"
-entry = "context.tar.gz"
-"#;
-
-/// A manifest naming an unknown runtime type — must be rejected.
-const UNKNOWN_RUNTIME_MANIFEST: &str = r#"
-[app]
-name = "weird"
-
-[lifecycle]
-mode = "always_on"
-
-[runtime]
-type  = "quantum-vm"
-entry = "app.bin"
-"#;
-
 /// Stand up a wiremock S3 that serves `latest`, `manifest.toml`, `app.wasm`
 /// for `APP_UUID` at version 1, with the given manifest body.
 async fn mock_s3(manifest: &str) -> MockServer {
@@ -137,58 +82,122 @@ async fn mock_s3(manifest: &str) -> MockServer {
     server
 }
 
-/// Like [`mock_s3`] but serves an arbitrary entry filename with arbitrary
-/// bytes (used to stand up a `firecracker`/unknown manifest whose entry is a
-/// rootfs image rather than `app.wasm`).
-async fn mock_s3_entry(manifest: &str, entry: &str, bytes: &[u8]) -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/apps/{APP_UUID}/latest")))
-        .respond_with(ResponseTemplate::new(200).set_body_string("1"))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/apps/{APP_UUID}/v1/manifest.toml")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(manifest))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/apps/{APP_UUID}/v1/{entry}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
-        .mount(&server)
-        .await;
-    server
+// ---------------------------------------------------------------------------
+// Orchestrator-backed test harness
+// ---------------------------------------------------------------------------
+
+/// A control-API test harness: a wiremock S3, a real [`Orchestrator`] over temp
+/// dirs (pointed at the cargo-built `tabbify-runner`), and the temp dirs kept
+/// alive for the test's duration.
+struct Harness {
+    orchestrator: Orchestrator,
+    fetcher: S3Fetcher,
+    runner_dir: tempfile::TempDir,
+    _data_dir: tempfile::TempDir,
 }
 
-/// Loopback-hosted registry: no mesh/TUN, so per-app listeners bind `[::1]:0`
-/// and tests dial the address the registry reports in its summary.
-fn temp_registry(base_url: &str) -> (AppRegistry, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let fetcher = S3Fetcher::new(base_url, dir.path());
-    (AppRegistry::new(fetcher, AppHost::loopback()), dir)
+impl Harness {
+    /// Build a harness whose orchestrator spawns real no-mesh runners that fetch
+    /// from `s3_uri`.
+    fn new(s3_uri: &str) -> Self {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let runner_dir = tempfile::tempdir().expect("runner dir");
+        let shared = SharedRunnerConfig {
+            runner_bin: env!("CARGO_BIN_EXE_tabbify-runner").into(),
+            s3_base_url: s3_uri.to_owned(),
+            data_dir: data_dir.path().to_path_buf(),
+            parent: None,
+            no_mesh: true,
+        };
+        let orchestrator = Orchestrator::new(shared, runner_dir.path().to_path_buf());
+        let fetcher = S3Fetcher::new(s3_uri, data_dir.path());
+        Self {
+            orchestrator,
+            fetcher,
+            runner_dir,
+            _data_dir: data_dir,
+        }
+    }
+
+    /// Build the control-API router over this harness's orchestrator + fetcher.
+    fn router(&self) -> axum::Router {
+        let state = SupervisorState::new(
+            self.orchestrator.clone(),
+            self.fetcher.clone(),
+            "test-supervisor".into(),
+            "fd5a:1f00:1::1".into(),
+        );
+        router(state)
+    }
+
+    /// Force-kill every runner this harness's orchestrator has a record for
+    /// (best-effort teardown so a panicking test never leaks a detached runner).
+    fn kill_all_runners(&self) {
+        if let Ok(records) = RunnerHandle::list(self.runner_dir.path()) {
+            for rec in records {
+                force_kill(rec.pid);
+            }
+        }
+    }
 }
 
-fn test_state(registry: AppRegistry) -> SupervisorState {
-    SupervisorState::new(registry, "test-supervisor".into(), "fd5a:1f00:1::1".into())
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.kill_all_runners();
+    }
 }
 
-/// GET the hosted app's per-app listener directly (the address the registry
-/// bound it on) and return (status, body string).
-async fn dial_app(registry: &AppRegistry, uuid: &str, path: &str) -> (StatusCode, String) {
-    let addr = registry
-        .get(uuid)
-        .expect("app known")
-        .bound_addr
-        .expect("app hosted (bound_addr present)");
-    let resp = reqwest::Client::new()
-        .get(format!("http://{addr}{path}"))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .expect("dial per-app listener");
+/// Force-kill `pid` (best-effort, no-op if already gone).
+fn force_kill(pid: u32) {
+    // SAFETY: `kill(2)` is a standard POSIX syscall; SIGKILL to a (possibly
+    // already-dead) pid is harmless in this short test window.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Drive one HTTP request through `router` and return (status, JSON body).
+async fn call(router: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = router.oneshot(req).await.expect("router oneshot");
     let status = resp.status();
-    let body = resp.text().await.expect("body");
-    (StatusCode::from_u16(status.as_u16()).unwrap(), body)
+    let body = json_body(resp).await;
+    (status, body)
+}
+
+/// `POST /v1/apps/:uuid/start` helper.
+fn start_req(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/apps/{uuid}/start"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `POST /v1/apps/:uuid/<verb>` helper.
+fn post_req(uuid: &str, verb: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/apps/{uuid}/{verb}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `GET <uri>` helper.
+fn get_req(uri: &str) -> Request<Body> {
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+/// Wait until the runner record for `uuid` is gone (the orchestrator forgot it
+/// after stop/purge). Returns `true` if it disappeared within `timeout`.
+async fn wait_record_gone(runner_dir: &Path, uuid: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match RunnerHandle::load(runner_dir, uuid) {
+            Ok(None) => return true,
+            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -242,21 +251,10 @@ async fn fetcher_bad_latest_body_errors() {
 
 #[tokio::test]
 async fn health_reports_ok_with_identity() {
-    let (registry, _dir) = temp_registry("http://unused.invalid");
-    let app = router(test_state(registry));
+    let harness = Harness::new("http://unused.invalid");
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body: Value = json_body(resp).await;
+    let (status, body) = call(harness.router(), get_req("/health")).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
     assert_eq!(body["supervisor_id"], "test-supervisor");
     assert_eq!(body["ula"], "fd5a:1f00:1::1");
@@ -269,499 +267,212 @@ async fn health_reports_ok_with_identity() {
 #[tokio::test]
 async fn get_app_present_when_fetchable_from_s3() {
     let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-    let app = router(test_state(registry));
+    let harness = Harness::new(&server.uri());
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/v1/apps/{APP_UUID}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body: Value = json_body(resp).await;
+    let (status, body) = call(harness.router(), get_req(&format!("/v1/apps/{APP_UUID}"))).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["present"], true);
-    assert_eq!(body["version"], 1);
     // app_ula is the deterministic per-app ULA (golden prefix).
-    assert_eq!(body["app_ula"], "fd5a:1f02:44a5:240b:121a::1");
-    // on_request + not started → not hosted yet.
-    assert!(body["bound_addr"].is_null());
+    assert_eq!(body["app_ula"], APP_ULA);
+    // Not started → no live runner → stopped.
+    assert_eq!(body["state"], "stopped");
 }
 
 #[tokio::test]
 async fn get_app_absent_returns_not_present() {
     let server = MockServer::start().await; // empty → 404
-    let (registry, _dir) = temp_registry(&server.uri());
-    let app = router(test_state(registry));
+    let harness = Harness::new(&server.uri());
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/v1/apps/{APP_UUID}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let body: Value = json_body(resp).await;
+    let (status, body) = call(harness.router(), get_req(&format!("/v1/apps/{APP_UUID}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["present"], false);
 }
 
 // ---------------------------------------------------------------------------
-// CONTROL API: GET /v1/apps listing reflects hosted state
+// CONTROL API start: spawns a runner that becomes healthy + serves the fixture
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn list_apps_reflects_registered_app_with_app_ula() {
+async fn start_spawns_runner_and_reports_running() {
     let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-    let state = registry.register(APP_UUID).await.expect("register");
-    assert_eq!(state, AppState::Available); // on_request → available, not hosted
+    let harness = Harness::new(&server.uri());
 
-    let app = router(test_state(registry));
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/apps")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let (status, body) = call(harness.router(), start_req(APP_UUID)).await;
+    assert_eq!(status, StatusCode::OK, "start should succeed, body: {body}");
+    assert_eq!(body["state"], "running");
+    // In the orchestrator model the app's address IS its app-ULA.
+    assert_eq!(body["app_ula"], APP_ULA);
+    assert_eq!(
+        body["bound_addr"], APP_ULA,
+        "bound_addr is the app-ULA (the runner serves on its own ULA)"
+    );
+
+    // A record was persisted for the spawned runner.
+    let rec = RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
+        .expect("load record")
+        .expect("record present after start");
+    assert_eq!(rec.uuid, APP_UUID);
+    assert_eq!(rec.app_ula, APP_ULA);
+
+    // The orchestrator can reach the spawned runner's control socket.
+    let state = harness
+        .orchestrator
+        .app_state(APP_UUID)
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+        .expect("app_state");
+    assert_eq!(state.as_str(), "running");
+}
 
-    let body: Value = json_body(resp).await;
+/// Starting an already-running app is idempotent: it returns the SAME running
+/// runner (same pid, same record) rather than spawning a second one.
+#[tokio::test]
+async fn start_is_idempotent_for_a_running_app() {
+    let server = mock_s3(ON_REQUEST_MANIFEST).await;
+    let harness = Harness::new(&server.uri());
+
+    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
+    assert_eq!(status, StatusCode::OK);
+    let pid1 = RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
+        .unwrap()
+        .unwrap()
+        .pid;
+
+    // Second start must not spawn a new process.
+    let (status, body) = call(harness.router(), start_req(APP_UUID)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "running");
+    let pid2 = RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
+        .unwrap()
+        .unwrap()
+        .pid;
+
+    assert_eq!(pid1, pid2, "idempotent start must reuse the running runner");
+}
+
+// ---------------------------------------------------------------------------
+// CONTROL API stop: shuts the runner down + forgets it
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stop_shuts_down_runner_and_forgets_it() {
+    let server = mock_s3(ON_REQUEST_MANIFEST).await;
+    let harness = Harness::new(&server.uri());
+
+    // Start → a runner exists + is reachable.
+    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
+            .unwrap()
+            .is_some()
+    );
+
+    // Stop via the API.
+    let (status, body) = call(harness.router(), post_req(APP_UUID, "stop")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "stopped");
+
+    // The orchestrator forgot the runner record.
+    assert!(
+        wait_record_gone(harness.runner_dir.path(), APP_UUID, Duration::from_secs(5)).await,
+        "stop must remove the runner record"
+    );
+
+    // The on-disk artifact cache is KEPT (stop frees memory, not disk — fast
+    // restart).
+    assert!(
+        harness
+            .fetcher
+            .cache_dir(APP_UUID, 1)
+            .join("app.wasm")
+            .is_file(),
+        "stop must keep the on-disk artifact cache for a fast restart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CONTROL API purge: purge + shut the runner down + forget it + clear cache
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn purge_endpoint_purges_shuts_down_and_forgets() {
+    let server = mock_s3(ON_REQUEST_MANIFEST).await;
+    let harness = Harness::new(&server.uri());
+
+    // Start → runner caches the artifact on disk.
+    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
+    assert_eq!(status, StatusCode::OK);
+    let cache = harness.fetcher.cache_dir(APP_UUID, 1);
+    assert!(cache.join("app.wasm").is_file(), "artifact cached on start");
+
+    // Purge via the API.
+    let (status, body) = call(harness.router(), post_req(APP_UUID, "purge")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "purged");
+
+    // The orchestrator forgot the runner record.
+    assert!(
+        wait_record_gone(harness.runner_dir.path(), APP_UUID, Duration::from_secs(5)).await,
+        "purge must remove the runner record"
+    );
+
+    // The on-disk artifact cache is reclaimed.
+    assert!(
+        !cache.exists(),
+        "purge must remove the on-disk artifact cache, but it lingers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CONTROL API GET /v1/apps listing reflects the live runner fleet
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_apps_reflects_running_runner() {
+    let server = mock_s3(ON_REQUEST_MANIFEST).await;
+    let harness = Harness::new(&server.uri());
+
+    // Empty fleet first.
+    let (status, body) = call(harness.router(), get_req("/v1/apps")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["apps"].as_array().unwrap().is_empty(),
+        "no runners spawned yet"
+    );
+
+    // Start one.
+    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The listing now shows the running runner with its app-ULA.
+    let (status, body) = call(harness.router(), get_req("/v1/apps")).await;
+    assert_eq!(status, StatusCode::OK);
     let apps = body["apps"].as_array().unwrap();
     assert_eq!(apps.len(), 1);
     assert_eq!(apps[0]["uuid"], APP_UUID);
-    assert_eq!(apps[0]["name"], "hello-tabbify");
-    assert_eq!(apps[0]["lifecycle"], "on_request");
-    assert_eq!(apps[0]["state"], "available");
-    assert_eq!(apps[0]["app_ula"], "fd5a:1f02:44a5:240b:121a::1");
-    assert!(apps[0]["bound_addr"].is_null(), "not hosted yet");
+    assert_eq!(apps[0]["app_ula"], APP_ULA);
+    assert_eq!(apps[0]["state"], "running");
 }
 
-// ---------------------------------------------------------------------------
-// HOSTING: a hosted app's per-app listener serves the WASM fixture end-to-end
-// ---------------------------------------------------------------------------
-
+/// `GET /v1/apps/:uuid` reports a started app as running with its app-ULA.
 #[tokio::test]
-async fn on_request_lazy_hosts_and_per_app_listener_serves_wasm() {
+async fn get_app_reports_running_after_start() {
     let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
+    let harness = Harness::new(&server.uri());
 
-    // First reference (pin=false, the on-request lazy-host path) hosts the app.
-    let state = registry
-        .ensure_running(APP_UUID, false)
-        .await
-        .expect("host");
-    assert_eq!(state, AppState::Running);
-
-    // The per-app listener serves the WHOLE path through the WASM (no prefix).
-    let (status, body) = dial_app(&registry, APP_UUID, "/").await;
+    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "Hello, Tabbify!");
 
-    // A deep subpath also reaches the wasm (the ULA is the identity, the path
-    // is passed verbatim).
-    let (status, body) = dial_app(&registry, APP_UUID, "/some/deep/path?q=1").await;
+    let (status, body) = call(harness.router(), get_req(&format!("/v1/apps/{APP_UUID}"))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "Hello, Tabbify!");
-}
-
-#[tokio::test]
-async fn always_on_app_hosts_on_register() {
-    let server = mock_s3(ALWAYS_ON_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    let state = registry.register(APP_UUID).await.expect("register");
-    assert_eq!(state, AppState::Running, "always_on must host on register");
-    assert_eq!(registry.get(APP_UUID).unwrap().state, AppState::Running);
-
-    // Hosted at registration → its per-app listener is already serving.
-    let (status, body) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "Hello, Tabbify!");
-
-    // always_on is never reaped, even past its idle timeout.
-    std::thread::sleep(Duration::from_millis(2));
-    let reaped = registry.reap_idle().await;
-    assert!(reaped.is_empty(), "always_on app was reaped: {reaped:?}");
-    // Still hosted.
-    let (status, _) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-}
-
-// ---------------------------------------------------------------------------
-// CONTROL API start/stop: hosts on start (+ pin), unhosts + tears down on stop
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn start_hosts_and_pins_then_reaper_skips_it() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    let app = router(test_state(registry.clone()));
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/v1/apps/{APP_UUID}/start"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = json_body(resp).await;
+    assert_eq!(body["present"], true);
     assert_eq!(body["state"], "running");
-    assert_eq!(body["app_ula"], "fd5a:1f02:44a5:240b:121a::1");
-    assert!(
-        body["bound_addr"].as_str().is_some(),
-        "start must report the bound per-app addr"
-    );
-
-    assert_eq!(registry.get(APP_UUID).unwrap().state, AppState::Running);
-
-    // Hosted + serving.
-    let (status, was) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(was, "Hello, Tabbify!");
-
-    // Even with idle_timeout 300s irrelevant — pinned overrides; a reap pass
-    // right now must NOT unhost it.
-    let reaped = registry.reap_idle().await;
-    assert!(reaped.is_empty(), "pinned app was reaped: {reaped:?}");
-    assert_eq!(registry.get(APP_UUID).unwrap().state, AppState::Running);
-    let (status, _) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["app_ula"], APP_ULA);
 }
 
-#[tokio::test]
-async fn stop_unhosts_and_tears_down_the_listener() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-    registry
-        .ensure_running(APP_UUID, true)
-        .await
-        .expect("start");
-    let addr = registry.get(APP_UUID).unwrap().bound_addr.expect("hosted");
-
-    // Serving before stop.
-    let (status, _) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Stop via the API.
-    let app = router(test_state(registry.clone()));
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/v1/apps/{APP_UUID}/stop"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = json_body(resp).await;
-    assert_eq!(body["state"], "stopped");
-
-    let s = registry.get(APP_UUID).unwrap();
-    assert_eq!(s.state, AppState::Stopped);
-    assert!(s.bound_addr.is_none(), "listener handle must be cleared");
-
-    // The listener is gone: a fresh connection must fail.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let dial = reqwest::Client::new()
-        .get(format!("http://{addr}/"))
-        .timeout(Duration::from_millis(300))
-        .send()
-        .await;
-    assert!(dial.is_err(), "listener still answered after stop");
-}
-
-// ---------------------------------------------------------------------------
-// CONTROL API purge: full cleanup — stop + reclaim on-disk cache + forget
-// ---------------------------------------------------------------------------
-
-/// `purge` (unlike `stop`, which only frees memory) reclaims the on-disk
-/// artifact cache AND forgets the app from the registry.
-#[tokio::test]
-async fn purge_forgets_app_and_clears_disk_cache() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    // Host it: caches the artifact on disk + binds the per-app listener.
-    registry.ensure_running(APP_UUID, true).await.expect("host");
-    let cache = registry.fetcher().cache_dir(APP_UUID, 1);
-    assert!(
-        cache.join("app.wasm").is_file(),
-        "artifact must be cached before purge"
-    );
-    assert!(registry.is_known(APP_UUID));
-
-    registry.purge(APP_UUID).await.expect("purge");
-
-    assert!(
-        !registry.is_known(APP_UUID),
-        "app must be forgotten after purge"
-    );
-    assert!(registry.get(APP_UUID).is_none());
-    assert!(
-        !cache.exists(),
-        "on-disk artifact cache must be removed by purge"
-    );
-}
-
-/// `POST /v1/apps/:uuid/purge` stops + purges + forgets, returning `purged`.
-#[tokio::test]
-async fn purge_endpoint_stops_and_forgets() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-    registry.ensure_running(APP_UUID, true).await.expect("host");
-
-    let app = router(test_state(registry.clone()));
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/v1/apps/{APP_UUID}/purge"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = json_body(resp).await;
-    assert_eq!(body["state"], "purged");
-    assert!(
-        !registry.is_known(APP_UUID),
-        "purge endpoint must forget the app"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// idle-reap: unhosts an idle, unpinned on_request app + tears down its listener
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn idle_reap_unhosts_unpinned_on_request_app() {
-    let server = mock_s3(FAST_REAP_MANIFEST).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    // Lazy-host (unpinned). idle_timeout_sec = 0 → immediately reapable.
-    registry
-        .ensure_running(APP_UUID, false)
-        .await
-        .expect("host");
-    let addr = registry.get(APP_UUID).unwrap().bound_addr.expect("hosted");
-    let (status, _) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-
-    // A reap pass must unhost it (unpinned + idle >= 0).
-    let reaped = registry.reap_idle().await;
-    assert_eq!(reaped, vec![APP_UUID.to_string()]);
-
-    let s = registry.get(APP_UUID).unwrap();
-    assert_eq!(s.state, AppState::Stopped);
-    assert!(s.bound_addr.is_none(), "listener must be torn down on reap");
-
-    // Listener gone.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let dial = reqwest::Client::new()
-        .get(format!("http://{addr}/"))
-        .timeout(Duration::from_millis(300))
-        .send()
-        .await;
-    assert!(dial.is_err(), "listener still answered after reap");
-}
-
-// ---------------------------------------------------------------------------
-// Runtime SELECTION branch (manifest.runtime.type → which AppRuntime)
-// ---------------------------------------------------------------------------
-
-/// A `wasm-http` manifest selects the WASM runtime and serves the fixture (the
-/// happy-path arm of the selection branch).
-#[tokio::test]
-async fn runtime_selection_wasm_http_hosts_and_serves() {
-    let server = mock_s3(ALWAYS_ON_MANIFEST).await; // type defaults to wasm-http
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    let state = registry
-        .register(APP_UUID)
-        .await
-        .expect("register wasm app");
-    assert_eq!(state, AppState::Running);
-    let (status, body) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "Hello, Tabbify!");
-}
-
-/// A `firecracker` manifest selects the firecracker runtime; on this (macOS /
-/// no-KVM) host the launch must fail with a CLEAR Linux/KVM error rather than
-/// silently falling back. The cached rootfs path still resolves (fetcher fix).
-#[tokio::test]
-async fn runtime_selection_firecracker_without_kvm_errors_clearly() {
-    let server = mock_s3_entry(FIRECRACKER_MANIFEST, "rootfs.ext4", b"fake-rootfs-bytes").await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    let err = registry
-        .register(APP_UUID)
-        .await
-        .expect_err("firecracker must fail without KVM / on non-Linux");
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("firecracker") && (msg.contains("kvm") || msg.contains("linux")),
-        "error should clearly mention firecracker + KVM/Linux, got: {err}"
-    );
-}
-
-/// An unknown `runtime.type` is a hard error (no silent default).
-#[tokio::test]
-async fn runtime_selection_unknown_type_is_rejected() {
-    let server = mock_s3_entry(UNKNOWN_RUNTIME_MANIFEST, "app.bin", b"bytes").await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    let err = registry
-        .register(APP_UUID)
-        .await
-        .expect_err("unknown runtime type must be rejected");
-    assert!(
-        err.to_string().contains("unknown runtime type"),
-        "got: {err}"
-    );
-}
-
-/// The fetcher caches the entry file under its manifest name (`rootfs.ext4`),
-/// NOT a hardcoded `app.wasm`, and reports that path as `cached_path`.
-#[tokio::test]
-async fn fetcher_caches_entry_under_manifest_name() {
-    let server = mock_s3_entry(FIRECRACKER_MANIFEST, "rootfs.ext4", b"rootfs-data").await;
-    let dir = tempfile::tempdir().unwrap();
-    let fetcher = S3Fetcher::new(server.uri(), dir.path());
-
-    let fetched = fetcher.fetch(APP_UUID).await.expect("fetch");
-    let cache = fetcher.cache_dir(APP_UUID, 1);
-    assert!(
-        cache.join("rootfs.ext4").is_file(),
-        "entry must be cached under its manifest name"
-    );
-    assert!(
-        !cache.join("app.wasm").exists(),
-        "must NOT hardcode app.wasm"
-    );
-    assert_eq!(fetched.cached_path, cache.join("rootfs.ext4"));
-    // firecracker entry is NOT loaded into memory.
-    assert!(fetched.wasm.is_empty(), "rootfs must not be read into RAM");
-}
-
-/// The fetcher caches a `docker` app's build-context tarball under its manifest
-/// name (`context.tar.gz`) and does NOT read it into RAM (only `cached_path`).
-#[tokio::test]
-async fn fetcher_caches_docker_context_without_loading_into_ram() {
-    let server = mock_s3_entry(DOCKER_MANIFEST, "context.tar.gz", b"fake-tarball-bytes").await;
-    let dir = tempfile::tempdir().unwrap();
-    let fetcher = S3Fetcher::new(server.uri(), dir.path());
-
-    let fetched = fetcher.fetch(APP_UUID).await.expect("fetch");
-    let cache = fetcher.cache_dir(APP_UUID, 1);
-    assert!(
-        cache.join("context.tar.gz").is_file(),
-        "docker context must be cached under its manifest name"
-    );
-    assert_eq!(fetched.cached_path, cache.join("context.tar.gz"));
-    assert!(
-        fetched.wasm.is_empty(),
-        "docker tarball must not be read into RAM"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// REAL docker runtime: build from source + run + proxy end-to-end.
-// Gated on `docker_available()` so a CI host without Docker skips it.
-// ---------------------------------------------------------------------------
-
-/// Build the `tests/fixtures/docker-app` directory into a gzipped-tar build
-/// context (the app dir + its `Dockerfile`) at `dest`, via the system `tar`
-/// (keeps the crate's dependency set unchanged — no `tar`/`flate2` dev-dep).
-fn make_docker_context(dest: &std::path::Path) {
-    let fixture_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/docker-app");
-    let status = std::process::Command::new("tar")
-        .arg("czf")
-        .arg(dest)
-        .arg("-C")
-        .arg(&fixture_dir)
-        .arg("Dockerfile")
-        .arg("server.py")
-        .status()
-        .expect("spawn tar");
-    assert!(status.success(), "tar failed to build the docker context");
-}
-
-/// REAL end-to-end docker runtime: stand up a wiremock S3 serving a `docker`
-/// manifest + the build-context tarball, register the app (→ the registry's
-/// `docker` selection branch builds the image from source + runs the container
-/// + binds the per-app listener), dial the listener, and assert the container
-/// app's body. Teardown: dropping the registry aborts the listener and the
-/// `DockerRuntime`'s `Drop` force-removes the container; we also remove the
-/// built image. Skipped (not failed) when no Docker daemon is reachable.
-#[tokio::test]
-async fn runtime_selection_docker_builds_runs_and_serves() {
-    if !docker_available() {
-        eprintln!("skipping: no reachable Docker daemon on this host");
-        return;
-    }
-
-    // Build the context tarball and serve it as the app's `context.tar.gz` entry.
-    let tmp = tempfile::tempdir().unwrap();
-    let ctx_path = tmp.path().join("context.tar.gz");
-    make_docker_context(&ctx_path);
-    let ctx_bytes = std::fs::read(&ctx_path).expect("read context tarball");
-
-    let server = mock_s3_entry(DOCKER_MANIFEST, "context.tar.gz", &ctx_bytes).await;
-    let (registry, _dir) = temp_registry(&server.uri());
-
-    // always_on → register builds the image, runs the container, binds the
-    // per-app listener. This exercises the `docker` runtime-selection branch
-    // (manifest.runtime.type == "docker" → DockerRuntime) for real.
-    let state = registry
-        .register(APP_UUID)
-        .await
-        .expect("docker app must build, run, and host");
-    assert_eq!(state, AppState::Running);
-
-    // The per-app listener proxies the WHOLE path to the container app.
-    let (status, body) = dial_app(&registry, APP_UUID, "/").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "hello from docker");
-
-    // A deep subpath also reaches the container app (path forwarded verbatim).
-    let (status, body) = dial_app(&registry, APP_UUID, "/some/deep/path?q=1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "hello from docker");
-
-    // Teardown via PURGE: stops, removes the container, removes the BUILT IMAGE,
-    // and clears the on-disk cache — reclaiming the disk that `stop` alone leaves
-    // behind. Assert the image is actually gone afterwards.
-    registry.purge(APP_UUID).await.expect("purge docker app");
-    let image = format!("tabbify-app-{APP_UUID}");
-    let out = std::process::Command::new("docker")
-        .args(["images", "-q", &image])
-        .output()
-        .expect("docker images");
-    assert!(
-        out.stdout.is_empty(),
-        "purge must remove the built image, but it lingers: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-}
+// NOTE: deterministic control-sock path + app-ULA derivation are covered by the
+// `orchestrator::api` unit tests (`control_sock_is_uuid_dot_sock_under_runner_dir`,
+// `app_ula_matches_derive`), so they are not re-tested here.
 
 // ---------------------------------------------------------------------------
 // helpers

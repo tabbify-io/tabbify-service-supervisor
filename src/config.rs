@@ -121,8 +121,8 @@ pub struct FcConfig {
 }
 
 impl Default for FcConfig {
-    /// The same defaults clap bakes — handy for tests + for an
-    /// [`crate::registry::AppRegistry`] that has no firecracker apps.
+    /// The same defaults clap bakes — handy for tests + for a runner that has
+    /// no firecracker app.
     fn default() -> Self {
         Self {
             bin: DEFAULT_FC_BIN.to_owned(),
@@ -177,8 +177,8 @@ pub struct DockerConfig {
 }
 
 impl Default for DockerConfig {
-    /// The same defaults clap bakes — handy for tests + for an
-    /// [`crate::registry::AppRegistry`] that has no docker apps.
+    /// The same defaults clap bakes — handy for tests + for a runner that has
+    /// no docker app.
     fn default() -> Self {
         Self {
             docker_bin: DEFAULT_DOCKER_BIN.to_owned(),
