@@ -39,6 +39,13 @@ pub enum Reply {
         app_uuid: String,
         /// PID of the runner process.
         pid: u32,
+        /// App-level health from [`crate::runtime::AppRuntime::health`].
+        /// `"serving"` or `"unavailable"`.
+        app_health: String,
+        /// Human-readable reason when `app_health` is `"unavailable"`. `None`
+        /// (omitted from JSON) when the app is serving.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        app_health_reason: Option<String>,
     },
     /// Generic success.
     Ok,
@@ -78,6 +85,8 @@ mod tests {
                 app_ula: "fd5a:1f02::1".to_owned(),
                 app_uuid: "abc-123".to_owned(),
                 pid: 42,
+                app_health: "serving".to_owned(),
+                app_health_reason: None,
             },
             Reply::Ok,
             Reply::Err {
@@ -98,5 +107,39 @@ mod tests {
         assert!(ping.contains("ping"), "got: {ping}");
         let pong = serde_json::to_string(&Reply::Pong).unwrap();
         assert!(pong.contains("pong"), "got: {pong}");
+    }
+
+    /// Health reply carries app_health="serving" when the app is up and
+    /// app_health_reason=null (None) when no reason is needed.
+    #[test]
+    fn health_reply_carries_app_health_fields() {
+        let h = Reply::Health {
+            state: "running".to_owned(),
+            app_ula: "fd5a::1".to_owned(),
+            app_uuid: "abc".to_owned(),
+            pid: 1,
+            app_health: "serving".to_owned(),
+            app_health_reason: None,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("\"app_health\":\"serving\""), "got: {json}");
+        // app_health_reason is absent (None → skip_serializing_if)
+        assert!(!json.contains("app_health_reason"), "got: {json}");
+
+        // Unavailable variant carries a reason.
+        let h2 = Reply::Health {
+            state: "running".to_owned(),
+            app_ula: "fd5a::1".to_owned(),
+            app_uuid: "abc".to_owned(),
+            pid: 1,
+            app_health: "unavailable".to_owned(),
+            app_health_reason: Some("TCP connect refused".to_owned()),
+        };
+        let json2 = serde_json::to_string(&h2).unwrap();
+        assert!(
+            json2.contains("\"app_health\":\"unavailable\""),
+            "got: {json2}"
+        );
+        assert!(json2.contains("TCP connect refused"), "got: {json2}");
     }
 }

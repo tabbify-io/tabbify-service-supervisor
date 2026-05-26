@@ -440,7 +440,7 @@ mod stub {
 
     use super::FcConfig;
     use crate::manifest::Runtime;
-    use crate::runtime::{AppRuntime, BoxRespFut};
+    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, RuntimeHealth};
 
     /// Non-Linux stub. Firecracker needs Linux + `/dev/kvm`, so on macOS the
     /// supervisor still builds + serves WASM, but any attempt to host a
@@ -484,6 +484,15 @@ mod stub {
                     .body(Bytes::from_static(
                         b"firecracker not supported on this host",
                     ))?)
+            })
+        }
+
+        /// Firecracker is never available on non-Linux hosts: always Unavailable.
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            Box::pin(async {
+                RuntimeHealth::Unavailable(
+                    "firecracker runtime not supported on this host (not Linux)".to_owned(),
+                )
             })
         }
     }
@@ -1116,5 +1125,54 @@ mod tests {
         .expect("status");
         assert_eq!(status, 400);
         drop(server);
+    }
+
+    // ---- health() contract for FirecrackerRuntime ---------------------------
+
+    /// On a non-Linux host the stub's health() always returns Unavailable with
+    /// a message indicating the host doesn't support firecracker.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn fc_stub_health_is_unavailable_on_non_linux() {
+        use crate::runtime::{AppRuntime, RuntimeHealth};
+        // The stub FirecrackerRuntime is zero-size; construct directly.
+        let rt = super::stub::FirecrackerRuntime;
+        let h = rt.health().await;
+        assert!(
+            matches!(h, RuntimeHealth::Unavailable(_)),
+            "stub must be Unavailable, got {:?}",
+            h
+        );
+    }
+
+    /// On a Linux host, a FirecrackerRuntime with a probe faked to return
+    /// "reachable" must report Serving.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fc_linux_health_serving_when_probe_reachable() {
+        use crate::runtime::{AppRuntime, RuntimeHealth};
+        use std::sync::Arc;
+        let rt = super::linux::FirecrackerRuntime::with_probe_for_test(
+            "http://172.31.0.2:8080",
+            Arc::new(|_addr: &str| true),
+        );
+        assert_eq!(rt.health().await, RuntimeHealth::Serving);
+    }
+
+    /// On a Linux host, a FirecrackerRuntime with a probe faked to return
+    /// "unreachable" must report Unavailable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fc_linux_health_unavailable_when_probe_unreachable() {
+        use crate::runtime::{AppRuntime, RuntimeHealth};
+        use std::sync::Arc;
+        let rt = super::linux::FirecrackerRuntime::with_probe_for_test(
+            "http://172.31.0.2:8080",
+            Arc::new(|_addr: &str| false),
+        );
+        assert!(
+            matches!(rt.health().await, RuntimeHealth::Unavailable(_)),
+            "must be Unavailable when probe returns false"
+        );
     }
 }

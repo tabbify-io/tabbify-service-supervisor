@@ -40,6 +40,23 @@ pub const DEFAULT_FUEL_PER_REQUEST: u64 = 1_000_000_000;
 /// (avoids the `async-trait` dependency, mirroring [`crate::host::MeshHost`]).
 pub type BoxRespFut<'a> = Pin<Box<dyn Future<Output = Result<Response<Bytes>>> + Send + 'a>>;
 
+/// A generic boxed, `Send` future for any output type — used by
+/// [`AppRuntime::health`] so the trait stays object-safe without `async-trait`.
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Liveness of the app itself (not the runner process).
+///
+/// Returned by [`AppRuntime::health`]. `Serving` means the runtime considers
+/// the app reachable and ready; `Unavailable` carries a human-readable reason
+/// (e.g. "TCP connect refused" or "container stopped").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeHealth {
+    /// The app is up and serving requests.
+    Serving,
+    /// The app is not reachable; the String explains why.
+    Unavailable(String),
+}
+
 /// The runtime seam the per-app listener ([`crate::host`]) dispatches to. Both
 /// the in-process WASM runtime ([`WasmRuntime`]) and the Firecracker microVM
 /// runtime ([`crate::firecracker::FirecrackerRuntime`]) implement it, so the
@@ -54,6 +71,15 @@ pub trait AppRuntime: Send + Sync {
     /// Runtime-specific: a wasm trap / fuel exhaustion, or (firecracker) a proxy
     /// failure talking to the guest.
     fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a>;
+
+    /// Liveness of the app itself (not the runner process).
+    ///
+    /// Default: [`RuntimeHealth::Serving`] — a wasm runtime is serviceable as
+    /// soon as it is loaded. Firecracker and Docker override this with a real
+    /// probe (TCP connect to the guest/container).
+    fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+        Box::pin(async { RuntimeHealth::Serving })
+    }
 }
 
 impl AppRuntime for WasmRuntime {
@@ -345,5 +371,26 @@ mod tests {
             let resp = rt.handle(req).await.expect("handle request");
             assert_eq!(resp.status(), 200);
         }
+    }
+
+    // ---- health() contract ---------------------------------------------------
+
+    /// WasmRuntime uses the default health() implementation, which always
+    /// returns Serving (a wasm component is ready as soon as it is loaded).
+    #[tokio::test]
+    async fn wasm_runtime_health_is_serving_by_default() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt = WasmRuntime::load(wasm).expect("load fixture");
+        assert_eq!(rt.health().await, RuntimeHealth::Serving);
+    }
+
+    /// WasmRuntime health is also Serving when accessed through the AppRuntime
+    /// trait object (confirms the default is visible through dyn dispatch).
+    #[tokio::test]
+    async fn wasm_health_via_trait_object_is_serving() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt: std::sync::Arc<dyn AppRuntime> =
+            std::sync::Arc::new(WasmRuntime::load(wasm).expect("load fixture"));
+        assert_eq!(rt.health().await, RuntimeHealth::Serving);
     }
 }

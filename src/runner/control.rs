@@ -23,6 +23,7 @@ use crate::config::DockerConfig;
 use crate::control_proto::{Cmd, Reply};
 use crate::fetcher::S3Fetcher;
 use crate::host::HostedApp;
+use crate::runtime::{AppRuntime, RuntimeHealth};
 
 /// Shared lifecycle state driven by the control server.
 ///
@@ -42,6 +43,10 @@ pub struct RunnerLifecycle {
     pub(crate) fetcher: S3Fetcher,
     /// Docker config — used by `Purge` to remove the built docker image.
     pub(crate) docker: DockerConfig,
+    /// The app runtime, held so `Health` can call `AppRuntime::health()` to
+    /// report the app's own liveness (not just whether the runner process is
+    /// alive).
+    pub(crate) runtime: Arc<dyn AppRuntime>,
 }
 
 impl RunnerLifecycle {
@@ -71,17 +76,27 @@ impl RunnerLifecycle {
     }
 
     /// Build a [`Reply::Health`] snapshot from current state.
+    ///
+    /// Calls `AppRuntime::health()` to probe the app's own liveness so the
+    /// reply reflects whether the app itself is serving, not just whether the
+    /// runner process is up.
     async fn health(&self) -> Reply {
         let state = if self.is_running().await {
             "running"
         } else {
             "stopped"
         };
+        let (app_health, app_health_reason) = match self.runtime.health().await {
+            RuntimeHealth::Serving => ("serving".to_owned(), None),
+            RuntimeHealth::Unavailable(reason) => ("unavailable".to_owned(), Some(reason)),
+        };
         Reply::Health {
             state: state.to_owned(),
             app_ula: self.app_ula.clone(),
             app_uuid: self.uuid.clone(),
             pid: std::process::id(),
+            app_health,
+            app_health_reason,
         }
     }
 }
@@ -176,6 +191,90 @@ async fn dispatch(cmd: Cmd, lifecycle: &RunnerLifecycle) -> Reply {
                 std::process::exit(0);
             });
             Reply::Ok
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use http::{Request, Response};
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::config::DockerConfig;
+    use crate::control_proto::{Cmd, Reply};
+    use crate::fetcher::S3Fetcher;
+    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, RuntimeHealth};
+
+    // ---- Fake runtime -------------------------------------------------------
+
+    /// A fake runtime whose health() returns a fixed value — no WASM or VM.
+    struct FakeRuntime {
+        health: RuntimeHealth,
+    }
+
+    impl AppRuntime for FakeRuntime {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async { Ok(Response::builder().status(200).body(Bytes::new()).unwrap()) })
+        }
+
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            let h = self.health.clone();
+            Box::pin(async move { h })
+        }
+    }
+
+    fn fake_lifecycle(health: RuntimeHealth) -> RunnerLifecycle {
+        RunnerLifecycle {
+            uuid: "test-uuid".to_owned(),
+            app_ula: "fd5a::1".to_owned(),
+            hosted: Arc::new(Mutex::new(None)), // stopped
+            fetcher: S3Fetcher::new("http://s3.invalid", std::path::Path::new("/tmp")),
+            docker: DockerConfig::default(),
+            runtime: Arc::new(FakeRuntime { health }),
+        }
+    }
+
+    // ---- Health dispatch tests ----------------------------------------------
+
+    /// Health reply carries app_health="serving" when the runtime is healthy.
+    #[tokio::test]
+    async fn health_reply_carries_app_health_serving() {
+        let lc = fake_lifecycle(RuntimeHealth::Serving);
+        let reply = dispatch(Cmd::Health, &lc).await;
+        match reply {
+            Reply::Health {
+                app_health,
+                app_health_reason,
+                ..
+            } => {
+                assert_eq!(app_health, "serving");
+                assert!(app_health_reason.is_none());
+            }
+            other => panic!("expected Health reply, got {other:?}"),
+        }
+    }
+
+    /// Health reply carries app_health="unavailable" + a reason when the
+    /// runtime reports Unavailable.
+    #[tokio::test]
+    async fn health_reply_carries_app_health_unavailable() {
+        let lc = fake_lifecycle(RuntimeHealth::Unavailable("guest down".to_owned()));
+        let reply = dispatch(Cmd::Health, &lc).await;
+        match reply {
+            Reply::Health {
+                app_health,
+                app_health_reason,
+                ..
+            } => {
+                assert_eq!(app_health, "unavailable");
+                assert_eq!(app_health_reason.as_deref(), Some("guest down"));
+            }
+            other => panic!("expected Health reply, got {other:?}"),
         }
     }
 }

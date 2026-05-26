@@ -204,6 +204,7 @@ async fn spawn_runner_detaches_persists_record_and_survives_handle_drop() {
             app_uuid,
             app_ula,
             pid,
+            ..
         } => {
             assert_eq!(state, "running", "runner should be running after spawn");
             assert_eq!(app_uuid, APP_UUID);
@@ -277,6 +278,7 @@ async fn client_health_reports_running() {
             app_uuid,
             app_ula,
             pid,
+            ..
         } => {
             assert_eq!(state, "running");
             assert_eq!(app_uuid, APP_UUID);
@@ -545,6 +547,7 @@ async fn monitor_tick_respawns_dead_runner() {
             app_uuid,
             app_ula,
             pid,
+            ..
         } => {
             assert_eq!(state, "running", "respawned runner should be running");
             assert_eq!(app_uuid, APP_UUID);

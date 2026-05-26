@@ -114,6 +114,10 @@ impl RunnerServe {
             .await
             .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 
+        // Clone the runtime handle so the lifecycle can call health() on it
+        // independently of the AppServe's copy (both are Arc<dyn AppRuntime>).
+        let runtime_for_lifecycle = runtime.clone();
+
         // No idle-reaper in the runner yet — the on_request callback is a no-op.
         let on_request: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         let serve = AppServe::new(runtime, on_request);
@@ -154,6 +158,7 @@ impl RunnerServe {
             hosted: Arc::new(Mutex::new(Some(hosted))),
             fetcher,
             docker: cfg.docker,
+            runtime: runtime_for_lifecycle,
         };
 
         Ok(Self {

@@ -270,6 +270,7 @@ mod protocol {
 mod runtime_impl {
     use std::path::Path;
     use std::process::Stdio;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -285,7 +286,7 @@ mod runtime_impl {
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
-    use crate::runtime::{AppRuntime, BoxRespFut};
+    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, RuntimeHealth};
 
     /// How long to wait for the container app's HTTP server to come up.
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -295,6 +296,25 @@ mod runtime_impl {
     /// Monotonic per-process counter → a unique container name per launch, so
     /// repeated launches of the same app (stop→start, re-host) don't collide.
     static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Probe type: given a `host:port` string returns `true` iff a TCP connect
+    /// succeeds. In production this calls [`tcp_connect_probe`]; in tests an
+    /// injected closure fakes the result so no real container is needed.
+    type TcpProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+    /// Production TCP probe: try to connect to `addr` with a short timeout.
+    /// Returns `true` iff the connection succeeds.
+    fn tcp_connect_probe(addr: &str) -> bool {
+        use std::net::TcpStream;
+        use std::time::Duration;
+        TcpStream::connect_timeout(
+            &addr
+                .parse()
+                .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()),
+            Duration::from_millis(300),
+        )
+        .is_ok()
+    }
 
     /// A running app container. Owns the container (by name) + the loopback host
     /// port its app port is published on; [`Drop`] force-removes the container.
@@ -306,6 +326,9 @@ mod runtime_impl {
         /// `http://127.0.0.1:<host_port>` — the base the proxy targets.
         container_base: String,
         client: reqwest::Client,
+        /// TCP-connect probe, injectable for tests. Production uses
+        /// [`tcp_connect_probe`]; tests substitute a closure.
+        probe: TcpProbe,
     }
 
     impl DockerRuntime {
@@ -364,11 +387,41 @@ mod runtime_impl {
                 docker_bin: cfg.docker_bin.clone(),
                 container_base: format!("http://127.0.0.1:{host_port}"),
                 client: reqwest::Client::new(),
+                probe: Arc::new(tcp_connect_probe),
             };
 
             // On any readiness failure `me` drops → container force-removed.
             me.wait_until_ready().await?;
             Ok(me)
+        }
+
+        /// Build a `DockerRuntime` with an injectable probe for unit tests.
+        /// `container_base` is `http://127.0.0.1:<port>` (the proxy target base);
+        /// `container` is the `tbf-…` container name; `probe` is the
+        /// TCP-connect check that `health()` will call.
+        ///
+        /// This constructor is `#[cfg(test)]`-only so it never surfaces in
+        /// production code.
+        #[cfg(test)]
+        pub fn with_probe_for_test(container_base: &str, container: &str, probe: TcpProbe) -> Self {
+            Self {
+                container: container.to_owned(),
+                docker_bin: "docker".to_owned(),
+                container_base: container_base.to_owned(),
+                client: reqwest::Client::new(),
+                probe,
+            }
+        }
+
+        /// Extract the `host:port` from `container_base` (e.g.
+        /// `http://127.0.0.1:49231` → `127.0.0.1:49231`). Used by `health()`.
+        fn host_port(&self) -> Option<String> {
+            let url = self.container_base.trim_start_matches("http://");
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_owned())
+            }
         }
 
         /// Poll the container app's HTTP server until it answers (any status) or
@@ -400,6 +453,24 @@ mod runtime_impl {
         fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a> {
             // Delegate to the container-independent proxy core (wiremock-tested).
             Box::pin(proxy_request(&self.client, &self.container_base, request))
+        }
+
+        /// Probe whether the container's published port is reachable (TCP connect).
+        /// Uses the injected `probe` closure so unit tests need no real Docker daemon.
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            let addr = self.host_port();
+            let probe = self.probe.clone();
+            Box::pin(async move {
+                match addr {
+                    Some(hp) if (probe)(&hp) => RuntimeHealth::Serving,
+                    Some(hp) => RuntimeHealth::Unavailable(format!(
+                        "TCP connect to container port {hp} refused"
+                    )),
+                    None => {
+                        RuntimeHealth::Unavailable("container base URL is malformed".to_owned())
+                    }
+                }
+            })
         }
     }
 
@@ -758,5 +829,38 @@ mod tests {
             .expect("proxy");
         assert_eq!(resp.status(), 200);
         assert_eq!(String::from_utf8_lossy(resp.body()), "ok");
+    }
+
+    // ---- health() contract for DockerRuntime --------------------------------
+
+    /// A DockerRuntime whose probe is faked to return "reachable" must report
+    /// RuntimeHealth::Serving.
+    #[tokio::test]
+    async fn docker_health_serving_when_probe_reachable() {
+        use crate::runtime::{AppRuntime, RuntimeHealth};
+        use std::sync::Arc;
+        let rt = super::runtime_impl::DockerRuntime::with_probe_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-0",
+            Arc::new(|_addr: &str| true),
+        );
+        assert_eq!(rt.health().await, RuntimeHealth::Serving);
+    }
+
+    /// A DockerRuntime whose probe is faked to return "unreachable" must report
+    /// RuntimeHealth::Unavailable.
+    #[tokio::test]
+    async fn docker_health_unavailable_when_probe_unreachable() {
+        use crate::runtime::{AppRuntime, RuntimeHealth};
+        use std::sync::Arc;
+        let rt = super::runtime_impl::DockerRuntime::with_probe_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-0",
+            Arc::new(|_addr: &str| false),
+        );
+        assert!(
+            matches!(rt.health().await, RuntimeHealth::Unavailable(_)),
+            "must be Unavailable when probe returns false"
+        );
     }
 }

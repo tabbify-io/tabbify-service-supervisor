@@ -189,8 +189,8 @@ async fn control_socket_health_stop_purge() {
         Reply::Health {
             state,
             app_uuid,
-            app_ula: _,
             pid,
+            ..
         } => {
             assert_eq!(state, "running");
             assert_eq!(app_uuid, APP_UUID);
