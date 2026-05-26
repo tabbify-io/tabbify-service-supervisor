@@ -27,6 +27,7 @@ pub mod api;
 pub mod app_ula;
 pub mod build;
 pub mod config;
+pub mod control_proto;
 pub mod docker;
 pub mod fetcher;
 pub mod firecracker;

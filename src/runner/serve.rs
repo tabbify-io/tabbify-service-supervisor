@@ -9,6 +9,11 @@
 //! 5. wraps the live [`HostedApp`] in a [`RunnerServe`] that exposes the bound
 //!    address — the test (and the binary) dial this to reach the app.
 //!
+//! The returned [`RunnerServe`] also exposes a [`RunnerServe::lifecycle`] handle
+//! that the control server (Task 1.4) uses to share ownership of the live
+//! listener, allowing `Stop`, `Purge`, and `Health` commands to operate on the
+//! same `HostedApp`.
+//!
 //! # Deferred: mesh path
 //! When `no_mesh = false` the mesh join is needed (Task 1.3). For now that
 //! branch returns an explicit `todo!` error so the binary panics loudly instead
@@ -19,13 +24,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::app_ula::derive_app_ula;
 use crate::build::build_runtime;
 use crate::config::{DockerConfig, FcConfig};
 use crate::fetcher::S3Fetcher;
-use crate::host::{AppHost, AppServe, HostedApp};
+use crate::host::{AppHost, AppServe};
+use crate::runner::control::RunnerLifecycle;
 
 /// Configuration subset the runner serve core needs (decoupled from the full
 /// clap [`crate::runner::RunnerConfig`] so the unit tests can construct it
@@ -47,13 +54,15 @@ pub struct ServeConfig {
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
-/// alive for the duration of this value. Drop to stop serving.
+/// alive for the duration of this value via a shared [`RunnerLifecycle`] handle
+/// that the control server may also hold.
 pub struct RunnerServe {
-    /// The live per-app listener. Kept here so the listener task lives as long
-    /// as the `RunnerServe` does; dropping this aborts the listener.
-    _hosted: HostedApp,
     /// The address the listener bound (loopback ephemeral in `--no-mesh` mode).
     addr: SocketAddr,
+    /// Shared lifecycle state (wraps the live `HostedApp`). Kept here so the
+    /// listener task lives as long as the `RunnerServe` does unless the control
+    /// server issues a `Stop`.
+    lifecycle: RunnerLifecycle,
 }
 
 impl RunnerServe {
@@ -100,15 +109,28 @@ impl RunnerServe {
             .with_context(|| format!("host app {} on {:?}", cfg.uuid, app_ula))?;
 
         let addr = hosted.addr;
-        Ok(Self {
-            _hosted: hosted,
-            addr,
-        })
+
+        let lifecycle = RunnerLifecycle {
+            uuid: cfg.uuid.clone(),
+            app_ula: app_ula.to_string(),
+            hosted: Arc::new(Mutex::new(Some(hosted))),
+            fetcher,
+            docker: cfg.docker,
+        };
+
+        Ok(Self { addr, lifecycle })
     }
 
     /// The address the per-app listener is bound on. Dial this to reach the app.
     #[must_use]
     pub const fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// A cloneable handle to the runner's lifecycle state, for use by the
+    /// control server ([`crate::runner::control::serve`]).
+    #[must_use]
+    pub fn lifecycle(&self) -> RunnerLifecycle {
+        self.lifecycle.clone()
     }
 }
