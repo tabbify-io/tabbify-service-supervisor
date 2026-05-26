@@ -635,6 +635,7 @@ async fn readopt_adopts_living_runner_and_respawns_dead_one() {
         control_sock: dead_sock.clone(),
         app_ula: derive_app_ula(Uuid::parse_str(DEAD_UUID).unwrap()).to_string(),
         parent: Some("fd5a:1f00:1::1".to_owned()),
+        spawned_at: 0,
     };
     dead_handle
         .save(runner_dir.path())
@@ -720,4 +721,266 @@ async fn readopt_adopts_living_runner_and_respawns_dead_one() {
     dead_client.shutdown().await.ok();
     wait_unreachable(&live_client, Duration::from_secs(5)).await;
     wait_unreachable(&dead_client, Duration::from_secs(5)).await;
+}
+
+// ── Task 2.7: spawn-grace + kill-before-respawn ──────────────────────────────
+
+/// A second UUID used for the kill-before-respawn test to keep records separate.
+const HUNG_UUID: &str = "0191e7c2-3333-7222-8333-444455556666";
+
+/// THE grace test (Task 2.7 fix 1):
+///
+/// Scenario: a runner was just spawned (alive pid) but its control socket is
+/// pointed at a bogus path (simulating "socket not bound yet"). `spawned_at` is
+/// set to `now`. One `tick()` MUST NOT respawn — the pid is within the grace
+/// window so the monitor leaves it alone.
+///
+/// After the test the runner is shut down cleanly.
+#[tokio::test]
+async fn monitor_tick_does_not_respawn_within_grace_window() {
+    let s3 = mock_s3(ON_REQUEST_MANIFEST).await;
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let runner_dir = tempfile::tempdir().expect("runner dir");
+    let sock_dir = tempfile::tempdir().expect("sock dir");
+    // The real socket path (the runner binds here).
+    let real_sock = sock_dir.path().join(format!("{APP_UUID}.sock"));
+    // A bogus socket path (nothing binds here) — simulates "not yet bound".
+    let bogus_sock = sock_dir.path().join("bogus-not-bound.sock");
+
+    // Spawn a real runner on the real socket so we have a live pid.
+    let spec = make_spec(&s3, &real_sock, data_dir.path());
+    let (handle, _child) = spawn_runner(&spec, runner_dir.path())
+        .await
+        .expect("spawn_runner");
+    let original_pid = handle.pid;
+
+    // Cleanup guard: kill the runner (and any respawn) no matter what.
+    let runner_dir_path = runner_dir.path().to_path_buf();
+    let uuid_str = APP_UUID.to_owned();
+    let _guard = scopeguard(move || {
+        force_kill(original_pid);
+        if let Ok(Some(h)) = RunnerHandle::load(&runner_dir_path, &uuid_str) {
+            if h.pid != original_pid {
+                force_kill(h.pid);
+            }
+        }
+    });
+
+    // Wait until the runner is actually up (confirms pid is truly alive).
+    let real_client = ControlClient::new(&real_sock);
+    wait_health(&real_client, Duration::from_secs(20)).await;
+
+    // Overwrite the on-disk record: same pid but pointing the control_sock at
+    // the bogus path AND setting spawned_at = now (within the grace window).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let grace_record = RunnerHandle {
+        uuid: APP_UUID.to_owned(),
+        pid: original_pid,
+        control_sock: bogus_sock.clone(), // unreachable socket
+        app_ula: handle.app_ula.clone(),
+        parent: handle.parent.clone(),
+        spawned_at: now_secs, // within grace window
+    };
+    grace_record
+        .save(runner_dir.path())
+        .expect("overwrite record with grace-window spawned_at");
+
+    // One tick: the monitor must see pid alive + within grace → adopt, NO respawn.
+    let orch = Orchestrator::new(
+        make_shared(&s3, data_dir.path()),
+        runner_dir.path().to_path_buf(),
+    );
+    let respawned = orch.tick().await.expect("tick");
+    assert!(
+        respawned.is_empty(),
+        "tick must NOT respawn within grace window, got respawned: {respawned:?}"
+    );
+
+    // The on-disk record must still have the ORIGINAL pid.
+    let after = RunnerHandle::load(runner_dir.path(), APP_UUID)
+        .expect("load record")
+        .expect("record present");
+    assert_eq!(
+        after.pid, original_pid,
+        "pid must be unchanged after grace-window tick"
+    );
+
+    // Clean up: shut the real runner down (restore the real socket in the record
+    // first so shutdown reaches it).
+    real_client.shutdown().await.ok();
+    wait_unreachable(&real_client, Duration::from_secs(5)).await;
+}
+
+/// THE kill-before-respawn test (Task 2.7 fix 2):
+///
+/// Scenario: a runner record has an alive pid (a real OS process that will never
+/// bind a control socket) but an OLD `spawned_at` (well past grace) and an
+/// unreachable socket. One `tick()` must:
+///  1. Kill the old pid (it must not be alive afterwards).
+///  2. Spawn a real replacement runner (new pid written to the record).
+///
+/// To get a "live pid that never answers the control socket" we use the
+/// `tabbify-runner` binary itself but with an impossible `--control-sock` path
+/// inside a directory that doesn't exist — the runner process spawns fine (pid
+/// is live) but exits quickly when it fails to bind. We use a `sleep` subprocess
+/// instead to guarantee the old pid stays alive through the whole tick window.
+/// Concretely: `cat /dev/stdin` in detached mode — a blocking read on stdin that
+/// never receives EOF while the pipe is open, giving us a stable live pid.
+///
+/// Implementation note: the "hung" pid is a detached `cat /dev/urandom` — it
+/// stays alive indefinitely and never binds any socket. After the tick we assert
+/// the pid is dead (killed) and a real replacement runner is reachable.
+#[tokio::test]
+async fn monitor_tick_kills_hung_runner_before_respawn() {
+    let s3 = MockServer::start().await;
+    mount_app(&s3, HUNG_UUID, ON_REQUEST_MANIFEST).await;
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let runner_dir = tempfile::tempdir().expect("runner dir");
+    let sock_dir = tempfile::tempdir().expect("sock dir");
+    // The control socket the REAL respawned runner will bind.
+    let sock_path = sock_dir.path().join(format!("{HUNG_UUID}.sock"));
+    // A bogus socket path — nothing will ever bind here (simulates hung runner).
+    let bogus_sock = sock_dir.path().join("hung-bogus-never-bound.sock");
+
+    // Spawn a long-lived OS process that will NEVER bind a control socket.
+    // `cat` with no args reads stdin (which we null out so it blocks on EOF) —
+    // stays alive indefinitely without consuming CPU.
+    let hung_child = tokio::process::Command::new("cat")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn cat (hung stub process)");
+    let hung_pid = hung_child.id().expect("cat must have a pid");
+
+    // Cleanup guard: ensure we kill the hung pid and whatever the monitor spawns.
+    let runner_dir_path = runner_dir.path().to_path_buf();
+    let _guard = scopeguard(move || {
+        force_kill(hung_pid);
+        // Also reap so it doesn't remain a zombie.
+        let _ =
+            unsafe { libc::waitpid(hung_pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
+        if let Ok(Some(h)) = RunnerHandle::load(&runner_dir_path, HUNG_UUID) {
+            if h.pid != hung_pid {
+                force_kill(h.pid);
+            }
+        }
+    });
+
+    // Verify the hung pid is alive (kill -0).
+    // SAFETY: POSIX existence check, no signal sent.
+    assert!(
+        unsafe { libc::kill(hung_pid as libc::pid_t, 0) } == 0,
+        "cat stub process must be alive"
+    );
+
+    // Write a record for HUNG_UUID: hung pid, bogus socket, OLD spawned_at
+    // (well past the grace window) — this is the "hung runner" scenario.
+    let old_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(120); // 2 minutes old — well past the 10-second grace
+    let hung_ula = tabbify_supervisor::app_ula::derive_app_ula(Uuid::parse_str(HUNG_UUID).unwrap())
+        .to_string();
+    let hung_record = RunnerHandle {
+        uuid: HUNG_UUID.to_owned(),
+        pid: hung_pid,
+        control_sock: bogus_sock.clone(), // unreachable
+        app_ula: hung_ula,
+        parent: Some("fd5a:1f00:1::1".to_owned()),
+        spawned_at: old_secs,
+    };
+    hung_record
+        .save(runner_dir.path())
+        .expect("write hung runner record");
+
+    // One tick with a SharedRunnerConfig that uses the REAL sock_path for
+    // newly spawned runners (the `spawn_spec_for` must produce a spec whose
+    // `control_sock` is `sock_path`, not the hung record's bogus path).
+    // We achieve this by constructing the record with `control_sock = sock_path`
+    // for the RESPAWN spec — but `spawn_spec_for` copies `record.control_sock`
+    // verbatim. So we must have the record's `control_sock` = `sock_path` for
+    // the respawned runner to bind the right socket.
+    //
+    // Fix: use sock_path in the hung record (the socket is simply not bound yet
+    // because the cat process never binds it). The monitor detects: pid alive,
+    // past grace, socket at sock_path unreachable → KillThenRespawn.
+    let hung_ula2 =
+        tabbify_supervisor::app_ula::derive_app_ula(Uuid::parse_str(HUNG_UUID).unwrap())
+            .to_string();
+    let hung_record2 = RunnerHandle {
+        uuid: HUNG_UUID.to_owned(),
+        pid: hung_pid,
+        control_sock: sock_path.clone(), // real path, but not bound by cat
+        app_ula: hung_ula2,
+        parent: Some("fd5a:1f00:1::1".to_owned()),
+        spawned_at: old_secs,
+    };
+    hung_record2
+        .save(runner_dir.path())
+        .expect("overwrite record with real sock_path");
+
+    let shared = SharedRunnerConfig {
+        runner_bin: env!("CARGO_BIN_EXE_tabbify-runner").into(),
+        s3_base_url: s3.uri(),
+        data_dir: data_dir.path().to_path_buf(),
+        parent: Some("fd5a:1f00:1::1".to_owned()),
+        no_mesh: true,
+    };
+    let orch = Orchestrator::new(shared, runner_dir.path().to_path_buf());
+    let respawned = orch.tick().await.expect("tick");
+
+    // The monitor must have respawned the hung runner.
+    assert!(
+        respawned.contains(&HUNG_UUID.to_owned()),
+        "tick must respawn the hung runner, got respawned: {respawned:?}"
+    );
+
+    // Drop the child handle so it can be reaped (the zombie is now safe to reap).
+    drop(hung_child);
+
+    // Reap the zombie so kill -0 gives the correct answer.
+    // SAFETY: standard POSIX waitpid; WNOHANG returns immediately.
+    unsafe {
+        libc::waitpid(hung_pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG);
+    }
+
+    // The OLD pid must be dead (SIGKILL was delivered before respawn).
+    // SAFETY: kill(pid, 0) is a POSIX existence check.
+    let old_alive = unsafe { libc::kill(hung_pid as libc::pid_t, 0) } == 0;
+    assert!(
+        !old_alive,
+        "the old hung pid {hung_pid} must be dead after kill-before-respawn"
+    );
+
+    // The new record must carry a DIFFERENT pid.
+    let new_handle = wait_pid_changed(
+        runner_dir.path(),
+        HUNG_UUID,
+        hung_pid,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_ne!(new_handle.pid, hung_pid, "replacement must have a new pid");
+    assert_eq!(new_handle.uuid, HUNG_UUID, "uuid preserved");
+
+    // The replacement runner binds sock_path and becomes reachable.
+    let new_client = ControlClient::new(&sock_path);
+    let reply = wait_health(&new_client, Duration::from_secs(20)).await;
+    match reply {
+        tabbify_supervisor::control_proto::Reply::Health { state, pid, .. } => {
+            assert_eq!(state, "running", "respawned runner must be running");
+            assert_eq!(pid, new_handle.pid, "pid matches record");
+        }
+        other => panic!("expected Health from respawned runner, got {other:?}"),
+    }
+
+    // Clean up the replacement.
+    new_client.shutdown().await.ok();
+    wait_unreachable(&new_client, Duration::from_secs(5)).await;
 }

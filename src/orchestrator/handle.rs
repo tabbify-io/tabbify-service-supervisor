@@ -28,6 +28,18 @@ pub struct RunnerHandle {
     /// ULA of the parent supervisor that spawned this runner (`None` for a
     /// standalone runner launched outside of a supervisor).
     pub parent: Option<String>,
+    /// Unix timestamp (seconds) at which this runner was last spawned.
+    ///
+    /// Used by the monitor to implement a post-spawn grace period: a runner
+    /// that is alive but whose control socket is not yet healthy is treated as
+    /// "still starting" for [`SPAWN_GRACE`](crate::orchestrator::monitor::SPAWN_GRACE)
+    /// seconds after spawn, preventing a duplicate from being created.
+    ///
+    /// `#[serde(default)]` ensures old records (before this field existed)
+    /// decode correctly — they get `0`, which is treated as "old enough that
+    /// the grace window has long expired".
+    #[serde(default)]
+    pub spawned_at: u64,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -128,6 +140,7 @@ mod tests {
             control_sock: PathBuf::from("/var/run/tabbify/runners/0191e7c2.sock"),
             app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
             parent: Some("fd5a:1f00:0:3::1".to_owned()),
+            spawned_at: 1_700_000_000,
         }
     }
 
@@ -138,6 +151,7 @@ mod tests {
             control_sock: PathBuf::from("/tmp/runner.sock"),
             app_ula: "fd5a:1f02:dead:beef:cafe::1".to_owned(),
             parent: None,
+            spawned_at: 0,
         }
     }
 
@@ -172,6 +186,21 @@ mod tests {
         let back: RunnerHandle = serde_json::from_str(&json).unwrap();
         assert_eq!(h, back);
         assert!(back.parent.is_none());
+    }
+
+    /// Old records written before `spawned_at` was added must still deserialize:
+    /// the missing field defaults to `0` (treated as "long past the grace window").
+    #[test]
+    fn spawned_at_defaults_to_zero_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert_eq!(h.spawned_at, 0, "missing spawned_at must default to 0");
     }
 
     // ── save / load ──────────────────────────────────────────────────────────

@@ -171,12 +171,18 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         .id()
         .context("spawned runner has no pid (already exited?)")?;
 
+    let spawned_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     let handle = RunnerHandle {
         uuid: spec.uuid.clone(),
         pid,
         control_sock: spec.control_sock.clone(),
         app_ula: app_ula.to_string(),
         parent: spec.parent.clone(),
+        spawned_at,
     };
 
     handle
