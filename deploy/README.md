@@ -13,7 +13,7 @@ is ready to host apps — out of the box.
 ## TL;DR
 
 ```bash
-docker run -d --name tbf-sup \
+docker run -d --name tbf-sup --restart=on-failure \
   --device /dev/net/tun --cap-add NET_ADMIN \    # mesh transport (always)
   -v tbf-state:/var/lib/tabbify \                # persist identity + artifact cache
   tabbify-supervisor
@@ -154,6 +154,20 @@ docker run -d --name tbf-sup --device /dev/net/tun --cap-add NET_ADMIN \
   detached process; its lifecycle shows in the monitor lines.
 
 ---
+
+### Keeping the supervisor alive (L1)
+
+The supervisor restarts its **apps** with backoff + crash-loop handling (L2,
+built in — see the restart-supervision spec). Keeping the **supervisor process
+itself** alive is the launch backend's job:
+- **Docker:** add `--restart=on-failure` (or `unless-stopped`) to the `docker
+  run` — `tcli node up` sets this from `node.toml`'s `[backend] restart`. Docker
+  applies its own exponential backoff.
+- **VPS / bare metal / firecracker guest (systemd):** install
+  [`tabbify-supervisor.service`](tabbify-supervisor.service) — `Restart=on-failure`
+  + `RestartSec`/`RestartSteps` backoff + `StartLimit*` rate cap. Clear a
+  crash-loop give-up with `systemctl reset-failed tabbify-supervisor` (the L1
+  analog of the app `/reset` endpoint).
 
 ## 6. Caveats — read before production
 

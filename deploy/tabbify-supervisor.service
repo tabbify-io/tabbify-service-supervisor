@@ -1,0 +1,43 @@
+# L1 supervision for a supervisor running on bare metal / a VPS / inside a
+# firecracker microVM guest (a full Linux init). systemd keeps `supervisord`
+# alive; the supervisor itself keeps its app runners alive (L2).
+#
+#   install: cp deploy/tabbify-supervisor.service /etc/systemd/system/
+#            systemctl daemon-reload && systemctl enable --now tabbify-supervisor
+#   logs:    journalctl -u tabbify-supervisor -f
+#   clear a crash-loop give-up (the L1 analog of our /reset endpoint):
+#            systemctl reset-failed tabbify-supervisor
+#
+# (For the dockerized supervisor use `docker run --restart=on-failure` instead —
+#  `tcli node up` sets it from node.toml. See deploy/README.md.)
+
+[Unit]
+Description=Tabbify supervisor node
+After=network-online.target
+Wants=network-online.target
+# Rate cap: if it restarts more than StartLimitBurst times within
+# StartLimitIntervalSec, systemd stops trying and marks the unit `failed`
+# (clear with `systemctl reset-failed`). Distinguishes a transient crash from a
+# fundamentally broken binary — same idea as the L2 crash-loop status.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# The supervisor self-detects capabilities + joins the baked-in coordinator.
+# Override via the environment (mesh coordinator, data dir, name, ...):
+#   Environment=TABBIFY_MESH_COORDINATOR=http://3.124.69.92:8888
+#   Environment=SUPERVISOR_DATA_DIR=/var/lib/tabbify
+# or point at a file:  EnvironmentFile=/etc/tabbify/supervisor.env
+ExecStart=/usr/local/bin/supervisord
+# The mesh needs a TUN device + NET_ADMIN; simplest is to run as root, or grant
+# just the capability:  AmbientCapabilities=CAP_NET_ADMIN
+Restart=on-failure
+RestartSec=10
+# Exponential-ish backoff (systemd >=254; ignored on older versions, which keep
+# the fixed RestartSec=10). 10s -> ... -> 300s cap, mirroring the L2 policy.
+RestartSteps=5
+RestartMaxDelaySec=300
+
+[Install]
+WantedBy=multi-user.target
