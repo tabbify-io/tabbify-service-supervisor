@@ -523,7 +523,7 @@ mod linux {
     };
     use super::{FcConfig, kvm_available};
     use crate::manifest::Runtime;
-    use crate::runtime::{AppRuntime, BoxRespFut};
+    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
 
     /// How long to wait for the guest app's HTTP server to come up after boot.
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -733,6 +733,60 @@ mod linux {
         fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a> {
             // Delegate to the VM-independent proxy core (tested via wiremock).
             Box::pin(proxy_request(&self.client, &self.guest_base, request))
+        }
+
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            // The app is healthy iff its guest HTTP server answers (any status).
+            Box::pin(async move {
+                match self
+                    .client
+                    .get(&self.guest_base)
+                    .timeout(API_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(_) => RuntimeHealth::Serving,
+                    Err(e) => RuntimeHealth::Unavailable(format!(
+                        "guest {} unreachable: {e}",
+                        self.guest_base
+                    )),
+                }
+            })
+        }
+
+        fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
+            // The runner is the firecracker child's parent; poll its liveness via
+            // the zombie-aware `process_is_alive` (waitpid-based) so this stays
+            // `&self` (`Child::wait` needs `&mut`, which `Drop` owns). When the VM
+            // process exits the app is gone → fail-fast → the runner exits → L2
+            // respawns it.
+            let pid = self.child.as_ref().and_then(|c| c.id());
+            Box::pin(async move {
+                match pid {
+                    None => std::future::pending().await,
+                    Some(pid) => {
+                        while pidfile::process_is_alive(pid) {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        ExitReason::Died(format!("firecracker child pid {pid} exited"))
+                    }
+                }
+            })
+        }
+
+        fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
+            // Graceful teardown: kill the VM (if still alive) + delete the tap.
+            // Idempotent — `Drop` repeats it as the safety net.
+            let pid = self.child.as_ref().and_then(|c| c.id());
+            let tap = self.tap_name.clone();
+            Box::pin(async move {
+                if let Some(pid) = pid {
+                    pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
+                }
+                if let Err(e) = run_ip(&["link", "del", &tap]).await {
+                    tracing::debug!(%tap, error = %e, "shutdown: ip link del tap (may already be gone)");
+                }
+            })
         }
     }
 
