@@ -28,7 +28,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::app_ula::derive_app_ula;
-use crate::config::FcConfig;
+use crate::config::{DockerConfig, FcConfig};
+use crate::docker::DockerRuntime;
 use crate::fetcher::{FetchError, FetchedApp, S3Fetcher};
 use crate::firecracker::FirecrackerRuntime;
 use crate::host::{AppHost, AppServe, HostedApp};
@@ -158,6 +159,8 @@ pub struct AppRegistry {
     app_host: AppHost,
     /// Firecracker runtime config (only consulted for `firecracker` apps).
     fc_config: FcConfig,
+    /// Docker runtime config (only consulted for `docker` apps).
+    docker_config: DockerConfig,
     /// Per-uuid spawn lock so concurrent first-requests don't double-host.
     spawn_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
@@ -184,23 +187,43 @@ pub struct AppSummary {
 
 impl AppRegistry {
     /// Build a registry backed by `fetcher`, hosting apps via `app_host`, with
-    /// default firecracker config (firecracker apps use the baked-in defaults).
-    /// Use [`AppRegistry::with_fc_config`] to supply operator config.
+    /// default firecracker + docker config (those runtimes use the baked-in
+    /// defaults). Use [`AppRegistry::with_runtime_configs`] to supply operator
+    /// config.
     #[must_use]
     pub fn new(fetcher: S3Fetcher, app_host: AppHost) -> Self {
-        Self::with_fc_config(fetcher, app_host, FcConfig::default())
+        Self::with_runtime_configs(
+            fetcher,
+            app_host,
+            FcConfig::default(),
+            DockerConfig::default(),
+        )
     }
 
-    /// Build a registry with an explicit [`FcConfig`] (the main binary passes
-    /// the parsed CLI config so firecracker apps boot with the operator's
-    /// kernel / vcpus / tap subnet / app port).
+    /// Build a registry with an explicit [`FcConfig`] (docker uses defaults).
+    /// Kept for callers that only customize firecracker.
     #[must_use]
     pub fn with_fc_config(fetcher: S3Fetcher, app_host: AppHost, fc_config: FcConfig) -> Self {
+        Self::with_runtime_configs(fetcher, app_host, fc_config, DockerConfig::default())
+    }
+
+    /// Build a registry with explicit [`FcConfig`] + [`DockerConfig`] (the main
+    /// binary passes the parsed CLI config so firecracker apps boot with the
+    /// operator's kernel / vcpus / tap subnet / app port, and docker apps build
+    /// + run with the operator's docker binary / app port / build timeout).
+    #[must_use]
+    pub fn with_runtime_configs(
+        fetcher: S3Fetcher,
+        app_host: AppHost,
+        fc_config: FcConfig,
+        docker_config: DockerConfig,
+    ) -> Self {
         Self {
             apps: Arc::new(DashMap::new()),
             fetcher,
             app_host,
             fc_config,
+            docker_config,
             spawn_locks: Arc::new(DashMap::new()),
         }
     }
@@ -240,7 +263,7 @@ impl AppRegistry {
         let mode = fetched.manifest.lifecycle.mode;
 
         let (state, hosted) = if spawn_on_register(mode) {
-            let rt = self.build_runtime(&fetched).await?;
+            let rt = self.build_runtime(uuid, &fetched).await?;
             let hosted = self.host_app(uuid, app_ula, rt).await?;
             (AppState::Running, Some(hosted))
         } else {
@@ -303,7 +326,7 @@ impl AppRegistry {
             Some(version) => self.fetcher.fetch_version(uuid, version).await?,
             None => self.fetcher.fetch(uuid).await?,
         };
-        let rt = self.build_runtime(&fetched).await?;
+        let rt = self.build_runtime(uuid, &fetched).await?;
 
         // Host BEFORE touching the map: hosting awaits (joiner route + bind), so
         // we must not hold a DashMap guard across it.
@@ -380,13 +403,21 @@ impl AppRegistry {
     /// `wasm-http` → the in-process [`WasmRuntime`]; `firecracker` → a booted
     /// [`FirecrackerRuntime`] microVM (the launch returns a clear `Err` if this
     /// host lacks `/dev/kvm` or isn't Linux, so a WASM-only supervisor refuses
-    /// firecracker apps loudly without affecting WASM apps); anything else is a
-    /// hard error.
+    /// firecracker apps loudly without affecting WASM apps); `docker` → a built
+    /// + run [`DockerRuntime`] container (the launch returns a clear `Err` if no
+    ///   Docker daemon is reachable); anything else is a hard error.
+    ///
+    /// `uuid` makes the docker image tag + container name deterministic.
     ///
     /// # Errors
     /// A wasm compile failure, a firecracker launch failure (no KVM / non-Linux
-    /// / boot failure), or an unknown runtime type.
-    async fn build_runtime(&self, fetched: &FetchedApp) -> anyhow::Result<Arc<dyn AppRuntime>> {
+    /// / boot failure), a docker launch failure (no daemon / build / run
+    /// failure), or an unknown runtime type.
+    async fn build_runtime(
+        &self,
+        uuid: &str,
+        fetched: &FetchedApp,
+    ) -> anyhow::Result<Arc<dyn AppRuntime>> {
         let rt = &fetched.manifest.runtime;
         match rt.r#type.as_str() {
             "wasm-http" => {
@@ -397,6 +428,16 @@ impl AppRegistry {
                 let vm =
                     FirecrackerRuntime::launch(&fetched.cached_path, rt, &self.fc_config).await?;
                 Ok(Arc::new(vm))
+            }
+            "docker" => {
+                let container = DockerRuntime::launch_with_id(
+                    &fetched.cached_path,
+                    rt,
+                    &self.docker_config,
+                    uuid,
+                )
+                .await?;
+                Ok(Arc::new(container))
             }
             other => anyhow::bail!("unknown runtime type: {other}"),
         }

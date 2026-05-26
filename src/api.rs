@@ -37,11 +37,14 @@ pub struct SupervisorState {
     /// Whether this host can run Firecracker microVMs (/dev/kvm present). Surfaced
     /// on `/health` so an operator can see at a glance what this supervisor can run.
     pub firecracker: bool,
+    /// Whether this host can run Docker containers (daemon reachable). Surfaced
+    /// on `/health` alongside `firecracker`.
+    pub docker: bool,
 }
 
 impl SupervisorState {
-    /// Construct shared state. Firecracker capability defaults off; set it with
-    /// [`Self::with_firecracker`].
+    /// Construct shared state. Firecracker + docker capabilities default off;
+    /// set them with [`Self::with_firecracker`] / [`Self::with_docker`].
     #[must_use]
     pub fn new(registry: AppRegistry, supervisor_id: String, ula: String) -> Self {
         Self {
@@ -49,6 +52,7 @@ impl SupervisorState {
             supervisor_id,
             ula,
             firecracker: false,
+            docker: false,
         }
     }
 
@@ -56,6 +60,13 @@ impl SupervisorState {
     #[must_use]
     pub fn with_firecracker(mut self, firecracker: bool) -> Self {
         self.firecracker = firecracker;
+        self
+    }
+
+    /// Set the Docker capability reported on `/health`.
+    #[must_use]
+    pub fn with_docker(mut self, docker: bool) -> Self {
+        self.docker = docker;
         self
     }
 }
@@ -80,6 +91,7 @@ async fn health(State(state): State<SharedState>) -> Response {
         "supervisor_id": state.supervisor_id,
         "ula": state.ula,
         "firecracker": state.firecracker,
+        "docker": state.docker,
     }))
     .into_response()
 }

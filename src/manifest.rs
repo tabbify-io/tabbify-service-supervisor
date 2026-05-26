@@ -69,11 +69,13 @@ pub enum LifecycleMode {
 /// `[runtime]` table.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Runtime {
-    /// Runtime type: `"wasm-http"` (any host) or `"firecracker"` (Linux + KVM).
+    /// Runtime type: `"wasm-http"` (any host), `"firecracker"` (Linux + KVM),
+    /// or `"docker"` (any host with a reachable Docker daemon).
     #[serde(rename = "type", default = "default_rt")]
     pub r#type: String,
     /// Entry filename: the wasm component for `wasm-http`, the rootfs image
-    /// (e.g. `rootfs.ext4`) for `firecracker`.
+    /// (e.g. `rootfs.ext4`) for `firecracker`, the build-context tarball (e.g.
+    /// `context.tar.gz`, the app dir + `Dockerfile`) for `docker`.
     #[serde(default = "default_entry")]
     pub entry: String,
     /// Per-request fuel budget (wasm-http only).
@@ -234,6 +236,28 @@ entry = "rootfs.ext4"
 "#;
         let m: AppManifest = toml::from_str(src).unwrap();
         assert_eq!(m.runtime.r#type, "firecracker");
+        assert!(m.runtime.kernel.is_none());
+    }
+
+    /// A docker-runtime manifest parses its type + the build-context tarball as
+    /// `entry`.
+    #[test]
+    fn parses_docker_runtime() {
+        let src = r#"
+[app]
+name = "container-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type  = "docker"
+entry = "context.tar.gz"
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.runtime.r#type, "docker");
+        assert_eq!(m.runtime.entry, "context.tar.gz");
+        // docker uses no kernel.
         assert!(m.runtime.kernel.is_none());
     }
 

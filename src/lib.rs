@@ -14,6 +14,8 @@
 //!   `wasi:http/proxy` runtime (contract §8).
 //! - [`firecracker`] — the second [`runtime::AppRuntime`]: a KVM-gated
 //!   Firecracker microVM runtime (real on Linux, stub elsewhere).
+//! - [`docker`] — the third [`runtime::AppRuntime`]: a cross-platform Docker
+//!   container runtime that builds the app image from source on the supervisor.
 //! - [`fetcher`] — anonymous S3 artifact fetch + local cache (contract §2).
 //! - [`host`] — per-app-ULA hosting: one listener per app on its own ULA
 //!   (contract §5, Component 3).
@@ -24,6 +26,7 @@
 pub mod api;
 pub mod app_ula;
 pub mod config;
+pub mod docker;
 pub mod fetcher;
 pub mod firecracker;
 pub mod host;

@@ -69,6 +69,11 @@ pub struct Config {
     /// `firecracker` app on a KVM-capable Linux host).
     #[command(flatten)]
     pub firecracker: FcConfig,
+
+    /// Docker container runtime configuration (only consulted when hosting a
+    /// `docker` app on a host with a reachable Docker daemon).
+    #[command(flatten)]
+    pub docker: DockerConfig,
 }
 
 /// Default firecracker binary (looked up on `$PATH`).
@@ -125,6 +130,60 @@ impl Default for FcConfig {
             vcpus: 1,
             tap_subnet: DEFAULT_FC_TAP_SUBNET.to_owned(),
             app_port: 8080,
+        }
+    }
+}
+
+/// Default `docker` binary (looked up on `$PATH`).
+pub const DEFAULT_DOCKER_BIN: &str = "docker";
+
+/// Default port the app's HTTP server listens on inside the container.
+pub const DEFAULT_DOCKER_APP_PORT: u16 = 8080;
+
+/// Default `docker build` timeout (seconds). A cold build that pulls a base
+/// image + installs deps can take a while; 300s is a generous ceiling.
+pub const DEFAULT_DOCKER_BUILD_TIMEOUT_SECS: u64 = 300;
+
+/// Docker container runtime configuration. Only consulted when the supervisor is
+/// asked to host an app whose `runtime.type == "docker"` on a host with a
+/// reachable Docker daemon; ignored everywhere else (so a WASM-only supervisor
+/// never needs any of these). Unlike firecracker, Docker is cross-platform — it
+/// shells out to the `docker` CLI, which runs on macOS + Linux alike.
+#[derive(Debug, Clone, Parser)]
+pub struct DockerConfig {
+    /// Path to the `docker` binary.
+    #[arg(long = "docker-bin", env = "SUPERVISOR_DOCKER_BIN", default_value = DEFAULT_DOCKER_BIN)]
+    pub docker_bin: String,
+
+    /// Port the app's HTTP server listens on inside the container (the image's
+    /// `EXPOSE`d / served port). The supervisor publishes an ephemeral loopback
+    /// host port onto this container port. The clap `id` is distinct from
+    /// [`FcConfig`]'s `app_port` so the two flattened structs don't collide.
+    #[arg(
+        id = "docker_app_port",
+        long = "docker-app-port",
+        env = "SUPERVISOR_DOCKER_APP_PORT",
+        default_value_t = DEFAULT_DOCKER_APP_PORT
+    )]
+    pub app_port: u16,
+
+    /// Maximum time to wait for `docker build` to finish (seconds).
+    #[arg(
+        long = "docker-build-timeout-secs",
+        env = "SUPERVISOR_DOCKER_BUILD_TIMEOUT_SECS",
+        default_value_t = DEFAULT_DOCKER_BUILD_TIMEOUT_SECS
+    )]
+    pub build_timeout_secs: u64,
+}
+
+impl Default for DockerConfig {
+    /// The same defaults clap bakes — handy for tests + for an
+    /// [`crate::registry::AppRegistry`] that has no docker apps.
+    fn default() -> Self {
+        Self {
+            docker_bin: DEFAULT_DOCKER_BIN.to_owned(),
+            app_port: DEFAULT_DOCKER_APP_PORT,
+            build_timeout_secs: DEFAULT_DOCKER_BUILD_TIMEOUT_SECS,
         }
     }
 }
@@ -203,6 +262,43 @@ mod tests {
         assert_eq!(cfg.firecracker.vcpus, 4);
         assert_eq!(cfg.firecracker.tap_subnet, "10.200.0.0/16");
         assert_eq!(cfg.firecracker.app_port, 3000);
+    }
+
+    #[test]
+    fn docker_defaults_apply() {
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert_eq!(cfg.docker.docker_bin, DEFAULT_DOCKER_BIN);
+        assert_eq!(cfg.docker.app_port, DEFAULT_DOCKER_APP_PORT);
+        assert_eq!(
+            cfg.docker.build_timeout_secs,
+            DEFAULT_DOCKER_BUILD_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn docker_default_impl_matches_clap_defaults() {
+        let parsed = Config::try_parse_from(["supervisord"]).unwrap().docker;
+        let dflt = DockerConfig::default();
+        assert_eq!(parsed.docker_bin, dflt.docker_bin);
+        assert_eq!(parsed.app_port, dflt.app_port);
+        assert_eq!(parsed.build_timeout_secs, dflt.build_timeout_secs);
+    }
+
+    #[test]
+    fn docker_overrides_parse() {
+        let cfg = Config::try_parse_from([
+            "supervisord",
+            "--docker-bin",
+            "/usr/local/bin/docker",
+            "--docker-app-port",
+            "3000",
+            "--docker-build-timeout-secs",
+            "600",
+        ])
+        .unwrap();
+        assert_eq!(cfg.docker.docker_bin, "/usr/local/bin/docker");
+        assert_eq!(cfg.docker.app_port, 3000);
+        assert_eq!(cfg.docker.build_timeout_secs, 600);
     }
 
     #[test]

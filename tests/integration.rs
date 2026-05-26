@@ -16,6 +16,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tabbify_supervisor::api::{SupervisorState, router};
+use tabbify_supervisor::docker::docker_available;
 use tabbify_supervisor::fetcher::{FetchError, S3Fetcher};
 use tabbify_supervisor::host::AppHost;
 use tabbify_supervisor::registry::{AppRegistry, AppState};
@@ -85,6 +86,20 @@ mode = "always_on"
 type      = "firecracker"
 entry     = "rootfs.ext4"
 memory_mb = 256
+"#;
+
+/// A `docker`-runtime manifest. Its entry is a build-context tarball (the app
+/// dir + a `Dockerfile`), NOT wasm.
+const DOCKER_MANIFEST: &str = r#"
+[app]
+name = "container-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type  = "docker"
+entry = "context.tar.gz"
 "#;
 
 /// A manifest naming an unknown runtime type — must be rejected.
@@ -584,6 +599,104 @@ async fn fetcher_caches_entry_under_manifest_name() {
     assert_eq!(fetched.cached_path, cache.join("rootfs.ext4"));
     // firecracker entry is NOT loaded into memory.
     assert!(fetched.wasm.is_empty(), "rootfs must not be read into RAM");
+}
+
+/// The fetcher caches a `docker` app's build-context tarball under its manifest
+/// name (`context.tar.gz`) and does NOT read it into RAM (only `cached_path`).
+#[tokio::test]
+async fn fetcher_caches_docker_context_without_loading_into_ram() {
+    let server = mock_s3_entry(DOCKER_MANIFEST, "context.tar.gz", b"fake-tarball-bytes").await;
+    let dir = tempfile::tempdir().unwrap();
+    let fetcher = S3Fetcher::new(server.uri(), dir.path());
+
+    let fetched = fetcher.fetch(APP_UUID).await.expect("fetch");
+    let cache = fetcher.cache_dir(APP_UUID, 1);
+    assert!(
+        cache.join("context.tar.gz").is_file(),
+        "docker context must be cached under its manifest name"
+    );
+    assert_eq!(fetched.cached_path, cache.join("context.tar.gz"));
+    assert!(
+        fetched.wasm.is_empty(),
+        "docker tarball must not be read into RAM"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REAL docker runtime: build from source + run + proxy end-to-end.
+// Gated on `docker_available()` so a CI host without Docker skips it.
+// ---------------------------------------------------------------------------
+
+/// Build the `tests/fixtures/docker-app` directory into a gzipped-tar build
+/// context (the app dir + its `Dockerfile`) at `dest`, via the system `tar`
+/// (keeps the crate's dependency set unchanged — no `tar`/`flate2` dev-dep).
+fn make_docker_context(dest: &std::path::Path) {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/docker-app");
+    let status = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(dest)
+        .arg("-C")
+        .arg(&fixture_dir)
+        .arg("Dockerfile")
+        .arg("server.py")
+        .status()
+        .expect("spawn tar");
+    assert!(status.success(), "tar failed to build the docker context");
+}
+
+/// REAL end-to-end docker runtime: stand up a wiremock S3 serving a `docker`
+/// manifest + the build-context tarball, register the app (→ the registry's
+/// `docker` selection branch builds the image from source + runs the container
+/// + binds the per-app listener), dial the listener, and assert the container
+/// app's body. Teardown: dropping the registry aborts the listener and the
+/// `DockerRuntime`'s `Drop` force-removes the container; we also remove the
+/// built image. Skipped (not failed) when no Docker daemon is reachable.
+#[tokio::test]
+async fn runtime_selection_docker_builds_runs_and_serves() {
+    if !docker_available() {
+        eprintln!("skipping: no reachable Docker daemon on this host");
+        return;
+    }
+
+    // Build the context tarball and serve it as the app's `context.tar.gz` entry.
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx_path = tmp.path().join("context.tar.gz");
+    make_docker_context(&ctx_path);
+    let ctx_bytes = std::fs::read(&ctx_path).expect("read context tarball");
+
+    let server = mock_s3_entry(DOCKER_MANIFEST, "context.tar.gz", &ctx_bytes).await;
+    let (registry, _dir) = temp_registry(&server.uri());
+
+    // always_on → register builds the image, runs the container, binds the
+    // per-app listener. This exercises the `docker` runtime-selection branch
+    // (manifest.runtime.type == "docker" → DockerRuntime) for real.
+    let state = registry
+        .register(APP_UUID)
+        .await
+        .expect("docker app must build, run, and host");
+    assert_eq!(state, AppState::Running);
+
+    // The per-app listener proxies the WHOLE path to the container app.
+    let (status, body) = dial_app(&registry, APP_UUID, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello from docker");
+
+    // A deep subpath also reaches the container app (path forwarded verbatim).
+    let (status, body) = dial_app(&registry, APP_UUID, "/some/deep/path?q=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello from docker");
+
+    // Teardown: stop (aborts the listener; DockerRuntime::Drop removes the
+    // container), then drop the registry, then remove the built image.
+    let _ = registry.stop(APP_UUID).await;
+    drop(registry);
+    // Give Drop a moment to force-remove the container before removing the image.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let image = format!("tabbify-app-{APP_UUID}");
+    let _ = std::process::Command::new("docker")
+        .args(["rmi", "-f", &image])
+        .status();
 }
 
 // ---------------------------------------------------------------------------

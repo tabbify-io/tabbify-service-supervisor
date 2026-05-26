@@ -157,7 +157,11 @@ impl S3Fetcher {
 
         let entry = manifest.runtime.entry.clone();
         let entry_path = dir.join(&entry);
-        let is_firecracker = manifest.runtime.r#type == "firecracker";
+        // Only `wasm-http` needs the artifact bytes resident in memory (the
+        // wasmtime engine compiles them). `firecracker` (a rootfs image) and
+        // `docker` (a build-context tarball) consume the on-disk path instead,
+        // so we never read a large artifact into RAM for those.
+        let loads_into_memory = manifest.runtime.r#type == "wasm-http";
 
         // Ensure the entry file is present on disk (fetch + persist on miss). We
         // stream it to disk and only load it into memory for wasm.
@@ -167,12 +171,12 @@ impl S3Fetcher {
             write_file(&entry_path, &bytes)?;
         }
 
-        // wasm-http needs the bytes in memory; firecracker only needs the path
-        // (don't read a multi-hundred-MB rootfs into RAM).
-        let wasm = if is_firecracker {
-            Bytes::new()
-        } else {
+        // wasm-http needs the bytes in memory; firecracker/docker only need the
+        // path (don't read a multi-hundred-MB rootfs / tarball into RAM).
+        let wasm = if loads_into_memory {
             Bytes::from(read_file_bytes(&entry_path)?)
+        } else {
+            Bytes::new()
         };
 
         Ok(FetchedApp {
