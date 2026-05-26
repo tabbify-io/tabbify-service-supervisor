@@ -55,7 +55,9 @@ fn default_kvm_check() -> bool {
 /// `cargo build` on macOS compiles them but doesn't call them).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod protocol {
+    use anyhow::{Result, anyhow};
     use serde_json::{Value, json};
+    use tokio::io::{AsyncRead, AsyncReadExt};
 
     /// Hop-by-hop headers (RFC 7230 §6.1) that MUST NOT be forwarded when
     /// proxying between the inbound request and the guest, nor copied back from
@@ -192,6 +194,46 @@ mod protocol {
             .context("collect guest response body")?;
         resp.body(bytes).context("build proxied response")
     }
+
+    /// Parse the HTTP status code out of a raw HTTP/1.1 response head.
+    pub fn parse_status_line(raw: &[u8]) -> Result<u16> {
+        let text = String::from_utf8_lossy(raw);
+        let line = text
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow!("empty firecracker API response"))?;
+        // "HTTP/1.1 204 No Content"
+        let code = line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("malformed status line {line:?}"))?;
+        code.parse::<u16>()
+            .map_err(|e| anyhow!("bad status code in {line:?}: {e}"))
+    }
+
+    /// Read an HTTP/1.1 response head from `reader` and return its status code.
+    ///
+    /// Firecracker's API server uses HTTP keep-alive and IGNORES a request
+    /// `Connection: close`, so it does NOT close the socket after replying —
+    /// reading to EOF would block until the connection is torn down elsewhere.
+    /// Our PUTs only need the status code (success is `204 No Content`, no body),
+    /// so this stops at the end-of-headers marker (`\r\n\r\n`) and never waits on
+    /// a kept-alive connection.
+    pub async fn read_http_status<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u16> {
+        let mut buf = Vec::with_capacity(256);
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 {
+                break; // EOF before the header terminator; parse what we have.
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break; // full response head received; status is known.
+            }
+        }
+        parse_status_line(&buf)
+    }
 }
 
 // The concrete `FirecrackerRuntime` differs by platform. The real Linux impl
@@ -262,13 +304,13 @@ mod linux {
     use anyhow::{Context, Result, anyhow, bail};
     use bytes::Bytes;
     use http::Request;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
     use tokio::process::{Child, Command};
 
     use super::protocol::{
         boot_source_body, instance_start_body, machine_config_body, network_iface_body,
-        proxy_request, rootfs_drive_body,
+        proxy_request, read_http_status, rootfs_drive_body,
     };
     use super::{FcConfig, kvm_available};
     use crate::manifest::Runtime;
@@ -553,27 +595,10 @@ mod linux {
         stream.write_all(body).await?;
         stream.flush().await?;
 
-        // Read the response; `Connection: close` means the server closes after
-        // the body, so read to EOF and parse the status line.
-        let mut buf = Vec::with_capacity(256);
-        stream.read_to_end(&mut buf).await?;
-        parse_status_line(&buf)
-    }
-
-    /// Parse the HTTP status code out of a raw HTTP/1.1 response head.
-    fn parse_status_line(raw: &[u8]) -> Result<u16> {
-        let text = String::from_utf8_lossy(raw);
-        let line = text
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow!("empty firecracker API response"))?;
-        // "HTTP/1.1 204 No Content"
-        let code = line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("malformed status line {line:?}"))?;
-        code.parse::<u16>()
-            .map_err(|e| anyhow!("bad status code in {line:?}: {e}"))
+        // Firecracker's API server uses keep-alive and ignores `Connection:
+        // close`, so it doesn't close the socket; read just the response head
+        // (NOT to EOF, which would hang) and parse its status.
+        read_http_status(&mut stream).await
     }
 
     #[cfg(test)]
@@ -595,18 +620,6 @@ mod linux {
         fn guest_mac_is_locally_administered_and_deterministic() {
             assert_eq!(derive_guest_mac(0), "02:FC:00:00:00:00");
             assert_eq!(derive_guest_mac(1), "02:FC:01:00:00:00");
-        }
-
-        #[test]
-        fn parses_firecracker_status_line() {
-            assert_eq!(
-                parse_status_line(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap(),
-                204
-            );
-            assert_eq!(
-                parse_status_line(b"HTTP/1.1 400 Bad Request\r\n\r\n{\"x\":1}").unwrap(),
-                400
-            );
         }
 
         /// REAL microVM boot — Linux + `/dev/kvm` + a provisioned kernel + a
@@ -658,7 +671,8 @@ mod linux {
 mod tests {
     use super::protocol::{
         boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
-        kvm_available_with, machine_config_body, network_iface_body, rootfs_drive_body,
+        kvm_available_with, machine_config_body, network_iface_body, parse_status_line,
+        read_http_status, rootfs_drive_body,
     };
 
     #[test]
@@ -793,5 +807,63 @@ mod tests {
             .expect("proxy");
         assert_eq!(resp.status(), 200);
         assert_eq!(String::from_utf8_lossy(resp.body()), "ok");
+    }
+
+    #[test]
+    fn parses_firecracker_status_line() {
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap(),
+            204
+        );
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 400 Bad Request\r\n\r\n{\"x\":1}").unwrap(),
+            400
+        );
+    }
+
+    /// Firecracker replies then KEEPS THE SOCKET OPEN (keep-alive, ignoring our
+    /// `Connection: close`). `read_http_status` must return at the header
+    /// terminator and not block waiting for an EOF that never comes.
+    #[tokio::test]
+    async fn read_http_status_returns_on_keepalive_without_eof() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        server
+            .write_all(
+                b"HTTP/1.1 204 \r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        // Deliberately keep `server` alive (no EOF) across the read.
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_status(&mut client),
+        )
+        .await
+        .expect("must not block waiting for EOF on a kept-alive socket")
+        .expect("status parsed");
+        assert_eq!(status, 204);
+        drop(server);
+    }
+
+    /// A non-2xx reply carries a JSON body; only the status from the head is
+    /// needed, and the trailing body must not cause a hang either.
+    #[tokio::test]
+    async fn read_http_status_reads_head_then_ignores_body() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        server
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 9\r\n\r\n{\"err\":1}")
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_status(&mut client),
+        )
+        .await
+        .expect("no hang")
+        .expect("status");
+        assert_eq!(status, 400);
+        drop(server);
     }
 }
