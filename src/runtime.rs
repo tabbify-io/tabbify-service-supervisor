@@ -9,23 +9,25 @@
 //! Design:
 //! - One [`Engine`] per [`WasmRuntime`] (engine construction is expensive; it is
 //!   refcounted and cheap to clone).
-//! - A compiled [`Component`] + a pre-built [`Linker`] are kept on the runtime;
-//!   each request gets a FRESH [`Store`] with its own fuel budget and resource
-//!   table, so no state leaks across requests.
+//! - `instantiate_pre` + `ProxyPre::new` (the link/type-check step) are done
+//!   ONCE in [`WasmRuntime::load`] and stored as `proxy_pre`.
+//! - Each request gets a FRESH [`Store`] with its own fuel budget and resource
+//!   table, then calls `proxy_pre.instantiate_async` — no re-linking per request.
 //!
 //! Public API (§8):
-//! - [`WasmRuntime::load`] — compile a component once.
+//! - [`WasmRuntime::load`] — compile + link a component once.
 //! - [`WasmRuntime::handle`] — run one request, return its response.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use tokio::sync::oneshot;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::bindings::ProxyPre;
@@ -171,13 +173,16 @@ impl WasiHttpView for Ctx {
 
 /// A compiled-and-linked WASM HTTP component, ready to serve requests.
 ///
-/// Cheap to clone (`Component`, `Linker`, `Engine` are all refcounted), so a
-/// running app instance can be shared across concurrent requests.
+/// Cheap to clone: `Engine` is refcounted, `ProxyPre` is wrapped in `Arc`
+/// (the macro-generated type may not derive `Clone` itself, but `Arc` is always
+/// cheap to clone). A running app instance can be shared across concurrent
+/// requests without re-linking.
 #[derive(Clone)]
 pub struct WasmRuntime {
-    component: Component,
-    linker: Linker<Ctx>,
     engine: Engine,
+    /// Pre-instantiation artifact: the link/type-check step done once in `load`.
+    /// Per-request code only calls `proxy_pre.instantiate_async(store)`.
+    proxy_pre: Arc<ProxyPre<Ctx>>,
     fuel_per_request: u64,
 }
 
@@ -196,16 +201,21 @@ impl WasmRuntime {
     /// Like [`WasmRuntime::load`] but with an explicit per-request fuel budget
     /// (taken from the app manifest's `runtime.fuel_per_request`).
     ///
+    /// The link/type-check step (`instantiate_pre` + `ProxyPre::new`) runs here,
+    /// once, and the result is stored in `proxy_pre`. Per-request code only calls
+    /// `instantiate_async` against the pre-built artifact.
+    ///
     /// # Errors
     /// See [`WasmRuntime::load`].
     pub fn load_with_fuel(wasm_bytes: &[u8], fuel_per_request: u64) -> Result<Self> {
         let engine = new_engine()?;
-        let component = Component::new(&engine, wasm_bytes)?;
+        let component = wasmtime::component::Component::new(&engine, wasm_bytes)?;
         let linker = build_linker(&engine)?;
+        let pre = linker.instantiate_pre(&component)?;
+        let proxy_pre = Arc::new(ProxyPre::new(pre)?);
         Ok(Self {
-            component,
-            linker,
             engine,
+            proxy_pre,
             fuel_per_request,
         })
     }
@@ -220,7 +230,9 @@ impl WasmRuntime {
     /// response into memory.
     ///
     /// A fresh [`Store`] with its own fuel budget is created per call; both the
-    /// request and response bodies are buffered (Phase-1).
+    /// request and response bodies are buffered (Phase-1). The link/type-check
+    /// step was done once in [`WasmRuntime::load`]; this method only calls the
+    /// cheap `instantiate_async` against the pre-built `proxy_pre`.
     ///
     /// # Errors
     /// - per-request fuel exhausted or the component traps,
@@ -231,11 +243,9 @@ impl WasmRuntime {
         let mut store = Store::new(&self.engine, ctx);
         store.set_fuel(self.fuel_per_request)?;
 
-        // Pre-instantiate against the wasi:http proxy world, then realise into
-        // a per-request `Proxy` bound to the fresh store.
-        let pre = self.linker.instantiate_pre(&self.component)?;
-        let proxy_pre = ProxyPre::new(pre)?;
-        let proxy = proxy_pre.instantiate_async(&mut store).await?;
+        // Realise the pre-built proxy_pre into a per-request `Proxy` bound to
+        // the fresh store. No re-linking: the link/type-check step is in `load`.
+        let proxy = self.proxy_pre.instantiate_async(&mut store).await?;
 
         // Translate the inbound http::Request<Bytes> into a wasi:http body,
         // then mint the incoming-request resource via WasiHttpView.
@@ -414,6 +424,59 @@ mod tests {
                 .unwrap();
             let resp = rt.handle(req).await.expect("handle request");
             assert_eq!(resp.status(), 200);
+        }
+    }
+
+    // ---- warm-path: pre-instantiation in load --------------------------------
+
+    /// `WasmRuntime::load` must succeed and produce a runtime whose `proxy_pre`
+    /// is usable: a single `handle` call after `load` must return 200.
+    ///
+    /// This is the primary warm-path correctness check: compile + link happen in
+    /// `load`; `handle` only calls `instantiate_async`.
+    #[tokio::test]
+    async fn load_builds_proxy_pre_and_handle_serves() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt = WasmRuntime::load(wasm).expect("load must succeed (proxy_pre built here)");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/warm-path")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = rt
+            .handle(req)
+            .await
+            .expect("handle must succeed using stored proxy_pre");
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
+    }
+
+    /// Two sequential `handle` calls against ONE loaded runtime both succeed —
+    /// the stored `proxy_pre` is reused and per-request isolation is preserved
+    /// (each call gets a fresh `Store`).
+    #[tokio::test]
+    async fn two_sequential_handles_reuse_proxy_pre() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt = WasmRuntime::load(wasm).expect("load fixture");
+
+        for i in 0..2u32 {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("http://example.com/req/{i}"))
+                .body(Bytes::new())
+                .unwrap();
+            let resp = rt
+                .handle(req)
+                .await
+                .unwrap_or_else(|e| panic!("handle {i} failed: {e}"));
+            assert_eq!(resp.status(), 200, "request {i} must return 200");
+            assert_eq!(
+                String::from_utf8_lossy(resp.body()),
+                "Hello, Tabbify!",
+                "request {i} body mismatch"
+            );
         }
     }
 
