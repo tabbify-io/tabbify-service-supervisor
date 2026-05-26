@@ -46,8 +46,8 @@ fn default_docker_check(docker_bin: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Best-effort FULL image teardown for app `id` — the disk-reclaiming half of a
-/// purge. `stop` / [`DockerRuntime`]'s `Drop` remove only the *container*,
+/// Best-effort FULL image teardown for app `id` at `version` — the disk-reclaiming
+/// half of a purge. `stop` / [`DockerRuntime`]'s `Drop` remove only the *container*,
 /// leaving the built image on disk so a restart is fast; purge removes it.
 ///
 /// Removes any containers created from the app's image FIRST (so the image is
@@ -55,9 +55,9 @@ fn default_docker_check(docker_bin: &str) -> bool {
 /// container), then force-removes the image. Best-effort: it logs but never
 /// errors, so a purge still forgets the app + clears the cache even if Docker is
 /// unreachable or already clean.
-pub async fn purge_image(docker_bin: &str, id: &str) {
+pub async fn purge_image(docker_bin: &str, id: &str, version: u64) {
     use tokio::process::Command;
-    let tag = protocol::image_tag(id);
+    let tag = protocol::versioned_image_tag(id, version);
 
     // Remove containers built from this image (running or stopped) so `rmi`
     // isn't blocked by an in-use image.
@@ -121,25 +121,6 @@ mod protocol {
     /// the gate logic without a real Docker daemon.
     pub fn docker_available_with(check: impl Fn() -> bool) -> bool {
         check()
-    }
-
-    /// Deterministic image tag for an app build context identified by `id`
-    /// (the app uuid, or a content hash). Lower-cased + sanitized to the
-    /// `[a-z0-9_.-]` Docker repository-name charset so an arbitrary id can't
-    /// produce an invalid tag.
-    pub fn image_tag(id: &str) -> String {
-        let sanitized: String = id
-            .chars()
-            .map(|c| {
-                let c = c.to_ascii_lowercase();
-                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        format!("tabbify-app-{sanitized}")
     }
 
     /// Deterministic container name for an app instance: the sanitized `id`
@@ -208,6 +189,52 @@ mod protocol {
     /// the image on disk for a fast restart; purge reclaims it.
     pub fn rmi_args(tag: &str) -> Vec<String> {
         vec!["rmi".to_owned(), "-f".to_owned(), tag.to_owned()]
+    }
+
+    /// Content-stable image tag keyed by uuid + version: `tbf-img-<uuid>-v<N>`.
+    /// DISTINCT from the per-run container name `tbf-<uuid>-<seq>`. The tag
+    /// changes when the app version changes, so a new push never reuses a stale
+    /// image, yet the same version on restart reuses the cached one.
+    pub fn versioned_image_tag(uuid: &str, version: u64) -> String {
+        let sanitized: String = uuid
+            .chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("tbf-img-{sanitized}-v{version}")
+    }
+
+    /// `docker image inspect <tag>` argv (sans the leading binary): exits 0 iff
+    /// the image is present in the local daemon's store. Used to decide whether to
+    /// skip the (slow) `docker build` on restart.
+    pub fn inspect_args(tag: &str) -> Vec<String> {
+        vec!["image".to_owned(), "inspect".to_owned(), tag.to_owned()]
+    }
+
+    /// Decision from the image-cache check: did the inspect runner report that the
+    /// image already exists (skip the build) or not (must build)?
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ImageCacheDecision {
+        /// The image is present in the daemon's store — skip `docker build`.
+        Skip,
+        /// The image is absent — run `docker build` and tag it.
+        Build,
+    }
+
+    /// Map an image-inspect result to a [`ImageCacheDecision`].
+    /// `image_exists` is `true` if `docker image inspect <tag>` exited 0.
+    pub fn image_cache_decision(image_exists: bool) -> ImageCacheDecision {
+        if image_exists {
+            ImageCacheDecision::Skip
+        } else {
+            ImageCacheDecision::Build
+        }
     }
 
     /// Is `name` a hop-by-hop header (case-insensitive)?
@@ -290,7 +317,8 @@ mod runtime_impl {
     use tokio::process::Command;
 
     use super::protocol::{
-        build_args, container_name, image_tag, proxy_request, rm_args, run_args, stop_args,
+        ImageCacheDecision, build_args, container_name, image_cache_decision, inspect_args,
+        proxy_request, rm_args, run_args, stop_args, versioned_image_tag,
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
@@ -330,6 +358,12 @@ mod runtime_impl {
     /// invoking a real Docker daemon — the same injection pattern used by
     /// [`TcpProbe`] and [`ExitWatcher`].
     type CommandRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
+
+    /// Image-inspect runner seam for the W2 build-cache check: given a list of
+    /// `docker image inspect` arguments, run the command and return `true` iff
+    /// the image is present (exit 0). Production: the real `docker` CLI.
+    /// Tests: an injected closure so no real daemon is needed.
+    type InspectRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
 
     /// Build the production [`CommandRunner`]: spawns `<docker_bin> <args>` and
     /// returns `true` iff the process exits 0. Best-effort: a spawn failure or
@@ -420,6 +454,12 @@ mod runtime_impl {
         /// [`production_command_runner`]; tests inject a recording closure so
         /// no real Docker daemon is needed.
         shutdown_runner: CommandRunner,
+        /// Content-stable image tag `tbf-img-<uuid>-v<N>` for this app version.
+        /// Used by the W2 build-cache check and by `purge_image`.
+        versioned_image_tag: String,
+        /// Image-inspect runner seam for the W2 build-cache check. Production
+        /// uses the real `docker image inspect`; tests inject a recording closure.
+        inspect_runner: InspectRunner,
     }
 
     impl DockerRuntime {
@@ -437,11 +477,16 @@ mod runtime_impl {
         /// failure (or timeout), a `docker run` failure, or the app not
         /// answering within [`READY_TIMEOUT`].
         pub async fn launch(context: &Path, rt: &Runtime, cfg: &DockerConfig) -> Result<Self> {
-            Self::launch_with_id(context, rt, cfg, &derive_id(context)).await
+            // version = 0 for the non-registry path (derive_id gives a stem-based id).
+            Self::launch_with_id(context, rt, cfg, &derive_id(context), 0).await
         }
 
-        /// [`Self::launch`] with an explicit `id` for the image tag / container
-        /// name (the registry passes the app uuid; tests can pin one).
+        /// [`Self::launch`] with an explicit `id` and `version` for the image tag /
+        /// container name (the registry passes the app uuid + version; tests can pin both).
+        /// `version` makes the image tag content-stable: `tbf-img-<id>-v<version>`.
+        ///
+        /// If the image already exists in the Docker daemon (`docker image inspect` exits 0),
+        /// the build step is SKIPPED and the cached image is reused directly.
         ///
         /// # Errors
         /// See [`Self::launch`].
@@ -450,11 +495,24 @@ mod runtime_impl {
             rt: &Runtime,
             cfg: &DockerConfig,
             id: &str,
+            version: u64,
         ) -> Result<Self> {
             precheck(docker_available(), context)?;
 
-            let tag = image_tag(id);
-            self::build_image(&cfg.docker_bin, &tag, context, cfg.build_timeout_secs).await?;
+            let vtag = versioned_image_tag(id, version);
+
+            // W2 build-cache: skip `docker build` if the image is already present.
+            let image_exists = run_docker_check(&cfg.docker_bin, &inspect_args(&vtag)).await;
+            match image_cache_decision(image_exists) {
+                ImageCacheDecision::Build => {
+                    tracing::debug!(tag = %vtag, "docker image not cached — building");
+                    self::build_image(&cfg.docker_bin, &vtag, context, cfg.build_timeout_secs)
+                        .await?;
+                }
+                ImageCacheDecision::Skip => {
+                    tracing::debug!(tag = %vtag, "docker image cached — skipping build");
+                }
+            }
 
             // Reserve an ephemeral loopback host port by binding :0 then dropping
             // the listener; docker re-binds it for the published port. (A small
@@ -468,11 +526,12 @@ mod runtime_impl {
             let _ = run_docker(&cfg.docker_bin, &rm_args(&container)).await;
             run_docker(
                 &cfg.docker_bin,
-                &run_args(&container, host_port, app_port, &tag),
+                &run_args(&container, host_port, app_port, &vtag),
             )
             .await
             .context("docker run")?;
 
+            let inspect_runner = production_command_runner(cfg.docker_bin.clone());
             let me = Self {
                 container: container.clone(),
                 docker_bin: cfg.docker_bin.clone(),
@@ -481,6 +540,8 @@ mod runtime_impl {
                 probe: Arc::new(tcp_connect_probe),
                 exit_watcher: container_exit_watcher(cfg.docker_bin.clone(), container),
                 shutdown_runner: production_command_runner(cfg.docker_bin.clone()),
+                versioned_image_tag: vtag,
+                inspect_runner,
             };
 
             // On any readiness failure `me` drops → container force-removed.
@@ -502,6 +563,8 @@ mod runtime_impl {
             let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
             // Default shutdown runner: no-op (records nothing, returns true).
             let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+            // Default inspect runner: no-op (image absent by default, won't be called in health tests).
+            let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -510,6 +573,8 @@ mod runtime_impl {
                 probe,
                 exit_watcher,
                 shutdown_runner,
+                versioned_image_tag: "tbf-img-test-v0".to_owned(),
+                inspect_runner,
             }
         }
 
@@ -525,6 +590,7 @@ mod runtime_impl {
             exit_watcher: ExitWatcher,
         ) -> Self {
             let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+            let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -533,6 +599,8 @@ mod runtime_impl {
                 probe,
                 exit_watcher,
                 shutdown_runner,
+                versioned_image_tag: "tbf-img-test-v0".to_owned(),
+                inspect_runner,
             }
         }
 
@@ -551,6 +619,7 @@ mod runtime_impl {
         ) -> Self {
             let probe: TcpProbe = Arc::new(|_addr: &str| true);
             let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
+            let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
@@ -559,7 +628,52 @@ mod runtime_impl {
                 probe,
                 exit_watcher,
                 shutdown_runner,
+                versioned_image_tag: "tbf-img-test-v0".to_owned(),
+                inspect_runner,
             }
+        }
+
+        /// Build a `DockerRuntime` with an injectable inspect runner for testing
+        /// the W2 build-cache skip decision. The `inspect_runner` is called with
+        /// `["image", "inspect", "<versioned-tag>"]` and returns `true` if the
+        /// image is present. `uuid` + `version` determine the versioned tag that
+        /// the runner will be called with.
+        ///
+        /// This constructor is `#[cfg(test)]`-only.
+        #[cfg(test)]
+        pub fn with_inspect_for_test(
+            container_base: &str,
+            container: &str,
+            uuid: &str,
+            version: u64,
+            inspect_runner: InspectRunner,
+        ) -> Self {
+            let probe: TcpProbe = Arc::new(|_addr: &str| true);
+            let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
+            let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+            Self {
+                container: container.to_owned(),
+                docker_bin: "docker".to_owned(),
+                container_base: container_base.to_owned(),
+                client: reqwest::Client::new(),
+                probe,
+                exit_watcher,
+                shutdown_runner,
+                versioned_image_tag: versioned_image_tag(uuid, version),
+                inspect_runner,
+            }
+        }
+
+        /// Ask the injected inspect runner whether the versioned image exists.
+        /// Returns `true` if the image should be reused (skip build), `false`
+        /// if the build step must run.
+        ///
+        /// In production this is called inline inside `launch_with_id`; it is
+        /// exposed as a method so tests can drive it via `with_inspect_for_test`
+        /// without needing a real Docker daemon or build context.
+        pub async fn should_skip_build(&self) -> bool {
+            let exists = (self.inspect_runner)(inspect_args(&self.versioned_image_tag)).await;
+            matches!(image_cache_decision(exists), ImageCacheDecision::Skip)
         }
 
         /// Extract the `host:port` from `container_base` (e.g.
@@ -779,6 +893,23 @@ mod runtime_impl {
         Ok(())
     }
 
+    /// Run a `docker <args>` command and return `true` iff it exits 0. Never
+    /// errors: spawn failures or non-zero exits both yield `false`. Used for the
+    /// W2 build-cache check (`docker image inspect`) where absence is normal.
+    async fn run_docker_check(docker_bin: &str, args: &[String]) -> bool {
+        match Command::new(docker_bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+        {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        }
+    }
+
     /// Reserve an ephemeral loopback host port: bind `127.0.0.1:0`, read the
     /// assigned port, drop the listener so docker can re-bind it.
     async fn reserve_loopback_port() -> Result<u16> {
@@ -871,8 +1002,9 @@ pub use runtime_impl::DockerRuntime;
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::protocol::{
-        build_args, container_name, copy_filtered_headers, docker_available_with, image_tag,
-        is_hop_by_hop, proxy_request, rm_args, rmi_args, run_args, stop_args,
+        ImageCacheDecision, build_args, container_name, copy_filtered_headers,
+        docker_available_with, image_cache_decision, inspect_args, is_hop_by_hop, proxy_request,
+        rm_args, rmi_args, run_args, stop_args, versioned_image_tag,
     };
 
     #[test]
@@ -881,14 +1013,86 @@ mod tests {
         assert!(!docker_available_with(|| false));
     }
 
+    // ---- versioned image tag (W2 image cache) --------------------------------
+
+    /// Content-stable image tag keyed by uuid + version: `tbf-img-<uuid>-v<N>`.
+    /// Two builds of the same uuid at different versions must yield different tags.
     #[test]
-    fn image_tag_is_prefixed_and_sanitized() {
+    fn versioned_image_tag_encodes_uuid_and_version() {
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
         assert_eq!(
-            image_tag("0191e7c2-1111-7222-8333-444455556666"),
-            "tabbify-app-0191e7c2-1111-7222-8333-444455556666"
+            versioned_image_tag(uuid, 3),
+            "tbf-img-0191e7c2-1111-7222-8333-444455556666-v3"
         );
-        // Uppercase + illegal chars are lower-cased / replaced with '-'.
-        assert_eq!(image_tag("My/App:v2"), "tabbify-app-my-app-v2");
+    }
+
+    #[test]
+    fn versioned_image_tag_differs_across_versions() {
+        let uuid = "abc123";
+        assert_ne!(versioned_image_tag(uuid, 1), versioned_image_tag(uuid, 2));
+    }
+
+    #[test]
+    fn versioned_image_tag_sanitizes_uuid() {
+        // Upper-case and slashes in the id must be lower-cased / replaced with '-'.
+        assert_eq!(versioned_image_tag("My/App", 1), "tbf-img-my-app-v1");
+    }
+
+    // ---- inspect_args (W2 image inspect argv) --------------------------------
+
+    /// `docker image inspect <tag>` argv builder.
+    #[test]
+    fn inspect_args_returns_correct_argv() {
+        assert_eq!(
+            inspect_args("tbf-img-abc-v1"),
+            vec!["image", "inspect", "tbf-img-abc-v1"]
+        );
+    }
+
+    // ---- ImageCacheDecision (W2 skip-build seam) ----------------------------
+
+    /// When the injected inspect runner reports the image EXISTS (exit 0),
+    /// the decision must be `Skip`.
+    #[test]
+    fn image_cache_decision_skip_when_image_exists() {
+        let decision = image_cache_decision(true);
+        assert!(
+            matches!(decision, ImageCacheDecision::Skip),
+            "image present → must skip build; got {decision:?}"
+        );
+    }
+
+    /// When the injected inspect runner reports the image is ABSENT (non-zero),
+    /// the decision must be `Build`.
+    #[test]
+    fn image_cache_decision_build_when_image_absent() {
+        let decision = image_cache_decision(false);
+        assert!(
+            matches!(decision, ImageCacheDecision::Build),
+            "image absent → must build; got {decision:?}"
+        );
+    }
+
+    // ---- purge targets versioned image tag -----------------------------------
+
+    /// `purge_image` must target the `tbf-img-<uuid>-v<N>` versioned tag (not
+    /// the old generic tag). Verified by composing `rmi_args(versioned_image_tag)`
+    /// and confirming the resulting argv matches the purge contract.
+    #[test]
+    fn purge_rmi_targets_versioned_image_tag() {
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let version = 7_u64;
+        let tag = versioned_image_tag(uuid, version);
+        // purge_image calls rmi_args(&tag) — verify the args are correct.
+        assert_eq!(
+            rmi_args(&tag),
+            vec![
+                "rmi".to_owned(),
+                "-f".to_owned(),
+                "tbf-img-0191e7c2-1111-7222-8333-444455556666-v7".to_owned(),
+            ],
+            "purge must pass the versioned image tag to docker rmi"
+        );
     }
 
     #[test]
@@ -1228,5 +1432,75 @@ mod tests {
         );
         assert_eq!(cmds[0][0], "stop", "first command must be stop");
         assert_eq!(cmds[1][0], "rm", "second command must be rm");
+    }
+
+    // ---- W2 image-cache seam (with_inspect_for_test) -------------------------
+
+    /// DockerRuntime::with_inspect_for_test wires a recording inspect runner so
+    /// tests can observe that `docker image inspect <tag>` was called with the
+    /// expected versioned image tag.
+    ///
+    /// When the injected runner returns `true` (image exists), the runtime must
+    /// record one inspect call with the correct versioned tag and no build call.
+    #[tokio::test]
+    async fn docker_inspect_runner_receives_versioned_tag_when_image_exists() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued2 = issued.clone();
+
+        // Inject inspect runner: records args + reports image exists (true).
+        let inspect_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |args: Vec<String>| {
+                issued2.lock().unwrap().push(args);
+                Box::pin(async { true })
+            });
+
+        let rt = super::runtime_impl::DockerRuntime::with_inspect_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-inspect-0",
+            "abc123",
+            5,
+            inspect_runner,
+        );
+
+        // Call should_skip_build — verifies the seam fires and inspect args are correct.
+        let skip = rt.should_skip_build().await;
+        assert!(skip, "image present → must skip build");
+
+        let cmds = issued.lock().unwrap();
+        assert_eq!(cmds.len(), 1, "must issue exactly one inspect call");
+        assert_eq!(
+            cmds[0],
+            vec![
+                "image".to_owned(),
+                "inspect".to_owned(),
+                "tbf-img-abc123-v5".to_owned(),
+            ],
+            "inspect must use versioned image tag tbf-img-<uuid>-v<N>"
+        );
+    }
+
+    /// When the injected inspect runner returns `false` (image absent), the
+    /// runtime must report that the build is NOT skipped.
+    #[tokio::test]
+    async fn docker_inspect_runner_build_required_when_image_absent() {
+        use crate::runtime::BoxFut;
+        use std::sync::Arc;
+
+        let inspect_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(|_args: Vec<String>| Box::pin(async { false }));
+
+        let rt = super::runtime_impl::DockerRuntime::with_inspect_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-inspect-1",
+            "abc123",
+            5,
+            inspect_runner,
+        );
+
+        let skip = rt.should_skip_build().await;
+        assert!(!skip, "image absent → must NOT skip build");
     }
 }

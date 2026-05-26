@@ -34,6 +34,8 @@ use crate::runtime::{AppRuntime, RuntimeHealth};
 pub struct RunnerLifecycle {
     /// The app's UUID (string form), for health replies and purge.
     pub(crate) uuid: String,
+    /// The app's version number, for versioned docker image tag on purge.
+    pub(crate) version: u64,
     /// The app's deterministic ULA (string form), for health replies.
     pub(crate) app_ula: String,
     /// Mutable ownership of the live per-app listener. Dropping the inner
@@ -81,7 +83,7 @@ impl RunnerLifecycle {
 
         // Best-effort docker image removal (docker apps only). A WASM runner
         // has no docker image; `purge_image` is a no-op when docker is absent.
-        crate::docker::purge_image(&self.docker.docker_bin, &self.uuid).await;
+        crate::docker::purge_image(&self.docker.docker_bin, &self.uuid, self.version).await;
 
         // Remove the on-disk cache.
         if let Err(e) = self.fetcher.purge_cache(&self.uuid).await {
@@ -254,6 +256,7 @@ mod tests {
     fn fake_lifecycle(health: RuntimeHealth) -> RunnerLifecycle {
         RunnerLifecycle {
             uuid: "test-uuid".to_owned(),
+            version: 0,
             app_ula: "fd5a::1".to_owned(),
             hosted: Arc::new(Mutex::new(None)), // stopped
             fetcher: S3Fetcher::new("http://s3.invalid", std::path::Path::new("/tmp")),

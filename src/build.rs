@@ -58,8 +58,14 @@ pub async fn build_runtime(
             Ok(Arc::new(vm))
         }
         "docker" => {
-            let container =
-                DockerRuntime::launch_with_id(&fetched.cached_path, rt, docker, uuid).await?;
+            let container = DockerRuntime::launch_with_id(
+                &fetched.cached_path,
+                rt,
+                docker,
+                uuid,
+                fetched.version,
+            )
+            .await?;
             Ok(Arc::new(container))
         }
         other => anyhow::bail!("unknown runtime type: {other}"),

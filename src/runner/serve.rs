@@ -200,6 +200,7 @@ impl RunnerServe {
 
         let lifecycle = RunnerLifecycle {
             uuid: cfg.uuid.clone(),
+            version: fetched.version,
             app_ula: app_ula.to_string(),
             hosted: Arc::new(Mutex::new(Some(hosted))),
             fetcher,
