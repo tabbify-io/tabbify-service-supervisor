@@ -22,7 +22,9 @@ use crate::runtime::{AppRuntime, WasmRuntime};
 ///   tarball (errors if no Docker daemon)
 /// - anything else → hard error (no silent fallback)
 ///
-/// `uuid` makes the docker image tag + container name deterministic.
+/// `uuid` makes the docker image tag + container name deterministic, and
+/// drives the firecracker pidfile path for stale-VM reconciliation.
+/// `data_dir` is the local cache root used to write / read the fc pidfile.
 ///
 /// # Errors
 /// A wasm compile failure, a firecracker launch failure (no KVM / non-Linux /
@@ -33,6 +35,7 @@ pub async fn build_runtime(
     fetched: &FetchedApp,
     fc: &FcConfig,
     docker: &DockerConfig,
+    data_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     let rt = &fetched.manifest.runtime;
     match rt.r#type.as_str() {
@@ -41,7 +44,9 @@ pub async fn build_runtime(
             Ok(Arc::new(wasm))
         }
         "firecracker" => {
-            let vm = FirecrackerRuntime::launch(&fetched.cached_path, rt, fc).await?;
+            let vm =
+                FirecrackerRuntime::launch_with_uuid(&fetched.cached_path, rt, fc, uuid, data_dir)
+                    .await?;
             Ok(Arc::new(vm))
         }
         "docker" => {

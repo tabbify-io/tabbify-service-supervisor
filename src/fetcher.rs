@@ -84,6 +84,12 @@ impl S3Fetcher {
         }
     }
 
+    /// Root data directory this fetcher caches artifacts under.
+    #[must_use]
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// Local cache dir for a given uuid + version.
     #[must_use]
     pub fn cache_dir(&self, uuid: &str, version: u64) -> PathBuf {

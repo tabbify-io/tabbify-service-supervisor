@@ -455,7 +455,14 @@ impl AppRegistry {
         uuid: &str,
         fetched: &FetchedApp,
     ) -> anyhow::Result<Arc<dyn AppRuntime>> {
-        build_runtime_free(uuid, fetched, &self.fc_config, &self.docker_config).await
+        build_runtime_free(
+            uuid,
+            fetched,
+            &self.fc_config,
+            &self.docker_config,
+            self.fetcher.data_dir(),
+        )
+        .await
     }
 
     /// Host an app on its per-app-ULA: build the per-app serve state (runtime +

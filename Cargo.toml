@@ -63,6 +63,9 @@ dashmap = "6"
 # Config
 clap = { version = "4.5", features = ["derive", "env"] }
 
+# POSIX syscalls (kill(2) for fc pidfile stale-process cleanup)
+libc = "0.2"
+
 # Errors
 anyhow = "1"
 thiserror = "2"
