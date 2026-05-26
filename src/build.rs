@@ -38,7 +38,17 @@ pub async fn build_runtime(
     let rt = &fetched.manifest.runtime;
     match rt.r#type.as_str() {
         "wasm-http" => {
-            let wasm = WasmRuntime::load_with_fuel(&fetched.wasm, rt.fuel_per_request)?;
+            // AOT cache: <data_dir>/apps/<uuid>/v<N>/app.cwasm
+            // The parent directory is created by `load_cached_or_compile` if
+            // it doesn't exist yet.  A missing/corrupt/version-mismatched cache
+            // falls back to Cranelift recompile automatically.
+            let cache_dir = data_dir.join("apps").join(uuid).join("cache");
+            let cache_path = cache_dir.join("app.cwasm");
+            let wasm = WasmRuntime::load_cached_or_compile(
+                &fetched.wasm,
+                &cache_path,
+                rt.fuel_per_request,
+            )?;
             Ok(Arc::new(wasm))
         }
         "firecracker" => {

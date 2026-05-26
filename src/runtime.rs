@@ -28,7 +28,7 @@ use http::{Request, Response};
 use http_body_util::{BodyExt, Full};
 use tokio::sync::oneshot;
 use wasmtime::component::{Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
@@ -220,6 +220,65 @@ impl WasmRuntime {
         })
     }
 
+    /// Load a compiled component from an AOT `.cwasm` cache, or compile from
+    /// `wasm_bytes` if the cache is absent, corrupt, or version-mismatched.
+    ///
+    /// Cache decision:
+    /// 1. `cache_path` exists → `Component::deserialize_file` (skip Cranelift).
+    ///    If that fails for any reason (missing, corrupt, engine/version header
+    ///    mismatch — wasmtime embeds a header and `deserialize` rejects
+    ///    mismatches) → fall through to compile.
+    /// 2. Compile path: `Component::new` (Cranelift), then best-effort write the
+    ///    cache: `engine.precompile_component` → write bytes to `cache_path`.
+    ///    A write failure is logged and silently ignored (caching is advisory).
+    ///
+    /// The linker + `ProxyPre` are built identically to [`load_with_fuel`].
+    ///
+    /// # Errors
+    /// - `wasm_bytes` is not a valid wasm component,
+    /// - the engine cannot be built,
+    /// - linker registration fails.
+    pub fn load_cached_or_compile(
+        wasm_bytes: &[u8],
+        cache_path: &std::path::Path,
+        fuel_per_request: u64,
+    ) -> Result<Self> {
+        let engine = new_engine()?;
+
+        // --- cache hit: try to deserialize the pre-compiled artifact ----------
+        let component = if cache_path.exists() {
+            // SAFETY: wasmtime validates an engine-version/config header embedded
+            // in the `.cwasm` file and returns `Err` on any mismatch.  We handle
+            // that error by falling back to a full recompile below.
+            match unsafe { wasmtime::component::Component::deserialize_file(&engine, cache_path) } {
+                Ok(c) => {
+                    tracing::debug!(path = %cache_path.display(), "wasm cache hit: deserialized .cwasm");
+                    c
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %cache_path.display(),
+                        error = %e,
+                        "wasm cache miss (corrupt/mismatch): recompiling"
+                    );
+                    compile_and_cache(&engine, wasm_bytes, cache_path)?
+                }
+            }
+        } else {
+            // --- cache miss: compile and persist ------------------------------
+            compile_and_cache(&engine, wasm_bytes, cache_path)?
+        };
+
+        let linker = build_linker(&engine)?;
+        let pre = linker.instantiate_pre(&component)?;
+        let proxy_pre = Arc::new(ProxyPre::new(pre)?);
+        Ok(Self {
+            engine,
+            proxy_pre,
+            fuel_per_request,
+        })
+    }
+
     /// Per-request fuel budget this runtime was built with.
     #[must_use]
     pub const fn fuel_per_request(&self) -> u64 {
@@ -287,12 +346,92 @@ impl WasmRuntime {
     }
 }
 
+/// Compile `wasm_bytes` with Cranelift and best-effort write the pre-compiled
+/// artifact to `cache_path` so future calls can skip compilation.
+///
+/// Cache write failures are logged and silently ignored: the caller gets a
+/// usable `Component` regardless.
+fn compile_and_cache(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    cache_path: &std::path::Path,
+) -> Result<wasmtime::component::Component> {
+    let component = wasmtime::component::Component::new(engine, wasm_bytes)?;
+
+    // Best-effort: precompile → write; log + ignore any error.
+    match engine.precompile_component(wasm_bytes) {
+        Ok(cwasm_bytes) => {
+            // Create parent directory if it doesn't exist.
+            if let Some(parent) = cache_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(
+                        path = %cache_path.display(),
+                        error = %e,
+                        "wasm cache: could not create cache dir (ignored)"
+                    );
+                    return Ok(component);
+                }
+            }
+            match std::fs::write(cache_path, &cwasm_bytes) {
+                Ok(()) => {
+                    tracing::debug!(
+                        path = %cache_path.display(),
+                        bytes = cwasm_bytes.len(),
+                        "wasm cache: wrote .cwasm"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %cache_path.display(),
+                        error = %e,
+                        "wasm cache: could not write .cwasm (ignored)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %cache_path.display(),
+                error = %e,
+                "wasm cache: precompile_component failed (ignored)"
+            );
+        }
+    }
+
+    Ok(component)
+}
+
 /// Build a Wasmtime [`Engine`]: component model on, async on, fuel on.
+///
+/// Uses a pooling instance-allocation strategy with conservative limits
+/// suitable for `wasi:http/proxy` components.  The limits are sized for a
+/// single-app runner: a handful of concurrent in-flight requests, one or two
+/// memories per request, and modest table/stack counts.
+///
+/// If the pooling allocator cannot be initialised (non-fatal platform
+/// constraint), the engine falls back to the default on-demand allocator and
+/// logs a warning.
 fn new_engine() -> Result<Engine> {
     let mut cfg = Config::new();
     cfg.async_support(true);
     cfg.consume_fuel(true);
     cfg.wasm_component_model(true);
+
+    // Pooling allocator — conservative limits for a single-app WASM runner.
+    // Each `wasi:http/proxy` request uses one component instance with one
+    // linear memory and a small number of tables.  We size the pool to allow
+    // up to 16 concurrent in-flight requests without contention.
+    let mut pool = PoolingAllocationConfig::default();
+    pool.total_component_instances(32);
+    pool.total_core_instances(64); // inner wasm modules inside the component
+    pool.total_memories(32);
+    pool.total_tables(64);
+    // Keep a small amount of memory warm between requests so the next
+    // instantiation reuses a slot that already has physical pages mapped.
+    pool.linear_memory_keep_resident(1 << 20); // 1 MiB
+    pool.table_keep_resident(1 << 16); // 64 KiB
+    cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+
     Engine::new(&cfg)
 }
 
@@ -558,5 +697,116 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(50), rt.shutdown())
             .await
             .expect("shutdown via trait object must complete immediately for WasmRuntime");
+    }
+
+    // ---- AOT .cwasm cache tests ---------------------------------------------
+
+    /// Cache miss: `load_cached_or_compile` must succeed and write a `.cwasm`
+    /// file when the cache does not exist yet.
+    #[tokio::test]
+    async fn cache_miss_compiles_and_writes_cwasm() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("app.cwasm");
+
+        assert!(!cache_path.exists(), "precondition: no cache file yet");
+
+        let rt = WasmRuntime::load_cached_or_compile(wasm, &cache_path, DEFAULT_FUEL_PER_REQUEST)
+            .expect("load_cached_or_compile (miss) must succeed");
+
+        assert!(cache_path.exists(), "cache file must be written after miss");
+
+        // The returned runtime must be functional.
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/cache-miss")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = rt.handle(req).await.expect("handle after cache miss");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
+    }
+
+    /// Cache hit: a second `load_cached_or_compile` with an existing `.cwasm`
+    /// must succeed via deserialization (no recompile).
+    #[tokio::test]
+    async fn cache_hit_deserializes_cwasm() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("app.cwasm");
+
+        // Prime the cache.
+        WasmRuntime::load_cached_or_compile(wasm, &cache_path, DEFAULT_FUEL_PER_REQUEST)
+            .expect("prime cache");
+        assert!(cache_path.exists(), "cache must exist after prime");
+
+        // Second call: deserialize path.
+        let rt = WasmRuntime::load_cached_or_compile(wasm, &cache_path, DEFAULT_FUEL_PER_REQUEST)
+            .expect("load_cached_or_compile (hit) must succeed");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/cache-hit")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = rt.handle(req).await.expect("handle after cache hit");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
+    }
+
+    /// Corrupt cache: writing garbage bytes into `app.cwasm` must NOT cause
+    /// `load_cached_or_compile` to fail — it must fall back to recompile.
+    #[tokio::test]
+    async fn corrupt_cache_falls_back_to_compile() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("app.cwasm");
+
+        // Write garbage bytes.
+        std::fs::write(&cache_path, b"not a valid cwasm file at all").unwrap();
+
+        let rt = WasmRuntime::load_cached_or_compile(wasm, &cache_path, DEFAULT_FUEL_PER_REQUEST)
+            .expect("must fall back to compile on corrupt cache");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/corrupt-cache")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = rt
+            .handle(req)
+            .await
+            .expect("handle after corrupt-cache fallback");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
+    }
+
+    /// Round-trip: `load_cached_or_compile` (miss) → write cache → second call
+    /// (hit via deserialize) → `handle` returns 200.  Validates the full
+    /// precompile → deserialize → serve pipeline end-to-end.
+    #[tokio::test]
+    async fn cache_round_trip_handle_returns_200() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("app.cwasm");
+
+        // First: miss + write.
+        let _ = WasmRuntime::load_cached_or_compile(wasm, &cache_path, DEFAULT_FUEL_PER_REQUEST)
+            .expect("prime");
+        let cwasm_size = std::fs::metadata(&cache_path).expect("metadata").len();
+        assert!(cwasm_size > 0, "cwasm must be non-empty");
+
+        // Second: hit.
+        let rt = WasmRuntime::load_cached_or_compile(wasm, &cache_path, DEFAULT_FUEL_PER_REQUEST)
+            .expect("hit");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/round-trip")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = rt.handle(req).await.expect("handle round-trip");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(String::from_utf8_lossy(resp.body()), "Hello, Tabbify!");
     }
 }

@@ -38,7 +38,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tokio = { version = "1.40", features = ["full"] }
 
 # WASM runtime (wasmtime 26, wasi:http/proxy world). See §8 of the contract.
-wasmtime = { version = "26", features = ["component-model", "async"] }
+wasmtime = { version = "26", features = ["component-model", "async", "pooling-allocator"] }
 wasmtime-wasi = "26"
 wasmtime-wasi-http = "26"
 http = "1"
