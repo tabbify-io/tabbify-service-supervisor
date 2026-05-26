@@ -313,7 +313,8 @@ mod tests {
 
     #[test]
     fn mesh_identity_path_is_under_data_dir() {
-        let cfg = Config::try_parse_from(["supervisord", "--data-dir", "/var/lib/tabbify"]).unwrap();
+        let cfg =
+            Config::try_parse_from(["supervisord", "--data-dir", "/var/lib/tabbify"]).unwrap();
         assert_eq!(
             cfg.mesh_identity_path(),
             PathBuf::from("/var/lib/tabbify/mesh-identity.json")
