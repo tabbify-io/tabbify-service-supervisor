@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use crate::config::DockerConfig;
 use crate::control_proto::{Cmd, Reply};
@@ -47,9 +47,23 @@ pub struct RunnerLifecycle {
     /// report the app's own liveness (not just whether the runner process is
     /// alive).
     pub(crate) runtime: Arc<dyn AppRuntime>,
+    /// Optional sender that signals the main task to exit cleanly when
+    /// `Shutdown` is dispatched. `None` when the control server was started
+    /// without a shutdown notifier (legacy / test path).
+    ///
+    /// Wrapped in `Arc<Mutex<Option<…>>>` so the `Clone` impl doesn't need to
+    /// duplicate the sender (only one `send` must fire; clones share the same
+    /// slot and the first `take` wins).
+    pub(crate) shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl RunnerLifecycle {
+    /// Wire a shutdown notifier into this lifecycle. When `Shutdown` is
+    /// dispatched the sender fires, signalling the main task's `select!`.
+    pub async fn set_shutdown_tx(&self, tx: oneshot::Sender<()>) {
+        *self.shutdown_tx.lock().await = Some(tx);
+    }
+
     /// Is the app currently running (listener alive)?
     async fn is_running(&self) -> bool {
         self.hosted.lock().await.is_some()
@@ -185,11 +199,20 @@ async fn dispatch(cmd: Cmd, lifecycle: &RunnerLifecycle) -> Reply {
         }
         Cmd::Shutdown => {
             lifecycle.stop().await;
-            // Reply before exiting so the caller can read the Ok.
-            tokio::spawn(async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                std::process::exit(0);
-            });
+            // Signal the main task to exit cleanly, if a shutdown notifier is
+            // wired. The main task calls `process::exit(0)` after the select
+            // resolves so the reply can be flushed first.
+            // Fallback: if no notifier is wired (legacy path), keep the old
+            // behaviour of spawning a delayed exit directly.
+            let tx = lifecycle.shutdown_tx.lock().await.take();
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            } else {
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    std::process::exit(0);
+                });
+            }
             Reply::Ok
         }
     }
@@ -236,6 +259,7 @@ mod tests {
             fetcher: S3Fetcher::new("http://s3.invalid", std::path::Path::new("/tmp")),
             docker: DockerConfig::default(),
             runtime: Arc::new(FakeRuntime { health }),
+            shutdown_tx: Arc::new(Mutex::new(None)),
         }
     }
 

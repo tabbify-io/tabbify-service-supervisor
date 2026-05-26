@@ -9,8 +9,9 @@ use anyhow::Context;
 use clap::Parser;
 use tabbify_supervisor::RunnerConfig;
 use tabbify_supervisor::runner::control;
-use tabbify_supervisor::runner::serve::RunnerServe;
+use tabbify_supervisor::runner::serve::{RunnerExit, RunnerServe, run_until_exit};
 use tabbify_supervisor::runner::wire::serve_config_from;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -38,9 +39,14 @@ async fn main() -> anyhow::Result<()> {
     let addr = runner.addr();
     tracing::info!(%addr, uuid = %cfg.uuid, "per-app listener bound");
 
+    // Wire the shutdown notifier: when the control server dispatches Shutdown it
+    // sends on this channel, which unblocks the main select below.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let lifecycle = runner.lifecycle();
+    lifecycle.set_shutdown_tx(shutdown_tx).await;
+
     // Spawn the control socket server. It runs for the process lifetime;
     // the lifecycle handle it holds keeps the HostedApp alive until Stop/Purge.
-    let lifecycle = runner.lifecycle();
     let sock_path = cfg.control_sock.clone();
     tokio::spawn(async move {
         if let Err(e) = control::serve(sock_path, lifecycle).await {
@@ -53,11 +59,19 @@ async fn main() -> anyhow::Result<()> {
         "control socket listening; runner ready"
     );
 
-    // Park the main task — the runner lives until the process is signalled or
-    // the control server issues Shutdown (which calls `std::process::exit`).
-    std::future::pending::<()>().await;
-
-    Ok(())
+    // Fail-fast loop: select between the runtime dying (crash) and a clean
+    // shutdown signal from the control server.
+    let runtime = runner.runtime();
+    match run_until_exit(runtime, shutdown_rx).await {
+        RunnerExit::Crashed(reason) => {
+            tracing::error!(reason = %reason, "app runtime died unexpectedly; exiting(1) for respawn");
+            std::process::exit(1);
+        }
+        RunnerExit::CleanShutdown => {
+            tracing::info!("clean shutdown requested; exiting(0)");
+            std::process::exit(0);
+        }
+    }
 }
 
 fn init_tracing() {

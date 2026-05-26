@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
 use crate::app_ula::derive_app_ula;
@@ -41,6 +41,52 @@ use crate::fetcher::S3Fetcher;
 use crate::host::{AppHost, AppServe};
 use crate::mesh::MeshMembership;
 use crate::runner::control::RunnerLifecycle;
+use crate::runtime::{AppRuntime, ExitReason};
+
+/// The outcome of the runner's main select loop.
+///
+/// A pure decision type — `decide_exit` maps the winning branch of the
+/// `tokio::select!` to this value. `process::exit` is NOT called here so the
+/// decision is unit-testable without side effects.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunnerExit {
+    /// The runtime died unexpectedly (`watch_for_exit` resolved first). The
+    /// runner should `process::exit(1)` so the L2 monitor respawns it.
+    Crashed(String),
+    /// A clean shutdown was requested (`shutdown_rx` resolved first). The
+    /// runner should exit cleanly (return 0).
+    CleanShutdown,
+}
+
+/// Pure decision: given which branch of the runner's main `select!` won,
+/// return the corresponding [`RunnerExit`].
+///
+/// Keeping this separate from `process::exit` makes it unit-testable. The
+/// caller is responsible for acting on the result.
+#[must_use]
+pub fn decide_exit(exit_reason: Option<ExitReason>) -> RunnerExit {
+    match exit_reason {
+        Some(ExitReason::Died(reason)) => RunnerExit::Crashed(reason),
+        None => RunnerExit::CleanShutdown,
+    }
+}
+
+/// Drive the runner's main loop: park until either `watch_for_exit` resolves
+/// (runtime died unexpectedly → `Crashed`) or `shutdown_rx` fires (operator
+/// shutdown → `CleanShutdown`).
+///
+/// Returns a [`RunnerExit`] that the binary translates into a `process::exit`
+/// call. Extracted as a free function so it is testable with a fake runtime
+/// without going through the full `RunnerServe::start` path.
+pub async fn run_until_exit(
+    runtime: Arc<dyn AppRuntime>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> RunnerExit {
+    tokio::select! {
+        exit = runtime.watch_for_exit() => decide_exit(Some(exit)),
+        _ = shutdown_rx => decide_exit(None),
+    }
+}
 
 /// Configuration subset the runner serve core needs (decoupled from the full
 /// clap [`crate::runner::RunnerConfig`] so the unit tests can construct it
@@ -159,6 +205,10 @@ impl RunnerServe {
             fetcher,
             docker: cfg.docker,
             runtime: runtime_for_lifecycle,
+            // Wired by the binary after start(); None here so the control
+            // server falls back to the legacy direct-exit path until the
+            // binary calls lifecycle.set_shutdown_tx(tx).
+            shutdown_tx: Arc::new(Mutex::new(None)),
         };
 
         Ok(Self {
@@ -179,6 +229,15 @@ impl RunnerServe {
     #[must_use]
     pub fn lifecycle(&self) -> RunnerLifecycle {
         self.lifecycle.clone()
+    }
+
+    /// The app runtime held by this runner.
+    ///
+    /// Exposed so the binary can pass it to [`run_until_exit`] for the
+    /// fail-fast `watch_for_exit` select loop.
+    #[must_use]
+    pub fn runtime(&self) -> Arc<dyn AppRuntime> {
+        self.lifecycle.runtime.clone()
     }
 }
 
@@ -294,5 +353,83 @@ mod tests {
         // Sanity: it really is the app-ULA prefix, distinct from loopback.
         assert_ne!(my_ula, Ipv6Addr::LOCALHOST);
         assert!(matches!(host.bind(), HostBind::OwnUla(8730)));
+    }
+
+    // ---- decide_exit / run_until_exit tests --------------------------------
+
+    use bytes::Bytes;
+    use http::{Request, Response};
+    use tokio::sync::oneshot;
+
+    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason};
+
+    /// Fake runtime whose `watch_for_exit` resolves immediately to Died.
+    struct CrashingRuntime {
+        reason: String,
+    }
+
+    impl AppRuntime for CrashingRuntime {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async { Ok(Response::builder().status(200).body(Bytes::new()).unwrap()) })
+        }
+
+        fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
+            let reason = self.reason.clone();
+            Box::pin(async move { ExitReason::Died(reason) })
+        }
+    }
+
+    /// Fake runtime whose `watch_for_exit` never resolves (wasm-like).
+    struct StableRuntime;
+
+    impl AppRuntime for StableRuntime {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async { Ok(Response::builder().status(200).body(Bytes::new()).unwrap()) })
+        }
+        // watch_for_exit uses the default: std::future::pending()
+    }
+
+    /// decide_exit: when exit_reason is Some(Died) → Crashed with the reason.
+    #[test]
+    fn decide_exit_died_returns_crashed() {
+        let result = decide_exit(Some(ExitReason::Died("container exited(1)".to_owned())));
+        assert_eq!(
+            result,
+            RunnerExit::Crashed("container exited(1)".to_owned())
+        );
+    }
+
+    /// decide_exit: when exit_reason is None (shutdown branch won) → CleanShutdown.
+    #[test]
+    fn decide_exit_none_returns_clean_shutdown() {
+        let result = decide_exit(None);
+        assert_eq!(result, RunnerExit::CleanShutdown);
+    }
+
+    /// run_until_exit: when watch_for_exit resolves first → Crashed.
+    #[tokio::test]
+    async fn run_until_exit_crash_wins_returns_crashed() {
+        let runtime: Arc<dyn AppRuntime> = Arc::new(CrashingRuntime {
+            reason: "container tbf-test-0 exited with code 1".to_owned(),
+        });
+        let (_tx, rx) = oneshot::channel::<()>();
+        // Deliberately drop tx so the channel is open but never sent to —
+        // watch_for_exit resolves first.
+        let result = run_until_exit(runtime, rx).await;
+        assert_eq!(
+            result,
+            RunnerExit::Crashed("container tbf-test-0 exited with code 1".to_owned())
+        );
+    }
+
+    /// run_until_exit: when shutdown_rx fires first → CleanShutdown.
+    #[tokio::test]
+    async fn run_until_exit_shutdown_wins_returns_clean() {
+        let runtime: Arc<dyn AppRuntime> = Arc::new(StableRuntime);
+        let (tx, rx) = oneshot::channel::<()>();
+        // Fire the shutdown immediately before awaiting.
+        tx.send(()).unwrap();
+        let result = run_until_exit(runtime, rx).await;
+        assert_eq!(result, RunnerExit::CleanShutdown);
     }
 }

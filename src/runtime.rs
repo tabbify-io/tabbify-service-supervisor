@@ -57,6 +57,18 @@ pub enum RuntimeHealth {
     Unavailable(String),
 }
 
+/// The reason an app runtime exited unexpectedly.
+///
+/// Resolved by [`AppRuntime::watch_for_exit`] when the runtime dies without an
+/// explicit [`AppRuntime::shutdown`] request. The runner uses this to trigger a
+/// fail-fast `process::exit(1)` so the supervisor's L2 monitor respawns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    /// The runtime process / container died; the String carries a detail
+    /// (e.g. the container name and exit code).
+    Died(String),
+}
+
 /// The runtime seam the per-app listener ([`crate::host`]) dispatches to. Both
 /// the in-process WASM runtime ([`WasmRuntime`]) and the Firecracker microVM
 /// runtime ([`crate::firecracker::FirecrackerRuntime`]) implement it, so the
@@ -79,6 +91,20 @@ pub trait AppRuntime: Send + Sync {
     /// probe (TCP connect to the guest/container).
     fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
         Box::pin(async { RuntimeHealth::Serving })
+    }
+
+    /// Resolves when the runtime dies UNEXPECTEDLY (without an explicit
+    /// [`shutdown`] call). The runner selects on this alongside its shutdown
+    /// signal: if this resolves first the runner calls `process::exit(1)` so
+    /// the supervisor's L2 monitor respawns it with backoff.
+    ///
+    /// Default: **never resolves** — a WASM runtime is in-process and handles
+    /// one request at a time; there is no long-lived external process to watch.
+    /// Docker and Firecracker override this with real process/container watching.
+    ///
+    /// [`shutdown`]: AppRuntime::shutdown
+    fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -392,5 +418,38 @@ mod tests {
         let rt: std::sync::Arc<dyn AppRuntime> =
             std::sync::Arc::new(WasmRuntime::load(wasm).expect("load fixture"));
         assert_eq!(rt.health().await, RuntimeHealth::Serving);
+    }
+
+    // ---- watch_for_exit() contract ------------------------------------------
+
+    /// WasmRuntime uses the default watch_for_exit() which never resolves. A
+    /// short timeout must elapse without the future completing — it must be
+    /// pending forever (wasm has no long-lived external process to watch).
+    #[tokio::test]
+    async fn wasm_watch_for_exit_never_resolves() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt = WasmRuntime::load(wasm).expect("load fixture");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rt.watch_for_exit()).await;
+        assert!(
+            result.is_err(),
+            "watch_for_exit must be pending (wasm has no long-lived process)"
+        );
+    }
+
+    /// WasmRuntime watch_for_exit() is also pending when accessed through the
+    /// AppRuntime trait object (confirms the default is visible through dyn
+    /// dispatch).
+    #[tokio::test]
+    async fn wasm_watch_for_exit_via_trait_object_never_resolves() {
+        let wasm = include_bytes!("../tests/fixtures/hello.wasm");
+        let rt: std::sync::Arc<dyn AppRuntime> =
+            std::sync::Arc::new(WasmRuntime::load(wasm).expect("load fixture"));
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rt.watch_for_exit()).await;
+        assert!(
+            result.is_err(),
+            "watch_for_exit via trait object must be pending"
+        );
     }
 }

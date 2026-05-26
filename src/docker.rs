@@ -286,7 +286,7 @@ mod runtime_impl {
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
-    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, RuntimeHealth};
+    use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
 
     /// How long to wait for the container app's HTTP server to come up.
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -301,6 +301,48 @@ mod runtime_impl {
     /// succeeds. In production this calls [`tcp_connect_probe`]; in tests an
     /// injected closure fakes the result so no real container is needed.
     type TcpProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+    /// Exit-watch signal type: a shared future that resolves to an
+    /// [`ExitReason`] when the container exits. Production uses
+    /// [`container_exit_watcher`]; tests inject a pre-resolved future via a
+    /// [`tokio::sync::watch`] channel or a one-shot sender so no real Docker
+    /// daemon is needed.
+    ///
+    /// Wrapped in `Arc` so [`DockerRuntime`] is `Clone`-compatible and the
+    /// future can be polled from multiple locations (both `watch_for_exit` calls
+    /// on a cloned `Arc<dyn AppRuntime>` share the same underlying signal).
+    type ExitWatcher = Arc<dyn Fn() -> BoxFut<'static, ExitReason> + Send + Sync>;
+
+    /// Build a production exit watcher for `container`: runs `docker wait
+    /// <container>` asynchronously and resolves to `ExitReason::Died(detail)`
+    /// when the container exits (any exit code). The Docker daemon blocks on
+    /// `docker wait` until the named container stops, so this future stays
+    /// pending while the container is alive.
+    fn container_exit_watcher(docker_bin: String, container: String) -> ExitWatcher {
+        Arc::new(move || {
+            let docker_bin = docker_bin.clone();
+            let container = container.clone();
+            let fut: BoxFut<'static, ExitReason> = Box::pin(async move {
+                match Command::new(&docker_bin)
+                    .args(["wait", &container])
+                    .stdin(Stdio::null())
+                    .output()
+                    .await
+                {
+                    Ok(out) => {
+                        let exit_code = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                        ExitReason::Died(format!(
+                            "container {container} exited with code {exit_code}"
+                        ))
+                    }
+                    Err(e) => {
+                        ExitReason::Died(format!("container {container}: docker wait failed: {e}"))
+                    }
+                }
+            });
+            fut
+        })
+    }
 
     /// Production TCP probe: try to connect to `addr` with a short timeout.
     /// Returns `true` iff the connection succeeds.
@@ -329,6 +371,10 @@ mod runtime_impl {
         /// TCP-connect probe, injectable for tests. Production uses
         /// [`tcp_connect_probe`]; tests substitute a closure.
         probe: TcpProbe,
+        /// Exit-watcher factory, injectable for tests. Production uses
+        /// [`container_exit_watcher`]; tests inject a factory that returns a
+        /// pre-resolved future so no real Docker daemon is needed.
+        exit_watcher: ExitWatcher,
     }
 
     impl DockerRuntime {
@@ -383,11 +429,12 @@ mod runtime_impl {
             .context("docker run")?;
 
             let me = Self {
-                container,
+                container: container.clone(),
                 docker_bin: cfg.docker_bin.clone(),
                 container_base: format!("http://127.0.0.1:{host_port}"),
                 client: reqwest::Client::new(),
                 probe: Arc::new(tcp_connect_probe),
+                exit_watcher: container_exit_watcher(cfg.docker_bin.clone(), container),
             };
 
             // On any readiness failure `me` drops → container force-removed.
@@ -404,12 +451,37 @@ mod runtime_impl {
         /// production code.
         #[cfg(test)]
         pub fn with_probe_for_test(container_base: &str, container: &str, probe: TcpProbe) -> Self {
+            // Default exit watcher: never resolves (pending), so existing health
+            // tests that only care about the probe are unaffected.
+            let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
             Self {
                 container: container.to_owned(),
                 docker_bin: "docker".to_owned(),
                 container_base: container_base.to_owned(),
                 client: reqwest::Client::new(),
                 probe,
+                exit_watcher,
+            }
+        }
+
+        /// Build a `DockerRuntime` with both injectable probe AND exit watcher
+        /// for unit tests. `exit_watcher` is a factory that returns a
+        /// `BoxFut<'static, ExitReason>` — each call to `watch_for_exit` invokes
+        /// the factory once and polls the returned future.
+        #[cfg(test)]
+        pub fn with_watcher_for_test(
+            container_base: &str,
+            container: &str,
+            probe: TcpProbe,
+            exit_watcher: ExitWatcher,
+        ) -> Self {
+            Self {
+                container: container.to_owned(),
+                docker_bin: "docker".to_owned(),
+                container_base: container_base.to_owned(),
+                client: reqwest::Client::new(),
+                probe,
+                exit_watcher,
             }
         }
 
@@ -471,6 +543,15 @@ mod runtime_impl {
                     }
                 }
             })
+        }
+
+        /// Watch for the container to exit unexpectedly. Calls the injected
+        /// `exit_watcher` factory (production: `docker wait <container>`; tests:
+        /// a pre-resolved future). Resolves to `ExitReason::Died(detail)` when
+        /// the container stops.
+        fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
+            // Invoke the factory to get a fresh future for this watch session.
+            (self.exit_watcher)()
         }
     }
 
@@ -861,6 +942,58 @@ mod tests {
         assert!(
             matches!(rt.health().await, RuntimeHealth::Unavailable(_)),
             "must be Unavailable when probe returns false"
+        );
+    }
+
+    // ---- watch_for_exit() contract for DockerRuntime -------------------------
+
+    /// A DockerRuntime with an injected exit watcher that resolves immediately
+    /// must return ExitReason::Died when watch_for_exit is awaited.
+    #[tokio::test]
+    async fn docker_watch_for_exit_resolves_died_with_injected_watcher() {
+        use crate::runtime::{AppRuntime, BoxFut, ExitReason};
+        use std::sync::Arc;
+
+        let exit_watcher: Arc<dyn Fn() -> BoxFut<'static, ExitReason> + Send + Sync> =
+            Arc::new(|| {
+                let fut: BoxFut<'static, ExitReason> = Box::pin(async {
+                    ExitReason::Died("container tbf-test-1 exited with code 1".to_owned())
+                });
+                fut
+            });
+
+        let rt = super::runtime_impl::DockerRuntime::with_watcher_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-1",
+            Arc::new(|_addr: &str| true),
+            exit_watcher,
+        );
+
+        let reason = rt.watch_for_exit().await;
+        assert_eq!(
+            reason,
+            ExitReason::Died("container tbf-test-1 exited with code 1".to_owned()),
+            "watch_for_exit must resolve to Died when the injected watcher fires"
+        );
+    }
+
+    /// A DockerRuntime with the default pending exit watcher must NOT resolve
+    /// within a short timeout — confirming the default (from with_probe_for_test)
+    /// is indeed pending.
+    #[tokio::test]
+    async fn docker_watch_for_exit_default_is_pending() {
+        use crate::runtime::AppRuntime;
+        use std::sync::Arc;
+        let rt = super::runtime_impl::DockerRuntime::with_probe_for_test(
+            "http://127.0.0.1:49999",
+            "tbf-test-2",
+            Arc::new(|_addr: &str| true),
+        );
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rt.watch_for_exit()).await;
+        assert!(
+            result.is_err(),
+            "default exit watcher for tests must be pending"
         );
     }
 }
