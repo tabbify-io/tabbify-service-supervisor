@@ -189,9 +189,19 @@ docker apps to untrusted tenants**. Until then: untrusted code → firecracker/w
 - ✅ Sticky identity: `docker restart` → reloads
   `/var/lib/tabbify/mesh-identity.json` → re-claims the SAME ULA.
 
-**Remaining (Lima / later):**
-- Firecracker in-container (needs `/dev/kvm`, absent on Docker Desktop Mac) —
-  run in the `kvmcheck` Lima VM with `--device /dev/kvm`.
+**Verified in Lima (`kvmcheck`, real `/dev/kvm`, 2026-05-26):**
+- ✅ **Firecracker microVM in-container** — the full fc image
+  (supervisord+tabbify-runner+firecracker+vmlinux+iproute2), `docker run --device
+  /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN tbf-sup-fc --no-mesh --app
+  <uuid>` → orchestrator spawns the runner → fetches the app → boots a microVM on
+  `fc-tap0` **inside the container's own netns** → guest `172.31.0.2:8080` returns
+  `200 OK "Hello from Firecracker microVM on Tabbify (aarch64)!"`. A
+  NON-privileged container (only `NET_ADMIN` + the two devices, no
+  `--privileged`). **Proves untrusted-code isolation (the microVM hardware
+  boundary) survives the container-in-VM nesting** — the SaaS trust model holds
+  in the dockerized supervisor.
+
+**Remaining (later):**
 - A docker app through the orchestrator while the supervisor itself runs in a
   container — mind the DooD caveat (§14).
 - Full data plane (curl an app over the mesh from another peer) — already proven
@@ -213,3 +223,14 @@ docker apps to untrusted tenants**. Until then: untrusted code → firecracker/w
   socket-mount docker app therefore needs `--network host` for the supervisor
   (or DinD). Validate before relying on socket-mount docker in-container;
   firecracker/wasm are unaffected (in-process / per-VM tap).
+- **Crash-survival failure domain changes in a single container:** the
+  per-app-runner crash-survival (supervisor process dies → detached runners +
+  their microVMs keep serving, re-adopted on restart) assumes supervisor and
+  runners are SEPARATE processes on a host. In the single-container packaging
+  `supervisord` is PID 1, so its death = container death = all in-container
+  runners + microVMs die with it (a `--restart` policy gives cold
+  auto-recovery, not survival). To preserve true crash-survival + per-tenant
+  isolation in the containerized world, runners want to be SIBLING
+  containers/microVMs (orchestrated, not in-process children) — which is exactly
+  the "each node/runner in firecracker" direction. For now the single container
+  is the failure domain; the microVM still isolates each app.

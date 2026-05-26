@@ -26,8 +26,12 @@ RUN apt-get update \
 
 COPY bin/supervisord    /usr/local/bin/supervisord
 COPY bin/tabbify-runner /usr/local/bin/tabbify-runner
-# Full image also bundles firecracker + a default kernel so fc apps work the
-# moment /dev/kvm is present (staged into ./deploy/bin when building the full image):
+# FULL (fc-capable) image: stage `firecracker` + a default kernel into
+# ./deploy/bin and uncomment the COPYs below — fc apps then work the moment
+# /dev/kvm is present. VERIFIED in Lima 2026-05-26: a microVM boots + serves
+# 200 OK inside a NON-privileged container (`--device /dev/kvm --device
+# /dev/net/tun --cap-add NET_ADMIN`, no --privileged). CI stages all four
+# binaries for the published image.
 # COPY bin/firecracker  /usr/local/bin/firecracker
 # COPY bin/vmlinux      /opt/tabbify/vmlinux
 
