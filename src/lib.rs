@@ -16,6 +16,9 @@
 //!   Firecracker microVM runtime (real on Linux, stub elsewhere).
 //! - [`docker`] — the third [`runtime::AppRuntime`]: a cross-platform Docker
 //!   container runtime that builds the app image from source on the supervisor.
+//! - [`build_backend`] — swappable OCI-image build backends:
+//!   [`build_backend::BuildBackend`] trait + [`build_backend::HostDockerBackend`]
+//!   (runs `docker build` on the host daemon; fc-sandbox backend is a follow-up).
 //! - [`git`] — secure `git clone` helper: injects `GIT_ASKPASS` so the token
 //!   never appears in process argv.
 //! - [`fetcher`] — anonymous S3 artifact fetch + local cache (contract §2).
@@ -31,6 +34,7 @@
 pub mod api;
 pub mod app_ula;
 pub mod build;
+pub mod build_backend;
 pub mod config;
 pub mod control_proto;
 pub mod docker;

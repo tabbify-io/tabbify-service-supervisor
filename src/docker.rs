@@ -232,6 +232,18 @@ mod protocol {
         vec!["pull".to_owned(), reff.to_owned()]
     }
 
+    /// `docker push <ref>` argv (sans the leading binary): push the locally-tagged
+    /// image to the mesh OCI registry by its full ref (host:port/name:tag).
+    /// Used by the build-runner after `docker build` to publish the image into
+    /// the mesh registry so supervisors on other nodes can pull it.
+    ///
+    /// Called via [`super::push_image`] → [`crate::build_backend::push_to_registry`];
+    /// `dead_code` is expected until the P3.4 orchestration caller lands.
+    #[allow(dead_code)]
+    pub fn push_args(reff: &str) -> Vec<String> {
+        vec!["push".to_owned(), reff.to_owned()]
+    }
+
     /// `docker tag <ref> <vtag>` argv (sans the leading binary): alias the
     /// pulled image under the supervisor's versioned local tag `tbf-img-<uuid>-v<N>`
     /// so the W2 cache check and downstream run_args can use the stable tag.
@@ -359,8 +371,8 @@ mod runtime_impl {
 
     use super::protocol::{
         ImageCacheDecision, PullDecision, build_args, container_name, image_cache_decision,
-        inspect_args, load_args, proxy_request, pull_args, pull_decision, rm_args, run_args,
-        stop_args, tag_args, versioned_image_tag,
+        inspect_args, load_args, proxy_request, pull_args, pull_decision, push_args, rm_args,
+        run_args, stop_args, tag_args, versioned_image_tag,
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
@@ -391,15 +403,18 @@ mod runtime_impl {
     /// on a cloned `Arc<dyn AppRuntime>` share the same underlying signal).
     type ExitWatcher = Arc<dyn Fn() -> BoxFut<'static, ExitReason> + Send + Sync>;
 
-    /// Command-runner seam for [`DockerRuntime::shutdown`]: given a list of
-    /// `docker` sub-command arguments (e.g. `["stop", "tbf-abc-0"]`), run the
-    /// command and return whether it succeeded.
+    /// Command-runner seam for [`DockerRuntime::shutdown`] and the push/pull
+    /// paths: given a list of `docker` sub-command arguments (e.g.
+    /// `["stop", "tbf-abc-0"]`), run the command and return whether it succeeded.
     ///
     /// Production: the real `docker` binary via [`tokio::process::Command`].
     /// Tests: an injected closure that records which commands were issued without
     /// invoking a real Docker daemon — the same injection pattern used by
     /// [`TcpProbe`] and [`ExitWatcher`].
-    type CommandRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
+    ///
+    /// Re-exported at the module level so [`crate::build_backend`] can reuse the
+    /// same seam for the host-docker build backend.
+    pub(crate) type CommandRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
 
     /// Image-inspect runner seam for the W2 build-cache check: given a list of
     /// `docker image inspect` arguments, run the command and return `true` iff
@@ -417,7 +432,10 @@ mod runtime_impl {
     /// Build the production [`CommandRunner`]: spawns `<docker_bin> <args>` and
     /// returns `true` iff the process exits 0. Best-effort: a spawn failure or
     /// non-zero exit both yield `false` (the shutdown path logs and continues).
-    fn production_command_runner(docker_bin: String) -> CommandRunner {
+    ///
+    /// Re-exported at the module level so [`crate::build_backend`] can construct
+    /// a production runner for the host-docker build backend.
+    pub(crate) fn production_command_runner(docker_bin: String) -> CommandRunner {
         Arc::new(move |args: Vec<String>| {
             let docker_bin = docker_bin.clone();
             let fut: BoxFut<'static, bool> = Box::pin(async move {
@@ -1014,6 +1032,37 @@ mod runtime_impl {
         (runner)(tag_args(reff, vtag)).await
     }
 
+    /// Tag `local_tag` as `reff` and push `reff` to the mesh OCI registry.
+    ///
+    /// This is the mirror of [`pull_and_tag`]: where pull fetches a remote ref
+    /// and aliases it locally, push takes a local build result (`local_tag`),
+    /// aliases it as the registry ref, and pushes it so other supervisors can
+    /// pull it.
+    ///
+    /// Returns `true` only if BOTH `docker tag <local_tag> <reff>` AND
+    /// `docker push <reff>` succeed; `false` on any failure (the caller should
+    /// treat a push failure as a non-fatal warning — the image was built
+    /// locally, just not yet distributed).
+    ///
+    /// Uses the injectable [`CommandRunner`] so tests can record the issued
+    /// commands without a real Docker daemon.
+    ///
+    /// Wrapped by [`crate::build_backend::push_to_registry`]; `dead_code` is
+    /// expected until the P3.4 orchestration caller lands.
+    #[allow(dead_code)]
+    pub(crate) async fn push_image(
+        _docker_bin: &str,
+        local_tag: &str,
+        reff: &str,
+        runner: &CommandRunner,
+    ) -> bool {
+        let tag_ok = (runner)(tag_args(local_tag, reff)).await;
+        if !tag_ok {
+            return false;
+        }
+        (runner)(push_args(reff)).await
+    }
+
     /// `docker build -t <tag> -` with the build-context tarball at `context`
     /// streamed to the child's stdin, bounded by `timeout_secs`.
     async fn build_image(
@@ -1186,9 +1235,18 @@ mod runtime_impl {
     }
 }
 
+/// Shared injectable command-runner seam — re-exported for [`crate::build_backend`].
+pub(crate) use runtime_impl::CommandRunner;
 pub use runtime_impl::DockerRuntime;
+/// Production command-runner constructor — re-exported for [`crate::build_backend`].
+pub(crate) use runtime_impl::production_command_runner;
 #[cfg(test)]
 pub(crate) use runtime_impl::pull_and_tag as pull_and_tag_for_test;
+/// Tag a local image and push it to the mesh OCI registry — wrapped by
+/// [`crate::build_backend::push_to_registry`] for the P3.4 orchestration layer.
+pub(crate) use runtime_impl::push_image;
+#[cfg(test)]
+pub(crate) use runtime_impl::push_image as push_image_for_test;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -1818,13 +1876,22 @@ mod tests {
         );
     }
 
-    // ---- pull_args / tag_args (registry pull argv) ---------------------------
+    // ---- pull_args / push_args / tag_args (registry argv) -------------------
 
     #[test]
     fn pull_args_returns_correct_argv() {
         assert_eq!(
             pull_args("[fd5a::1]:5000/acme/app:abc"),
             vec!["pull", "[fd5a::1]:5000/acme/app:abc"]
+        );
+    }
+
+    /// `push_args` must produce `["push", <ref>]` — the mirror of `pull_args`.
+    #[test]
+    fn push_args_returns_correct_argv() {
+        assert_eq!(
+            super::protocol::push_args("[fd5a::1]:5000/acme/app:sha"),
+            vec!["push", "[fd5a::1]:5000/acme/app:sha"]
         );
     }
 
@@ -1925,6 +1992,85 @@ mod tests {
             *call_count.lock().unwrap(),
             1,
             "must issue only the pull command (tag must NOT be called on pull failure)"
+        );
+    }
+
+    // ---- push_image seam (injected runner) -----------------------------------
+
+    /// When the runner succeeds for both tag and push, `push_image` must issue
+    /// `["tag", <local_tag>, <ref>]` then `["push", <ref>]` in that order and
+    /// return `true`.
+    #[tokio::test]
+    async fn push_image_issues_tag_then_push_on_success() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued2 = issued.clone();
+
+        let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |args: Vec<String>| {
+                issued2.lock().unwrap().push(args);
+                Box::pin(async { true })
+            });
+
+        let ok = super::push_image_for_test(
+            "docker",
+            "tbf-img-uuid-v1",
+            "[fd5a::1]:5000/acme/app:sha",
+            &runner,
+        )
+        .await;
+
+        assert!(ok, "both tag + push succeed → must return true");
+
+        let cmds = issued.lock().unwrap();
+        assert_eq!(cmds.len(), 2, "must issue exactly 2 commands (tag + push)");
+        assert_eq!(
+            cmds[0],
+            vec![
+                "tag".to_owned(),
+                "tbf-img-uuid-v1".to_owned(),
+                "[fd5a::1]:5000/acme/app:sha".to_owned(),
+            ],
+            "first command must be docker tag <local_tag> <ref>"
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["push".to_owned(), "[fd5a::1]:5000/acme/app:sha".to_owned()],
+            "second command must be docker push <ref>"
+        );
+    }
+
+    /// When the runner fails on the tag step, `push_image` must return `false`
+    /// and NOT issue the push command.
+    #[tokio::test]
+    async fn push_image_returns_false_and_skips_push_on_tag_failure() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cc = call_count.clone();
+
+        let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |_args: Vec<String>| {
+                *cc.lock().unwrap() += 1;
+                Box::pin(async { false }) // tag fails
+            });
+
+        let ok = super::push_image_for_test(
+            "docker",
+            "tbf-img-uuid-v2",
+            "[fd5a::1]:5000/acme/app:sha",
+            &runner,
+        )
+        .await;
+
+        assert!(!ok, "tag fails → must return false");
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            1,
+            "must issue only the tag command (push must NOT be called on tag failure)"
         );
     }
 }
