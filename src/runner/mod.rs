@@ -1,5 +1,6 @@
 //! Per-app runner module — hosts exactly one app instance.
 
+pub mod active;
 pub mod config;
 pub mod control;
 pub mod serve;

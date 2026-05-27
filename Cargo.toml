@@ -58,6 +58,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Concurrency
+arc-swap = "1"
 dashmap = "6"
 
 # Config

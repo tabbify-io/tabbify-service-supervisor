@@ -40,6 +40,7 @@ use crate::config::{DockerConfig, FcConfig};
 use crate::fetcher::S3Fetcher;
 use crate::host::{AppHost, AppServe};
 use crate::mesh::MeshMembership;
+use crate::runner::active::ActiveRuntime;
 use crate::runner::control::RunnerLifecycle;
 use crate::runtime::{AppRuntime, ExitReason};
 
@@ -156,17 +157,25 @@ impl RunnerServe {
             .await
             .with_context(|| format!("fetch app {}", cfg.uuid))?;
 
-        let runtime = build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.docker, &cfg.data_dir)
-            .await
-            .with_context(|| format!("build runtime for {}", cfg.uuid))?;
+        let initial_runtime =
+            build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.docker, &cfg.data_dir)
+                .await
+                .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 
-        // Clone the runtime handle so the lifecycle can call health() on it
-        // independently of the AppServe's copy (both are Arc<dyn AppRuntime>).
-        let runtime_for_lifecycle = runtime.clone();
+        // Wrap the initial runtime in a swappable cell so P2.3 can atomically
+        // replace it for zero-downtime deploys without touching the listener or
+        // the mesh peer.  In P2.2 no swap happens; behavior is identical to
+        // holding a plain Arc<dyn AppRuntime>.
+        let active: Arc<ActiveRuntime> = Arc::new(ActiveRuntime::new(initial_runtime));
+
+        // Clone the active-runtime handle so the lifecycle can call health() on
+        // it independently of the AppServe's copy.  Both coerce to
+        // Arc<dyn AppRuntime> via the AppRuntime impl on ActiveRuntime.
+        let runtime_for_lifecycle: Arc<dyn AppRuntime> = active.clone();
 
         // No idle-reaper in the runner yet — the on_request callback is a no-op.
         let on_request: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        let serve = AppServe::new(runtime, on_request);
+        let serve = AppServe::new(active.clone() as Arc<dyn AppRuntime>, on_request);
 
         // Build the host + (in mesh mode) the membership that MUST outlive this
         // function — dropping it tears down the WG/TUN tunnel (see field doc).
