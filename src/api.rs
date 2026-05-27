@@ -241,6 +241,18 @@ struct BuildBody {
     /// Token for pushing to the registry (`None` = anonymous).
     #[serde(default)]
     push_token: Option<String>,
+    /// Which build pipeline to run. Absent ⇒ [`BuildKind::Docker`] (the original
+    /// behaviour); `"wasm"` selects the wasm-component path.
+    #[serde(default)]
+    build_kind: crate::runner::build::BuildKind,
+    /// (Wasm only) shell command that produces the `.wasm`, run with the cloned
+    /// source dir as cwd. Ignored by the docker path.
+    #[serde(default)]
+    build_cmd: Option<String>,
+    /// (Wasm only) path to the produced `.wasm`, relative to the repo root.
+    /// Ignored by the docker path.
+    #[serde(default)]
+    artifact_path: Option<String>,
 }
 
 /// `POST /v1/build` — dispatch a one-shot build: clone `repo_url`@`ref`, build
@@ -259,11 +271,12 @@ async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildBody>
         registry_ula: body.registry_ula,
         clone_token: body.clone_token,
         push_token: body.push_token,
-        // build_kind / build_cmd / artifact_path are threaded through this
-        // endpoint by task WC; the bare `/v1/build` invoker is docker-only.
-        build_kind: crate::runner::build::BuildKind::Docker,
-        build_cmd: None,
-        artifact_path: None,
+        // Threaded from the request: a caller may select the wasm build path
+        // (`build_kind: "wasm"` + `build_cmd` + `artifact_path`); all three
+        // default to the docker pipeline when omitted (unchanged behaviour).
+        build_kind: body.build_kind,
+        build_cmd: body.build_cmd,
+        artifact_path: body.artifact_path,
     };
     match state.orchestrator.spawn_build(&job).await {
         Ok(art) => axum::Json(art).into_response(),
@@ -647,6 +660,47 @@ mod tests {
         }"#;
         let body: BuildBody = serde_json::from_str(json).unwrap();
         assert!(body.clone_token.is_none() && body.push_token.is_none());
+    }
+
+    /// A body WITHOUT the wasm fields defaults to `BuildKind::Docker` (the
+    /// pre-WC behaviour: every existing docker `/v1/build` request is unchanged).
+    #[test]
+    fn build_body_defaults_to_docker_build_kind() {
+        use crate::runner::build::BuildKind;
+        let json = r#"{
+            "repo_url":"r","ref":"v1","tenant":"t","app_uuid":"u","registry_ula":"[::1]:5000"
+        }"#;
+        let body: BuildBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.build_kind, BuildKind::Docker);
+        assert!(body.build_cmd.is_none());
+        assert!(body.artifact_path.is_none());
+    }
+
+    /// A body WITH `build_kind: "wasm"` (+ `build_cmd` / `artifact_path`) parses
+    /// to `BuildKind::Wasm` and carries the wasm build coordinates through.
+    #[test]
+    fn build_body_parses_wasm_build_kind() {
+        use crate::runner::build::BuildKind;
+        let json = r#"{
+            "repo_url":"https://github.com/acme/app",
+            "ref":"abc123",
+            "tenant":"acme",
+            "app_uuid":"u",
+            "registry_ula":"[fd5a::1]:5000",
+            "build_kind":"wasm",
+            "build_cmd":"cargo build --release --target wasm32-wasip2",
+            "artifact_path":"target/wasm32-wasip2/release/app.wasm"
+        }"#;
+        let body: BuildBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.build_kind, BuildKind::Wasm);
+        assert_eq!(
+            body.build_cmd.as_deref(),
+            Some("cargo build --release --target wasm32-wasip2")
+        );
+        assert_eq!(
+            body.artifact_path.as_deref(),
+            Some("target/wasm32-wasip2/release/app.wasm")
+        );
     }
 
     // ── POST /v1/build — route exists and delegates to the orchestrator ────────
