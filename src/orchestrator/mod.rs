@@ -23,6 +23,7 @@
 //! - Task 2.6 — API rewire.
 
 pub mod api;
+pub mod build;
 pub mod client;
 pub mod handle;
 pub mod monitor;

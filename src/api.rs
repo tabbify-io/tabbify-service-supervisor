@@ -103,6 +103,7 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/purge", post(purge_app))
         .route("/v1/apps/:uuid/reset", post(reset_app))
         .route("/v1/apps/:uuid/deploy", post(deploy_app))
+        .route("/v1/build", post(build_app))
         .with_state(Arc::new(state))
 }
 
@@ -215,6 +216,53 @@ async fn deploy_app(
     match state.orchestrator.deploy_app(&uuid, &body.reff).await {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_not_found_or_error(&e),
+    }
+}
+
+/// Request body for `POST /v1/build`.
+#[derive(serde::Deserialize)]
+struct BuildBody {
+    /// HTTPS URL of the Git repository to clone.
+    repo_url: String,
+    /// Git ref (branch, tag, or full SHA) to check out.
+    ///
+    /// Serialized as `"ref"` (a JSON key) because `ref` is a Rust keyword.
+    #[serde(rename = "ref")]
+    git_ref: String,
+    /// Tenant namespace used as the registry path prefix.
+    tenant: String,
+    /// UUID of the app; used in the image tag as `<tenant>/<app_uuid>:<git_ref>`.
+    app_uuid: String,
+    /// Mesh ULA + port of the registry to push to.
+    registry_ula: String,
+    /// Short-lived clone token (`None` = public repo).
+    #[serde(default)]
+    clone_token: Option<String>,
+    /// Token for pushing to the registry (`None` = anonymous).
+    #[serde(default)]
+    push_token: Option<String>,
+}
+
+/// `POST /v1/build` — dispatch a one-shot build: clone `repo_url`@`ref`, build
+/// an OCI image, push it to `registry_ula`, and return the [`ArtifactRef`] as
+/// JSON.
+///
+/// The full multi-target control-plane (build-then-deploy across a fleet) is
+/// Phase 4; this is the minimal invoker.
+async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildBody>) -> Response {
+    use crate::runner::build::BuildJob;
+    let job = BuildJob {
+        repo_url: body.repo_url,
+        git_ref: body.git_ref,
+        tenant: body.tenant,
+        app_uuid: body.app_uuid,
+        registry_ula: body.registry_ula,
+        clone_token: body.clone_token,
+        push_token: body.push_token,
+    };
+    match state.orchestrator.spawn_build(&job).await {
+        Ok(art) => axum::Json(art).into_response(),
+        Err(e) => anyhow_to_response(&e),
     }
 }
 
@@ -566,6 +614,108 @@ mod tests {
             updated.image_ref.as_deref(),
             Some("[fd5a::1]:5000/acme/app:sha256abc"),
             "image_ref must be persisted after HTTP deploy"
+        );
+    }
+
+    // ── BuildBody deserialization ─────────────────────────────────────────────
+
+    /// `{"ref":"abc","repo_url":..., ...}` parses `git_ref == "abc"` — pins the
+    /// `#[serde(rename="ref")]` on [`BuildBody`].
+    #[test]
+    fn build_body_ref_field_deserializes() {
+        let json = r#"{
+            "repo_url":"https://github.com/acme/app",
+            "ref":"abc123",
+            "tenant":"acme",
+            "app_uuid":"u",
+            "registry_ula":"[fd5a::1]:5000"
+        }"#;
+        let body: BuildBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.git_ref, "abc123", "git_ref must come from 'ref' key");
+    }
+
+    /// Optional token fields default to `None` when omitted.
+    #[test]
+    fn build_body_optional_tokens_default_to_none() {
+        let json = r#"{
+            "repo_url":"r","ref":"v1","tenant":"t","app_uuid":"u","registry_ula":"[::1]:5000"
+        }"#;
+        let body: BuildBody = serde_json::from_str(json).unwrap();
+        assert!(body.clone_token.is_none() && body.push_token.is_none());
+    }
+
+    // ── POST /v1/build — route exists and delegates to the orchestrator ────────
+
+    /// `POST /v1/build` with a valid body reaches the handler and returns 500
+    /// (the runner binary is not present in tests) — not 404, 405, or 422.
+    /// This pins the route registration.
+    #[tokio::test]
+    async fn post_v1_build_route_is_registered() {
+        let dir = TempDir::new().unwrap();
+        let state = make_state(dir.path().to_path_buf());
+        let app = router(state);
+
+        let body = r#"{
+            "repo_url":"https://github.com/acme/app",
+            "ref":"abc123",
+            "tenant":"acme",
+            "app_uuid":"u",
+            "registry_ula":"[fd5a::1]:5000"
+        }"#;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/build")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Runner binary missing → the orchestrator returns an error → 500.
+        // What matters here is that the route IS registered (not 404 / 405) and
+        // the body is correctly decoded (not 422).
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "POST /v1/build must be registered (got 404)"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /v1/build must accept POST (got 405)"
+        );
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "build body must parse correctly (got 422)"
+        );
+    }
+
+    /// A malformed JSON body to `POST /v1/build` returns a 4xx error (axum body
+    /// rejection — 400 or 422 depending on the axum version), confirming that the
+    /// route parses the body with the expected shape.
+    #[tokio::test]
+    async fn post_v1_build_rejects_bad_body() {
+        let dir = TempDir::new().unwrap();
+        let state = make_state(dir.path().to_path_buf());
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/build")
+            .header("content-type", "application/json")
+            .body(Body::from("not json at all"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // axum returns 400 Bad Request for syntactically invalid JSON and
+        // 422 Unprocessable Entity for valid JSON that fails schema validation.
+        // Either is acceptable here — what matters is that the route IS wired and
+        // the body extractor runs (not a 404 or 405).
+        let status = resp.status().as_u16();
+        assert!(
+            status == 400 || status == 422,
+            "malformed body must return 400 or 422, got {status}"
         );
     }
 }
