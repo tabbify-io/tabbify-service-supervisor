@@ -58,12 +58,14 @@ pub async fn build_runtime(
             Ok(Arc::new(vm))
         }
         "docker" => {
+            // Registry-pull is docker-only; wasm/firecracker ignore registry_ref.
             let container = DockerRuntime::launch_with_id(
                 &fetched.cached_path,
                 rt,
                 docker,
                 uuid,
                 fetched.version,
+                rt.registry_ref.as_deref(),
             )
             .await?;
             Ok(Arc::new(container))

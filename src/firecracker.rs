@@ -1311,6 +1311,7 @@ mod linux {
                 fuel_per_request: 0,
                 memory_mb: 256,
                 kernel: None,
+                registry_ref: None,
             };
             let cfg = FcConfig::default();
 

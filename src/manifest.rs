@@ -89,6 +89,12 @@ pub struct Runtime {
     /// supervisor's configured default kernel.
     #[serde(default)]
     pub kernel: Option<String>,
+    /// Optional OCI image ref to pull instead of building from source (docker
+    /// only), e.g. `"[fd5a:1f02:aaaa::1]:5000/acme/app:<sha>"`. When set, the
+    /// runtime pulls the image from the mesh OCI registry and tags it locally.
+    /// The host docker daemon must list the registry under `insecure-registries`.
+    #[serde(default)]
+    pub registry_ref: Option<String>,
 }
 fn default_rt() -> String {
     "wasm-http".into()
@@ -295,6 +301,51 @@ mode = "on_request"
         assert_eq!(
             m.app.id,
             Some(Uuid::parse_str("0191e7c2-1111-7222-8333-444455556666").unwrap())
+        );
+    }
+
+    /// A docker manifest with `registry_ref` set must parse and expose the ref.
+    /// Without the field, `registry_ref` defaults to `None`.
+    #[test]
+    fn parses_docker_runtime_with_registry_ref() {
+        let src = r#"
+[app]
+name = "registry-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type         = "docker"
+entry        = "context.tar.gz"
+registry_ref = "[fd5a:1f02:aaaa::1]:5000/acme/app:sha256abc"
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.runtime.r#type, "docker");
+        assert_eq!(
+            m.runtime.registry_ref.as_deref(),
+            Some("[fd5a:1f02:aaaa::1]:5000/acme/app:sha256abc")
+        );
+    }
+
+    /// When `registry_ref` is absent, the field defaults to `None`.
+    #[test]
+    fn docker_registry_ref_defaults_to_none() {
+        let src = r#"
+[app]
+name = "no-ref-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type  = "docker"
+entry = "context.tar.gz"
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert!(
+            m.runtime.registry_ref.is_none(),
+            "registry_ref must default to None when absent"
         );
     }
 }

@@ -224,6 +224,40 @@ mod protocol {
         vec!["image".to_owned(), "inspect".to_owned(), tag.to_owned()]
     }
 
+    /// `docker pull <ref>` argv (sans the leading binary): pull the image from
+    /// the mesh OCI registry by its full ref (host:port/name:tag). The daemon
+    /// must list the registry under `insecure-registries` for IPv6 or plain-HTTP
+    /// registries.
+    pub fn pull_args(reff: &str) -> Vec<String> {
+        vec!["pull".to_owned(), reff.to_owned()]
+    }
+
+    /// `docker tag <ref> <vtag>` argv (sans the leading binary): alias the
+    /// pulled image under the supervisor's versioned local tag `tbf-img-<uuid>-v<N>`
+    /// so the W2 cache check and downstream run_args can use the stable tag.
+    pub fn tag_args(reff: &str, vtag: &str) -> Vec<String> {
+        vec!["tag".to_owned(), reff.to_owned(), vtag.to_owned()]
+    }
+
+    /// Decision from the registry-ref check: should we pull the image from the
+    /// mesh OCI registry, or skip the pull (no ref configured)?
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum PullDecision {
+        /// Pull and tag the image using this OCI ref.
+        Pull(String),
+        /// No registry ref — skip the pull entirely.
+        Skip,
+    }
+
+    /// Map an optional OCI image ref to a [`PullDecision`].
+    /// When `image_ref` is `Some(r)`, we pull; when `None`, we skip.
+    pub fn pull_decision(image_ref: Option<&str>) -> PullDecision {
+        match image_ref {
+            Some(r) => PullDecision::Pull(r.to_owned()),
+            None => PullDecision::Skip,
+        }
+    }
+
     /// Decision from the image-cache check: did the inspect runner report that the
     /// image already exists (skip the build) or not (must build)?
     #[derive(Debug, PartialEq, Eq)]
@@ -324,8 +358,9 @@ mod runtime_impl {
     use tokio::process::Command;
 
     use super::protocol::{
-        ImageCacheDecision, build_args, container_name, image_cache_decision, inspect_args,
-        load_args, proxy_request, rm_args, run_args, stop_args, versioned_image_tag,
+        ImageCacheDecision, PullDecision, build_args, container_name, image_cache_decision,
+        inspect_args, load_args, proxy_request, pull_args, pull_decision, rm_args, run_args,
+        stop_args, tag_args, versioned_image_tag,
     };
     use super::{DockerConfig, docker_available};
     use crate::manifest::Runtime;
@@ -496,12 +531,22 @@ mod runtime_impl {
         /// answering within [`READY_TIMEOUT`].
         pub async fn launch(context: &Path, rt: &Runtime, cfg: &DockerConfig) -> Result<Self> {
             // version = 0 for the non-registry path (derive_id gives a stem-based id).
-            Self::launch_with_id(context, rt, cfg, &derive_id(context), 0).await
+            Self::launch_with_id(context, rt, cfg, &derive_id(context), 0, None).await
         }
 
         /// [`Self::launch`] with an explicit `id` and `version` for the image tag /
         /// container name (the registry passes the app uuid + version; tests can pin both).
         /// `version` makes the image tag content-stable: `tbf-img-<id>-v<version>`.
+        ///
+        /// `image_ref` is an optional OCI ref (e.g. `[fd5a::1]:5000/acme/app:sha`)
+        /// to pull from the mesh registry. When set it is tried BEFORE the W2 cache
+        /// check. Pass `None` to keep the existing W3 → W2 → build behaviour.
+        ///
+        /// Source priority (first hit wins):
+        /// 1. W3  — prebuilt `image.tar.gz` in the app dir
+        /// 2. Registry pull — `image_ref` set → `docker pull <ref>` + `docker tag`
+        /// 3. W2  — image already in the daemon (`docker image inspect` exits 0)
+        /// 4. Build from source (`docker build -`)
         ///
         /// If the image already exists in the Docker daemon (`docker image inspect` exits 0),
         /// the build step is SKIPPED and the cached image is reused directly.
@@ -514,15 +559,16 @@ mod runtime_impl {
             cfg: &DockerConfig,
             id: &str,
             version: u64,
+            image_ref: Option<&str>,
         ) -> Result<Self> {
             precheck(docker_available(), context)?;
 
             let vtag = versioned_image_tag(id, version);
 
             // W3 warm-start: if the app dir contains a prebuilt image tar, load
-            // it before the W2 cache check. After a successful load the image
-            // `tbf-img-<uuid>-v<N>` exists, so W2's inspect returns Skip and the
-            // build step is bypassed entirely.
+            // it before the registry-pull and W2 cache check. After a successful
+            // load the image `tbf-img-<uuid>-v<N>` exists, so all later steps
+            // short-circuit via the W2 inspect.
             let tar_load_runner =
                 production_command_runner(cfg.docker_bin.clone()) as TarLoadRunner;
             let app_dir = context.parent().unwrap_or(context);
@@ -533,12 +579,35 @@ mod runtime_impl {
                 if loaded {
                     tracing::info!(tag = %vtag, path = %tar_str, "docker image loaded from prebuilt tar (warm start)");
                 } else {
-                    tracing::warn!(tag = %vtag, path = %tar_str, "docker load failed — falling through to W2 build path");
+                    tracing::warn!(tag = %vtag, path = %tar_str, "docker load failed — falling through to registry pull / W2 build path");
+                }
+            }
+
+            // Registry pull: if an OCI ref is set, try to pull + tag it into the
+            // local daemon BEFORE the W2 cache check. On success the image is now
+            // present so W2's inspect returns Skip. On failure we warn and fall
+            // through to the W2 / build path unchanged.
+            let pull_runner = production_command_runner(cfg.docker_bin.clone()) as CommandRunner;
+            if let PullDecision::Pull(ref reff) = pull_decision(image_ref) {
+                let pulled = pull_and_tag(&cfg.docker_bin, reff, &vtag, &pull_runner).await;
+                if pulled {
+                    tracing::info!(
+                        tag = %vtag,
+                        registry_ref = %reff,
+                        "docker image pulled from mesh registry (registry source)"
+                    );
+                } else {
+                    tracing::warn!(
+                        tag = %vtag,
+                        registry_ref = %reff,
+                        "docker pull from mesh registry failed — falling through to W2 / build"
+                    );
                 }
             }
 
             // W2 build-cache: skip `docker build` if the image is already present
-            // (either loaded from the tar above, or left over from a prior run).
+            // (either loaded from the tar above, pulled from the registry, or left
+            // over from a prior run).
             let image_exists = run_docker_check(&cfg.docker_bin, &inspect_args(&vtag)).await;
             match image_cache_decision(image_exists) {
                 ImageCacheDecision::Build => {
@@ -923,6 +992,28 @@ mod runtime_impl {
         Ok(())
     }
 
+    /// Pull `reff` from the mesh OCI registry and immediately tag it as `vtag`
+    /// (the supervisor's versioned local tag `tbf-img-<uuid>-v<N>`).
+    ///
+    /// Returns `true` only if BOTH `docker pull <reff>` AND `docker tag <reff>
+    /// <vtag>` succeed; `false` on any failure (the caller falls through to the
+    /// W2 / build path).
+    ///
+    /// Uses the injectable [`CommandRunner`] so tests can record the issued
+    /// commands without a real Docker daemon.
+    pub(crate) async fn pull_and_tag(
+        _docker_bin: &str,
+        reff: &str,
+        vtag: &str,
+        runner: &CommandRunner,
+    ) -> bool {
+        let pull_ok = (runner)(pull_args(reff)).await;
+        if !pull_ok {
+            return false;
+        }
+        (runner)(tag_args(reff, vtag)).await
+    }
+
     /// `docker build -t <tag> -` with the build-context tarball at `context`
     /// streamed to the child's stdin, bounded by `timeout_secs`.
     async fn build_image(
@@ -1043,6 +1134,7 @@ mod runtime_impl {
                 fuel_per_request: 0,
                 memory_mb: 0,
                 kernel: None,
+                registry_ref: None,
             };
             let cfg = DockerConfig {
                 app_port: 9000,
@@ -1095,14 +1187,17 @@ mod runtime_impl {
 }
 
 pub use runtime_impl::DockerRuntime;
+#[cfg(test)]
+pub(crate) use runtime_impl::pull_and_tag as pull_and_tag_for_test;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::protocol::{
-        ImageCacheDecision, build_args, container_name, copy_filtered_headers,
+        ImageCacheDecision, PullDecision, build_args, container_name, copy_filtered_headers,
         docker_available_with, image_cache_decision, inspect_args, is_hop_by_hop, proxy_request,
-        rm_args, rmi_args, run_args, stop_args, versioned_image_tag,
+        pull_args, pull_decision, rm_args, rmi_args, run_args, stop_args, tag_args,
+        versioned_image_tag,
     };
 
     #[test]
@@ -1720,6 +1815,116 @@ mod tests {
         assert!(
             !loaded,
             "failed load → must return false (fall through to W2)"
+        );
+    }
+
+    // ---- pull_args / tag_args (registry pull argv) ---------------------------
+
+    #[test]
+    fn pull_args_returns_correct_argv() {
+        assert_eq!(
+            pull_args("[fd5a::1]:5000/acme/app:abc"),
+            vec!["pull", "[fd5a::1]:5000/acme/app:abc"]
+        );
+    }
+
+    #[test]
+    fn tag_args_returns_correct_argv() {
+        assert_eq!(
+            tag_args("[fd5a::1]:5000/acme/app:abc", "tbf-img-uuid-v3"),
+            vec!["tag", "[fd5a::1]:5000/acme/app:abc", "tbf-img-uuid-v3"]
+        );
+    }
+
+    // ---- PullDecision (registry-pull seam) -----------------------------------
+
+    /// When `image_ref` is `Some`, `pull_decision` must return `Pull(ref)`.
+    /// When `None`, it must return `Skip`.
+    #[test]
+    fn pull_decision_uses_ref_when_present_else_skips() {
+        assert_eq!(
+            pull_decision(Some("[fd5a::1]:5000/acme/app:abc")),
+            PullDecision::Pull("[fd5a::1]:5000/acme/app:abc".to_owned())
+        );
+        assert_eq!(pull_decision(None), PullDecision::Skip);
+    }
+
+    // ---- pull_and_tag seam (injected runner) ---------------------------------
+
+    /// When the runner succeeds for both pull and tag, `pull_and_tag` must
+    /// issue `["pull", <ref>]` then `["tag", <ref>, <vtag>]` in order and
+    /// return `true`.
+    #[tokio::test]
+    async fn pull_and_tag_issues_pull_then_tag_on_success() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let issued2 = issued.clone();
+
+        let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |args: Vec<String>| {
+                issued2.lock().unwrap().push(args);
+                Box::pin(async { true })
+            });
+
+        let ok = super::pull_and_tag_for_test(
+            "docker",
+            "[fd5a::1]:5000/acme/app:sha",
+            "tbf-img-uuid-v1",
+            &runner,
+        )
+        .await;
+
+        assert!(ok, "both pull + tag succeed → must return true");
+
+        let cmds = issued.lock().unwrap();
+        assert_eq!(cmds.len(), 2, "must issue exactly 2 commands (pull + tag)");
+        assert_eq!(
+            cmds[0],
+            vec!["pull".to_owned(), "[fd5a::1]:5000/acme/app:sha".to_owned()],
+            "first command must be docker pull <ref>"
+        );
+        assert_eq!(
+            cmds[1],
+            vec![
+                "tag".to_owned(),
+                "[fd5a::1]:5000/acme/app:sha".to_owned(),
+                "tbf-img-uuid-v1".to_owned(),
+            ],
+            "second command must be docker tag <ref> <vtag>"
+        );
+    }
+
+    /// When the runner fails on pull, `pull_and_tag` must return `false` and
+    /// NOT issue the tag command.
+    #[tokio::test]
+    async fn pull_and_tag_returns_false_and_skips_tag_on_pull_failure() {
+        use crate::runtime::BoxFut;
+        use std::sync::{Arc, Mutex};
+
+        let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let cc = call_count.clone();
+
+        let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
+            Arc::new(move |_args: Vec<String>| {
+                *cc.lock().unwrap() += 1;
+                Box::pin(async { false }) // pull fails
+            });
+
+        let ok = super::pull_and_tag_for_test(
+            "docker",
+            "[fd5a::1]:5000/acme/app:sha",
+            "tbf-img-uuid-v2",
+            &runner,
+        )
+        .await;
+
+        assert!(!ok, "pull fails → must return false");
+        assert_eq!(
+            *call_count.lock().unwrap(),
+            1,
+            "must issue only the pull command (tag must NOT be called on pull failure)"
         );
     }
 }
