@@ -137,6 +137,10 @@ impl Default for FcConfig {
 /// Default `docker` binary (looked up on `$PATH`).
 pub const DEFAULT_DOCKER_BIN: &str = "docker";
 
+/// Default `oras` binary (looked up on `$PATH`). Used to pull WASM OCI
+/// artifacts from the mesh registry (`oras pull --plain-http <ref>`).
+pub const DEFAULT_ORAS_BIN: &str = "oras";
+
 /// Default port the app's HTTP server listens on inside the container.
 pub const DEFAULT_DOCKER_APP_PORT: u16 = 8080;
 
@@ -149,11 +153,21 @@ pub const DEFAULT_DOCKER_BUILD_TIMEOUT_SECS: u64 = 300;
 /// reachable Docker daemon; ignored everywhere else (so a WASM-only supervisor
 /// never needs any of these). Unlike firecracker, Docker is cross-platform — it
 /// shells out to the `docker` CLI, which runs on macOS + Linux alike.
+///
+/// Also holds the `oras_bin` path used by the `wasm-http` runtime to pull WASM
+/// OCI artifacts from the mesh registry — co-located here because both are
+/// external CLI tools that the supervisor shells out to.
 #[derive(Debug, Clone, Parser)]
 pub struct DockerConfig {
     /// Path to the `docker` binary.
     #[arg(long = "docker-bin", env = "SUPERVISOR_DOCKER_BIN", default_value = DEFAULT_DOCKER_BIN)]
     pub docker_bin: String,
+
+    /// Path to the `oras` binary used to pull WASM OCI artifacts from the
+    /// mesh registry. The registry is plain HTTP over the WireGuard overlay so
+    /// `oras pull --plain-http` is used for every `[ula]:5000` ref.
+    #[arg(long = "oras-bin", env = "SUPERVISOR_ORAS_BIN", default_value = DEFAULT_ORAS_BIN)]
+    pub oras_bin: String,
 
     /// Port the app's HTTP server listens on inside the container (the image's
     /// `EXPOSE`d / served port). The supervisor publishes an ephemeral loopback
@@ -182,6 +196,7 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             docker_bin: DEFAULT_DOCKER_BIN.to_owned(),
+            oras_bin: DEFAULT_ORAS_BIN.to_owned(),
             app_port: DEFAULT_DOCKER_APP_PORT,
             build_timeout_secs: DEFAULT_DOCKER_BUILD_TIMEOUT_SECS,
         }
@@ -278,6 +293,7 @@ mod tests {
     fn docker_defaults_apply() {
         let cfg = Config::try_parse_from(["supervisord"]).unwrap();
         assert_eq!(cfg.docker.docker_bin, DEFAULT_DOCKER_BIN);
+        assert_eq!(cfg.docker.oras_bin, DEFAULT_ORAS_BIN);
         assert_eq!(cfg.docker.app_port, DEFAULT_DOCKER_APP_PORT);
         assert_eq!(
             cfg.docker.build_timeout_secs,
@@ -290,6 +306,7 @@ mod tests {
         let parsed = Config::try_parse_from(["supervisord"]).unwrap().docker;
         let dflt = DockerConfig::default();
         assert_eq!(parsed.docker_bin, dflt.docker_bin);
+        assert_eq!(parsed.oras_bin, dflt.oras_bin);
         assert_eq!(parsed.app_port, dflt.app_port);
         assert_eq!(parsed.build_timeout_secs, dflt.build_timeout_secs);
     }
@@ -300,6 +317,8 @@ mod tests {
             "supervisord",
             "--docker-bin",
             "/usr/local/bin/docker",
+            "--oras-bin",
+            "/usr/local/bin/oras",
             "--docker-app-port",
             "3000",
             "--docker-build-timeout-secs",
@@ -307,6 +326,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg.docker.docker_bin, "/usr/local/bin/docker");
+        assert_eq!(cfg.docker.oras_bin, "/usr/local/bin/oras");
         assert_eq!(cfg.docker.app_port, 3000);
         assert_eq!(cfg.docker.build_timeout_secs, 600);
     }

@@ -7,13 +7,17 @@
 use std::sync::Arc;
 
 use crate::config::{DockerConfig, FcConfig};
-use crate::docker::DockerRuntime;
+use crate::docker::{CommandRunner, DockerRuntime};
 use crate::fetcher::FetchedApp;
 use crate::firecracker::FirecrackerRuntime;
+use crate::oras::{find_wasm, oras_pull, production_oras_runner};
 use crate::runtime::{AppRuntime, WasmRuntime};
 
 /// Build the [`AppRuntime`] for a fetched app from `manifest.runtime.type`:
-/// - `wasm-http`   → in-process [`WasmRuntime`]
+/// - `wasm-http`   → in-process [`WasmRuntime`]; when `manifest.runtime.registry_ref`
+///   is set, the WASM bytes are pulled from the mesh OCI registry via `oras pull`
+///   (using `docker.oras_bin`). Falls back to S3 bytes if the pull fails or no
+///   ref is set.
 /// - `firecracker` → KVM-gated [`FirecrackerRuntime`] microVM (errors clearly on
 ///   non-Linux / no `/dev/kvm`)
 /// - `docker`      → [`DockerRuntime`] container built from the cached context
@@ -35,6 +39,27 @@ pub async fn build_runtime(
     docker: &DockerConfig,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
+    build_runtime_with_oras(
+        uuid,
+        fetched,
+        fc,
+        docker,
+        data_dir,
+        &production_oras_runner(docker.oras_bin.clone()),
+    )
+    .await
+}
+
+/// Like [`build_runtime`] but accepts an injectable [`CommandRunner`] for the
+/// `oras pull` step. Used by unit tests to avoid invoking a real `oras` binary.
+pub async fn build_runtime_with_oras(
+    uuid: &str,
+    fetched: &FetchedApp,
+    fc: &FcConfig,
+    docker: &DockerConfig,
+    data_dir: &std::path::Path,
+    oras_runner: &CommandRunner,
+) -> anyhow::Result<Arc<dyn AppRuntime>> {
     let rt = &fetched.manifest.runtime;
     match rt.r#type.as_str() {
         "wasm-http" => {
@@ -44,11 +69,69 @@ pub async fn build_runtime(
             // falls back to Cranelift recompile automatically.
             let cache_dir = data_dir.join("apps").join(uuid).join("cache");
             let cache_path = cache_dir.join("app.cwasm");
-            let wasm = WasmRuntime::load_cached_or_compile(
-                &fetched.wasm,
-                &cache_path,
-                rt.fuel_per_request,
-            )?;
+
+            // Registry-pull: if a ref is set, pull the WASM OCI artifact from
+            // the mesh registry via `oras pull --plain-http`. On success, read
+            // the pulled `.wasm` bytes. On failure (or no ref), fall back to the
+            // S3-cached bytes already in `fetched.wasm`.
+            let wasm_bytes: std::borrow::Cow<[u8]> = if let Some(reff) = rt.registry_ref.as_deref()
+            {
+                let pull_dir = data_dir.join("apps").join(uuid).join("pulled");
+                if let Err(e) = tokio::fs::create_dir_all(&pull_dir).await {
+                    tracing::warn!(
+                        uuid,
+                        error = %e,
+                        "failed to create oras pull dir — falling back to S3 bytes"
+                    );
+                    std::borrow::Cow::Borrowed(&fetched.wasm)
+                } else {
+                    let pulled = oras_pull(&docker.oras_bin, reff, &pull_dir, oras_runner).await;
+                    if pulled {
+                        match find_wasm(&pull_dir) {
+                            Some(wasm_path) => match tokio::fs::read(&wasm_path).await {
+                                Ok(bytes) => {
+                                    tracing::info!(
+                                        uuid,
+                                        registry_ref = %reff,
+                                        path = %wasm_path.display(),
+                                        "wasm pulled from mesh registry"
+                                    );
+                                    std::borrow::Cow::Owned(bytes)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        uuid,
+                                        error = %e,
+                                        path = %wasm_path.display(),
+                                        "failed to read pulled wasm — falling back to S3 bytes"
+                                    );
+                                    std::borrow::Cow::Borrowed(&fetched.wasm)
+                                }
+                            },
+                            None => {
+                                tracing::warn!(
+                                    uuid,
+                                    registry_ref = %reff,
+                                    "oras pull succeeded but no .wasm found in output dir — falling back to S3 bytes"
+                                );
+                                std::borrow::Cow::Borrowed(&fetched.wasm)
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            uuid,
+                            registry_ref = %reff,
+                            "oras pull from mesh registry failed — falling back to S3 bytes"
+                        );
+                        std::borrow::Cow::Borrowed(&fetched.wasm)
+                    }
+                }
+            } else {
+                std::borrow::Cow::Borrowed(&fetched.wasm)
+            };
+
+            let wasm =
+                WasmRuntime::load_cached_or_compile(&wasm_bytes, &cache_path, rt.fuel_per_request)?;
             Ok(Arc::new(wasm))
         }
         "firecracker" => {
@@ -58,7 +141,7 @@ pub async fn build_runtime(
             Ok(Arc::new(vm))
         }
         "docker" => {
-            // Registry-pull is docker-only; wasm/firecracker ignore registry_ref.
+            // Registry-pull is docker-only; wasm uses oras (above).
             let container = DockerRuntime::launch_with_id(
                 &fetched.cached_path,
                 rt,
@@ -95,11 +178,164 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
 
     use super::*;
     use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
+
+    /// Real WASM component used to verify the `wasm-http` arm of `build_runtime`.
+    const HELLO_WASM: &[u8] = include_bytes!("../tests/fixtures/hello.wasm");
+
+    /// Build a wasm-http [`FetchedApp`] with the given `registry_ref` and WASM bytes.
+    fn wasm_fetched(registry_ref: Option<String>, wasm: Bytes) -> FetchedApp {
+        FetchedApp {
+            version: 1,
+            manifest: AppManifest {
+                app: AppMeta {
+                    id: None,
+                    name: "hello".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    kind: "service".to_owned(),
+                    description: String::new(),
+                },
+                lifecycle: Lifecycle {
+                    mode: LifecycleMode::AlwaysOn,
+                    idle_timeout_sec: 300,
+                },
+                runtime: Runtime {
+                    r#type: "wasm-http".to_owned(),
+                    entry: "app.wasm".to_owned(),
+                    fuel_per_request: 0,
+                    memory_mb: 0,
+                    kernel: None,
+                    registry_ref,
+                },
+                routes: Routes::default(),
+            },
+            wasm,
+            cached_path: PathBuf::from("/cache/apps/hello/v1/app.wasm"),
+        }
+    }
+
+    /// When `registry_ref` is `None`, the wasm arm uses the S3 bytes unchanged.
+    #[tokio::test]
+    async fn wasm_arm_no_ref_uses_s3_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetched = wasm_fetched(None, Bytes::from_static(HELLO_WASM));
+        let cfg = DockerConfig::default();
+
+        // A runner that must NOT be called (no ref → no oras pull).
+        let called = Arc::new(Mutex::new(false));
+        let called2 = called.clone();
+        let runner: CommandRunner = Arc::new(move |_| {
+            *called2.lock().unwrap() = true;
+            Box::pin(async { false })
+        });
+
+        let rt = build_runtime_with_oras(
+            "uuid-no-ref",
+            &fetched,
+            &FcConfig::default(),
+            &cfg,
+            tmp.path(),
+            &runner,
+        )
+        .await
+        .unwrap();
+        // Should have loaded successfully from S3 bytes.
+        assert!(Arc::strong_count(&rt) > 0);
+        assert!(
+            !*called.lock().unwrap(),
+            "oras runner must NOT be called when registry_ref is None"
+        );
+    }
+
+    /// When `registry_ref` is set and the runner writes a `.wasm` file into
+    /// the pull dir (simulating a successful `oras pull`), the wasm arm loads
+    /// from the pulled bytes — not from the (intentionally empty) S3 bytes.
+    #[tokio::test]
+    async fn wasm_arm_with_ref_loads_from_oras_pull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reff = "[fd5a:1f02::1]:5000/acme/hello:sha256abc";
+
+        // S3 bytes are intentionally empty — the pull provides the real wasm.
+        let fetched = wasm_fetched(Some(reff.to_owned()), Bytes::new());
+        let cfg = DockerConfig::default();
+
+        // The pull dir will be <tmp>/apps/<uuid>/pulled.
+        let pull_dir = tmp.path().join("apps").join("uuid-oras-ref").join("pulled");
+        let pull_dir_clone = pull_dir.clone();
+
+        let captured_args: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured2 = captured_args.clone();
+
+        let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
+            *captured2.lock().unwrap() = args.clone();
+            // Simulate a successful pull: write the hello.wasm fixture into the pull dir.
+            let dir = pull_dir_clone.clone();
+            Box::pin(async move {
+                std::fs::create_dir_all(&dir).ok();
+                std::fs::write(dir.join("app.wasm"), HELLO_WASM).unwrap();
+                true
+            })
+        });
+
+        let rt = build_runtime_with_oras(
+            "uuid-oras-ref",
+            &fetched,
+            &FcConfig::default(),
+            &cfg,
+            tmp.path(),
+            &runner,
+        )
+        .await
+        .unwrap();
+        assert!(
+            Arc::strong_count(&rt) > 0,
+            "runtime should be built from pulled wasm"
+        );
+
+        let argv = captured_args.lock().unwrap().clone();
+        assert!(
+            argv.contains(&"--plain-http".to_owned()),
+            "oras pull must include --plain-http; got {argv:?}"
+        );
+        assert!(
+            argv.contains(&reff.to_owned()),
+            "oras pull must include the ref; got {argv:?}"
+        );
+    }
+
+    /// When `registry_ref` is set but the runner returns `false` (pull failed),
+    /// the wasm arm falls back to the S3 bytes.
+    #[tokio::test]
+    async fn wasm_arm_fallback_to_s3_on_pull_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reff = "[fd5a:1f02::1]:5000/acme/hello:sha256abc";
+        // S3 bytes hold the real WASM so the fallback path compiles successfully.
+        let fetched = wasm_fetched(Some(reff.to_owned()), Bytes::from_static(HELLO_WASM));
+        let cfg = DockerConfig::default();
+
+        // Runner always fails.
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+
+        let rt = build_runtime_with_oras(
+            "uuid-fallback",
+            &fetched,
+            &FcConfig::default(),
+            &cfg,
+            tmp.path(),
+            &runner,
+        )
+        .await
+        .unwrap();
+        assert!(
+            Arc::strong_count(&rt) > 0,
+            "should fall back to S3 bytes and still compile"
+        );
+    }
 
     fn docker_fetched(registry_ref: Option<String>) -> FetchedApp {
         FetchedApp {

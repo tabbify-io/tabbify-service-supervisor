@@ -15,12 +15,19 @@
 FROM debian:bookworm-slim
 
 # docker CLI ONLY (client; talks to a mounted host socket — no daemon in-image).
+# oras CLI for pulling WASM OCI artifacts from the mesh registry (plain-http over WG).
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG DOCKER_ARCH=aarch64
+# ORAS_ARCH uses the OCI-standard naming (amd64 / arm64).
+ARG ORAS_VERSION=1.2.0
+ARG ORAS_ARCH=arm64
 RUN apt-get update \
  && apt-get install -y --no-install-recommends iproute2 ca-certificates curl \
  && curl -fsSL "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar xz -C /usr/local/bin --strip-components=1 docker/docker \
+ && curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz" \
+      | tar xz -C /usr/local/bin oras \
+ && chmod +x /usr/local/bin/oras \
  && apt-get purge -y curl && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
