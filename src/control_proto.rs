@@ -21,6 +21,16 @@ pub enum Cmd {
     Purge,
     /// Stop + signal the process to exit. Returns [`Reply::Ok`] before exiting.
     Shutdown,
+    /// Deploy a new version by OCI image ref: the runner builds a fresh runtime
+    /// from `reff` and performs a zero-downtime swap (health-gate the new one,
+    /// atomically flip, drain + shut down the old). For a docker app this pulls
+    /// `reff` from the mesh registry. Returns [`Reply::Ok`] on success, or
+    /// [`Reply::Err`] if the new runtime never became healthy (the OLD runtime
+    /// stays in service — no downtime).
+    Deploy {
+        /// OCI image ref to deploy (e.g. `[fd5a:1f02::1]:5000/acme/app:<sha>`).
+        reff: String,
+    },
 }
 
 /// Replies the runner sends back over the control socket.
@@ -68,11 +78,37 @@ mod tests {
     /// Every Cmd variant round-trips through JSON without loss.
     #[test]
     fn cmd_serde_round_trip() {
-        for cmd in [Cmd::Ping, Cmd::Health, Cmd::Stop, Cmd::Purge, Cmd::Shutdown] {
+        for cmd in [
+            Cmd::Ping,
+            Cmd::Health,
+            Cmd::Stop,
+            Cmd::Purge,
+            Cmd::Shutdown,
+            Cmd::Deploy {
+                reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
+            },
+        ] {
             let json = serde_json::to_string(&cmd).unwrap();
             let back: Cmd = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, back, "round-trip failed for {json}");
         }
+    }
+
+    /// The `Deploy` command serializes its tag + the `reff` payload so the
+    /// runner-side handler can pull/build that exact image.
+    #[test]
+    fn deploy_cmd_carries_reff_on_the_wire() {
+        let cmd = Cmd::Deploy {
+            reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"deploy\""), "got: {json}");
+        assert!(
+            json.contains("[fd5a:1f02::1]:5000/acme/app:sha256abc"),
+            "got: {json}"
+        );
+        let back: Cmd = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
     }
 
     /// Every Reply variant round-trips through JSON without loss.

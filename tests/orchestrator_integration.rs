@@ -89,6 +89,7 @@ fn make_spec(s3: &MockServer, sock_path: &Path, data_dir: &Path) -> SpawnSpec {
         data_dir: data_dir.to_path_buf(),
         parent: Some("fd5a:1f00:1::1".to_owned()),
         no_mesh: true,
+        image_ref: None,
     }
 }
 
@@ -640,6 +641,7 @@ async fn readopt_adopts_living_runner_and_respawns_dead_one() {
         parent: Some("fd5a:1f00:1::1".to_owned()),
         spawned_at: 0,
         restart: Default::default(),
+        image_ref: None,
     };
     dead_handle
         .save(runner_dir.path())
@@ -788,6 +790,7 @@ async fn monitor_tick_does_not_respawn_within_grace_window() {
         parent: handle.parent.clone(),
         spawned_at: now_secs, // within grace window
         restart: Default::default(),
+        image_ref: None,
     };
     grace_record
         .save(runner_dir.path())
@@ -900,6 +903,7 @@ async fn monitor_tick_kills_hung_runner_before_respawn() {
         parent: Some("fd5a:1f00:1::1".to_owned()),
         spawned_at: old_secs,
         restart: Default::default(),
+        image_ref: None,
     };
     hung_record
         .save(runner_dir.path())
@@ -927,6 +931,7 @@ async fn monitor_tick_kills_hung_runner_before_respawn() {
         parent: Some("fd5a:1f00:1::1".to_owned()),
         spawned_at: old_secs,
         restart: Default::default(),
+        image_ref: None,
     };
     hung_record2
         .save(runner_dir.path())

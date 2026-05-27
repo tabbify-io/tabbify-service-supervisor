@@ -29,5 +29,6 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         port: cfg.port,
         fc: cfg.firecracker.clone(),
         docker: cfg.docker.clone(),
+        image_ref: cfg.image_ref.clone(),
     }
 }

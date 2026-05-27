@@ -117,6 +117,8 @@ impl Orchestrator {
             data_dir: shared.data_dir.clone(),
             parent: shared.parent.clone(),
             no_mesh: shared.no_mesh,
+            // A fresh start (no deploy yet) builds from the S3 manifest.
+            image_ref: None,
         }
     }
 
@@ -538,6 +540,7 @@ mod tests {
             parent: None,
             spawned_at: 0,
             restart,
+            image_ref: None,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -608,6 +611,7 @@ mod tests {
             parent: None,
             spawned_at: 0,
             restart: crashed_restart,
+            image_ref: None,
         };
         rec.save(dir.path()).unwrap();
 

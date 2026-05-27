@@ -93,6 +93,7 @@ async fn runner_serves_fixture_on_root_and_deep_path_loopback() {
         port: 8730,
         fc: FcConfig::default(),
         docker: DockerConfig::default(),
+        image_ref: None,
     };
 
     // Start the runner serve core and obtain the bound address.
@@ -163,6 +164,7 @@ async fn control_socket_health_stop_purge() {
         port: 8730,
         fc: FcConfig::default(),
         docker: DockerConfig::default(),
+        image_ref: None,
     };
 
     let sock_dir = tempfile::tempdir().expect("sock dir");
@@ -462,6 +464,7 @@ async fn docker_runner_removes_stale_container_before_starting_fresh() {
         port: 8730,
         fc: FcConfig::default(),
         docker: DockerConfig::default(),
+        image_ref: None,
     };
 
     // --- Start the runner (triggers launch_with_id which pre-rm's the stale) ---

@@ -85,6 +85,16 @@ impl ControlClient {
         self.round_trip(Cmd::Shutdown).await
     }
 
+    /// Send [`Cmd::Deploy`] with the OCI image `reff`, expect [`Reply::Ok`].
+    ///
+    /// The runner builds a fresh runtime from `reff` and performs a
+    /// zero-downtime swap. On success it replies [`Reply::Ok`]; if the new
+    /// runtime never became healthy it replies [`Reply::Err`] and the OLD
+    /// runtime stays in service (no downtime).
+    pub async fn deploy(&self, reff: impl Into<String>) -> Result<Reply> {
+        self.round_trip(Cmd::Deploy { reff: reff.into() }).await
+    }
+
     /// Open a fresh connection to `self.sock`, write `cmd` as a JSON line, read
     /// back one JSON-line [`Reply`], and close.
     ///

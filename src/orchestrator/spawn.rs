@@ -64,6 +64,13 @@ pub struct SpawnSpec {
     /// Skip mesh join; bind plain loopback. Used for local runs / tests without
     /// root + TUN.
     pub no_mesh: bool,
+    /// OCI image ref of the last successful deploy, forwarded to the runner as
+    /// `--image-ref <ref>` so a respawn comes up on the deployed version (the
+    /// runner applies it to the manifest's `registry_ref`). `None` (the default)
+    /// = build from the S3 manifest as usual. Set from
+    /// [`RunnerHandle::image_ref`](crate::orchestrator::handle::RunnerHandle) on
+    /// a respawn; `None` on a fresh spawn.
+    pub image_ref: Option<String>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -107,6 +114,11 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
     if let Some(parent) = &spec.parent {
         args.push("--parent".into());
         args.push(parent.as_str().into());
+    }
+    // Forward the deployed image ref so a respawn comes up on that version.
+    if let Some(image_ref) = &spec.image_ref {
+        args.push("--image-ref".into());
+        args.push(image_ref.as_str().into());
     }
     args
 }
@@ -184,6 +196,9 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         parent: spec.parent.clone(),
         spawned_at,
         restart: Default::default(),
+        // Carry the deployed ref through so a future respawn-from-record keeps
+        // the same version. `None` on a fresh spawn = today's behavior.
+        image_ref: spec.image_ref.clone(),
     };
 
     handle
@@ -217,6 +232,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/tabbify/data"),
             parent: Some("fd5a:1f00:1::1".to_owned()),
             no_mesh: true,
+            image_ref: None,
         }
     }
 
@@ -266,6 +282,45 @@ mod tests {
         assert!(!joined.iter().any(|a| a == "--no-mesh"), "got: {joined:?}");
         assert!(!joined.iter().any(|a| a == "--bind"), "got: {joined:?}");
         assert!(!joined.iter().any(|a| a == "--parent"), "got: {joined:?}");
+    }
+
+    /// When `image_ref` is set, the runner argv carries `--image-ref <ref>` so a
+    /// respawn comes up on the deployed version.
+    #[test]
+    fn build_args_includes_image_ref_when_present() {
+        let mut s = spec();
+        s.image_ref = Some("[fd5a::1]:5000/a/b:sha".to_owned());
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let idx = joined
+            .iter()
+            .position(|a| a == "--image-ref")
+            .unwrap_or_else(|| panic!("missing --image-ref in {joined:?}"));
+        assert_eq!(
+            joined.get(idx + 1).map(String::as_str),
+            Some("[fd5a::1]:5000/a/b:sha"),
+            "--image-ref must be followed by the ref"
+        );
+    }
+
+    /// When `image_ref` is `None`, no `--image-ref` arg is emitted (today's
+    /// default behavior is unchanged).
+    #[test]
+    fn build_args_omits_image_ref_when_none() {
+        let mut s = spec();
+        s.image_ref = None;
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a == "--image-ref"),
+            "no --image-ref when None; got: {joined:?}"
+        );
     }
 
     /// The prod binary path resolves next to the current executable (not the

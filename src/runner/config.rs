@@ -59,6 +59,14 @@ pub struct RunnerConfig {
     #[arg(long, env = "RUNNER_DATA_DIR", default_value = "./data")]
     pub data_dir: PathBuf,
 
+    /// OCI image ref of a previously-deployed version. When set the runner
+    /// applies it to the manifest's docker `registry_ref` before building the
+    /// initial runtime, so a supervisor-driven respawn comes up on the deployed
+    /// version (a `docker pull <ref>` instead of a source build). `None` =
+    /// build from the S3 manifest as usual.
+    #[arg(long, env = "RUNNER_IMAGE_REF")]
+    pub image_ref: Option<String>,
+
     /// Listener port used when binding the mesh ULA.
     #[arg(long, env = "RUNNER_PORT", default_value_t = 8730)]
     pub port: u16,

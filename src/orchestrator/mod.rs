@@ -100,6 +100,8 @@ impl SharedRunnerConfig {
             data_dir: self.data_dir.clone(),
             parent: record.parent.clone(),
             no_mesh: self.no_mesh,
+            // Respawn on the same deployed version the record was last at.
+            image_ref: record.image_ref.clone(),
         }
     }
 }
@@ -243,6 +245,7 @@ mod tests {
             parent: Some("fd5a:1f00:1::1".to_owned()),
             spawned_at: 0,
             restart: Default::default(),
+            image_ref: None,
         }
     }
 

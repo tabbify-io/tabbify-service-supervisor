@@ -11,19 +11,32 @@
 //! Dropping the `Option<HostedApp>` (via `Stop`) aborts the listener task in
 //! the `HostedApp::drop` impl — no extra teardown machinery needed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, oneshot};
 
-use crate::config::DockerConfig;
+use crate::build::{build_runtime, fetched_with_ref};
+use crate::config::{DockerConfig, FcConfig};
 use crate::control_proto::{Cmd, Reply};
-use crate::fetcher::S3Fetcher;
+use crate::fetcher::{FetchedApp, S3Fetcher};
 use crate::host::HostedApp;
+use crate::runner::active::{ActiveRuntime, perform_swap};
 use crate::runtime::{AppRuntime, RuntimeHealth};
+
+/// How long the in-flight (old) runtime keeps serving after a `Deploy` swap
+/// before it is asked to shut down — the drain window for requests already
+/// dispatched to the old runtime.
+const DEPLOY_DRAIN: Duration = Duration::from_secs(10);
+
+/// How long [`perform_swap`] waits for the NEW runtime to report
+/// [`RuntimeHealth::Serving`] before aborting the deploy (the OLD runtime stays
+/// in service, so an abort causes no downtime).
+const DEPLOY_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Shared lifecycle state driven by the control server.
 ///
@@ -49,6 +62,20 @@ pub struct RunnerLifecycle {
     /// report the app's own liveness (not just whether the runner process is
     /// alive).
     pub(crate) runtime: Arc<dyn AppRuntime>,
+    /// The swappable active-runtime cell `Deploy` performs its zero-downtime
+    /// swap against. Shared with [`super::serve::RunnerServe`] and the binary's
+    /// `run_until_exit` loop (which re-arms its crash-watch across swaps).
+    pub(crate) active: Arc<ActiveRuntime>,
+    /// The fetched app artifact (manifest + cached path + version). `Deploy`
+    /// clones it, overrides the docker `registry_ref` with the deploy ref, and
+    /// rebuilds the runtime from it via [`build_runtime`].
+    pub(crate) fetched: FetchedApp,
+    /// Firecracker runtime config — passed to [`build_runtime`] when `Deploy`
+    /// rebuilds the runtime (ignored for docker/wasm apps).
+    pub(crate) fc: FcConfig,
+    /// Local data dir for the artifact / AOT cache — passed to
+    /// [`build_runtime`] when `Deploy` rebuilds the runtime.
+    pub(crate) data_dir: PathBuf,
     /// Optional sender that signals the main task to exit cleanly when
     /// `Shutdown` is dispatched. `None` when the control server was started
     /// without a shutdown notifier (legacy / test path).
@@ -113,6 +140,70 @@ impl RunnerLifecycle {
             pid: std::process::id(),
             app_health,
             app_health_reason,
+        }
+    }
+
+    /// Deploy a new version by OCI image `reff`: build a fresh runtime from the
+    /// app's manifest with `registry_ref = Some(reff)` applied, then perform a
+    /// zero-downtime swap against the shared [`ActiveRuntime`] cell.
+    ///
+    /// The new docker container coexists with the old during the swap window:
+    /// each launch gets a unique container name (`tbf-<uuid>-<seq>`, fresh
+    /// monotonic `seq`) and a fresh ephemeral loopback host port, so there is no
+    /// name/port collision with the still-serving old container.
+    ///
+    /// Returns:
+    /// - [`Reply::Ok`] when the new runtime became healthy and the swap flipped
+    ///   (the old runtime is draining + shutting down in the background);
+    /// - [`Reply::Err`] when the build failed (e.g. `docker pull` failed / image
+    ///   never came up) or [`perform_swap`] aborted because the new runtime was
+    ///   unhealthy — in both cases the OLD runtime stays in service (no
+    ///   downtime).
+    async fn deploy(&self, reff: &str) -> Reply {
+        // Build the new runtime from the app's manifest with the deploy ref
+        // applied. For docker this triggers `docker pull <reff>` instead of a
+        // source build; for wasm/firecracker the ref is ignored and the runtime
+        // is rebuilt from the existing (cached) artifact.
+        let next_fetched = fetched_with_ref(&self.fetched, reff);
+        let new_runtime = match build_runtime(
+            &self.uuid,
+            &next_fetched,
+            &self.fc,
+            &self.docker,
+            &self.data_dir,
+        )
+        .await
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(uuid = %self.uuid, reff = %reff, error = %e, "deploy: build new runtime failed (keeping old)");
+                return Reply::Err {
+                    message: format!("deploy: build runtime for {reff}: {e}"),
+                };
+            }
+        };
+
+        // Zero-downtime swap: health-gate the new runtime, atomically flip, then
+        // drain + shut down the old one. On a health-gate timeout the OLD
+        // runtime stays active and the new one is torn down.
+        match perform_swap(
+            &self.active,
+            new_runtime,
+            DEPLOY_DRAIN,
+            DEPLOY_HEALTH_TIMEOUT,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(uuid = %self.uuid, reff = %reff, "deploy: zero-downtime swap complete");
+                Reply::Ok
+            }
+            Err(e) => {
+                tracing::warn!(uuid = %self.uuid, reff = %reff, error = %e, "deploy: swap aborted (keeping old)");
+                Reply::Err {
+                    message: format!("deploy: swap aborted for {reff}: {e}"),
+                }
+            }
         }
     }
 }
@@ -199,6 +290,7 @@ async fn dispatch(cmd: Cmd, lifecycle: &RunnerLifecycle) -> Reply {
             lifecycle.purge().await;
             Reply::Ok
         }
+        Cmd::Deploy { reff } => lifecycle.deploy(&reff).await,
         Cmd::Shutdown => {
             lifecycle.stop().await;
             // Signal the main task to exit cleanly, if a shutdown notifier is
@@ -229,10 +321,13 @@ mod tests {
     use http::{Request, Response};
     use tokio::sync::Mutex;
 
+    use bytes::Bytes as BytesAlias;
+
     use super::*;
     use crate::config::DockerConfig;
     use crate::control_proto::{Cmd, Reply};
-    use crate::fetcher::S3Fetcher;
+    use crate::fetcher::{FetchedApp, S3Fetcher};
+    use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
     use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, RuntimeHealth};
 
     // ---- Fake runtime -------------------------------------------------------
@@ -253,7 +348,42 @@ mod tests {
         }
     }
 
+    /// A `wasm-http` `FetchedApp` carrying the committed hello.wasm fixture, so
+    /// `build_runtime` (called by `deploy`) compiles a real, healthy runtime
+    /// without needing docker or a live registry.
+    fn wasm_fetched() -> FetchedApp {
+        let wasm = include_bytes!("../../tests/fixtures/hello.wasm");
+        FetchedApp {
+            version: 1,
+            manifest: AppManifest {
+                app: AppMeta {
+                    id: None,
+                    name: "hello".to_owned(),
+                    version: String::new(),
+                    kind: "headless".to_owned(),
+                    description: String::new(),
+                },
+                lifecycle: Lifecycle {
+                    mode: LifecycleMode::OnRequest,
+                    idle_timeout_sec: 300,
+                },
+                runtime: Runtime {
+                    r#type: "wasm-http".to_owned(),
+                    entry: "app.wasm".to_owned(),
+                    fuel_per_request: crate::runtime::DEFAULT_FUEL_PER_REQUEST,
+                    memory_mb: 64,
+                    kernel: None,
+                    registry_ref: None,
+                },
+                routes: Routes::default(),
+            },
+            wasm: BytesAlias::from_static(wasm),
+            cached_path: std::path::PathBuf::from("/tmp/tabbify-deploy-test/app.wasm"),
+        }
+    }
+
     fn fake_lifecycle(health: RuntimeHealth) -> RunnerLifecycle {
+        let runtime: Arc<dyn AppRuntime> = Arc::new(FakeRuntime { health });
         RunnerLifecycle {
             uuid: "test-uuid".to_owned(),
             version: 0,
@@ -261,7 +391,11 @@ mod tests {
             hosted: Arc::new(Mutex::new(None)), // stopped
             fetcher: S3Fetcher::new("http://s3.invalid", std::path::Path::new("/tmp")),
             docker: DockerConfig::default(),
-            runtime: Arc::new(FakeRuntime { health }),
+            runtime: runtime.clone(),
+            active: Arc::new(ActiveRuntime::new(runtime)),
+            fetched: wasm_fetched(),
+            fc: FcConfig::default(),
+            data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
             shutdown_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -303,5 +437,81 @@ mod tests {
             }
             other => panic!("expected Health reply, got {other:?}"),
         }
+    }
+
+    // ---- Deploy dispatch tests ----------------------------------------------
+
+    /// A `Deploy` whose new runtime builds + becomes healthy must reply `Ok` and
+    /// the shared `ActiveRuntime` cell must now hold a DIFFERENT runtime (the
+    /// swap flipped). The new runtime is a real wasm runtime compiled from the
+    /// committed fixture (default health = Serving), so `perform_swap` passes its
+    /// health-gate and flips. The swap mechanics themselves are covered by
+    /// `perform_swap`'s own P2.3a tests; here we verify the command is dispatched
+    /// to the swap path and the active cell is updated.
+    #[tokio::test]
+    async fn deploy_healthy_new_runtime_swaps_active_and_replies_ok() {
+        let lc = fake_lifecycle(RuntimeHealth::Serving);
+        let before = lc.active.load();
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: "ignored-for-wasm".to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        assert!(
+            matches!(reply, Reply::Ok),
+            "healthy deploy must reply Ok, got {reply:?}"
+        );
+        // The active runtime was swapped: the post-deploy load is a different
+        // allocation than the pre-deploy one (the FakeRuntime we started with).
+        assert!(
+            !Arc::ptr_eq(&before, &lc.active.load()),
+            "Deploy must swap the active runtime to the freshly-built one"
+        );
+        // And the new active runtime serves 200 (it is the real wasm fixture).
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = lc.active.load().handle(req).await.expect("handle");
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// When building the new runtime fails (an unknown runtime type triggers a
+    /// hard error in `build_runtime`), `Deploy` must reply `Err` and the active
+    /// runtime must be UNCHANGED — the old runtime stays in service (no
+    /// downtime).
+    #[tokio::test]
+    async fn deploy_build_failure_keeps_old_runtime_and_replies_err() {
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        // Force the build to fail: an unrecognised runtime type is a hard error
+        // in `build_runtime` (no silent fallback).
+        lc.fetched.manifest.runtime.r#type = "no-such-runtime".to_owned();
+        let before = lc.active.load();
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: "[fd5a::1]:5000/acme/app:sha".to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        match reply {
+            Reply::Err { message } => assert!(
+                message.contains("deploy"),
+                "error must mention deploy, got: {message}"
+            ),
+            other => panic!("expected Err reply on build failure, got {other:?}"),
+        }
+        // The active runtime is unchanged — same allocation as before.
+        assert!(
+            Arc::ptr_eq(&before, &lc.active.load()),
+            "a failed deploy must NOT swap the active runtime (no downtime)"
+        );
     }
 }

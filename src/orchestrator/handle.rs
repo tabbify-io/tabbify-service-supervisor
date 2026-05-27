@@ -47,6 +47,20 @@ pub struct RunnerHandle {
     /// [`RestartState::default()`], which is the clean "never failed" sentinel.
     #[serde(default)]
     pub restart: crate::orchestrator::restart::RestartState,
+    /// The OCI image ref of the last successful deploy (`Deploy{reff}`), if any.
+    ///
+    /// Persisted so a supervisor-driven respawn comes back on the SAME deployed
+    /// version: the orchestrator passes it to the runner as `--image-ref` and
+    /// the runner applies it to the manifest's `registry_ref` before building
+    /// the initial runtime. `None` (the default) = build from the S3 manifest as
+    /// usual.
+    ///
+    /// `#[serde(default)]` keeps old on-disk records (written before this field
+    /// existed) loading — they get `None`, i.e. today's behavior. Setting this
+    /// on a successful deploy is the orchestrator's job (P2.4); here it only
+    /// exists, persists/loads, and flows into the spawn args.
+    #[serde(default)]
+    pub image_ref: Option<String>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -149,6 +163,7 @@ mod tests {
             parent: Some("fd5a:1f00:0:3::1".to_owned()),
             spawned_at: 1_700_000_000,
             restart: Default::default(),
+            image_ref: None,
         }
     }
 
@@ -161,6 +176,7 @@ mod tests {
             parent: None,
             spawned_at: 0,
             restart: Default::default(),
+            image_ref: None,
         }
     }
 
@@ -236,6 +252,48 @@ mod tests {
         assert_eq!(
             loaded.restart, h.restart,
             "restart state must survive save/load"
+        );
+    }
+
+    // ── image_ref field ──────────────────────────────────────────────────────
+
+    /// A handle with a non-default `image_ref` must round-trip through
+    /// `save` → `load` with the ref intact (so a respawn comes back on the same
+    /// deployed version).
+    #[test]
+    fn image_ref_round_trips_via_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.image_ref = Some("[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned());
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded.image_ref.as_deref(),
+            Some("[fd5a:1f02::1]:5000/acme/app:sha256abc"),
+            "image_ref must survive save/load"
+        );
+        assert_eq!(loaded, h);
+    }
+
+    /// JSON written before the `image_ref` field was added (no `"image_ref"`
+    /// key) must deserialize with `image_ref = None` so old records still load.
+    #[test]
+    fn image_ref_defaults_to_none_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert!(
+            h.image_ref.is_none(),
+            "missing image_ref key must deserialize as None"
         );
     }
 

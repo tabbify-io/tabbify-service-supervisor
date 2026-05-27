@@ -337,6 +337,7 @@ mod tests {
                 next_retry_at: 1_700_001_000,
                 last_healthy_at: 0,
             },
+            image_ref: None,
         }
     }
 

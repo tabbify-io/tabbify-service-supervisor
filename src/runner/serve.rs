@@ -161,6 +161,11 @@ pub struct ServeConfig {
     pub fc: FcConfig,
     /// Docker runtime config.
     pub docker: DockerConfig,
+    /// OCI image ref of a previously-deployed version. When `Some`, it is
+    /// applied to the fetched manifest's docker `registry_ref` before the
+    /// INITIAL [`build_runtime`], so a supervisor-driven respawn comes up on the
+    /// deployed version. `None` = build from the S3 manifest as usual.
+    pub image_ref: Option<String>,
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
@@ -201,10 +206,22 @@ impl RunnerServe {
         let app_ula = derive_app_ula(parsed_uuid);
 
         let fetcher = S3Fetcher::new(&cfg.s3_base_url, &cfg.data_dir);
-        let fetched = fetcher
+        let mut fetched = fetcher
             .fetch(&cfg.uuid)
             .await
             .with_context(|| format!("fetch app {}", cfg.uuid))?;
+
+        // If a deployed image ref was passed (`--image-ref`, set by the
+        // orchestrator on a respawn), apply it to the manifest's docker
+        // `registry_ref` so the INITIAL build comes up on the deployed version
+        // (a `docker pull <ref>` instead of a source build). The override is
+        // also reflected in the `fetched` we store for later `Deploy` calls, so
+        // the runner's baseline version is the deployed one. Ignored for
+        // wasm/firecracker (`build_runtime` does not read `registry_ref` there).
+        if let Some(reff) = cfg.image_ref.as_deref() {
+            fetched = crate::build::fetched_with_ref(&fetched, reff);
+            tracing::info!(uuid = %cfg.uuid, %reff, "applied deployed image ref to manifest for initial build");
+        }
 
         let initial_runtime =
             build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.docker, &cfg.data_dir)
@@ -264,6 +281,13 @@ impl RunnerServe {
             fetcher,
             docker: cfg.docker,
             runtime: runtime_for_lifecycle,
+            // Shared with this RunnerServe + the binary's run_until_exit loop so
+            // a `Deploy` swaps the live runtime here and the crash-watch re-arms.
+            active: active.clone(),
+            // The build context `Deploy` rebuilds from (manifest + cached path).
+            fetched,
+            fc: cfg.fc,
+            data_dir: cfg.data_dir,
             // Wired by the binary after start(); None here so the control
             // server falls back to the legacy direct-exit path until the
             // binary calls lifecycle.set_shutdown_tx(tx).
@@ -361,6 +385,7 @@ mod tests {
             port: 8730,
             fc: FcConfig::default(),
             docker: DockerConfig::default(),
+            image_ref: None,
         }
     }
 
