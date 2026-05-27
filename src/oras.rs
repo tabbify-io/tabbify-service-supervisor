@@ -52,6 +52,56 @@ pub async fn oras_pull(oras_bin: &str, reff: &str, out_dir: &Path, runner: &Comm
     (runner)(args).await
 }
 
+/// Build the `oras push` argument list (sans the leading binary name).
+///
+/// Pushes a single `.wasm` file as an OCI artifact of type
+/// `application/vnd.tabbify.wasm.component.v1`, with the file's media type set to
+/// `application/wasm`. Always includes `--plain-http` because the mesh registry
+/// is served over plain HTTP on the encrypted WireGuard overlay (`[ula]:5000`).
+///
+/// The file argument follows oras's `<path>:<media-type>` form so the registry
+/// records the layer with the right content type. `artifact_path` may be an
+/// absolute path on the builder's disk; oras stores it under its basename.
+///
+/// # Example
+/// ```
+/// # use tabbify_service_supervisor::oras::oras_push_args;
+/// let args = oras_push_args("[fd5a::1]:5000/acme/app:sha", "/tmp/app.wasm");
+/// assert_eq!(args[0], "push");
+/// assert!(args.contains(&"--plain-http".to_owned()));
+/// assert!(args.contains(&"/tmp/app.wasm:application/wasm".to_owned()));
+/// ```
+#[must_use]
+pub fn oras_push_args(reff: &str, artifact_path: &str) -> Vec<String> {
+    vec![
+        "push".to_owned(),
+        "--plain-http".to_owned(),
+        "--artifact-type".to_owned(),
+        "application/vnd.tabbify.wasm.component.v1".to_owned(),
+        reff.to_owned(),
+        format!("{artifact_path}:application/wasm"),
+    ]
+}
+
+/// Run `<oras_bin> push --plain-http --artifact-type <type> <reff>
+/// <artifact_path>:application/wasm` via the injected `runner`. Returns `true`
+/// iff the command exits successfully.
+///
+/// Mirrors [`oras_pull`]: the injectable [`CommandRunner`] (same type as in
+/// [`crate::docker`]) lets tests record the exact argv without invoking a real
+/// `oras` binary. The `oras_bin` is consumed by [`production_oras_runner`]; the
+/// seam args themselves don't carry the binary name.
+pub async fn oras_push(
+    oras_bin: &str,
+    reff: &str,
+    artifact_path: &str,
+    runner: &CommandRunner,
+) -> bool {
+    let _ = oras_bin; // oras_bin is used by production_oras_runner, not the seam args
+    let args = oras_push_args(reff, artifact_path);
+    (runner)(args).await
+}
+
 /// Scan `dir` for the first `*.wasm` file and return its path.
 ///
 /// `oras pull` restores the artifact under its original pushed filename, so
@@ -213,6 +263,100 @@ mod tests {
         use std::sync::Arc;
         let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
         let ok = oras_pull("oras", "reg/app:v1", Path::new("/tmp/x"), &runner).await;
+        assert!(!ok);
+    }
+
+    // ---- oras_push_args ------------------------------------------------------
+
+    /// The push args must include `--plain-http`, the tabbify wasm artifact-type,
+    /// the ref, and the `<path>:application/wasm` file argument.
+    #[test]
+    fn push_args_includes_plain_http_artifact_type_ref_and_wasm_media() {
+        let reff = "[fd5a:1f02::1]:5000/acme/app:sha256abc";
+        let path = "/tmp/build/app.wasm";
+        let args = oras_push_args(reff, path);
+        assert_eq!(args[0], "push", "first arg must be 'push'");
+        assert!(
+            args.contains(&"--plain-http".to_owned()),
+            "must include --plain-http; got {args:?}"
+        );
+        assert!(
+            args.contains(&"--artifact-type".to_owned()),
+            "must include --artifact-type; got {args:?}"
+        );
+        assert!(
+            args.contains(&"application/vnd.tabbify.wasm.component.v1".to_owned()),
+            "must include the tabbify wasm artifact-type; got {args:?}"
+        );
+        assert!(args.contains(&reff.to_owned()), "must include the ref");
+        assert!(
+            args.contains(&format!("{path}:application/wasm")),
+            "must include the <path>:application/wasm file arg; got {args:?}"
+        );
+    }
+
+    /// Exact argv shape:
+    /// `["push", "--plain-http", "--artifact-type", <type>, <reff>, "<path>:application/wasm"]`.
+    #[test]
+    fn push_args_exact_shape() {
+        let args = oras_push_args("reg/app:tag", "out/app.wasm");
+        assert_eq!(
+            args,
+            vec![
+                "push",
+                "--plain-http",
+                "--artifact-type",
+                "application/vnd.tabbify.wasm.component.v1",
+                "reg/app:tag",
+                "out/app.wasm:application/wasm",
+            ]
+        );
+    }
+
+    // ---- oras_push (seam) ----------------------------------------------------
+
+    /// The runner is called with the correct oras push argv and the function
+    /// returns `true` when the runner succeeds.
+    #[tokio::test]
+    async fn oras_push_calls_runner_with_correct_args() {
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap2 = captured.clone();
+        let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
+            cap2.lock().unwrap().push(args);
+            Box::pin(async { true })
+        });
+
+        let reff = "[fd5a::1]:5000/myapp:latest";
+        let path = "/tmp/oras-test/app.wasm";
+        let ok = oras_push("oras", reff, path, &runner).await;
+        assert!(ok, "runner returned true → oras_push must return true");
+
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 1, "runner must be called exactly once");
+        let argv = &calls[0];
+        assert_eq!(argv[0], "push", "argv must start with push; got {argv:?}");
+        assert!(
+            argv.contains(&"--plain-http".to_owned()),
+            "argv must contain --plain-http; got {argv:?}"
+        );
+        assert!(
+            argv.contains(&reff.to_owned()),
+            "argv must contain the ref; got {argv:?}"
+        );
+        assert!(
+            argv.contains(&format!("{path}:application/wasm")),
+            "argv must contain the wasm file arg; got {argv:?}"
+        );
+    }
+
+    /// A failing runner causes `oras_push` to return `false`.
+    #[tokio::test]
+    async fn oras_push_returns_false_on_runner_failure() {
+        use std::sync::Arc;
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+        let ok = oras_push("oras", "reg/app:v1", "/tmp/x/app.wasm", &runner).await;
         assert!(!ok);
     }
 }

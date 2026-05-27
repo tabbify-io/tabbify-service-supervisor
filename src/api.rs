@@ -259,6 +259,11 @@ async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildBody>
         registry_ula: body.registry_ula,
         clone_token: body.clone_token,
         push_token: body.push_token,
+        // build_kind / build_cmd / artifact_path are threaded through this
+        // endpoint by task WC; the bare `/v1/build` invoker is docker-only.
+        build_kind: crate::runner::build::BuildKind::Docker,
+        build_cmd: None,
+        artifact_path: None,
     };
     match state.orchestrator.spawn_build(&job).await {
         Ok(art) => axum::Json(art).into_response(),

@@ -219,6 +219,9 @@ mod tests {
             registry_ula: "[fd5a::1]:5000".into(),
             clone_token: None,
             push_token: None,
+            build_kind: crate::runner::build::BuildKind::Docker,
+            build_cmd: None,
+            artifact_path: None,
         }
     }
 
