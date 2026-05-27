@@ -16,6 +16,8 @@
 //!   Firecracker microVM runtime (real on Linux, stub elsewhere).
 //! - [`docker`] — the third [`runtime::AppRuntime`]: a cross-platform Docker
 //!   container runtime that builds the app image from source on the supervisor.
+//! - [`git`] — secure `git clone` helper: injects `GIT_ASKPASS` so the token
+//!   never appears in process argv.
 //! - [`fetcher`] — anonymous S3 artifact fetch + local cache (contract §2).
 //! - [`host`] — per-app-ULA hosting: one listener per app on its own ULA, used
 //!   by the per-app [`runner`] (contract §5, Component 3).
@@ -34,6 +36,7 @@ pub mod control_proto;
 pub mod docker;
 pub mod fetcher;
 pub mod firecracker;
+pub mod git;
 pub mod host;
 pub mod manifest;
 pub mod mesh;
