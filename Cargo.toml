@@ -75,9 +75,11 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Temporary directories for build workdirs (also used in tests).
+tempfile = "3"
+
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full", "test-util"] }
 http-body-util = "0.1"
 # Local mock HTTP server to stand in for S3 in fetcher tests.
 wiremock = "0.6"
-tempfile = "3"

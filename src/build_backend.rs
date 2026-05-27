@@ -74,8 +74,12 @@ pub trait BuildBackend: Send + Sync {
 /// Wraps [`crate::docker::push_image`] for direct use by the build-runner
 /// orchestration layer (P3.4) so it has a single import point in this module.
 ///
-/// Called by P3.4 `run_build` orchestration; `dead_code` is expected until
-/// that caller lands.
+/// Convenience alias: tag the locally-built `local_tag` as `registry_ref`
+/// and push to the mesh OCI registry.
+///
+/// Wraps [`crate::docker::push_image`] so callers inside this module have a
+/// single import point.  The P3.4 orchestration calls `crate::docker::push_image`
+/// directly; this wrapper remains for future callers within `build_backend`.
 #[allow(dead_code)]
 pub(crate) async fn push_to_registry(
     docker_bin: &str,

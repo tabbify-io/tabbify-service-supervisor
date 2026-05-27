@@ -237,9 +237,8 @@ mod protocol {
     /// Used by the build-runner after `docker build` to publish the image into
     /// the mesh registry so supervisors on other nodes can pull it.
     ///
-    /// Called via [`super::push_image`] → [`crate::build_backend::push_to_registry`];
-    /// `dead_code` is expected until the P3.4 orchestration caller lands.
-    #[allow(dead_code)]
+    /// Called via [`super::push_image`] → [`crate::build_backend::push_to_registry`]
+    /// and directly by the P3.4 `run_build` orchestration.
     pub fn push_args(reff: &str) -> Vec<String> {
         vec!["push".to_owned(), reff.to_owned()]
     }
@@ -1047,9 +1046,8 @@ mod runtime_impl {
     /// Uses the injectable [`CommandRunner`] so tests can record the issued
     /// commands without a real Docker daemon.
     ///
-    /// Wrapped by [`crate::build_backend::push_to_registry`]; `dead_code` is
-    /// expected until the P3.4 orchestration caller lands.
-    #[allow(dead_code)]
+    /// Wrapped by [`crate::build_backend::push_to_registry`]; called directly
+    /// by the P3.4 `run_build` orchestration via `crate::docker::push_image`.
     pub(crate) async fn push_image(
         _docker_bin: &str,
         local_tag: &str,
