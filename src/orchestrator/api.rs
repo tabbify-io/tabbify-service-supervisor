@@ -323,6 +323,72 @@ impl Orchestrator {
         }))
     }
 
+    /// Deploy `reff` to `uuid`: if a runner is live send it a `Deploy` control
+    /// message (zero-downtime swap); if there is no live runner, spawn one
+    /// pinned to `reff`. The deployed ref is persisted so a future supervisor
+    /// restart respawns the runner on the same version.
+    ///
+    /// # Errors
+    /// - `uuid` is not a valid UUID;
+    /// - the control-socket deploy fails (runner returned `Reply::Err`);
+    /// - spawning a cold runner fails or it never becomes healthy.
+    pub async fn deploy_app(&self, uuid: &str, reff: &str) -> Result<AppSummary> {
+        let app_ula = self.app_ula_for(uuid)?;
+
+        if self.client_for(uuid).health().await.is_ok() {
+            // Live runner: send the Deploy message.
+            match self.client_for(uuid).deploy(reff).await {
+                Ok(Reply::Ok) => {}
+                Ok(Reply::Err { message }) => {
+                    return Err(anyhow::anyhow!("runner deploy failed: {message}"));
+                }
+                Ok(other) => {
+                    return Err(anyhow::anyhow!("unexpected reply to Deploy: {other:?}"));
+                }
+                Err(e) => return Err(e.context("deploy control message failed")),
+            }
+
+            // Persist the new ref so a future respawn comes up on this version.
+            let mut record = RunnerHandle::load(self.runner_dir(), uuid)
+                .with_context(|| format!("load runner record for {uuid} after deploy"))?
+                .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
+            record.image_ref = Some(reff.to_owned());
+            record
+                .save(self.runner_dir())
+                .with_context(|| format!("save runner record for {uuid} after deploy"))?;
+
+            Ok(AppSummary {
+                uuid: uuid.to_owned(),
+                app_ula: app_ula.to_string(),
+                state: AppState::Running,
+                restart_status: restart_status_str(RestartStatus::Running),
+                restart_count: 0,
+                next_retry_at: 0,
+            })
+        } else {
+            // No live runner: spawn one pinned to reff.
+            let mut spec = self.spawn_spec_for_uuid(uuid);
+            spec.image_ref = Some(reff.to_owned());
+            let (handle, _child) = spawn_runner(&spec, self.runner_dir())
+                .await
+                .with_context(|| format!("spawn runner for {uuid}"))?;
+
+            let client = ControlClient::new(&handle.control_sock);
+            wait_healthy(&client, START_HEALTHY_TIMEOUT)
+                .await
+                .with_context(|| format!("runner for {uuid} never became healthy"))?;
+
+            Ok(AppSummary {
+                uuid: uuid.to_owned(),
+                app_ula: app_ula.to_string(),
+                state: AppState::Running,
+                restart_status: restart_status_str(RestartStatus::Running),
+                restart_count: 0,
+                next_retry_at: 0,
+            })
+        }
+    }
+
     /// Reset `uuid`'s crash-loop / backoff state and retry immediately.
     ///
     /// This is the `systemctl reset-failed` analog: it zeroes the
@@ -664,6 +730,113 @@ mod tests {
         assert!(
             o.reset_app("not-a-uuid").await.is_err(),
             "malformed uuid must be rejected"
+        );
+    }
+
+    // ── deploy_app ────────────────────────────────────────────────────────────
+
+    /// deploy_app rejects malformed uuids before touching any socket.
+    #[tokio::test]
+    async fn deploy_app_rejects_bad_uuid() {
+        let o = orch(PathBuf::from("/run/tabbify/runners"));
+        assert!(
+            o.deploy_app("not-a-uuid", "reg:5000/a/b:sha")
+                .await
+                .is_err(),
+            "malformed uuid must be rejected"
+        );
+    }
+
+    /// deploy_app: when no live runner exists AND no runner binary is available
+    /// the spawn fails fast with an error (cold-path failure path test).
+    #[tokio::test]
+    async fn deploy_app_cold_path_spawn_fails_cleanly() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let o = orch(dir.path().to_path_buf());
+
+        // No runner binary → spawn will fail → deploy returns Err.
+        let result = o.deploy_app(APP_UUID, "[fd5a::1]:5000/a/b:sha").await;
+        assert!(
+            result.is_err(),
+            "deploy_app must fail when the runner binary is missing"
+        );
+    }
+
+    /// deploy_app: after a Deploy control command succeeds (simulated via a live
+    /// fake unix-socket server that returns Reply::Ok), the persisted RunnerHandle
+    /// must have image_ref updated to the deployed ref.
+    ///
+    /// This test wires up a minimal fake control server on a real Unix socket so
+    /// the orchestrator's deploy_app round-trips through ControlClient::deploy.
+    #[tokio::test]
+    async fn deploy_app_live_path_persists_image_ref() {
+        use std::time::Duration;
+        use tempfile::TempDir;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+
+        // Spawn a fake control server: answers Deploy{...} with Reply::Ok,
+        // Health with Reply::Ok (for the liveness check), then exits.
+        let sock_path_srv = sock_path.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            // Handle a few connections (health probe + deploy command).
+            for _ in 0..5 {
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        // Reply Ok to everything (health probe or deploy).
+                        let reply = r#"{"reply":"ok"}"#;
+                        let _ = reader
+                            .into_inner()
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Give the fake server a moment to bind.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Persist a runner record so the live-path can load/mutate/save it.
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+        };
+        rec.save(dir.path()).unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        let reff = "[fd5a::1]:5000/acme/app:sha256abc";
+        let result = o.deploy_app(APP_UUID, reff).await;
+
+        assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
+        let summary = result.unwrap();
+        assert_eq!(summary.uuid, APP_UUID);
+        assert_eq!(summary.state, AppState::Running);
+
+        // The persisted handle must carry the deployed ref.
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must still exist after deploy");
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some(reff),
+            "image_ref must be persisted after a live deploy"
         );
     }
 }

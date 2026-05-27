@@ -19,9 +19,11 @@
 //! - `POST /v1/apps/:uuid/stop`   (shutdown the runner + forget)
 //! - `POST /v1/apps/:uuid/purge`  (purge + shutdown the runner + forget + clear cache)
 //! - `POST /v1/apps/:uuid/reset`  (clear crash-loop/backoff state + retry immediately)
+//! - `POST /v1/apps/:uuid/deploy` (zero-downtime swap or cold spawn pinned to `ref`)
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -100,6 +102,7 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/stop", post(stop_app))
         .route("/v1/apps/:uuid/purge", post(purge_app))
         .route("/v1/apps/:uuid/reset", post(reset_app))
+        .route("/v1/apps/:uuid/deploy", post(deploy_app))
         .with_state(Arc::new(state))
 }
 
@@ -182,6 +185,34 @@ async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -
 /// when no runner record exists (the app was never started).
 async fn reset_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     match state.orchestrator.reset_app(&uuid).await {
+        Ok(s) => running_json(&s).into_response(),
+        Err(e) => anyhow_to_not_found_or_error(&e),
+    }
+}
+
+/// Request body for `POST /v1/apps/:uuid/deploy`.
+#[derive(serde::Deserialize)]
+struct DeployBody {
+    /// OCI image ref to deploy (e.g. `[fd5a::1]:5000/acme/app:sha256abc`).
+    ///
+    /// Renamed from `reff` because `ref` is a Rust keyword.
+    #[serde(rename = "ref")]
+    reff: String,
+}
+
+/// `POST /v1/apps/:uuid/deploy` — zero-downtime swap if a runner is live, or
+/// cold spawn pinned to `ref` if not. Persists the deployed ref so a future
+/// supervisor restart respawns the runner on the same version.
+///
+/// Returns the app's current status JSON (same shape as `start` / `reset`).
+/// Returns `404` when no runner record exists AND the cold spawn fails because
+/// the uuid is unknown; otherwise mirrors `reset_app` error semantics.
+async fn deploy_app(
+    State(state): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<DeployBody>,
+) -> Response {
+    match state.orchestrator.deploy_app(&uuid, &body.reff).await {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_not_found_or_error(&e),
     }
@@ -417,5 +448,124 @@ mod tests {
         let e = anyhow::anyhow!("something went wrong");
         let resp = anyhow_to_not_found_or_error(&e);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── DeployBody deserialization ────────────────────────────────────────────
+
+    /// `{"ref":"x"}` parses to `reff == "x"` — pins the `#[serde(rename="ref")]`.
+    #[test]
+    fn deploy_body_ref_field_deserializes() {
+        let body: DeployBody = serde_json::from_str(r#"{"ref":"x"}"#).unwrap();
+        assert_eq!(body.reff, "x");
+    }
+
+    /// A realistic OCI image ref round-trips through DeployBody.
+    #[test]
+    fn deploy_body_oci_ref_round_trips() {
+        let json = r#"{"ref":"[fd5a::1]:5000/a/b:sha256abc"}"#;
+        let body: DeployBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.reff, "[fd5a::1]:5000/a/b:sha256abc");
+    }
+
+    // ── POST /v1/apps/:uuid/deploy — 404 for unknown uuid (no record) ─────────
+
+    /// Posting deploy for a uuid that has no on-disk runner record and no live
+    /// runner returns a non-200 response (spawn failure or 404).
+    #[tokio::test]
+    async fn deploy_unknown_uuid_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let state = make_state(dir.path().to_path_buf());
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_UUID}/deploy"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"ref":"reg:5000/a/b:sha"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // No runner binary available → spawn fails → should not be 200.
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "deploy of unknown uuid with no runner binary must not return 200"
+        );
+    }
+
+    // ── POST /v1/apps/:uuid/deploy — 200 for known uuid with a live runner ────
+
+    /// Posting deploy for a uuid that has a live (fake) runner returns 200 with
+    /// state/app_ula/bound_addr, and the persisted record has image_ref updated.
+    #[tokio::test]
+    async fn deploy_known_uuid_with_live_runner_returns_200() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+
+        // Fake control server: replies Ok to every command (health + deploy).
+        let sock_path_srv = sock_path.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            for _ in 0..5 {
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Persist a runner record pointing at the fake socket.
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: RestartState::default(),
+            image_ref: None,
+        };
+        rec.save(dir.path()).unwrap();
+
+        let state = make_state(dir.path().to_path_buf());
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_UUID}/deploy"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"ref":"[fd5a::1]:5000/acme/app:sha256abc"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("state").is_some(), "response must contain 'state'");
+        assert!(
+            json.get("app_ula").is_some(),
+            "response must contain 'app_ula'"
+        );
+
+        // Persisted record must have image_ref updated.
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must exist after deploy");
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some("[fd5a::1]:5000/acme/app:sha256abc"),
+            "image_ref must be persisted after HTTP deploy"
+        );
     }
 }
