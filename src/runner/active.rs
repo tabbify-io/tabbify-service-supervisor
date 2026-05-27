@@ -10,11 +10,98 @@
 //! inner `Arc<dyn AppRuntime>`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::sync::Notify;
 
 use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
+
+/// Poll interval for [`perform_swap`]'s health check on the new runtime.
+const SWAP_HEALTH_POLL: Duration = Duration::from_millis(100);
+
+/// Why a zero-downtime swap was aborted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapError {
+    /// The new runtime never reported [`RuntimeHealth::Serving`] before the
+    /// deadline elapsed. The OLD runtime stays active (no downtime); the new
+    /// runtime has already been shut down by [`perform_swap`].
+    Unhealthy,
+}
+
+impl std::fmt::Display for SwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unhealthy => write!(f, "new runtime did not become healthy before deadline"),
+        }
+    }
+}
+
+impl std::error::Error for SwapError {}
+
+/// Bring `new` into service on `active` with zero downtime.
+///
+/// The state machine:
+/// 1. **Health-gate.** Poll `new.health()` every [`SWAP_HEALTH_POLL`] until it
+///    reports [`RuntimeHealth::Serving`] or `deadline` elapses.
+/// 2. **Flip (healthy).** Atomically [`ActiveRuntime::swap`] `new` in. Spawn a
+///    detached drain task that sleeps `drain`, then calls
+///    [`AppRuntime::shutdown`] on the OLD runtime. Return `Ok(())` immediately —
+///    in-flight requests on the old runtime finish because each request holds
+///    its own `Arc` clone of it (P2.2's design).
+/// 3. **Abort (timeout).** Call `new.shutdown()` and return [`SwapError`]. The
+///    OLD runtime stays active, so a failed deploy causes **no downtime** and no
+///    flip.
+///
+/// The flip happens ONLY after health passes, so the live runtime is never
+/// replaced by an unhealthy one.
+///
+/// # Errors
+/// [`SwapError::Unhealthy`] if `new` never became healthy within `deadline`.
+pub async fn perform_swap(
+    active: &ActiveRuntime,
+    new: Arc<dyn AppRuntime>,
+    drain: Duration,
+    deadline: Duration,
+) -> Result<(), SwapError> {
+    // --- 1. health-gate the new runtime ------------------------------------
+    if !await_healthy(new.as_ref(), deadline).await {
+        // Never became healthy: tear the new one down, leave OLD serving.
+        new.shutdown().await;
+        return Err(SwapError::Unhealthy);
+    }
+
+    // --- 2. flip: install `new`, get the OLD back for draining -------------
+    let old = active.swap(new);
+
+    // --- 3. drain the OLD runtime off the hot path (fire-and-forget) -------
+    // Spawned so `perform_swap` returns promptly after the flip; in-flight
+    // requests on `old` keep their own Arc clone alive until they complete.
+    tokio::spawn(async move {
+        tokio::time::sleep(drain).await;
+        old.shutdown().await;
+    });
+
+    Ok(())
+}
+
+/// Poll `rt.health()` every [`SWAP_HEALTH_POLL`] until it returns
+/// [`RuntimeHealth::Serving`] or `deadline` elapses. Returns `true` iff the
+/// runtime became healthy in time.
+///
+/// The first probe runs immediately (a runtime that is already serving — e.g. a
+/// warm-started one — passes without waiting a full interval).
+async fn await_healthy(rt: &dyn AppRuntime, deadline: Duration) -> bool {
+    let probe = async {
+        loop {
+            if rt.health().await == RuntimeHealth::Serving {
+                return;
+            }
+            tokio::time::sleep(SWAP_HEALTH_POLL).await;
+        }
+    };
+    tokio::time::timeout(deadline, probe).await.is_ok()
+}
 
 /// Sized newtype that holds one `Arc<dyn AppRuntime>`.
 ///
@@ -186,7 +273,11 @@ mod tests {
             "B",
             "must serve B after swap"
         );
-        assert_eq!(fake_tag(&old).await, "A", "swap must return the previous runtime");
+        assert_eq!(
+            fake_tag(&old).await,
+            "A",
+            "swap must return the previous runtime"
+        );
     }
 
     /// swap() returns the OLD runtime (the caller drains + shuts it down).
@@ -252,5 +343,184 @@ mod tests {
             .await
             .expect("swapped() must resolve after swap")
             .expect("waiter task must not panic");
+    }
+
+    // ---- perform_swap state machine -----------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A controllable fake runtime for the swap state machine:
+    /// - `tag` distinguishes it in `handle()` bodies,
+    /// - `healthy` controls whether `health()` reports `Serving`,
+    /// - `shutdown_called` records whether `shutdown()` was invoked.
+    struct SwapFake {
+        tag: &'static str,
+        healthy: bool,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl SwapFake {
+        /// A runtime that reports `Serving` immediately.
+        fn healthy(tag: &'static str) -> (Arc<Self>, Arc<AtomicBool>) {
+            let flag = Arc::new(AtomicBool::new(false));
+            let rt = Arc::new(Self {
+                tag,
+                healthy: true,
+                shutdown_called: flag.clone(),
+            });
+            (rt, flag)
+        }
+
+        /// A runtime that reports `Unavailable` forever.
+        fn unhealthy(tag: &'static str) -> (Arc<Self>, Arc<AtomicBool>) {
+            let flag = Arc::new(AtomicBool::new(false));
+            let rt = Arc::new(Self {
+                tag,
+                healthy: false,
+                shutdown_called: flag.clone(),
+            });
+            (rt, flag)
+        }
+    }
+
+    impl AppRuntime for SwapFake {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            let tag = self.tag;
+            Box::pin(async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .body(Bytes::from(tag))
+                    .unwrap())
+            })
+        }
+
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            let healthy = self.healthy;
+            Box::pin(async move {
+                if healthy {
+                    RuntimeHealth::Serving
+                } else {
+                    RuntimeHealth::Unavailable("fake never ready".to_owned())
+                }
+            })
+        }
+
+        fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
+            let flag = self.shutdown_called.clone();
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// A healthy new runtime is swapped in; the OLD runtime is drained + shut
+    /// down; the NEW runtime is NOT shut down.
+    #[tokio::test]
+    async fn healthy_new_swaps_and_drains_old() {
+        let (old, old_shut) = SwapFake::healthy("OLD");
+        let (new, new_shut) = SwapFake::healthy("NEW");
+        let active = ActiveRuntime::new(old);
+
+        assert!(
+            !old_shut.load(Ordering::SeqCst),
+            "precondition: OLD.shutdown not yet called"
+        );
+
+        perform_swap(
+            &active,
+            new,
+            Duration::from_millis(0),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("healthy swap must succeed");
+
+        // The active runtime is now NEW.
+        assert_eq!(
+            body_of(active.handle(req()).await),
+            "NEW",
+            "active.load() must serve the NEW runtime after a healthy swap"
+        );
+
+        // Give the spawned drain task (drain = 0ms) a chance to run.
+        for _ in 0..50 {
+            if old_shut.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            old_shut.load(Ordering::SeqCst),
+            "OLD.shutdown() must be called after drain"
+        );
+        assert!(
+            !new_shut.load(Ordering::SeqCst),
+            "NEW.shutdown() must NOT be called (it is now serving)"
+        );
+    }
+
+    /// The `Arc::ptr_eq` predicate that `run_until_exit`'s re-arm guard relies
+    /// on: two `load()` calls for the SAME active runtime are pointer-equal, but
+    /// a `load()` taken before a swap is pointer-DISTINCT from one taken after.
+    ///
+    /// This pins the invariant that lets the crash-watch tell "the runtime that
+    /// died is still active" (real crash) from "it is a retired old runtime"
+    /// (expected post-swap shutdown) without depending on `select!` ordering.
+    #[tokio::test]
+    async fn load_ptr_eq_tracks_active_runtime_across_swap() {
+        let active = ActiveRuntime::new(Arc::new(FakeRt::new("A")));
+
+        let before = active.load();
+        assert!(
+            Arc::ptr_eq(&before, &active.load()),
+            "two loads of the same active runtime must be pointer-equal"
+        );
+
+        active.swap(Arc::new(FakeRt::new("B")));
+
+        // The pre-swap handle is now a RETIRED runtime: pointer-distinct from
+        // the new active one — exactly what the re-arm guard detects.
+        assert!(
+            !Arc::ptr_eq(&before, &active.load()),
+            "a pre-swap load must be pointer-distinct from the post-swap active runtime"
+        );
+        // ...and the new active runtime is again self-consistent across loads.
+        assert!(Arc::ptr_eq(&active.load(), &active.load()));
+    }
+
+    /// An unhealthy new runtime aborts the swap: the OLD runtime stays active
+    /// (no downtime), the NEW runtime is shut down, the OLD is not.
+    #[tokio::test]
+    async fn unhealthy_new_aborts_keeping_old() {
+        let (old, old_shut) = SwapFake::healthy("OLD");
+        let (new, new_shut) = SwapFake::unhealthy("NEW");
+        let active = ActiveRuntime::new(old);
+
+        let err = perform_swap(
+            &active,
+            new,
+            Duration::from_millis(0),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("unhealthy new must abort the swap");
+        assert_eq!(err, SwapError::Unhealthy);
+
+        // The active runtime is STILL OLD — no flip happened.
+        assert_eq!(
+            body_of(active.handle(req()).await),
+            "OLD",
+            "active.load() must STILL be OLD after an aborted swap (no downtime)"
+        );
+
+        assert!(
+            new_shut.load(Ordering::SeqCst),
+            "NEW.shutdown() must be called when the swap aborts"
+        );
+        assert!(
+            !old_shut.load(Ordering::SeqCst),
+            "OLD.shutdown() must NOT be called — it stays in service"
+        );
     }
 }

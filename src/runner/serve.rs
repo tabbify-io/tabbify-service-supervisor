@@ -72,20 +72,65 @@ pub fn decide_exit(exit_reason: Option<ExitReason>) -> RunnerExit {
     }
 }
 
-/// Drive the runner's main loop: park until either `watch_for_exit` resolves
-/// (runtime died unexpectedly → `Crashed`) or `shutdown_rx` fires (operator
-/// shutdown → `CleanShutdown`).
+/// Drive the runner's main loop: park until the **currently-active** runtime
+/// dies unexpectedly (`watch_for_exit` resolves → `Crashed`) or `shutdown_rx`
+/// fires (operator shutdown → `CleanShutdown`).
+///
+/// # Re-arming across swaps (P2.3)
+/// A zero-downtime swap ([`perform_swap`]) installs a new runtime and, after a
+/// drain, calls `shutdown()` on the OLD one — which makes the OLD runtime's
+/// `watch_for_exit` resolve. That MUST NOT be treated as a crash: it is the
+/// retired runtime exiting as expected. So the loop:
+/// - selects on the active runtime's `watch_for_exit` AND on
+///   [`ActiveRuntime::swapped`] (registered BEFORE awaiting so a concurrent swap
+///   is not missed);
+/// - on `watch_for_exit`: only returns `Crashed` if the runtime that died is
+///   STILL the active one (`Arc::ptr_eq`); otherwise it was a retired old
+///   runtime — re-arm by looping;
+/// - on `swapped`: a swap happened — re-arm the watch on the NEW active runtime;
+/// - on `shutdown_rx`: clean shutdown.
+///
+/// `shutdown_rx` is polled by `&mut` inside the loop so it survives across
+/// re-arm iterations (a `oneshot::Receiver` is consumed only when it resolves).
 ///
 /// Returns a [`RunnerExit`] that the binary translates into a `process::exit`
 /// call. Extracted as a free function so it is testable with a fake runtime
 /// without going through the full `RunnerServe::start` path.
+///
+/// [`perform_swap`]: crate::runner::active::perform_swap
 pub async fn run_until_exit(
-    runtime: Arc<dyn AppRuntime>,
-    shutdown_rx: oneshot::Receiver<()>,
+    active: Arc<ActiveRuntime>,
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) -> RunnerExit {
-    tokio::select! {
-        exit = runtime.watch_for_exit() => decide_exit(Some(exit)),
-        _ = shutdown_rx => decide_exit(None),
+    loop {
+        // The currently-active runtime, and a future that resolves on the NEXT
+        // swap. `swapped()` is registered BEFORE we await the select, so a swap
+        // racing with this iteration is not missed (P2.2's `notify_waiters`).
+        let current = active.load();
+        let swapped = active.swapped();
+
+        tokio::select! {
+            exit = current.watch_for_exit() => {
+                // Only the death of the STILL-active runtime is a crash. After a
+                // swap, `current` is a retired old runtime being shut down — its
+                // `watch_for_exit` resolving is expected, so we ignore it and
+                // re-arm on the new active runtime by looping.
+                //
+                // `Arc::ptr_eq` compares the pointed-to allocation: `load()`
+                // returns a fresh Arc clone each call, but clones of the SAME
+                // runtime share one allocation, so this correctly detects
+                // "still the active one" (works on `Arc<dyn AppRuntime>`).
+                if Arc::ptr_eq(&current, &active.load()) {
+                    return decide_exit(Some(exit));
+                }
+                // else: retired old runtime died as expected — loop to re-arm.
+            }
+            () = swapped => {
+                // A swap occurred — loop to re-arm `watch_for_exit` on the NEW
+                // active runtime.
+            }
+            _ = &mut shutdown_rx => return decide_exit(None),
+        }
     }
 }
 
@@ -124,6 +169,10 @@ pub struct ServeConfig {
 pub struct RunnerServe {
     /// The address the listener bound (loopback ephemeral in `--no-mesh` mode).
     addr: SocketAddr,
+    /// The swappable active-runtime cell. Held so the binary can pass it to
+    /// [`run_until_exit`] (which needs `load()`/`swapped()` to re-arm its
+    /// crash-watch across zero-downtime swaps).
+    active: Arc<ActiveRuntime>,
     /// Shared lifecycle state (wraps the live `HostedApp`). Kept here so the
     /// listener task lives as long as the `RunnerServe` does unless the control
     /// server issues a `Stop`.
@@ -223,6 +272,7 @@ impl RunnerServe {
 
         Ok(Self {
             addr,
+            active,
             lifecycle,
             _membership: membership,
         })
@@ -241,13 +291,16 @@ impl RunnerServe {
         self.lifecycle.clone()
     }
 
-    /// The app runtime held by this runner.
+    /// The swappable active-runtime cell held by this runner.
     ///
     /// Exposed so the binary can pass it to [`run_until_exit`] for the
-    /// fail-fast `watch_for_exit` select loop.
+    /// re-arming `watch_for_exit` select loop (which needs `load()`/`swapped()`
+    /// to distinguish a real crash from a post-swap retirement of the old
+    /// runtime). Coerces to `Arc<dyn AppRuntime>` via the `AppRuntime` impl when
+    /// a plain runtime handle is needed (e.g. the binary's clean-shutdown path).
     #[must_use]
-    pub fn runtime(&self) -> Arc<dyn AppRuntime> {
-        self.lifecycle.runtime.clone()
+    pub fn runtime(&self) -> Arc<ActiveRuntime> {
+        self.active.clone()
     }
 }
 
@@ -399,6 +452,40 @@ mod tests {
         // watch_for_exit uses the default: std::future::pending()
     }
 
+    /// Fake runtime whose `watch_for_exit` resolves only when an external
+    /// trigger ([`tokio::sync::Notify`]) is fired — lets a test drive the exact
+    /// moment a runtime "dies", deterministically.
+    struct WatchableRuntime {
+        trigger: Arc<tokio::sync::Notify>,
+        reason: String,
+    }
+
+    impl WatchableRuntime {
+        fn new(reason: &str) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
+            let trigger = Arc::new(tokio::sync::Notify::new());
+            let rt = Arc::new(Self {
+                trigger: trigger.clone(),
+                reason: reason.to_owned(),
+            });
+            (rt, trigger)
+        }
+    }
+
+    impl AppRuntime for WatchableRuntime {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async { Ok(Response::builder().status(200).body(Bytes::new()).unwrap()) })
+        }
+
+        fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
+            let trigger = self.trigger.clone();
+            let reason = self.reason.clone();
+            Box::pin(async move {
+                trigger.notified().await;
+                ExitReason::Died(reason)
+            })
+        }
+    }
+
     /// decide_exit: when exit_reason is Some(Died) → Crashed with the reason.
     #[test]
     fn decide_exit_died_returns_crashed() {
@@ -419,13 +506,13 @@ mod tests {
     /// run_until_exit: when watch_for_exit resolves first → Crashed.
     #[tokio::test]
     async fn run_until_exit_crash_wins_returns_crashed() {
-        let runtime: Arc<dyn AppRuntime> = Arc::new(CrashingRuntime {
+        let active = Arc::new(ActiveRuntime::new(Arc::new(CrashingRuntime {
             reason: "container tbf-test-0 exited with code 1".to_owned(),
-        });
+        })));
         let (_tx, rx) = oneshot::channel::<()>();
         // Deliberately drop tx so the channel is open but never sent to —
         // watch_for_exit resolves first.
-        let result = run_until_exit(runtime, rx).await;
+        let result = run_until_exit(active, rx).await;
         assert_eq!(
             result,
             RunnerExit::Crashed("container tbf-test-0 exited with code 1".to_owned())
@@ -435,11 +522,80 @@ mod tests {
     /// run_until_exit: when shutdown_rx fires first → CleanShutdown.
     #[tokio::test]
     async fn run_until_exit_shutdown_wins_returns_clean() {
-        let runtime: Arc<dyn AppRuntime> = Arc::new(StableRuntime);
+        let active = Arc::new(ActiveRuntime::new(Arc::new(StableRuntime)));
         let (tx, rx) = oneshot::channel::<()>();
         // Fire the shutdown immediately before awaiting.
         tx.send(()).unwrap();
-        let result = run_until_exit(runtime, rx).await;
+        let result = run_until_exit(active, rx).await;
         assert_eq!(result, RunnerExit::CleanShutdown);
+    }
+
+    // ---- re-arming crash-watch across swaps (P2.3) --------------------------
+
+    /// After a swap, the OLD runtime is drained + shut down, which makes its
+    /// `watch_for_exit` resolve. That MUST NOT be treated as a crash: the
+    /// retired runtime is no longer the active one. The runner must keep
+    /// running (watching the NEW, pending runtime).
+    #[tokio::test]
+    async fn swap_then_old_death_does_not_exit() {
+        let (old, old_trigger) = WatchableRuntime::new("OLD died");
+        let active = Arc::new(ActiveRuntime::new(old));
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn({
+            let active = active.clone();
+            async move { run_until_exit(active, rx).await }
+        });
+
+        // Let the loop register its first `swapped()`/`watch_for_exit` select.
+        tokio::task::yield_now().await;
+
+        // Swap in a NEW runtime whose `watch_for_exit` pends forever.
+        active.swap(Arc::new(StableRuntime));
+
+        // Let the loop observe the swap and re-arm on the NEW runtime.
+        tokio::task::yield_now().await;
+
+        // Now fire the OLD runtime's death (post-swap, post-drain). The loop
+        // must recognise `current != active.load()` and re-arm, NOT exit.
+        old_trigger.notify_waiters();
+
+        // The task must STILL be running after a short grace period.
+        let still_running =
+            tokio::time::timeout(std::time::Duration::from_millis(150), handle).await;
+        assert!(
+            still_running.is_err(),
+            "run_until_exit must NOT return after a retired runtime dies post-swap"
+        );
+    }
+
+    /// When the runtime that dies IS the active one, the runner exits Crashed
+    /// promptly.
+    #[tokio::test]
+    async fn active_death_exits() {
+        let (only, only_trigger) = WatchableRuntime::new("the only runtime died");
+        let active = Arc::new(ActiveRuntime::new(only));
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn({
+            let active = active.clone();
+            async move { run_until_exit(active, rx).await }
+        });
+
+        // Let the loop arm its watch.
+        tokio::task::yield_now().await;
+
+        // Fire the ACTIVE runtime's death — there was no swap, so `current` is
+        // still the active one and the loop must return Crashed.
+        only_trigger.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("run_until_exit must return promptly when the active runtime dies")
+            .expect("run_until_exit task must not panic");
+        assert_eq!(
+            result,
+            RunnerExit::Crashed("the only runtime died".to_owned())
+        );
     }
 }

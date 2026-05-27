@@ -11,6 +11,9 @@ use tabbify_supervisor::RunnerConfig;
 use tabbify_supervisor::runner::control;
 use tabbify_supervisor::runner::serve::{RunnerExit, RunnerServe, run_until_exit};
 use tabbify_supervisor::runner::wire::serve_config_from;
+// `ActiveRuntime` implements `AppRuntime`; the trait must be in scope so the
+// clean-shutdown path can call `runtime.shutdown()` on the active-runtime cell.
+use tabbify_supervisor::runtime::AppRuntime;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
@@ -59,8 +62,10 @@ async fn main() -> anyhow::Result<()> {
         "control socket listening; runner ready"
     );
 
-    // Fail-fast loop: select between the runtime dying (crash) and a clean
-    // shutdown signal from the control server.
+    // Fail-fast loop: select between the active runtime dying (crash) and a
+    // clean shutdown signal from the control server. `runtime` is the swappable
+    // `ActiveRuntime` cell so `run_until_exit` can re-arm its watch across
+    // zero-downtime swaps (P2.3).
     let runtime = runner.runtime();
     match run_until_exit(runtime.clone(), shutdown_rx).await {
         RunnerExit::Crashed(reason) => {
