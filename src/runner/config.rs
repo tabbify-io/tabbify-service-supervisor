@@ -67,6 +67,16 @@ pub struct RunnerConfig {
     #[arg(long, env = "RUNNER_IMAGE_REF")]
     pub image_ref: Option<String>,
 
+    /// Path to a JSON build-spec file. When set the runner operates in
+    /// one-shot builder mode: it reads the [`BuildJob`], runs the build
+    /// pipeline, prints the [`ArtifactRef`] JSON to stdout, and exits.
+    /// The mesh join and serve-forever path are skipped entirely.
+    ///
+    /// [`BuildJob`]: crate::runner::build::BuildJob
+    /// [`ArtifactRef`]: crate::runner::build::ArtifactRef
+    #[arg(long, env = "RUNNER_BUILD_SPEC")]
+    pub build_spec: Option<PathBuf>,
+
     /// Listener port used when binding the mesh ULA.
     #[arg(long, env = "RUNNER_PORT", default_value_t = 8730)]
     pub port: u16,

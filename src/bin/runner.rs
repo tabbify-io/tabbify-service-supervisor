@@ -8,6 +8,7 @@
 use anyhow::Context;
 use clap::Parser;
 use tabbify_supervisor::RunnerConfig;
+use tabbify_supervisor::runner::build;
 use tabbify_supervisor::runner::control;
 use tabbify_supervisor::runner::serve::{RunnerExit, RunnerServe, run_until_exit};
 use tabbify_supervisor::runner::wire::serve_config_from;
@@ -22,6 +23,28 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cfg = RunnerConfig::parse();
+
+    // ── Builder mode ────────────────────────────────────────────────────────
+    // If `--build-spec` is provided, run a one-shot build and exit.
+    // This branch must come BEFORE any mesh-join / serve-forever setup so
+    // the two modes are completely disjoint.
+    if let Some(ref spec_path) = cfg.build_spec {
+        match build::run_one_shot_build(spec_path).await {
+            Ok(artifact) => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&artifact).expect("serialize ArtifactRef")
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("build failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     tracing::info!(
         uuid   = %cfg.uuid,
         s3     = %cfg.s3_base_url,
