@@ -91,30 +91,76 @@ pub async fn clone(
         .parent()
         .with_context(|| format!("dest path has no parent: {}", dest.display()))?;
 
-    if let Some(tok) = token {
+    // ── multi-step impl ──────────────────────────────────────────────────────
+    //
+    // `git clone --branch <ref>` only accepts BRANCH or TAG names — it rejects a
+    // commit SHA with "Remote branch X not found in upstream origin". GitHub's
+    // push webhook delivers `after` as the commit SHA, so a single-step clone is
+    // unusable in our pipeline. We unfold to the universal four-step sequence:
+    //
+    //   1. `git init -q <dest>`                  (no auth)
+    //   2. `git -C <dest> remote add origin <U>` (no auth; URL carries non-secret
+    //                                             username when a token is set)
+    //   3. `git -C <dest> fetch --depth 1 origin <ref>` (auth via askpass; works
+    //                                             for SHA, branch, AND tag because
+    //                                             `git fetch <ref>` is universal)
+    //   4. `git -C <dest> checkout FETCH_HEAD`   (no auth)
+    //
+    // This stays shallow (one-commit fetch) and supports every kind of ref
+    // GitHub sends. The token's lifetime is still scoped to the fetch step:
+    // the askpass tempfiles are written just before step 3 and removed
+    // immediately after, win or lose.
+
+    // Ensure dest's parent exists before any git command; `git init` will
+    // create `dest` itself.
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dest parent dir {}", parent.display()))?;
+    }
+    let dest_str = dest.to_string_lossy().into_owned();
+
+    // Step 1: git init <dest>.
+    runner(
+        vec!["init".to_owned(), "-q".to_owned(), dest_str.clone()],
+        vec![],
+    )
+    .await
+    .context("git init")?;
+
+    // Step 2: git -C <dest> remote add origin <url>. The URL carries the
+    // non-secret `x-access-token` username when a token is present so git's
+    // askpass is triggered by the credential prompt (which our wrapper script
+    // satisfies from the 0600 token file).
+    let url = if token.is_some() {
+        inject_username(repo_url, "x-access-token")
+    } else {
+        repo_url.to_owned()
+    };
+    runner(
+        vec![
+            "-C".to_owned(),
+            dest_str.clone(),
+            "remote".to_owned(),
+            "add".to_owned(),
+            "origin".to_owned(),
+            url,
+        ],
+        vec![],
+    )
+    .await
+    .context("git remote add")?;
+
+    // Step 3: git -C <dest> fetch --depth 1 origin <ref>. This is the only
+    // step that needs the token, so the askpass tempfiles live only for the
+    // duration of this call.
+    let (env, token_paths) = if let Some(tok) = token {
         let token_path = parent.join(".tabbify-git-token");
         let askpass_path = parent.join(".tabbify-askpass.sh");
 
-        // Write token file (0600).
         write_secret_file(&token_path, tok, 0o600)?;
-
-        // Write askpass script (0700): `#!/bin/sh\ncat "<token_path>"\n`.
         let script = format!("#!/bin/sh\ncat \"{}\"\n", token_path.to_string_lossy());
         write_secret_file(&askpass_path, &script, 0o700)?;
 
-        // Inject the non-secret username into the URL.
-        let url = inject_username(repo_url, "x-access-token");
-
-        let dest_str = dest.to_string_lossy().into_owned();
-        let args = vec![
-            "clone".to_owned(),
-            "--depth".to_owned(),
-            "1".to_owned(),
-            "--branch".to_owned(),
-            git_ref.to_owned(),
-            url,
-            dest_str,
-        ];
         let env = vec![
             (
                 "GIT_ASKPASS".to_owned(),
@@ -122,28 +168,47 @@ pub async fn clone(
             ),
             ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
         ];
-
-        let result = runner(args, env).await;
-
-        // Best-effort cleanup — always, regardless of success or failure.
-        let _ = std::fs::remove_file(&token_path);
-        let _ = std::fs::remove_file(&askpass_path);
-
-        result
+        (env, Some((token_path, askpass_path)))
     } else {
-        // Public repo: plain clone, no askpass env.
-        let dest_str = dest.to_string_lossy().into_owned();
-        let args = vec![
-            "clone".to_owned(),
+        (vec![], None)
+    };
+
+    let fetch_result = runner(
+        vec![
+            "-C".to_owned(),
+            dest_str.clone(),
+            "fetch".to_owned(),
             "--depth".to_owned(),
             "1".to_owned(),
-            "--branch".to_owned(),
+            "origin".to_owned(),
             git_ref.to_owned(),
-            repo_url.to_owned(),
-            dest_str,
-        ];
-        runner(args, vec![]).await
+        ],
+        env,
+    )
+    .await;
+
+    // Clean up secret files immediately after the fetch — always, regardless
+    // of success or failure.
+    if let Some((token_path, askpass_path)) = token_paths {
+        let _ = std::fs::remove_file(&token_path);
+        let _ = std::fs::remove_file(&askpass_path);
     }
+    fetch_result.context("git fetch")?;
+
+    // Step 4: git -C <dest> checkout FETCH_HEAD.
+    runner(
+        vec![
+            "-C".to_owned(),
+            dest_str,
+            "checkout".to_owned(),
+            "FETCH_HEAD".to_owned(),
+        ],
+        vec![],
+    )
+    .await
+    .context("git checkout")?;
+
+    Ok(())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -237,23 +302,45 @@ mod tests {
         );
     }
 
+    /// A `GitRun` that records every invocation. Returns the recorded list to
+    /// the test so it can assert across the entire init+remote+fetch+checkout
+    /// sequence (the new multi-step clone makes four runner calls).
+    type Calls = Vec<(Vec<String>, Vec<(String, String)>)>;
+
+    fn recording_runner() -> (GitRun, std::sync::Arc<std::sync::Mutex<Calls>>) {
+        let log: std::sync::Arc<std::sync::Mutex<Calls>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = log.clone();
+        let r: GitRun = std::sync::Arc::new(move |args, env| {
+            l.lock().unwrap().push((args.clone(), env.clone()));
+            Box::pin(async { Ok(()) })
+        });
+        (r, log)
+    }
+
+    /// Pick the recorded call whose first arg matches `subcommand`. For
+    /// "remote", "fetch", "checkout" the subcommand follows the `-C <dest>`
+    /// prefix; we scan for it inside the argv. For "init" it is argv[0].
+    fn find_call<'a>(
+        calls: &'a [(Vec<String>, Vec<(String, String)>)],
+        subcommand: &str,
+    ) -> &'a (Vec<String>, Vec<(String, String)>) {
+        calls
+            .iter()
+            .find(|(args, _)| args.iter().any(|a| a == subcommand))
+            .unwrap_or_else(|| panic!("no recorded call contains {subcommand:?}; got {calls:?}"))
+    }
+
     // -- clone with token: token must not appear in argv ----------------------
 
     /// The cardinal security property: a short-lived token must NEVER appear
     /// in the git argv (which is visible to other processes via `ps` or
     /// `/proc/<pid>/cmdline`). The token must live only in the 0600 token file.
+    /// This must hold across every git invocation in the multi-step clone.
     #[tokio::test]
     async fn clone_with_token_keeps_token_out_of_argv() {
         let dir = tempfile::tempdir().unwrap();
-        let recorded = std::sync::Arc::new(std::sync::Mutex::new((
-            Vec::<String>::new(),
-            Vec::<(String, String)>::new(),
-        )));
-        let r = recorded.clone();
-        let runner: GitRun = std::sync::Arc::new(move |args, env| {
-            *r.lock().unwrap() = (args.clone(), env.clone());
-            Box::pin(async { Ok(()) })
-        });
+        let (runner, log) = recording_runner();
 
         clone(
             "https://github.com/acme/app.git",
@@ -265,28 +352,126 @@ mod tests {
         .await
         .unwrap();
 
-        let (args, env) = recorded.lock().unwrap().clone();
+        let calls = log.lock().unwrap().clone();
+        // The clone is unfolded into init, remote add, fetch, checkout.
+        assert_eq!(calls.len(), 4, "expected 4 git invocations, got {calls:?}");
 
-        // Security invariant: token must NOT appear anywhere in argv.
+        // Security invariant: token must NOT appear in ANY argv.
+        for (args, _) in &calls {
+            assert!(
+                args.iter().all(|a| !a.contains("ghs_SECRETtoken")),
+                "token must NOT be in argv: {args:?}"
+            );
+        }
+
+        // `remote add` step carries the non-secret username in the URL.
+        let (remote_args, _) = find_call(&calls, "remote");
         assert!(
-            args.iter().all(|a| !a.contains("ghs_SECRETtoken")),
-            "token must NOT be in argv: {args:?}"
+            remote_args
+                .iter()
+                .any(|a| a.contains("x-access-token@github.com")),
+            "remote add URL must carry non-secret username: {remote_args:?}"
         );
-        // The non-secret username must be in the URL argument.
+
+        // GIT_ASKPASS + GIT_TERMINAL_PROMPT=0 must be set ONLY on the fetch
+        // step (the only call that performs network IO needing the password).
+        let (_, fetch_env) = find_call(&calls, "fetch");
         assert!(
-            args.iter().any(|a| a.contains("x-access-token@github.com")),
-            "url must carry non-secret username: {args:?}"
+            fetch_env.iter().any(|(k, _)| k == "GIT_ASKPASS"),
+            "fetch env must include GIT_ASKPASS"
         );
-        // GIT_ASKPASS must be set.
         assert!(
-            env.iter().any(|(k, _)| k == "GIT_ASKPASS"),
-            "GIT_ASKPASS must be set in env"
-        );
-        // GIT_TERMINAL_PROMPT=0 must be set.
-        assert!(
-            env.iter()
+            fetch_env
+                .iter()
                 .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v == "0"),
-            "GIT_TERMINAL_PROMPT=0 must be set"
+            "fetch env must include GIT_TERMINAL_PROMPT=0"
+        );
+
+        // The other steps must NOT leak the askpass env (defense in depth).
+        for sub in ["init", "remote", "checkout"] {
+            let (_, env) = find_call(&calls, sub);
+            assert!(
+                !env.iter().any(|(k, _)| k == "GIT_ASKPASS"),
+                "{sub} must not carry GIT_ASKPASS in env"
+            );
+        }
+    }
+
+    /// Sequence check: init → remote add → fetch → checkout.
+    #[tokio::test]
+    async fn clone_invokes_init_remote_fetch_checkout_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runner, log) = recording_runner();
+
+        clone(
+            "https://github.com/acme/app.git",
+            "deadbeef",
+            None,
+            &dir.path().join("src"),
+            &runner,
+        )
+        .await
+        .unwrap();
+
+        let calls = log.lock().unwrap().clone();
+        let sequence: Vec<String> = calls
+            .iter()
+            .map(|(args, _)| {
+                args.iter()
+                    .find(|a| matches!(a.as_str(), "init" | "remote" | "fetch" | "checkout"))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec!["init", "remote", "fetch", "checkout"],
+            "clone must run init -> remote add -> fetch -> checkout in order; got {calls:?}"
+        );
+    }
+
+    /// Fetch passes `<ref>` verbatim — this is what makes the universal path
+    /// work for branches, tags, AND raw commit SHAs (the old `--branch <sha>`
+    /// approach was rejected by GitHub with "Remote branch X not found").
+    #[tokio::test]
+    async fn clone_fetches_ref_verbatim_supporting_sha_branch_or_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runner, log) = recording_runner();
+
+        // A 40-char hex string mimics a real commit SHA.
+        let sha = "c64f621abcdef0123456789abcdef0123456789a";
+        clone(
+            "https://github.com/acme/app.git",
+            sha,
+            None,
+            &dir.path().join("src"),
+            &runner,
+        )
+        .await
+        .unwrap();
+
+        let calls = log.lock().unwrap().clone();
+        let (fetch_args, _) = find_call(&calls, "fetch");
+        assert!(
+            fetch_args.iter().any(|a| a == sha),
+            "fetch must include the SHA verbatim: {fetch_args:?}"
+        );
+        assert!(
+            !fetch_args.iter().any(|a| a == "--branch"),
+            "fetch must NOT use --branch (incompatible with SHAs): {fetch_args:?}"
+        );
+        assert!(
+            fetch_args.iter().any(|a| a == "--depth"),
+            "fetch must stay shallow with --depth 1: {fetch_args:?}"
+        );
+
+        // Checkout targets FETCH_HEAD, not the ref directly (so the SHA isn't
+        // resolved against the local repo, which has nothing yet — fetch is
+        // the only place the ref lives).
+        let (checkout_args, _) = find_call(&calls, "checkout");
+        assert!(
+            checkout_args.iter().any(|a| a == "FETCH_HEAD"),
+            "checkout must target FETCH_HEAD: {checkout_args:?}"
         );
     }
 
@@ -355,20 +540,12 @@ mod tests {
 
     // -- clone without token: plain URL, no askpass ---------------------------
 
-    /// Without a token the original URL must be passed verbatim and GIT_ASKPASS
-    /// must NOT be set (no unnecessary env).
+    /// Without a token the original URL must be passed verbatim and
+    /// GIT_ASKPASS must NOT be set on ANY of the four git invocations.
     #[tokio::test]
     async fn clone_without_token_uses_plain_url_and_no_askpass() {
         let dir = tempfile::tempdir().unwrap();
-        let recorded = std::sync::Arc::new(std::sync::Mutex::new((
-            Vec::<String>::new(),
-            Vec::<(String, String)>::new(),
-        )));
-        let r = recorded.clone();
-        let runner: GitRun = std::sync::Arc::new(move |args, env| {
-            *r.lock().unwrap() = (args, env);
-            Box::pin(async { Ok(()) })
-        });
+        let (runner, log) = recording_runner();
 
         clone(
             "https://github.com/acme/pub.git",
@@ -380,16 +557,20 @@ mod tests {
         .await
         .unwrap();
 
-        let (args, env) = recorded.lock().unwrap().clone();
-
+        let calls = log.lock().unwrap().clone();
+        let (remote_args, _) = find_call(&calls, "remote");
         assert!(
-            args.iter().any(|a| a == "https://github.com/acme/pub.git"),
-            "original URL must be in argv for public clone: {args:?}"
+            remote_args
+                .iter()
+                .any(|a| a == "https://github.com/acme/pub.git"),
+            "remote add must carry the original URL for public clone: {remote_args:?}"
         );
-        assert!(
-            !env.iter().any(|(k, _)| k == "GIT_ASKPASS"),
-            "GIT_ASKPASS must NOT be set for public clone"
-        );
+        for (_, env) in &calls {
+            assert!(
+                !env.iter().any(|(k, _)| k == "GIT_ASKPASS"),
+                "GIT_ASKPASS must NOT be set on any call for public clone: {env:?}"
+            );
+        }
     }
 
     // -- real git clone (ignored, network-dependent) --------------------------
