@@ -32,7 +32,6 @@ mesh-joiner = { git = "https://github.com/tabbify-io/tabbify-service-mesh.git", 
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
 
 # OpenAPI / Swagger UI (axum 0.7). Pin utoipa-swagger-ui to 8.x — 9.x requires
 # axum 0.8 which this crate does not use.
