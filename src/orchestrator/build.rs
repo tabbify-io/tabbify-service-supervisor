@@ -34,18 +34,28 @@ pub struct BuildOutput {
 
 /// Injectable seam for the captured-child build spawn.
 ///
-/// The production implementation runs `tabbify-runner --build-spec <path>` and
-/// captures its output; tests supply a closure that returns canned data without
-/// starting any process.
+/// The production implementation runs
+/// `tabbify-runner --uuid <UUID> --build-spec <PATH>` and captures its output;
+/// tests supply a closure that returns canned data without starting any
+/// process.
 ///
 /// The `Box<dyn …>` indirection keeps [`Orchestrator`] object-safe and avoids
 /// generic parameters leaking into the rest of the API layer.
+///
+/// # Why `app_uuid` is here
+///
+/// `RunnerConfig` requires `--uuid` at parse time even in builder mode (the
+/// flag is declared without a default and clap rejects the invocation without
+/// it). Passing it through the spawner — rather than putting it only inside
+/// the spec JSON — keeps the CLI contract honest: the runner can be launched
+/// directly from a shell with the exact arg list shown here.
 pub trait BuildSpawner: Send + Sync {
-    /// Run the build runner with `spec_path` as the `--build-spec` argument and
-    /// return the captured output.
+    /// Run the build runner with `spec_path` as the `--build-spec` argument
+    /// and `app_uuid` as the `--uuid` argument, returning the captured output.
     fn run<'a>(
         &'a self,
         spec_path: &'a Path,
+        app_uuid: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>>;
 }
 
@@ -60,6 +70,7 @@ impl BuildSpawner for ProcessBuildSpawner {
     fn run<'a>(
         &'a self,
         spec_path: &'a Path,
+        app_uuid: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>>
     {
         use std::process::Stdio;
@@ -67,9 +78,15 @@ impl BuildSpawner for ProcessBuildSpawner {
 
         let runner_bin = self.runner_bin.clone();
         let spec_path = spec_path.to_path_buf();
+        let app_uuid = app_uuid.to_owned();
         Box::pin(async move {
             let out = Command::new(&runner_bin)
-                .args(["--build-spec", spec_path.to_string_lossy().as_ref()])
+                .args([
+                    "--uuid",
+                    &app_uuid,
+                    "--build-spec",
+                    spec_path.to_string_lossy().as_ref(),
+                ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 // NOTE: no setsid, no kill_on_drop override — this is a captured
@@ -129,7 +146,10 @@ impl Orchestrator {
 
         // Run the build runner.  We delete the spec file on both success and
         // failure so tokens do not linger.
-        let result = spawner.run(&spec_path).await;
+        // `app_uuid` is forwarded explicitly: `tabbify-runner --uuid` is required
+        // at parse time even in builder mode, so the spawner can't infer it from
+        // the spec file alone.
+        let result = spawner.run(&spec_path, &job.app_uuid).await;
         let _ = std::fs::remove_file(&spec_path); // best-effort cleanup
 
         let output = result.context("build runner invocation")?;
@@ -257,6 +277,7 @@ mod tests {
         fn run<'a>(
             &'a self,
             spec_path: &'a Path,
+            _app_uuid: &'a str,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>> {
             // Record the spec path; also verify the file exists at call time.
             *self.called_with.lock().unwrap() = Some(spec_path.to_path_buf());
@@ -372,6 +393,7 @@ mod tests {
             fn run<'a>(
                 &'a self,
                 spec_path: &'a Path,
+                _app_uuid: &'a str,
             ) -> Pin<Box<dyn Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>>
             {
                 *self.slot.lock().unwrap() = Some(spec_path.to_path_buf());
@@ -448,6 +470,113 @@ mod tests {
         assert!(art.digest.is_none());
     }
 
+    /// `spawn_build_with` forwards the job's `app_uuid` to the spawner, so the
+    /// production [`ProcessBuildSpawner`] can pass it as `--uuid <UUID>` to the
+    /// runner. Without this `tabbify-runner` aborts at clap-parse time even in
+    /// builder mode (the field has no default).
+    #[tokio::test]
+    async fn spawn_build_forwards_app_uuid_to_spawner() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let o = orch(dir.path().to_path_buf(), dir.path().to_path_buf());
+
+        struct UuidCapturingSpawner {
+            seen: Arc<Mutex<Option<String>>>,
+            stdout: Vec<u8>,
+        }
+        impl BuildSpawner for UuidCapturingSpawner {
+            fn run<'a>(
+                &'a self,
+                _spec_path: &'a Path,
+                app_uuid: &'a str,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>>
+            {
+                *self.seen.lock().unwrap() = Some(app_uuid.to_owned());
+                let stdout = self.stdout.clone();
+                Box::pin(async move {
+                    Ok(BuildOutput {
+                        stdout,
+                        stderr: vec![],
+                        success: true,
+                    })
+                })
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let spawner = UuidCapturingSpawner {
+            seen: seen.clone(),
+            stdout: br#"{"reff":"x","digest":null}"#.to_vec(),
+        };
+
+        let mut job = test_job();
+        job.app_uuid = "0191e7c2-1111-7222-8333-444455556666".into();
+        o.spawn_build_with(&job, &spawner).await.unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("0191e7c2-1111-7222-8333-444455556666")
+        );
+    }
+
+    /// The production [`ProcessBuildSpawner`] constructs a child-process arg
+    /// list that includes BOTH `--uuid <app_uuid>` and `--build-spec <path>` —
+    /// in any order, but both must be present. We exercise it by pointing the
+    /// `runner_bin` at `/bin/sh -c 'printf %s "$*"'` which echoes its arg list,
+    /// then assert the echo contains the expected flags.
+    ///
+    /// This is a real child-spawn, but uses only `/bin/sh`, so it is portable
+    /// across the Linux dev hosts the supervisor runs on.
+    #[tokio::test]
+    async fn process_spawner_passes_uuid_and_build_spec_flags() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Wrapper script: print all args, separated by spaces, on stdout
+        // (mirrors a real `tabbify-runner` invocation argv), exit 0.
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("fake-runner.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            // `--build-spec` is on argv at a known position; `--uuid` precedes.
+            // We echo argv and exit successfully with a canned ArtifactRef so
+            // the parent's stdout-parse path still works.
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" 1>&2\nprintf '{{\"reff\":\"x\",\"digest\":null}}\\n'\n"
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let spawner = ProcessBuildSpawner {
+            runner_bin: wrapper.clone(),
+        };
+
+        let spec_file = dir.path().join("spec.json");
+        std::fs::write(&spec_file, br#"{"x":1}"#).unwrap();
+
+        let out = spawner
+            .run(&spec_file, "0191e7c2-1111-7222-8333-444455556666")
+            .await
+            .expect("spawn");
+        assert!(out.success, "wrapper script must exit 0");
+        // The wrapper writes argv to STDERR (so it doesn't collide with the
+        // ArtifactRef JSON on stdout).
+        let argv = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            argv.contains("--uuid 0191e7c2-1111-7222-8333-444455556666"),
+            "argv must contain `--uuid <app_uuid>`; got: {argv:?}"
+        );
+        assert!(
+            argv.contains(&format!("--build-spec {}", spec_file.to_string_lossy())),
+            "argv must contain `--build-spec <path>`; got: {argv:?}"
+        );
+    }
+
     /// When the spawner returns a digest, it is forwarded in the `ArtifactRef`.
     #[tokio::test]
     async fn spawn_build_parses_digest_some() {
@@ -481,6 +610,7 @@ mod tests {
             fn run<'a>(
                 &'a self,
                 spec_path: &'a Path,
+                _app_uuid: &'a str,
             ) -> Pin<Box<dyn Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>>
             {
                 let slot = self.slot.clone();
