@@ -5,9 +5,15 @@
 //! [`ArtifactRef`] as JSON to stdout, and exits — it never joins the mesh or
 //! starts a serve loop.
 //!
-//! The orchestration pipeline (`run_build`) is fully injection-seamed so tests
+//! The orchestration pipeline ([`run_build`]) is fully injection-seamed so tests
 //! can drive clone/build/push without any real git or Docker daemon.  The
-//! production wiring (real `git`, `docker`) lives only in `run_one_shot_build`.
+//! production wiring (real `git`, `docker`) lives only in [`run_one_shot_build`].
+//!
+//! ## Module layout
+//! - [`docker`] — the docker sub-pipeline (`Dockerfile` → build → docker push).
+//! - [`wasm`]   — the wasm sub-pipeline (`build_cmd` → verify `.wasm` → oras push).
+//! - Everything else (the [`BuildJob`] type, the dispatcher, the production
+//!   wiring, and the tests) lives in this file.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +21,9 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::BoxFut;
+
+mod docker;
+mod wasm;
 
 /// Which build pipeline a [`BuildJob`] drives.
 ///
@@ -186,100 +195,12 @@ pub async fn run_build(
 
     match job.build_kind {
         BuildKind::Docker => {
-            run_docker_build(job, backend, push_runner, docker_bin, &src, reff).await
+            docker::run_docker_build(job, backend, push_runner, docker_bin, &src, reff).await
         }
         BuildKind::Wasm => {
-            run_wasm_build(job, build_cmd_runner, oras_runner, oras_bin, &src, reff).await
+            wasm::run_wasm_build(job, build_cmd_runner, oras_runner, oras_bin, &src, reff).await
         }
     }
-}
-
-/// The DOCKER build path (unchanged behaviour): require a `Dockerfile`, build
-/// the local image via `backend`, then tag + push to the mesh registry.
-///
-/// # Errors
-/// Missing `Dockerfile`, build error, or push failure.
-async fn run_docker_build(
-    job: &BuildJob,
-    backend: &dyn crate::build_backend::BuildBackend,
-    push_runner: &crate::docker::CommandRunner,
-    docker_bin: &str,
-    src: &Path,
-    reff: String,
-) -> anyhow::Result<ArtifactRef> {
-    // Require a Dockerfile.
-    if !src.join("Dockerfile").is_file() {
-        anyhow::bail!(
-            "no Dockerfile in {} (set build_kind=wasm for a wasm-component build)",
-            src.display()
-        );
-    }
-
-    // Build the local image. Local tag is scoped to this build so concurrent
-    // builds don't collide.
-    let local_tag = format!("tbf-build-{}", job.app_uuid);
-    backend
-        .build(src, &local_tag)
-        .await
-        .context("build image")?;
-
-    // Tag + push to the mesh registry.
-    let pushed = crate::docker::push_image(docker_bin, &local_tag, &reff, push_runner).await;
-    if !pushed {
-        anyhow::bail!("push to registry failed: {reff}");
-    }
-
-    Ok(ArtifactRef { reff, digest: None })
-}
-
-/// The WASM build path: run `job.build_cmd` in the cloned `src` dir, verify the
-/// produced `.wasm` at `job.artifact_path`, then `oras push` it to the mesh
-/// registry as a wasm OCI artifact.
-///
-/// # Errors
-/// Missing `build_cmd`/`artifact_path`, a failing build command, a missing
-/// produced artifact, or an `oras push` failure.
-async fn run_wasm_build(
-    job: &BuildJob,
-    build_cmd_runner: &BuildCmdRunner,
-    oras_runner: &crate::docker::CommandRunner,
-    oras_bin: &str,
-    src: &Path,
-    reff: String,
-) -> anyhow::Result<ArtifactRef> {
-    // Require build_cmd + artifact_path for a wasm job.
-    let build_cmd = job.build_cmd.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("wasm build job requires `build_cmd` (the command that produces the .wasm)")
-    })?;
-    let artifact_path = job.artifact_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "wasm build job requires `artifact_path` (path to the produced .wasm, relative to repo root)"
-        )
-    })?;
-
-    // Run the build command in the cloned source dir.
-    let built = (build_cmd_runner)(build_cmd.to_owned(), src.to_path_buf()).await;
-    if !built {
-        anyhow::bail!("wasm build command failed: {build_cmd}");
-    }
-
-    // Verify the produced artifact exists at <src>/<artifact_path>.
-    let artifact_abs = src.join(artifact_path);
-    if !artifact_abs.is_file() {
-        anyhow::bail!(
-            "wasm build produced no artifact at {} (expected from build_cmd `{build_cmd}`)",
-            artifact_abs.display()
-        );
-    }
-
-    // oras push the wasm artifact to the mesh registry.
-    let artifact_abs_str = artifact_abs.to_string_lossy().into_owned();
-    let pushed = crate::oras::oras_push(oras_bin, &reff, &artifact_abs_str, oras_runner).await;
-    if !pushed {
-        anyhow::bail!("oras push to registry failed: {reff}");
-    }
-
-    Ok(ArtifactRef { reff, digest: None })
 }
 
 /// Read + parse a [`BuildJob`] from `spec_path` and run it with production
