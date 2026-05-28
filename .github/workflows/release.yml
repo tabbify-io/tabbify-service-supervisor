@@ -200,6 +200,26 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/tabbify-supervisor:${{ matrix.arch }}
 
+      # Also push to ECR (private; AWS EC2 pulls via instance role — no PAT,
+      # no public GHCR). x86_64-only: the coordinator EC2 is x86_64.
+      - name: Log in to Amazon ECR
+        if: matrix.arch == 'x86_64'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push to ECR (x86_64)
+        if: matrix.arch == 'x86_64'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./deploy
+          file: ./deploy/Dockerfile
+          platforms: linux/amd64
+          build-args: DOCKER_ARCH=${{ matrix.arch }}
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/tabbify-supervisor:latest
+            ${{ steps.ecr.outputs.registry }}/tabbify-supervisor:${{ github.sha }}
+
   # After both per-arch images are pushed, stitch them into one multi-arch
   # `:latest` manifest so `docker run ghcr.io/tabbify-io/tabbify-supervisor`
   # pulls the right arch automatically.
