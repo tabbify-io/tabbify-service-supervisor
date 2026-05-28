@@ -29,7 +29,9 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use http::StatusCode;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use utoipa::ToSchema;
 
 use crate::fetcher::{FetchError, S3Fetcher};
 use crate::orchestrator::{AppState, AppSummary, Orchestrator};
@@ -92,7 +94,8 @@ impl SupervisorState {
 }
 
 /// Build the axum [`Router`] with the supervisor CONTROL endpoints (no app
-/// serving — that lives on the per-app runners' own ULAs).
+/// serving — that lives on the per-app runners' own ULAs). Also mounts
+/// `/openapi.json` + `/swagger-ui` for the OpenAPI 3 doc.
 pub fn router(state: SupervisorState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -104,12 +107,24 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/reset", post(reset_app))
         .route("/v1/apps/:uuid/deploy", post(deploy_app))
         .route("/v1/build", post(build_app))
+        .merge(crate::openapi::swagger_routes())
         .with_state(Arc::new(state))
 }
 
 type SharedState = Arc<SupervisorState>;
 
-async fn health(State(state): State<SharedState>) -> Response {
+/// Liveness probe + capability report.
+///
+/// Surfaces this host's Firecracker / Docker availability so an operator can
+/// see at a glance what this supervisor can run.
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Supervisor is alive", body = HealthResponse),
+    ),
+)]
+pub async fn health(State(state): State<SharedState>) -> Response {
     axum::Json(json!({
         "status": "ok",
         "supervisor_id": state.supervisor_id,
@@ -120,7 +135,36 @@ async fn health(State(state): State<SharedState>) -> Response {
     .into_response()
 }
 
-async fn list_apps(State(state): State<SharedState>) -> Response {
+/// List the live runner fleet on this supervisor.
+///
+/// Each row reflects the result of one control-socket health probe per runner
+/// record on disk, plus the persisted restart / backoff state.
+#[utoipa::path(
+    get,
+    path = "/v1/apps",
+    responses(
+        (
+            status = 200,
+            description = "Snapshot of the runner fleet on this supervisor",
+            body = AppListResponse,
+            example = json!({
+                "apps": [
+                    {
+                        "uuid": "0191e7c2-0000-7000-8000-000000000001",
+                        "app_ula": "fd5a:1f02:abcdef::1",
+                        "state": "running",
+                        "bound_addr": "fd5a:1f02:abcdef::1",
+                        "restart_status": "running",
+                        "restart_count": 0,
+                        "next_retry_at": 0
+                    }
+                ]
+            })
+        ),
+        (status = 500, description = "Failed to list runner records", body = ErrorResponse),
+    ),
+)]
+pub async fn list_apps(State(state): State<SharedState>) -> Response {
     match state.orchestrator.app_summaries().await {
         Ok(apps) => {
             let apps: Vec<_> = apps.iter().map(summary_json).collect();
@@ -130,7 +174,23 @@ async fn list_apps(State(state): State<SharedState>) -> Response {
     }
 }
 
-async fn get_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+/// Look up a single app.
+///
+/// If the orchestrator holds a runner record for the uuid, returns its live
+/// state. Otherwise probes S3: if the artifact is fetchable, returns a
+/// discovery row (`state: "stopped"`, `bound_addr: null`); otherwise 404.
+#[utoipa::path(
+    get,
+    path = "/v1/apps/{uuid}",
+    params(("uuid" = String, Path, description = "App UUID v7")),
+    responses(
+        (status = 200, description = "App found", body = AppPresence),
+        (status = 404, description = "App not present", body = ErrorResponse),
+        (status = 400, description = "Malformed uuid", body = ErrorResponse),
+        (status = 502, description = "S3 probe failed", body = ErrorResponse),
+    ),
+)]
+pub async fn get_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     // Does the orchestrator have a runner record for it? Report its live state.
     match state.orchestrator.app_summary(&uuid).await {
         Ok(Some(s)) => return present_json(&s).into_response(),
@@ -151,7 +211,18 @@ async fn get_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> 
 /// state. Returns `{state, app_ula, bound_addr}` where `bound_addr` is the
 /// app-ULA (the runner serves on its own ULA — there is no in-supervisor
 /// listener address any more).
-async fn start_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/v1/apps/{uuid}/start",
+    params(("uuid" = String, Path, description = "App UUID v7")),
+    responses(
+        (status = 200, description = "Runner is healthy", body = AppActionResponse),
+        (status = 404, description = "Artifact not found in S3", body = ErrorResponse),
+        (status = 500, description = "Spawn or health-probe failed", body = ErrorResponse),
+        (status = 502, description = "S3 fetch failed", body = ErrorResponse),
+    ),
+)]
+pub async fn start_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     match state.orchestrator.start_app(&uuid).await {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_response(&e),
@@ -160,7 +231,16 @@ async fn start_app(State(state): State<SharedState>, Path(uuid): Path<String>) -
 
 /// `POST /v1/apps/:uuid/stop` — shut the runner down (it exits, KEEPING its
 /// on-disk artifacts + docker image for a fast restart) + forget its record.
-async fn stop_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/v1/apps/{uuid}/stop",
+    params(("uuid" = String, Path, description = "App UUID v7")),
+    responses(
+        (status = 200, description = "Runner shut down + record forgotten", body = AppStopResponse),
+        (status = 400, description = "Malformed uuid", body = ErrorResponse),
+    ),
+)]
+pub async fn stop_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     match state.orchestrator.stop_app(&uuid).await {
         Ok(()) => axum::Json(json!({ "state": "stopped" })).into_response(),
         Err(e) => anyhow_to_response(&e),
@@ -170,7 +250,16 @@ async fn stop_app(State(state): State<SharedState>, Path(uuid): Path<String>) ->
 /// `POST /v1/apps/:uuid/purge` — full teardown: purge the runner (it clears its
 /// cache + removes its docker image) then shut it down, forget its record, and
 /// reclaim the on-disk cache. The disk-reclaiming counterpart to `stop`.
-async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/v1/apps/{uuid}/purge",
+    params(("uuid" = String, Path, description = "App UUID v7")),
+    responses(
+        (status = 200, description = "Runner purged + cache reclaimed", body = AppPurgeResponse),
+        (status = 400, description = "Malformed uuid", body = ErrorResponse),
+    ),
+)]
+pub async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     match state.orchestrator.purge_app(&uuid).await {
         Ok(()) => axum::Json(json!({ "state": "purged", "uuid": uuid })).into_response(),
         Err(e) => anyhow_to_response(&e),
@@ -184,7 +273,18 @@ async fn purge_app(State(state): State<SharedState>, Path(uuid): Path<String>) -
 ///
 /// Returns the app's current status JSON (same shape as `start`). Returns `404`
 /// when no runner record exists (the app was never started).
-async fn reset_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/v1/apps/{uuid}/reset",
+    params(("uuid" = String, Path, description = "App UUID v7")),
+    responses(
+        (status = 200, description = "Crash-loop / backoff cleared + reconcile triggered", body = AppActionResponse),
+        (status = 404, description = "No runner record exists for this uuid", body = ErrorResponse),
+        (status = 400, description = "Malformed uuid", body = ErrorResponse),
+        (status = 500, description = "Reconcile failure", body = ErrorResponse),
+    ),
+)]
+pub async fn reset_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
     match state.orchestrator.reset_app(&uuid).await {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_not_found_or_error(&e),
@@ -192,12 +292,13 @@ async fn reset_app(State(state): State<SharedState>, Path(uuid): Path<String>) -
 }
 
 /// Request body for `POST /v1/apps/:uuid/deploy`.
-#[derive(serde::Deserialize)]
-struct DeployBody {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DeployBody {
     /// OCI image ref to deploy (e.g. `[fd5a::1]:5000/acme/app:sha256abc`).
     ///
     /// Renamed from `reff` because `ref` is a Rust keyword.
     #[serde(rename = "ref")]
+    #[schema(example = "[fd5a:1f00:0:3::1]:5000/tabbify/0191e7c2-0000-7000-8000-000000000001:sha256abc")]
     reff: String,
 }
 
@@ -208,7 +309,33 @@ struct DeployBody {
 /// Returns the app's current status JSON (same shape as `start` / `reset`).
 /// Returns `404` when no runner record exists AND the cold spawn fails because
 /// the uuid is unknown; otherwise mirrors `reset_app` error semantics.
-async fn deploy_app(
+#[utoipa::path(
+    post,
+    path = "/v1/apps/{uuid}/deploy",
+    params(("uuid" = String, Path, description = "App UUID v7")),
+    request_body(
+        content = DeployBody,
+        description = "New image ref to deploy",
+        content_type = "application/json",
+        example = json!({"ref": "[fd5a:1f00:0:3::1]:5000/tabbify/0191e7c2-0000-7000-8000-000000000001:sha256abc"})
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Deploy applied (zero-downtime swap or cold spawn)",
+            body = AppActionResponse,
+            example = json!({
+                "state": "running",
+                "app_ula": "fd5a:1f02:abcdef::1",
+                "bound_addr": "fd5a:1f02:abcdef::1"
+            })
+        ),
+        (status = 400, description = "Malformed uuid or body", body = ErrorResponse),
+        (status = 404, description = "No runner record + uuid is unknown", body = ErrorResponse),
+        (status = 500, description = "Control-socket or spawn failure", body = ErrorResponse),
+    ),
+)]
+pub async fn deploy_app(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
     Json(body): Json<DeployBody>,
@@ -220,20 +347,25 @@ async fn deploy_app(
 }
 
 /// Request body for `POST /v1/build`.
-#[derive(serde::Deserialize)]
-struct BuildBody {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BuildBody {
     /// HTTPS URL of the Git repository to clone.
+    #[schema(example = "https://github.com/acme/hello-tabbify")]
     repo_url: String,
     /// Git ref (branch, tag, or full SHA) to check out.
     ///
     /// Serialized as `"ref"` (a JSON key) because `ref` is a Rust keyword.
     #[serde(rename = "ref")]
+    #[schema(example = "deadbeefcafe1234567890abcdef1234567890ab")]
     git_ref: String,
     /// Tenant namespace used as the registry path prefix.
+    #[schema(example = "acme")]
     tenant: String,
     /// UUID of the app; used in the image tag as `<tenant>/<app_uuid>:<git_ref>`.
+    #[schema(example = "0191e7c2-0000-7000-8000-000000000001")]
     app_uuid: String,
     /// Mesh ULA + port of the registry to push to.
+    #[schema(example = "[fd5a:1f00:0:3::1]:5000")]
     registry_ula: String,
     /// Short-lived clone token (`None` = public repo).
     #[serde(default)]
@@ -261,7 +393,36 @@ struct BuildBody {
 ///
 /// The full multi-target control-plane (build-then-deploy across a fleet) is
 /// Phase 4; this is the minimal invoker.
-async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildBody>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/v1/build",
+    request_body(
+        content = BuildBody,
+        description = "Build job: clone source, build artifact, push to mesh registry",
+        content_type = "application/json",
+        example = json!({
+            "repo_url": "https://github.com/acme/hello-tabbify",
+            "ref": "deadbeefcafe1234567890abcdef1234567890ab",
+            "tenant": "acme",
+            "app_uuid": "0191e7c2-0000-7000-8000-000000000001",
+            "registry_ula": "[fd5a:1f00:0:3::1]:5000"
+        })
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Build succeeded; pushed image ref returned",
+            body = crate::runner::build::ArtifactRef,
+            example = json!({
+                "reff": "[fd5a:1f00:0:3::1]:5000/tabbify/0191e7c2-0000-7000-8000-000000000001:deadbeefcafe1234567890abcdef1234567890ab",
+                "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            })
+        ),
+        (status = 400, description = "Malformed body", body = ErrorResponse),
+        (status = 500, description = "Build pipeline failure (clone / build / push)", body = ErrorResponse),
+    ),
+)]
+pub async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildBody>) -> Response {
     use crate::runner::build::BuildJob;
     let job = BuildJob {
         repo_url: body.repo_url,
@@ -378,6 +539,105 @@ fn anyhow_to_not_found_or_error(e: &anyhow::Error) -> Response {
 
 fn error_json(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(json!({ "error": msg }))).into_response()
+}
+
+// ── OpenAPI response DTOs ────────────────────────────────────────────────────
+//
+// These types describe the JSON shapes the handlers above emit so they can be
+// referenced from `#[utoipa::path]` annotations. The handlers themselves still
+// return ad-hoc `serde_json::Value` — the DTOs are doc-only and MUST stay in
+// sync with the actual JSON keys produced by `summary_json` / `running_json` /
+// `present_json` / `health` / `stop_app` / `purge_app`.
+
+/// `GET /health` body.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HealthResponse {
+    /// Always `"ok"` when the supervisor is serving.
+    #[schema(example = "ok")]
+    pub status: String,
+    /// Stable-ish supervisor id (peer id, or a local placeholder w/o mesh).
+    #[schema(example = "0191e7c2-1111-7222-8333-444455556666")]
+    pub supervisor_id: String,
+    /// This supervisor's control ULA (peer-ULA).
+    #[schema(example = "fd5a:1f00:0:3::1")]
+    pub ula: String,
+    /// Whether this host can run Firecracker microVMs (`/dev/kvm` present).
+    pub firecracker: bool,
+    /// Whether this host can run Docker containers (daemon reachable).
+    pub docker: bool,
+}
+
+/// One row of `GET /v1/apps` — a snapshot of one app in the live runner fleet.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppPresence {
+    /// App UUID (v7, string form).
+    #[schema(example = "0191e7c2-0000-7000-8000-000000000001")]
+    pub uuid: String,
+    /// The app's deterministic mesh ULA.
+    #[schema(example = "fd5a:1f02:abcdef::1")]
+    pub app_ula: String,
+    /// Lifecycle state: `"running"` if the per-app runner answers its socket,
+    /// otherwise `"stopped"`.
+    #[schema(example = "running")]
+    pub state: String,
+    /// The runner serves on its OWN ULA, so the bound address is the app-ULA.
+    /// `null` when the app is discovered via S3 only (no runner record).
+    #[schema(example = "fd5a:1f02:abcdef::1", nullable = true)]
+    pub bound_addr: Option<String>,
+    /// Coarse restart lifecycle status (`"running"` / `"backoff"` / `"crashloop"`).
+    #[schema(example = "running")]
+    pub restart_status: String,
+    /// Consecutive failure count without a stable window in between.
+    pub restart_count: u32,
+    /// Earliest Unix timestamp (seconds) at which a respawn is eligible.
+    pub next_retry_at: u64,
+}
+
+/// Body of `GET /v1/apps`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppListResponse {
+    /// Snapshots of every app the orchestrator has a runner record for.
+    pub apps: Vec<AppPresence>,
+}
+
+/// Body of `POST /v1/apps/{uuid}/start|reset|deploy` — "what happened?".
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppActionResponse {
+    /// Resulting state (`"running"` / `"stopped"`).
+    #[schema(example = "running")]
+    pub state: String,
+    /// The app's deterministic mesh ULA.
+    #[schema(example = "fd5a:1f02:abcdef::1")]
+    pub app_ula: String,
+    /// The bound address (the runner serves on its OWN ULA — the same value).
+    #[schema(example = "fd5a:1f02:abcdef::1")]
+    pub bound_addr: String,
+}
+
+/// Body of `POST /v1/apps/{uuid}/stop`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppStopResponse {
+    /// Always `"stopped"`.
+    #[schema(example = "stopped")]
+    pub state: String,
+}
+
+/// Body of `POST /v1/apps/{uuid}/purge`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppPurgeResponse {
+    /// Always `"purged"`.
+    #[schema(example = "purged")]
+    pub state: String,
+    /// The uuid that was purged.
+    #[schema(example = "0191e7c2-0000-7000-8000-000000000001")]
+    pub uuid: String,
+}
+
+/// Body of any error response (4xx/5xx).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    /// Human-readable error message.
+    pub error: String,
 }
 
 #[cfg(test)]

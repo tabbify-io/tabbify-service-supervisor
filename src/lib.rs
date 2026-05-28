@@ -44,6 +44,7 @@ pub mod git;
 pub mod host;
 pub mod manifest;
 pub mod mesh;
+pub mod openapi;
 pub mod oras;
 pub mod orchestrator;
 pub mod runner;

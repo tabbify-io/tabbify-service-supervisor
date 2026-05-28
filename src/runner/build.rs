@@ -21,7 +21,17 @@ use crate::runtime::BoxFut;
 /// Absent in the JSON spec ⇒ [`BuildKind::Docker`] (the original behaviour), so
 /// every pre-existing docker job + test is unchanged. [`BuildKind::Wasm`] selects
 /// the additive wasm-component build path (`build_cmd` → `oras push`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildKind {
     /// Clone → require `Dockerfile` → `docker build` → `docker push`.
@@ -75,7 +85,7 @@ pub fn production_build_cmd_runner() -> BuildCmdRunner {
 ///
 /// `build_kind` selects the pipeline (docker — the default — or wasm). The
 /// `build_cmd` / `artifact_path` fields are only consulted for the wasm path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct BuildJob {
     /// HTTPS URL of the Git repository to clone.
     pub repo_url: String,
@@ -111,7 +121,7 @@ pub struct BuildJob {
 }
 
 /// The result of a build: the immutable image ref and (optionally) its digest.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct ArtifactRef {
     /// Fully-qualified OCI image reference, e.g. `"[fd5a::1]:5000/acme/myapp:abc1234"`.
     pub reff: String,

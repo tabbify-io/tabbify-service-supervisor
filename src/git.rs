@@ -302,10 +302,12 @@ mod tests {
         );
     }
 
+    /// One recorded git invocation: (argv, env vars).
+    type Call = (Vec<String>, Vec<(String, String)>);
     /// A `GitRun` that records every invocation. Returns the recorded list to
     /// the test so it can assert across the entire init+remote+fetch+checkout
     /// sequence (the new multi-step clone makes four runner calls).
-    type Calls = Vec<(Vec<String>, Vec<(String, String)>)>;
+    type Calls = Vec<Call>;
 
     fn recording_runner() -> (GitRun, std::sync::Arc<std::sync::Mutex<Calls>>) {
         let log: std::sync::Arc<std::sync::Mutex<Calls>> =
@@ -321,10 +323,7 @@ mod tests {
     /// Pick the recorded call whose first arg matches `subcommand`. For
     /// "remote", "fetch", "checkout" the subcommand follows the `-C <dest>`
     /// prefix; we scan for it inside the argv. For "init" it is argv[0].
-    fn find_call<'a>(
-        calls: &'a [(Vec<String>, Vec<(String, String)>)],
-        subcommand: &str,
-    ) -> &'a (Vec<String>, Vec<(String, String)>) {
+    fn find_call<'a>(calls: &'a [Call], subcommand: &str) -> &'a Call {
         calls
             .iter()
             .find(|(args, _)| args.iter().any(|a| a == subcommand))
