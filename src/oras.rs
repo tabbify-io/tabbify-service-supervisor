@@ -20,7 +20,7 @@ use crate::docker::CommandRunner;
 ///
 /// # Example
 /// ```
-/// # use tabbify_service_supervisor::oras::oras_pull_args;
+/// # use tabbify_supervisor::oras::oras_pull_args;
 /// let args = oras_pull_args("[fd5a:1f02::1]:5000/acme/app:sha256abc", "/tmp/pulled");
 /// assert_eq!(args[0], "pull");
 /// assert!(args.contains(&"--plain-http".to_owned()));
@@ -65,7 +65,7 @@ pub async fn oras_pull(oras_bin: &str, reff: &str, out_dir: &Path, runner: &Comm
 ///
 /// # Example
 /// ```
-/// # use tabbify_service_supervisor::oras::oras_push_args;
+/// # use tabbify_supervisor::oras::oras_push_args;
 /// let args = oras_push_args("[fd5a::1]:5000/acme/app:sha", "/tmp/app.wasm");
 /// assert_eq!(args[0], "push");
 /// assert!(args.contains(&"--plain-http".to_owned()));
