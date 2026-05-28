@@ -40,7 +40,7 @@ utoipa = { version = "5", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 
 # WASM runtime (wasmtime 26, wasi:http/proxy world). See §8 of the contract.
 wasmtime = { version = "26", features = ["component-model", "async", "pooling-allocator"] }
@@ -54,7 +54,7 @@ bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 # Identifiers / hashing / encoding
-uuid = { version = "1.10", features = ["v7", "serde"] }
+uuid = { version = "1.23", features = ["v7", "serde"] }
 blake3 = "1"
 
 # Serde + TOML (manifest)
@@ -67,7 +67,7 @@ arc-swap = "1"
 dashmap = "6"
 
 # Config
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 
 # POSIX syscalls (kill(2) for fc pidfile stale-process cleanup)
 libc = "0.2"
@@ -84,7 +84,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tempfile = "3"
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio = { version = "1.52", features = ["full", "test-util"] }
 http-body-util = "0.1"
 # Local mock HTTP server to stand in for S3 in fetcher tests.
 wiremock = "0.6"
