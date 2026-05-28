@@ -1,0 +1,701 @@
+//! Linux microVM runtime: owns a firecracker child process + tap, configures
+//! it via its unix-socket REST API, and proxies HTTP into the guest.
+
+#![cfg(target_os = "linux")]
+
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
+use http::Request;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
+
+use super::pidfile;
+use super::protocol::{
+    boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
+    proxy_request, read_http_status, resume_body, rootfs_drive_body, snapshot_create_body,
+    snapshot_load_body,
+};
+use super::snapshot;
+use super::{FcConfig, kvm_available};
+use crate::manifest::Runtime;
+use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
+
+/// How long to wait for the guest app's HTTP server to come up after boot.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval while waiting for the guest app.
+const READY_POLL: Duration = Duration::from_millis(250);
+/// How long to wait for one firecracker API call over the unix socket.
+const API_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Monotonic per-process counter → a unique tap name + /30 offset per VM, so
+/// concurrently-hosted firecracker apps don't collide on tap devices/links.
+static VM_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// A booted Firecracker microVM hosting one app. Owns the firecracker child
+/// process + the host tap device; [`Drop`] tears both down.
+pub struct FirecrackerRuntime {
+    /// The firecracker child. `Option` so [`Drop`] can take it and spawn a
+    /// kill+reap (so no `<defunct>` zombie lingers). `Some` while alive.
+    child: Option<Child>,
+    tap_name: String,
+    api_sock: PathBuf,
+    /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
+    guest_base: String,
+    client: reqwest::Client,
+}
+
+impl FirecrackerRuntime {
+    /// Boot `rootfs` as a microVM and wait for its app HTTP server.
+    ///
+    /// Steps (design §4): KVM guard → allocate tap + /30 → spawn
+    /// `firecracker --api-sock` → configure via the unix-socket REST API
+    /// (machine-config, boot-source, rootfs drive, eth0 tap, InstanceStart)
+    /// → poll the guest app until ready.
+    ///
+    /// # Errors
+    /// `!kvm_available()`, tap setup failure, firecracker spawn failure, any
+    /// REST configuration call failing, or the guest app not answering
+    /// within [`READY_TIMEOUT`].
+    pub async fn launch(rootfs: &Path, rt: &Runtime, cfg: &FcConfig) -> Result<Self> {
+        Self::cold_boot(rootfs, rt, cfg, None).await
+    }
+
+    /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
+    /// after first boot (best-effort) and stored there for future warm starts.
+    async fn cold_boot(
+        rootfs: &Path,
+        rt: &Runtime,
+        cfg: &FcConfig,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self> {
+        if !kvm_available() {
+            bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
+        }
+        if !rootfs.is_file() {
+            bail!("firecracker rootfs not found at {}", rootfs.display());
+        }
+
+        let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
+        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
+            .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
+        let tap_name = format!("fc-tap{seq}");
+        let guest_mac = derive_guest_mac(seq);
+
+        // Host tap + /30 link (design §4.2). Best-effort cleanup of a stale
+        // tap of the same name first (ignore failure — it may not exist).
+        let _ = run_ip(&["link", "del", &tap_name]).await;
+        setup_tap(&tap_name, host_ip).await?;
+
+        // Spawn firecracker with its API socket. Clean any stale socket.
+        let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
+        let _ = std::fs::remove_file(&api_sock);
+        let child = Command::new(&cfg.bin)
+            .arg("--api-sock")
+            .arg(&api_sock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
+
+        let me = Self {
+            child: Some(child),
+            tap_name,
+            api_sock: api_sock.clone(),
+            guest_base: format!("http://{guest_ip}:{}", cfg.app_port),
+            client: reqwest::Client::new(),
+        };
+
+        // Configure + boot the VM, then wait for the guest app. On any
+        // failure `me` drops → child killed + tap deleted.
+        me.configure_and_boot(rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac)
+            .await?;
+        me.wait_until_ready().await?;
+
+        // Best-effort snapshot after first boot. A failure is logged and
+        // does NOT fail the launch — the VM continues to serve cold.
+        if let Some(dir) = cache_dir {
+            if !snapshot::files_present(dir) {
+                me.try_create_snapshot(dir).await;
+            }
+        }
+
+        Ok(me)
+    }
+
+    /// [`Self::launch`] with per-uuid pidfile reconciliation and snapshot
+    /// warm-start.
+    ///
+    /// Decision flow:
+    /// 1. Kill any stale VM recorded in `<data_dir>/tabbify-fc-<uuid>.pid`.
+    /// 2. If `<data_dir>/apps/<uuid>/cache/snap.vmstate` + `snap.mem` both
+    ///    exist → attempt a warm start via [`Self::launch_from_snapshot`].
+    ///    If the load fails (corrupt snapshot, kernel mismatch, etc.) → fall
+    ///    back to cold boot automatically.
+    /// 3. On the first (cold) boot, a snapshot is created in the cache dir
+    ///    after the guest app is ready. Subsequent restarts will be warm.
+    ///
+    /// # Notes
+    /// Snapshots are host-kernel + CPU-template specific. This supervisor
+    /// creates and consumes them on the same host, so they are always
+    /// compatible. Cross-host snapshot reuse is NOT supported.
+    ///
+    /// # Errors
+    /// See [`Self::launch`].
+    pub async fn launch_with_uuid(
+        rootfs: &Path,
+        rt: &Runtime,
+        cfg: &FcConfig,
+        uuid: &str,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        // Reconcile: kill any stale VM for this uuid before spawning fresh.
+        if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
+            pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
+        }
+
+        // Per-app snapshot cache: <data_dir>/apps/<uuid>/cache/
+        // (mirrors the wasm .cwasm cache directory layout)
+        let cache_dir = data_dir.join("apps").join(uuid).join("cache");
+
+        let vm = if snapshot::files_present(&cache_dir) {
+            // Warm path: try to restore from a previously-taken snapshot.
+            // Fall back to cold boot on any failure (corrupt files, kernel
+            // mismatch, etc.) so the app always comes up eventually.
+            match Self::launch_from_snapshot(&cache_dir, cfg).await {
+                Ok(warm_vm) => {
+                    tracing::info!(uuid, "warm start from snapshot");
+                    warm_vm
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        uuid,
+                        error = %e,
+                        "snapshot load failed; falling back to cold boot"
+                    );
+                    Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir)).await?
+                }
+            }
+        } else {
+            // Cold path: first boot — take a snapshot on the way out.
+            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir)).await?
+        };
+
+        // Record the new child PID so a future restart can clean it up.
+        if let Some(pid) = vm.child.as_ref().and_then(|c| c.id()) {
+            pidfile::write(data_dir, uuid, pid);
+        }
+        Ok(vm)
+    }
+
+    /// Restore a previously-snapshotted VM from `cache_dir`.
+    ///
+    /// Flow: `setup_tap` (new tap/IP, derived by VM_SEQ) → spawn
+    /// `firecracker --api-sock` → `PUT /snapshot/load` (resume_vm=true) →
+    /// `wait_until_ready` (should be ~ms not seconds).
+    ///
+    /// The machine-config / boot-source / drives / network-interfaces sequence
+    /// from `configure_and_boot` is intentionally SKIPPED here — the snapshot
+    /// embeds all that state. The only networking re-wiring needed is the host
+    /// tap; the guest MAC and IP are baked into the snapshot.
+    ///
+    /// # Errors
+    /// Tap setup failure, firecracker spawn failure, snapshot load API failure,
+    /// or the guest app failing to answer within [`READY_TIMEOUT`].
+    async fn launch_from_snapshot(cache_dir: &Path, cfg: &FcConfig) -> Result<Self> {
+        if !kvm_available() {
+            bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
+        }
+
+        let vmstate = snapshot::vmstate_path(cache_dir);
+        let mem = snapshot::mem_path(cache_dir);
+
+        let vmstate_str = vmstate
+            .to_str()
+            .ok_or_else(|| anyhow!("snapshot vmstate path is not valid UTF-8"))?;
+        let mem_str = mem
+            .to_str()
+            .ok_or_else(|| anyhow!("snapshot mem path is not valid UTF-8"))?;
+
+        // Allocate a fresh tap + /30 for this restored VM.
+        let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
+        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
+            .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
+        let tap_name = format!("fc-tap{seq}");
+
+        let _ = run_ip(&["link", "del", &tap_name]).await;
+        setup_tap(&tap_name, host_ip).await?;
+
+        let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
+        let _ = std::fs::remove_file(&api_sock);
+        let child = Command::new(&cfg.bin)
+            .arg("--api-sock")
+            .arg(&api_sock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
+
+        let me = Self {
+            child: Some(child),
+            tap_name,
+            api_sock: api_sock.clone(),
+            guest_base: format!("http://{guest_ip}:{}", cfg.app_port),
+            client: reqwest::Client::new(),
+        };
+
+        // Wait for the API socket, then load the snapshot (resume_vm=true).
+        // This replaces the full configure_and_boot sequence.
+        wait_for_socket(&me.api_sock).await?;
+        me.api_put(
+            "/snapshot/load",
+            &snapshot_load_body(vmstate_str, mem_str, true),
+        )
+        .await
+        .context("PUT /snapshot/load")?;
+
+        // After a snapshot load the guest resumes immediately; wait_until_ready
+        // should return within milliseconds (app was already initialised when
+        // the snapshot was taken).
+        me.wait_until_ready().await?;
+        Ok(me)
+    }
+
+    /// Push the full firecracker REST configuration, then start the VM.
+    async fn configure_and_boot(
+        &self,
+        rootfs: &Path,
+        rt: &Runtime,
+        cfg: &FcConfig,
+        guest_ip: &Ipv4Addr,
+        host_ip: &Ipv4Addr,
+        guest_mac: &str,
+    ) -> Result<()> {
+        // The API socket appears asynchronously after spawn; wait for it.
+        wait_for_socket(&self.api_sock).await?;
+
+        let kernel = rt.kernel.clone().unwrap_or_else(|| cfg.kernel.clone());
+        let rootfs_str = rootfs
+            .to_str()
+            .ok_or_else(|| anyhow!("rootfs path is not valid UTF-8"))?;
+
+        self.api_put(
+            "/machine-config",
+            &machine_config_body(cfg.vcpus, rt.memory_mb),
+        )
+        .await
+        .context("PUT /machine-config")?;
+        self.api_put(
+            "/boot-source",
+            &boot_source_body(&kernel, &guest_ip.to_string(), &host_ip.to_string()),
+        )
+        .await
+        .context("PUT /boot-source")?;
+        self.api_put("/drives/rootfs", &rootfs_drive_body(rootfs_str))
+            .await
+            .context("PUT /drives/rootfs")?;
+        self.api_put(
+            "/network-interfaces/eth0",
+            &network_iface_body(&self.tap_name, guest_mac),
+        )
+        .await
+        .context("PUT /network-interfaces/eth0")?;
+        self.api_put("/actions", &instance_start_body())
+            .await
+            .context("PUT /actions InstanceStart")?;
+        Ok(())
+    }
+
+    /// One firecracker REST `PUT` over the API unix socket. Hand-rolled
+    /// HTTP/1.1: firecracker speaks plain HTTP/1.1 with `Content-Length`
+    /// bodies and replies `204 No Content` (or 200) on success, an error
+    /// JSON otherwise.
+    async fn api_put(&self, path: &str, body: &serde_json::Value) -> Result<()> {
+        let payload = serde_json::to_vec(body)?;
+        let status =
+            tokio::time::timeout(API_TIMEOUT, unix_http_put(&self.api_sock, path, &payload))
+                .await
+                .map_err(|_| anyhow!("firecracker API timed out on PUT {path}"))??;
+        if !(200..300).contains(&status) {
+            bail!("firecracker API PUT {path} returned HTTP {status}");
+        }
+        Ok(())
+    }
+
+    /// One firecracker REST `PATCH` over the API unix socket.
+    ///
+    /// Used for VM state transitions (`/vm`): pause before snapshot, resume
+    /// after. The Firecracker API uses PATCH (not PUT) for state changes.
+    async fn api_patch(&self, path: &str, body: &serde_json::Value) -> Result<()> {
+        let payload = serde_json::to_vec(body)?;
+        let status =
+            tokio::time::timeout(API_TIMEOUT, unix_http_patch(&self.api_sock, path, &payload))
+                .await
+                .map_err(|_| anyhow!("firecracker API timed out on PATCH {path}"))??;
+        if !(200..300).contains(&status) {
+            bail!("firecracker API PATCH {path} returned HTTP {status}");
+        }
+        Ok(())
+    }
+
+    /// Take a snapshot of a running VM into `cache_dir/snap.vmstate` +
+    /// `cache_dir/snap.mem`. Called once after the first cold boot.
+    ///
+    /// Flow: PATCH /vm Paused → PUT /snapshot/create → PATCH /vm Resumed.
+    ///
+    /// This is best-effort: any error is logged and the VM continues serving
+    /// cold (the caller must NOT fail the launch on snapshot errors).
+    async fn try_create_snapshot(&self, cache_dir: &std::path::Path) {
+        if let Err(e) = self.create_snapshot_inner(cache_dir).await {
+            tracing::warn!(
+                cache_dir = %cache_dir.display(),
+                error = %e,
+                "snapshot create failed (best-effort; VM continues serving cold)"
+            );
+            // Attempt to resume in case we paused but failed after that.
+            if let Err(re) = self.api_patch("/vm", &resume_body()).await {
+                tracing::warn!(error = %re, "PATCH /vm Resumed failed during snapshot error recovery");
+            }
+        }
+    }
+
+    async fn create_snapshot_inner(&self, cache_dir: &std::path::Path) -> Result<()> {
+        // Ensure the cache directory exists so snapshot files can be written.
+        std::fs::create_dir_all(cache_dir)
+            .with_context(|| format!("create snapshot cache dir {}", cache_dir.display()))?;
+
+        let vmstate = snapshot::vmstate_path(cache_dir);
+        let mem = snapshot::mem_path(cache_dir);
+
+        let vmstate_str = vmstate
+            .to_str()
+            .ok_or_else(|| anyhow!("snapshot vmstate path is not valid UTF-8"))?;
+        let mem_str = mem
+            .to_str()
+            .ok_or_else(|| anyhow!("snapshot mem path is not valid UTF-8"))?;
+
+        self.api_patch("/vm", &pause_body())
+            .await
+            .context("PATCH /vm Paused before snapshot")?;
+        self.api_put(
+            "/snapshot/create",
+            &snapshot_create_body(vmstate_str, mem_str),
+        )
+        .await
+        .context("PUT /snapshot/create")?;
+        self.api_patch("/vm", &resume_body())
+            .await
+            .context("PATCH /vm Resumed after snapshot")?;
+
+        tracing::info!(
+            vmstate = %vmstate.display(),
+            mem = %mem.display(),
+            "snapshot created; subsequent launches will warm-start"
+        );
+        Ok(())
+    }
+
+    /// Poll the guest app's HTTP server until it answers (any status) or
+    /// [`READY_TIMEOUT`] elapses.
+    async fn wait_until_ready(&self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match self
+                .client
+                .get(&self.guest_base)
+                .timeout(READY_POLL)
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(READY_POLL).await;
+                }
+                Err(e) => {
+                    bail!("guest app at {} never became ready: {e}", self.guest_base)
+                }
+            }
+        }
+    }
+}
+
+impl AppRuntime for FirecrackerRuntime {
+    fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a> {
+        // Delegate to the VM-independent proxy core (tested via wiremock).
+        Box::pin(proxy_request(&self.client, &self.guest_base, request))
+    }
+
+    fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+        // The app is healthy iff its guest HTTP server answers (any status).
+        Box::pin(async move {
+            match self
+                .client
+                .get(&self.guest_base)
+                .timeout(API_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(_) => RuntimeHealth::Serving,
+                Err(e) => RuntimeHealth::Unavailable(format!(
+                    "guest {} unreachable: {e}",
+                    self.guest_base
+                )),
+            }
+        })
+    }
+
+    fn watch_for_exit<'a>(&'a self) -> BoxFut<'a, ExitReason> {
+        // The firecracker child is OUR child, so a dead VM becomes a ZOMBIE
+        // until we reap it. `kill(pid, 0)` (`process_is_alive`) reports a
+        // zombie as "alive" forever — the live Lima test proved that hangs
+        // fail-fast — so we poll with `waitpid(WNOHANG)`, which REAPS the
+        // zombie AND detects the exit. Polling keeps this `&self` (tokio
+        // `Child::wait` needs `&mut`, which `Drop` owns). When the VM exits
+        // the app is gone → the runner exits → L2 respawns it.
+        let pid = self.child.as_ref().and_then(|c| c.id());
+        Box::pin(async move {
+            match pid {
+                None => std::future::pending().await,
+                Some(pid) => loop {
+                    // SAFETY: waitpid is a POSIX syscall; WNOHANG is
+                    // non-blocking. Returns the pid (and reaps) once it has
+                    // exited, 0 while still running, <0 (ECHILD) if already
+                    // reaped — any non-zero result means the child is gone.
+                    let r = unsafe {
+                        libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
+                    };
+                    if r != 0 {
+                        return ExitReason::Died(format!("firecracker child pid {pid} exited"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                },
+            }
+        })
+    }
+
+    fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
+        // Graceful teardown: kill the VM (if still alive) + delete the tap.
+        // Idempotent — `Drop` repeats it as the safety net.
+        let pid = self.child.as_ref().and_then(|c| c.id());
+        let tap = self.tap_name.clone();
+        Box::pin(async move {
+            if let Some(pid) = pid {
+                pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
+            }
+            if let Err(e) = run_ip(&["link", "del", &tap]).await {
+                tracing::debug!(%tap, error = %e, "shutdown: ip link del tap (may already be gone)");
+            }
+        })
+    }
+}
+
+impl Drop for FirecrackerRuntime {
+    fn drop(&mut self) {
+        // Kill AND REAP the firecracker child. `start_kill` alone SIGKILLs but
+        // leaves a zombie until tokio's orphan reaper runs (seconds later);
+        // spawning `kill()` (SIGKILL + `wait`) reaps it immediately so no
+        // `<defunct>` lingers in the process table. We're normally inside the
+        // tokio runtime here; if not (e.g. a sync drop in a test), fall back
+        // to a best-effort non-reaping kill. The tap delete stays synchronous
+        // (quick) so it happens even if there's no runtime to spawn on.
+        if let Some(mut child) = self.child.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        let _ = child.kill().await;
+                    });
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&self.api_sock);
+        let tap = self.tap_name.clone();
+        match std::process::Command::new("ip")
+            .args(["link", "del", &tap])
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => tracing::warn!(%tap, code = ?s.code(), "ip link del tap nonzero exit"),
+            Err(e) => tracing::warn!(%tap, error = %e, "ip link del tap failed"),
+        }
+    }
+}
+
+/// Create the host tap device and assign it the /30 host IP.
+async fn setup_tap(tap_name: &str, host_ip: Ipv4Addr) -> Result<()> {
+    run_ip(&["tuntap", "add", tap_name, "mode", "tap"])
+        .await
+        .with_context(|| format!("ip tuntap add {tap_name}"))?;
+    run_ip(&["addr", "add", &format!("{host_ip}/30"), "dev", tap_name])
+        .await
+        .with_context(|| format!("ip addr add {host_ip}/30 dev {tap_name}"))?;
+    run_ip(&["link", "set", tap_name, "up"])
+        .await
+        .with_context(|| format!("ip link set {tap_name} up"))?;
+    Ok(())
+}
+
+/// Run an `ip ...` command, erroring on a non-zero exit.
+async fn run_ip(args: &[&str]) -> Result<()> {
+    let out = Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("spawn ip {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "ip {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Derive a (host_ip, guest_ip) /30 pair for VM index `seq` out of
+/// `subnet`. We carve sequential /30s: VM `n` gets hosts
+/// `base + 4n + 1` (host) and `base + 4n + 2` (guest).
+fn derive_link_ips(subnet: &str, seq: u32) -> Result<(Ipv4Addr, Ipv4Addr)> {
+    let base = subnet
+        .split('/')
+        .next()
+        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        .ok_or_else(|| anyhow!("invalid tap subnet {subnet:?}"))?;
+    let base_u32 = u32::from(base);
+    let host = base_u32
+        .checked_add(seq * 4 + 1)
+        .ok_or_else(|| anyhow!("tap subnet exhausted at seq {seq}"))?;
+    let guest = host + 1;
+    Ok((Ipv4Addr::from(host), Ipv4Addr::from(guest)))
+}
+
+/// Deterministic locally-administered guest MAC from the VM index.
+fn derive_guest_mac(seq: u32) -> String {
+    let b = seq.to_le_bytes();
+    // 02:xx → locally administered, unicast.
+    format!("02:FC:{:02X}:{:02X}:{:02X}:{:02X}", b[0], b[1], b[2], b[3])
+}
+
+/// Wait (bounded) for firecracker to create its API socket after spawn.
+async fn wait_for_socket(sock: &Path) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("firecracker API socket {} never appeared", sock.display());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// Hand-rolled HTTP/1.1 `PUT` over a unix socket: write the request, read
+/// the status line, return the status code. Bodies are small JSON; we send
+/// `Content-Length` and read just enough of the reply to learn the status
+/// (firecracker responds 204/200 on success).
+async fn unix_http_put(sock: &Path, path: &str, body: &[u8]) -> Result<u16> {
+    unix_http_verb(sock, "PUT", path, body).await
+}
+
+/// Hand-rolled HTTP/1.1 `PATCH` over a unix socket. Same framing as PUT;
+/// used for the `/vm` state transitions (pause/resume) which the Firecracker
+/// API exposes as PATCH, not PUT.
+async fn unix_http_patch(sock: &Path, path: &str, body: &[u8]) -> Result<u16> {
+    unix_http_verb(sock, "PATCH", path, body).await
+}
+
+/// Shared HTTP/1.1 request writer for PUT and PATCH. Both methods carry a
+/// JSON body and expect a 2xx status; the difference is just the verb string.
+async fn unix_http_verb(sock: &Path, verb: &str, path: &str, body: &[u8]) -> Result<u16> {
+    let mut stream = UnixStream::connect(sock)
+        .await
+        .with_context(|| format!("connect firecracker socket {}", sock.display()))?;
+
+    let head = format!(
+        "{verb} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+
+    // Firecracker's API server uses keep-alive and ignores `Connection:
+    // close`, so it doesn't close the socket; read just the response head
+    // (NOT to EOF, which would hang) and parse its status.
+    read_http_status(&mut stream).await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_ips_carve_sequential_slash30s() {
+        let (h0, g0) = derive_link_ips("172.31.0.0/16", 0).unwrap();
+        assert_eq!(h0, Ipv4Addr::new(172, 31, 0, 1));
+        assert_eq!(g0, Ipv4Addr::new(172, 31, 0, 2));
+        let (h1, g1) = derive_link_ips("172.31.0.0/16", 1).unwrap();
+        assert_eq!(h1, Ipv4Addr::new(172, 31, 0, 5));
+        assert_eq!(g1, Ipv4Addr::new(172, 31, 0, 6));
+    }
+
+    #[test]
+    fn guest_mac_is_locally_administered_and_deterministic() {
+        assert_eq!(derive_guest_mac(0), "02:FC:00:00:00:00");
+        assert_eq!(derive_guest_mac(1), "02:FC:01:00:00:00");
+    }
+
+    /// REAL microVM boot — Linux + `/dev/kvm` + a provisioned kernel + a
+    /// rootfs only. `#[ignore]`d so CI / the macOS dev host never runs it;
+    /// run it by hand on a KVM box (e.g. Leo's Lima Ubuntu):
+    ///
+    /// ```text
+    /// # On the Lima guest, as root (needs /dev/kvm + iproute2 + firecracker):
+    /// #   - put a vmlinux at /opt/tabbify/vmlinux
+    /// #   - put a rootfs whose app serves HTTP on :8080 at /tmp/rootfs.ext4
+    /// sudo -E cargo test -p tabbify-service-supervisor \
+    ///     firecracker::linux::tests::real_vm_boots_and_serves -- --ignored --nocapture
+    /// ```
+    ///
+    /// Asserts the VM boots, the guest app answers, and `Drop` tears the VM
+    /// + tap down.
+    #[tokio::test]
+    #[ignore = "requires Linux + /dev/kvm + a provisioned kernel/rootfs (run on Lima)"]
+    async fn real_vm_boots_and_serves() {
+        use crate::runtime::AppRuntime;
+
+        let rootfs = std::path::PathBuf::from("/tmp/rootfs.ext4");
+        let rt = crate::manifest::Runtime {
+            r#type: "firecracker".to_owned(),
+            entry: "rootfs.ext4".to_owned(),
+            fuel_per_request: 0,
+            memory_mb: 256,
+            kernel: None,
+            registry_ref: None,
+        };
+        let cfg = FcConfig::default();
+
+        let vm = FirecrackerRuntime::launch(&rootfs, &rt, &cfg)
+            .await
+            .expect("boot microVM");
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://app/")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = vm.handle(req).await.expect("proxy to guest");
+        assert!(resp.status().is_success());
+        drop(vm); // child killed + tap deleted
+    }
+}
