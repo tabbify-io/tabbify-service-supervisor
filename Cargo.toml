@@ -86,6 +86,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Temporary directories for build workdirs (also used in tests).
 tempfile = "3"
 
+# OCI image-config parsing for the generic Firecracker runtime: read an
+# image's entrypoint/cmd/env/workdir to translate into the guest PID-1 init.
+# Default features (no distribution client) keep the dep light + musl-clean.
+oci-spec = { version = "0.10", default-features = false, features = ["image"] }
+
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util"] }
 http-body-util = "0.1"

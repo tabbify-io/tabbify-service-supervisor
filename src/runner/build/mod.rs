@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::runtime::BoxFut;
 
 mod docker;
+pub(crate) mod firecracker;
 mod wasm;
 
 /// Which build pipeline a [`BuildJob`] drives.
