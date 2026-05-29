@@ -381,6 +381,8 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
         .collect();
 
     // POSIX sh init. `set -e` so a failed mount aborts loudly to the console.
+    // OCI/Docker auto-create a missing WorkingDir; with `set -e` a bare `cd` into
+    // an unmaterialized workdir would kill PID 1, so `mkdir -p` it first (FIX 3).
     let workdir = sh_single_quote(&exec.workdir);
     Ok(format!(
         "#!/bin/sh\n\
@@ -394,7 +396,7 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
          fi\n\
          ip link show eth0 >/dev/null 2>&1 || true\n\
          {env_lines}\
-         cd {workdir}\n\
+         mkdir -p {workdir} 2>/dev/null; cd {workdir}\n\
          exec {exec_line}\n",
     ))
 }

@@ -238,6 +238,33 @@ fn render_init_escapes_embedded_single_quote() {
     );
 }
 
+/// FIX 3 regression: OCI/Docker auto-create a missing WorkingDir. With `set -e`,
+/// a bare `cd <workdir>` to a non-existent dir kills PID 1 at boot. The init must
+/// `mkdir -p` the workdir before `cd`, and the workdir must be single-quoted
+/// (FIX 1) so a path with special chars survives.
+#[test]
+fn render_init_creates_workdir_before_cd() {
+    let exec = OciExec {
+        entrypoint: vec!["/srv/app".to_owned()],
+        cmd: Vec::new(),
+        env: Vec::new(),
+        workdir: "/var/My App".to_owned(),
+    };
+    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    assert!(
+        init.contains("mkdir -p '/var/My App'"),
+        "must mkdir -p the workdir (single-quoted) before cd; got:\n{init}"
+    );
+    assert!(
+        init.contains("cd '/var/My App'"),
+        "must cd into the single-quoted workdir; got:\n{init}"
+    );
+    // mkdir must come before cd.
+    let mkdir_at = init.find("mkdir -p '/var/My App'").unwrap();
+    let cd_at = init.find("cd '/var/My App'").unwrap();
+    assert!(mkdir_at < cd_at, "mkdir -p must precede cd; got:\n{init}");
+}
+
 /// Shell-form (empty entrypoint, no parseable argv) is DEFERRED (D3): render
 /// must return a clear "shell-form not yet supported" error, not silently
 /// guess a shell.
