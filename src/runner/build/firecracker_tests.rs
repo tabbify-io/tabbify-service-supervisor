@@ -385,3 +385,70 @@ async fn run_fc_build_converts_on_cache_miss() {
     assert_eq!(rootfs, target);
     assert!(rootfs.is_file());
 }
+
+/// The registry pull+tag step of `run_firecracker_build` must issue argv whose
+/// FIRST element is the `docker` binary — the [`super::FcBuildRunner`] contract
+/// (and [`super::production_fc_build_runner`]) spawns `Command::new(argv[0])`,
+/// so the program MUST be argv[0]. The `docker::protocol::{pull_args, tag_args}`
+/// builders return argv WITHOUT the binary (`["pull", reff]` / `["tag", reff,
+/// vtag]`) because they're consumed by the docker module's runner which bakes
+/// `docker` in via `Command::new(docker_bin).args(args)`. Feeding those raw into
+/// the FC runner would spawn nonexistent `pull`/`tag` executables in production.
+/// This asserts the FC pull+tag step prepends `docker` so it spawns
+/// `docker pull <reff>` and `docker tag <reff> <vtag>`.
+#[tokio::test]
+async fn pull_and_tag_argv_has_docker_as_program() {
+    let reff = "[fd5a::1]:5000/acme/vm@sha256:fresh01";
+    let vtag = "tbf-img-uuid-pull-v3";
+
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+        calls2.lock().unwrap().push(argv);
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    super::pull_and_tag(reff, vtag, &runner)
+        .await
+        .expect("pull+tag must succeed");
+
+    let recorded = calls.lock().unwrap().clone();
+    let pull = recorded
+        .iter()
+        .find(|c| c.iter().any(|a| a == "pull"))
+        .expect("must issue a docker pull");
+    assert_eq!(
+        pull.first().map(String::as_str),
+        Some("docker"),
+        "pull argv[0] must be the docker binary (FcBuildRunner spawns argv[0]); got {pull:?}"
+    );
+    assert_eq!(pull, &vec!["docker".to_owned(), "pull".to_owned(), reff.to_owned()]);
+
+    let tag = recorded
+        .iter()
+        .find(|c| c.iter().any(|a| a == "tag"))
+        .expect("must issue a docker tag");
+    assert_eq!(
+        tag.first().map(String::as_str),
+        Some("docker"),
+        "tag argv[0] must be the docker binary (FcBuildRunner spawns argv[0]); got {tag:?}"
+    );
+    assert_eq!(
+        tag,
+        &vec!["docker".to_owned(), "tag".to_owned(), reff.to_owned(), vtag.to_owned()]
+    );
+}
+
+/// A failing `docker pull` surfaces a clear error naming the pull step (so a
+/// cache-miss conversion can never silently proceed against a missing image).
+#[tokio::test]
+async fn pull_and_tag_errors_when_pull_fails() {
+    let runner: super::FcBuildRunner = Arc::new(|_argv| Box::pin(async { (false, Vec::new()) }));
+    let err = super::pull_and_tag("reg/img@sha256:x", "tbf-img-u-v1", &runner)
+        .await
+        .expect_err("must error when pull fails");
+    assert!(
+        err.to_string().to_lowercase().contains("pull"),
+        "error must name the failing pull step; got: {err}"
+    );
+}

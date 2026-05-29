@@ -443,6 +443,42 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
     })
 }
 
+/// Pull the deployed OCI image from the mesh registry and alias it under the
+/// supervisor's versioned local tag, the same `docker pull <reff>` +
+/// `docker tag <reff> <vtag>` sequence as [`crate::docker::push::pull_and_tag`].
+///
+/// CRITICAL — argv contract. The [`FcBuildRunner`] (and its production form,
+/// [`production_fc_build_runner`]) spawns `Command::new(argv[0]).args(argv[1..])`,
+/// so the program MUST be argv[0]. The `protocol::{pull_args, tag_args}` builders
+/// return argv WITHOUT the binary (`["pull", reff]` / `["tag", reff, vtag]`)
+/// because they're consumed by the docker module's `production_command_runner`,
+/// which bakes `docker` in via `Command::new(docker_bin).args(args)`. Feeding
+/// those raw into the FC runner would spawn nonexistent `pull`/`tag`
+/// executables. So we prepend `"docker"` here to honour the FC runner contract.
+///
+/// # Errors
+/// A failing `docker pull` or `docker tag`.
+async fn pull_and_tag(reff: &str, vtag: &str, runner: &FcBuildRunner) -> Result<()> {
+    // `protocol::pull_args(reff)` = `["pull", reff]`; prepend the binary so the
+    // FcBuildRunner spawns `docker pull <reff>` (program at argv[0]).
+    let mut pull = vec!["docker".to_owned()];
+    pull.extend(crate::docker::protocol::pull_args(reff));
+    let (pulled, _) = (runner)(pull).await;
+    if !pulled {
+        bail!("docker pull of registry_ref {reff:?} from mesh registry failed");
+    }
+
+    // `protocol::tag_args(reff, vtag)` = `["tag", reff, vtag]`; prepend the
+    // binary so the FcBuildRunner spawns `docker tag <reff> <vtag>`.
+    let mut tag = vec!["docker".to_owned()];
+    tag.extend(crate::docker::protocol::tag_args(reff, vtag));
+    let (tagged, _) = (runner)(tag).await;
+    if !tagged {
+        bail!("docker tag {reff:?} -> {vtag} failed");
+    }
+    Ok(())
+}
+
 /// Entry point for the `"firecracker"` arm of [`crate::build::build_runtime`]:
 /// resolve (cache or convert) the rootfs, then boot it via the existing
 /// `FirecrackerRuntime` contract (guest `172.31.0.2:8080`, kernel
@@ -475,22 +511,12 @@ pub async fn run_firecracker_build(
     // Spec §7 step 1: PULL the OCI image from the mesh registry FIRST. Both the
     // OCI-config read (`docker inspect`) and the rootfs export (`docker export`)
     // operate on the LOCAL daemon, so the image must be present locally before
-    // either runs. We reuse the existing docker registry-pull argv builders
-    // (`protocol::pull_args` + `protocol::tag_args`) — the same `docker pull
-    // <reff>` + `docker tag <reff> <vtag>` sequence as `docker::push::pull_and_tag`
-    // — issued through the FcBuildRunner seam. The local versioned tag matches
-    // what `resolve_rootfs` reads from (`versioned_image_tag(uuid, version)`).
+    // either runs. The local versioned tag matches what `resolve_rootfs` reads
+    // from (`versioned_image_tag(uuid, version)`).
     // (Skipped iff the rootfs is already cached by digest — fc-3.)
     if !rootfs_is_cached(data_dir, uuid, digest) {
         let vtag = crate::docker::protocol::versioned_image_tag(uuid, fetched.version);
-        let (pulled, _) = (runner)(crate::docker::protocol::pull_args(reff)).await;
-        if !pulled {
-            bail!("docker pull of registry_ref {reff:?} from mesh registry failed");
-        }
-        let (tagged, _) = (runner)(crate::docker::protocol::tag_args(reff, &vtag)).await;
-        if !tagged {
-            bail!("docker tag {reff:?} -> {vtag} failed");
-        }
+        pull_and_tag(reff, &vtag, runner).await?;
     }
 
     let rootfs = resolve_rootfs(uuid, fetched, digest, data_dir, runner).await?;
