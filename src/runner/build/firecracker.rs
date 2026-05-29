@@ -59,7 +59,7 @@ use crate::runtime::BoxFut;
 /// argv (first element = program) and returns `(exit_ok, stdout_bytes)`:
 /// `exit_ok` is `true` iff the process exits 0, and `stdout_bytes` is the
 /// captured STDOUT (empty for commands whose output we ignore, populated for
-/// `docker inspect` whose JSON config we parse — see [`read_oci_config`]).
+/// `docker inspect` whose JSON config we parse — see `read_oci_config`).
 ///
 /// `docker::CommandRunner` returns only `bool`; we widen to also carry stdout
 /// because `docker inspect` writes its OCI config to STDOUT (it has NO `-o`

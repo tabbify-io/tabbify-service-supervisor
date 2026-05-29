@@ -12,6 +12,9 @@
 //! ## Module layout
 //! - [`docker`] — the docker sub-pipeline (`Dockerfile` → build → docker push).
 //! - [`wasm`]   — the wasm sub-pipeline (`build_cmd` → verify `.wasm` → oras push).
+//! - [`firecracker`] — the generic Firecracker RUNTIME-build (OCI image →
+//!   bootable `rootfs.ext4` + PID-1 init); `pub` so the KVM-gated integration
+//!   test can drive [`firecracker::run_firecracker_build`] end-to-end.
 //! - Everything else (the [`BuildJob`] type, the dispatcher, the production
 //!   wiring, and the tests) lives in this file.
 
@@ -23,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::runtime::BoxFut;
 
 mod docker;
-pub(crate) mod firecracker;
+pub mod firecracker;
 mod wasm;
 
 /// Which build pipeline a [`BuildJob`] drives.
