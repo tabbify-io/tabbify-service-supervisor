@@ -490,6 +490,49 @@ fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
         .join(digest.digest())
 }
 
+/// Map a layer descriptor's media type to the explicit host-`tar` decompression
+/// flag (FIX 4). Real container layers are gzip- or zstd-compressed; relying on
+/// `tar` autodetect breaks on busybox / older tar (notably for zstd), so the flag
+/// is selected from the media type, NOT guessed by the archiver.
+///
+/// Matches by media-type STRING so both the OCI spellings (`…tar+gzip` /
+/// `…tar+zstd`, which `oci-spec` types as [`MediaType::ImageLayerGzip`] /
+/// [`MediaType::ImageLayerZstd`]) AND the Docker v2s2 spellings real images ship
+/// with (`…rootfs.diff.tar.gzip` / `.zstd`, which `oci-spec` types as
+/// [`MediaType::Other`]) resolve correctly.
+///
+/// Returns `Some("-z")` for gzip, `Some("--zstd")` for zstd, and `None` for plain
+/// uncompressed tar (or an unknown type — let `tar` read the raw archive).
+fn tar_decompress_flag(media_type: &oci_spec::image::MediaType) -> Option<&'static str> {
+    let mt = media_type.to_string();
+    if mt.ends_with("+gzip") || mt.ends_with(".tar.gzip") {
+        Some("-z")
+    } else if mt.ends_with("+zstd") || mt.ends_with(".tar.zstd") {
+        Some("--zstd")
+    } else {
+        None
+    }
+}
+
+/// Build the host-`tar` extract argv `tar -x [<flag>] -f <blob> -C <out>`.
+///
+/// `flag` is the media-type-derived decompression flag from
+/// [`tar_decompress_flag`] (`-z` / `--zstd`), or empty for plain tar. It is
+/// placed BEFORE `-f` so `tar` decompresses the blob it then reads. Kept as a
+/// pure argv builder so the flag-selection ↔ argv assembly is unit-testable
+/// without spawning `tar`.
+fn unpack_tar_argv(flag: &str, blob: &Path, out: &Path) -> Vec<String> {
+    let mut argv = vec!["tar".to_owned(), "-x".to_owned()];
+    if !flag.is_empty() {
+        argv.push(flag.to_owned());
+    }
+    argv.push("-f".to_owned());
+    argv.push(blob.to_string_lossy().into_owned());
+    argv.push("-C".to_owned());
+    argv.push(out.to_string_lossy().into_owned());
+    argv
+}
+
 /// Unpack the image's layers (in manifest order) into `staging`, whiteout-aware.
 /// Each layer is untarred via the `tar` seam (shelled host `tar`, no daemon)
 /// into its OWN per-layer dir — that dir is the authoritative set of paths the
@@ -560,14 +603,12 @@ async fn unpack_oci_layers(
             .await
             .with_context(|| format!("create layer dir {}", layer_dir.display()))?;
         let blob = blob_path(layout, layer.digest());
-        let (ok, _) = (runner)(vec![
-            "tar".to_owned(),
-            "-xf".to_owned(),
-            blob.to_string_lossy().into_owned(),
-            "-C".to_owned(),
-            layer_dir.to_string_lossy().into_owned(),
-        ])
-        .await;
+        // Decompress per the layer descriptor's media type rather than trusting
+        // `tar` autodetect: real layers are gzip (`+gzip`) or zstd (`+zstd`), and
+        // busybox/older host tar cannot autodetect zstd. An explicit `-z` / `--zstd`
+        // is correct everywhere; plain tar gets no flag (FIX 4).
+        let flag = tar_decompress_flag(layer.media_type()).unwrap_or("");
+        let (ok, _) = (runner)(unpack_tar_argv(flag, &blob, &layer_dir)).await;
         if !ok {
             bail!("untar of OCI layer {} failed", blob.display());
         }

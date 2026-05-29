@@ -753,6 +753,77 @@ async fn unpack_oci_layers_replaces_lower_file_with_upper_dir() {
     );
 }
 
+/// FIX 4 regression: the layer-unpack tar argv must carry the right
+/// decompression flag derived from the layer's media type — `tar` autodetect is
+/// unreliable (busybox/older tar cannot autodetect zstd), so the flag must be
+/// explicit. Covers BOTH the OCI media types and the Docker v2s2 equivalents
+/// real images ship with.
+#[test]
+fn tar_decompress_flag_branches_on_media_type() {
+    use oci_spec::image::MediaType;
+
+    // gzip → -z (both OCI and Docker spellings).
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::ImageLayerGzip),
+        Some("-z")
+    );
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::from(
+            "application/vnd.docker.image.rootfs.diff.tar.gzip"
+        )),
+        Some("-z")
+    );
+    // zstd → --zstd (both OCI and Docker spellings).
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::ImageLayerZstd),
+        Some("--zstd")
+    );
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::from(
+            "application/vnd.docker.image.rootfs.diff.tar.zstd"
+        )),
+        Some("--zstd")
+    );
+    // plain tar → no flag (let tar read the raw archive).
+    assert_eq!(super::tar_decompress_flag(&MediaType::ImageLayer), None);
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::from(
+            "application/vnd.docker.image.rootfs.diff.tar"
+        )),
+        None
+    );
+}
+
+/// FIX 4: the assembled untar argv must include the media-type-derived
+/// decompression flag (`-z` for gzip, `--zstd` for zstd) ahead of `-f <blob>`.
+#[test]
+fn unpack_tar_argv_includes_decompress_flag() {
+    let blob = Path::new("/blobs/sha256/abc");
+    let out = Path::new("/stage/layer-0");
+
+    let gz = super::unpack_tar_argv("-z", blob, out);
+    assert_eq!(gz.first().map(String::as_str), Some("tar"));
+    assert!(gz.contains(&"-z".to_owned()), "gzip layer must pass -z; got {gz:?}");
+    // The decompress flag must precede -f so tar reads the blob compressed.
+    let z_at = gz.iter().position(|a| a == "-z").unwrap();
+    let f_at = gz.iter().position(|a| a == "-f").unwrap();
+    assert!(z_at < f_at, "decompress flag must precede -f; got {gz:?}");
+
+    let zstd = super::unpack_tar_argv("--zstd", blob, out);
+    assert!(
+        zstd.contains(&"--zstd".to_owned()),
+        "zstd layer must pass --zstd; got {zstd:?}"
+    );
+
+    // Plain tar: empty flag yields no spurious arg, still `-f <blob> -C <out>`.
+    let plain = super::unpack_tar_argv("", blob, out);
+    assert!(
+        !plain.iter().any(|a| a == "-z" || a == "--zstd"),
+        "plain tar must carry no decompress flag; got {plain:?}"
+    );
+    assert!(plain.contains(&"-f".to_owned()) && plain.contains(&"-C".to_owned()));
+}
+
 /// A layer count that disagrees with rootfs.diff_ids errors loudly (corrupt
 /// layout) rather than silently unpacking a partial rootfs.
 #[tokio::test]
