@@ -195,6 +195,115 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
     Ok(())
 }
 
+/// The exec-form entrypoint distilled from an OCI image config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // first non-test caller arrives in fc-5
+pub struct OciExec {
+    /// `config.Entrypoint` — the program + leading args (PID 1).
+    pub entrypoint: Vec<String>,
+    /// `config.Cmd` — default args appended after the entrypoint.
+    pub cmd: Vec<String>,
+    /// `config.Env` — `KEY=VALUE` strings exported before exec.
+    pub env: Vec<String>,
+    /// `config.WorkingDir` — `cd`'d into before exec (`/` if empty).
+    pub workdir: String,
+}
+
+/// How the image declares its process. Phase-1 supports EXEC-FORM only (D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // first non-test caller arrives in fc-5
+pub enum Entrypoint {
+    /// A concrete argv to `exec` as PID 1.
+    Exec(OciExec),
+    /// No usable exec-form argv (image relies on a shell). DEFERRED — render
+    /// returns a clear error rather than guessing `/bin/sh -c`.
+    ShellForm,
+}
+
+impl Entrypoint {
+    /// Classify an OCI config into exec-form vs shell-form.
+    ///
+    /// Exec-form requires a non-empty `Entrypoint` OR `Cmd` (the program to run
+    /// is then `entrypoint ++ cmd`). An image with NEITHER is shell-form
+    /// (deferred): a bare `Cmd` that is meant for a shell base image can't be
+    /// distinguished safely in Phase-1, so empty argv ⇒ ShellForm.
+    #[must_use]
+    #[allow(dead_code)] // first non-test caller arrives in fc-5
+    pub fn from_oci(cfg: &oci_spec::image::ImageConfiguration) -> Self {
+        let Some(inner) = cfg.config().as_ref() else {
+            return Entrypoint::ShellForm;
+        };
+        let entrypoint = inner.entrypoint().clone().unwrap_or_default();
+        let cmd = inner.cmd().clone().unwrap_or_default();
+        if entrypoint.is_empty() && cmd.is_empty() {
+            return Entrypoint::ShellForm;
+        }
+        Entrypoint::Exec(OciExec {
+            entrypoint,
+            cmd,
+            env: inner.env().clone().unwrap_or_default(),
+            workdir: {
+                let wd = inner.working_dir().clone().unwrap_or_default();
+                if wd.is_empty() { "/".to_owned() } else { wd }
+            },
+        })
+    }
+}
+
+/// Render the guest PID-1 init script from an [`Entrypoint`].
+///
+/// The script (run as PID 1 by the kernel `init=/init` arg) mounts the pseudo
+/// filesystems, verifies `eth0` (the kernel `ip=` boot-arg already configured
+/// it to `172.31.0.2` per the existing `FirecrackerRuntime` contract), exports
+/// the OCI env, cd's to the workdir, then `exec`s the entrypoint argv so the
+/// app server becomes PID 1's successor.
+///
+/// # Errors
+/// [`Entrypoint::ShellForm`] — shell-form entrypoints are not yet supported
+/// (D3); the error message says so clearly.
+#[allow(dead_code)] // first non-test caller arrives in fc-5
+pub fn render_init(entry: &Entrypoint) -> Result<String> {
+    let exec = match entry {
+        Entrypoint::Exec(e) => e,
+        Entrypoint::ShellForm => {
+            bail!(
+                "shell-form entrypoint not yet supported by the generic \
+                 firecracker runtime (Phase-1 is EXEC-FORM only); set an \
+                 explicit exec-form ENTRYPOINT/CMD in the image"
+            );
+        }
+    };
+
+    // Build the exec argv: entrypoint ++ cmd, space-joined verbatim (exec-form).
+    let mut argv = exec.entrypoint.clone();
+    argv.extend(exec.cmd.iter().cloned());
+    let exec_line = argv.join(" ");
+
+    let env_lines: String = exec
+        .env
+        .iter()
+        .map(|kv| format!("export {kv}\n"))
+        .collect();
+
+    // POSIX sh init. `set -e` so a failed mount aborts loudly to the console.
+    Ok(format!(
+        "#!/bin/sh\n\
+         set -e\n\
+         mount -t proc proc /proc\n\
+         mount -t sysfs sysfs /sys\n\
+         mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev\n\
+         # eth0 is configured by the kernel ip= boot-arg; verify it came up.\n\
+         if [ ! -e /sys/class/net/eth0 ]; then\n\
+         \techo 'tabbify-init: eth0 missing (kernel ip= boot-arg did not configure it)' >&2\n\
+         fi\n\
+         ip link show eth0 >/dev/null 2>&1 || true\n\
+         {env_lines}\
+         cd {workdir}\n\
+         exec {exec_line}\n",
+        workdir = exec.workdir,
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -323,5 +432,89 @@ mod tests {
             msg.contains("export") || msg.contains("mkfs"),
             "error must name the failing step; got: {err}"
         );
+    }
+
+    use super::{Entrypoint, OciExec, render_init};
+
+    /// Exec-form entrypoint+cmd renders an init that:
+    /// - mounts /proc, /sys, /dev,
+    /// - exports the OCI env,
+    /// - cd's to the workdir,
+    /// - exec's the entrypoint argv verbatim (PID 1).
+    #[test]
+    fn render_init_exec_form_mounts_env_workdir_and_execs() {
+        let exec = OciExec {
+            entrypoint: vec!["/app/server".to_owned()],
+            cmd: vec!["--port".to_owned(), "8080".to_owned()],
+            env: vec!["RUST_LOG=info".to_owned(), "PORT=8080".to_owned()],
+            workdir: "/app".to_owned(),
+        };
+        let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+
+        assert!(init.starts_with("#!"), "must be a shebang script");
+        assert!(init.contains("mount -t proc"), "mounts /proc; got:\n{init}");
+        assert!(init.contains("mount -t sysfs"), "mounts /sys; got:\n{init}");
+        assert!(init.contains("/dev"), "mounts /dev; got:\n{init}");
+        // eth0 is configured by the kernel ip= boot-arg; init only verifies it.
+        assert!(
+            init.contains("ip link show eth0") || init.contains("/sys/class/net/eth0"),
+            "must verify eth0 presence; got:\n{init}"
+        );
+        assert!(
+            init.contains("export RUST_LOG=info"),
+            "env exported; got:\n{init}"
+        );
+        assert!(init.contains("cd /app"), "cd to workdir; got:\n{init}");
+        // exec-form: the entrypoint argv is exec'd as PID 1, args appended.
+        assert!(
+            init.contains("exec /app/server --port 8080"),
+            "must exec entrypoint+cmd verbatim; got:\n{init}"
+        );
+        // No shell-wrapping `sh -c` around the entrypoint (exec-form only).
+        assert!(
+            !init.contains("sh -c \"/app/server"),
+            "exec-form must not shell-wrap the entrypoint; got:\n{init}"
+        );
+    }
+
+    /// Shell-form (empty entrypoint, no parseable argv) is DEFERRED (D3): render
+    /// must return a clear "shell-form not yet supported" error, not silently
+    /// guess a shell.
+    #[test]
+    fn render_init_shell_form_returns_clear_error() {
+        let err = render_init(&Entrypoint::ShellForm).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("shell-form") && msg.contains("not") && msg.contains("support"),
+            "must clearly say shell-form is unsupported; got: {err}"
+        );
+    }
+
+    /// `Entrypoint::from_oci` derives exec-form from a typed OCI config; an image
+    /// with NO entrypoint AND no cmd is treated as shell-form (deferred).
+    #[test]
+    fn entrypoint_from_oci_classifies_exec_vs_shell_form() {
+        let json = r#"{
+            "architecture":"amd64","os":"linux",
+            "config":{"Entrypoint":["/bin/app"],"Cmd":["serve"],
+                      "Env":["A=1"],"WorkingDir":"/srv"},
+            "rootfs":{"type":"layers","diff_ids":[]}
+        }"#;
+        let cfg: oci_spec::image::ImageConfiguration =
+            serde_json::from_str(json).unwrap();
+        match Entrypoint::from_oci(&cfg) {
+            Entrypoint::Exec(e) => {
+                assert_eq!(e.entrypoint, vec!["/bin/app".to_owned()]);
+                assert_eq!(e.cmd, vec!["serve".to_owned()]);
+                assert_eq!(e.workdir, "/srv");
+            }
+            Entrypoint::ShellForm => panic!("should be exec-form"),
+        }
+
+        let empty = r#"{"architecture":"amd64","os":"linux",
+            "config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+        let cfg2: oci_spec::image::ImageConfiguration =
+            serde_json::from_str(empty).unwrap();
+        assert!(matches!(Entrypoint::from_oci(&cfg2), Entrypoint::ShellForm));
     }
 }
