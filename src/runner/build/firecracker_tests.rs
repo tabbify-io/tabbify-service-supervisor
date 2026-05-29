@@ -307,6 +307,18 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(&cached, b"\0").unwrap();
 
+    // DOCKER-LESS: the pull + config-read now live in `run_firecracker_build`,
+    // so `resolve_rootfs` takes the already-pulled `layout`/`config`. On a cache
+    // hit it returns before touching either, so we hand it a minimal real layout
+    // (and a config parsed from it) that is simply never read.
+    let layout_tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux","config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":[]}
+    });
+    let layout = write_min_oci_layout(layout_tmp.path(), &cfg, &[]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
     let called = std::sync::Arc::new(std::sync::Mutex::new(false));
     let called2 = called.clone();
     let runner: super::FcBuildRunner = std::sync::Arc::new(move |_argv| {
@@ -316,9 +328,17 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
 
     // resolve_rootfs is the conversion-or-cache step extracted from
     // run_firecracker_build so it's testable without a real VM boot.
-    let rootfs = super::resolve_rootfs("uuid-cache", &fetched, digest, tmp.path(), &runner)
-        .await
-        .unwrap();
+    let rootfs = super::resolve_rootfs(
+        "uuid-cache",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(rootfs, cached, "cache hit must return the cached rootfs");
     assert!(
@@ -341,44 +361,43 @@ async fn run_fc_build_converts_on_cache_miss() {
     let fetched = fc_fetched(digest);
     let target = super::cached_rootfs_path(tmp.path(), "uuid-miss", digest);
 
-    // Stage a real OCI layout where `pull_oci_layout` would have left it
-    // (`<digest-dir>/oci`), with an exec-form entrypoint so render_init succeeds.
+    // Stage a real OCI layout where `pull_oci_layout` would have left it.
     let l0 = make_tar(&[("bin/server", b"elf")]);
     let cfg = serde_json::json!({
         "architecture":"amd64","os":"linux",
-        "config":{"Entrypoint":["/app/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
+        "config":{"Entrypoint":["/bin/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
         "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
     });
-    let layout_dir = target.parent().unwrap().join("oci");
-    std::fs::create_dir_all(&layout_dir).unwrap();
-    write_min_oci_layout(&layout_dir, &cfg, &[("sha256:l0", &l0)]);
+    let work = target.parent().unwrap().to_path_buf();
+    let layout = write_min_oci_layout(&work, &cfg, &[("sha256:l0", &l0)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
 
-    let target2 = target.clone();
     let real = super::production_fc_build_runner();
     let runner: super::FcBuildRunner = std::sync::Arc::new(move |argv: Vec<String>| {
-        let target3 = target2.clone();
         let real = real.clone();
         Box::pin(async move {
-            match argv.first().map(String::as_str) {
-                // `mkfs.ext4` → produce the rootfs file at the cache path.
-                Some("mkfs.ext4") => {
-                    std::fs::create_dir_all(target3.parent().unwrap()).ok();
-                    if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
-                        std::fs::write(out, b"\0").unwrap();
-                    }
-                    (true, Vec::new())
+            if argv.first().map(String::as_str) == Some("mkfs.ext4") {
+                if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
+                    std::fs::write(out, b"\0").unwrap();
                 }
-                // `oras` copy is a no-op (layout pre-staged); real host tar for
-                // the layer unpack.
-                Some("oras") => (true, Vec::new()),
-                _ => (real)(argv).await,
+                (true, Vec::new())
+            } else {
+                (real)(argv).await // real host tar for the layer unpack
             }
         })
     });
 
-    let rootfs = super::resolve_rootfs("uuid-miss", &fetched, digest, tmp.path(), &runner)
-        .await
-        .unwrap();
+    let rootfs = super::resolve_rootfs(
+        "uuid-miss",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
+    )
+    .await
+    .unwrap();
     assert_eq!(rootfs, target);
     assert!(rootfs.is_file());
 }
@@ -445,73 +464,6 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
             .iter()
             .any(|c| c.first().map(String::as_str) == Some("docker")),
         "FC conversion is docker-less; no argv may start with `docker`; got {recorded:?}"
-    );
-}
-
-/// The registry pull+tag step of `run_firecracker_build` must issue argv whose
-/// FIRST element is the `docker` binary — the [`super::FcBuildRunner`] contract
-/// (and [`super::production_fc_build_runner`]) spawns `Command::new(argv[0])`,
-/// so the program MUST be argv[0]. The `docker::protocol::{pull_args, tag_args}`
-/// builders return argv WITHOUT the binary (`["pull", reff]` / `["tag", reff,
-/// vtag]`) because they're consumed by the docker module's runner which bakes
-/// `docker` in via `Command::new(docker_bin).args(args)`. Feeding those raw into
-/// the FC runner would spawn nonexistent `pull`/`tag` executables in production.
-/// This asserts the FC pull+tag step prepends `docker` so it spawns
-/// `docker pull <reff>` and `docker tag <reff> <vtag>`.
-#[tokio::test]
-async fn pull_and_tag_argv_has_docker_as_program() {
-    let reff = "[fd5a::1]:5000/acme/vm@sha256:fresh01";
-    let vtag = "tbf-img-uuid-pull-v3";
-
-    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-    let calls2 = calls.clone();
-    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
-        calls2.lock().unwrap().push(argv);
-        Box::pin(async { (true, Vec::new()) })
-    });
-
-    super::pull_and_tag(reff, vtag, &runner)
-        .await
-        .expect("pull+tag must succeed");
-
-    let recorded = calls.lock().unwrap().clone();
-    let pull = recorded
-        .iter()
-        .find(|c| c.iter().any(|a| a == "pull"))
-        .expect("must issue a docker pull");
-    assert_eq!(
-        pull.first().map(String::as_str),
-        Some("docker"),
-        "pull argv[0] must be the docker binary (FcBuildRunner spawns argv[0]); got {pull:?}"
-    );
-    assert_eq!(pull, &vec!["docker".to_owned(), "pull".to_owned(), reff.to_owned()]);
-
-    let tag = recorded
-        .iter()
-        .find(|c| c.iter().any(|a| a == "tag"))
-        .expect("must issue a docker tag");
-    assert_eq!(
-        tag.first().map(String::as_str),
-        Some("docker"),
-        "tag argv[0] must be the docker binary (FcBuildRunner spawns argv[0]); got {tag:?}"
-    );
-    assert_eq!(
-        tag,
-        &vec!["docker".to_owned(), "tag".to_owned(), reff.to_owned(), vtag.to_owned()]
-    );
-}
-
-/// A failing `docker pull` surfaces a clear error naming the pull step (so a
-/// cache-miss conversion can never silently proceed against a missing image).
-#[tokio::test]
-async fn pull_and_tag_errors_when_pull_fails() {
-    let runner: super::FcBuildRunner = Arc::new(|_argv| Box::pin(async { (false, Vec::new()) }));
-    let err = super::pull_and_tag("reg/img@sha256:x", "tbf-img-u-v1", &runner)
-        .await
-        .expect_err("must error when pull fails");
-    assert!(
-        err.to_string().to_lowercase().contains("pull"),
-        "error must name the failing pull step; got: {err}"
     );
 }
 

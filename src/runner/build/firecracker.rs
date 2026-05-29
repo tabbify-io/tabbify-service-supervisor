@@ -8,8 +8,10 @@
 //!
 //! ## OCI → ext4 contract (CURRENT — docker-less)
 //! The conversion path no longer shells the LOCAL docker daemon: a bare-metal
-//! FC node needs only `oras` + `tar` + `mkfs.ext4`. `run_firecracker_build`
-//! delegates the pull + config-read + conversion to `resolve_rootfs`.
+//! FC node needs only `oras` + `tar` + `mkfs.ext4`. On a cache miss
+//! `run_firecracker_build` pulls the layout (`pull_oci_layout`) and reads its
+//! config (`read_oci_config_from_layout`), then hands `layout`/`config` to
+//! `resolve_rootfs` for the conversion.
 //! 1. PULL: `pull_oci_layout` pulls the deployed image from the mesh OCI
 //!    registry into `<out_dir>/oci` as a spec-compliant OCI LAYOUT via the
 //!    `oras copy --from-plain-http <ref> --to-oci-layout <dir>` argv form
@@ -43,11 +45,6 @@
 //!    init only verifies it, then `exec`s the image entrypoint so the same
 //!    image that runs under `runtime=docker` also runs under
 //!    `runtime=firecracker`.
-//!
-//! The docker-based helpers `read_oci_config` (`docker inspect`) and
-//! `pull_and_tag` (`docker pull`/`docker tag`) are no longer reached by the
-//! conversion; they are dead (`#[allow(dead_code)]`) and slated for deletion in
-//! fc-dl-6.
 //!
 //! ## fc-dl-1 probe outcome (RECORDED — `oras` 1.3.2, real registry)
 //! Step 0a probed `oras` against a real registry (docker.io busybox). RESULT:
@@ -91,17 +88,14 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::runtime::BoxFut;
 
-/// External-command seam for the OCI→ext4 conversion (`docker pull`,
-/// `docker inspect`, `docker export`, `tar`, `mkfs.ext4`). Receives the full
-/// argv (first element = program) and returns `(exit_ok, stdout_bytes)`:
-/// `exit_ok` is `true` iff the process exits 0, and `stdout_bytes` is the
-/// captured STDOUT (empty for commands whose output we ignore, populated for
-/// `docker inspect` whose JSON config we parse — see `read_oci_config`).
-///
-/// `docker::CommandRunner` returns only `bool`; we widen to also carry stdout
-/// because `docker inspect` writes its OCI config to STDOUT (it has NO `-o`
-/// flag). Unit tests inject a fake runner that returns canned stdout for
-/// `inspect` and side-effects the rootfs file for `mkfs.ext4`.
+/// External-command seam for the DOCKER-LESS OCI→ext4 conversion (`oras copy`,
+/// `tar`, `mkfs.ext4`). Receives the full argv (first element = program) and
+/// returns `(exit_ok, stdout_bytes)`: `exit_ok` is `true` iff the process exits
+/// 0, and `stdout_bytes` is the captured STDOUT. The OCI config is now read from
+/// the pulled layout on disk (`read_oci_config_from_layout`), not from a
+/// command's STDOUT, so all current callers ignore the second tuple element; the
+/// stdout slot is retained for the seam's shape. Unit tests inject a fake runner
+/// that side-effects the rootfs file for `mkfs.ext4` and no-ops `oras copy`.
 pub type FcBuildRunner =
     Arc<dyn Fn(Vec<String>) -> BoxFut<'static, (bool, Vec<u8>)> + Send + Sync>;
 
@@ -368,16 +362,22 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
 }
 
 /// Resolve the bootable rootfs for an app: cache-hit by digest (fc-3) → return
-/// the cached `rootfs.ext4`; cache-miss → parse the OCI config, render the
-/// PID-1 init (fc-2), and convert image → `rootfs.ext4` (fc-1) at the
+/// the cached `rootfs.ext4`; cache-miss → render the PID-1 init (fc-2) from the
+/// already-read OCI config and convert the image → `rootfs.ext4` (fc-1) at the
 /// digest-keyed path. Extracted from [`run_firecracker_build`] so the
 /// cache/convert decision is unit-testable without a VM boot.
 ///
+/// DOCKER-LESS: the image is pulled as an OCI LAYOUT and its config is read FROM
+/// that layout by the caller ([`run_firecracker_build`]); `layout`/`config` are
+/// passed in here. On a cache hit neither is read.
+///
 /// # Errors
-/// OCI-config parse failure, shell-form entrypoint (D3), or conversion failure.
+/// Shell-form entrypoint (D3) or conversion failure.
 pub async fn resolve_rootfs(
     uuid: &str,
     fetched: &crate::fetcher::FetchedApp,
+    layout: &Path,
+    config: &oci_spec::image::ImageConfiguration,
     digest: &str,
     data_dir: &Path,
     runner: &FcBuildRunner,
@@ -397,76 +397,23 @@ pub async fn resolve_rootfs(
         .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
         .to_path_buf();
 
-    // DOCKER-LESS: pull the deployed image into an OCI layout via the `oras`
-    // seam, read its config FROM the layout (no `docker inspect`), then render
-    // the PID-1 init from its entrypoint (fc-2). The conversion itself
+    // DOCKER-LESS: config already read from the OCI layout (no `docker inspect`).
+    // Render the PID-1 init from its entrypoint (fc-2); the conversion itself
     // (unpack → inject_init → mkfs) is the SINGLE shared primitive
     // `build_rootfs_ext4_inner` (fc-1) — we just pass `Some(&init)` so the init
-    // is baked in. (fc-dl-6 will lift the pull/config-read into
-    // `run_firecracker_build` and pass `layout`/`config` in directly.)
-    let reff = fetched
-        .manifest
-        .runtime
-        .registry_ref
-        .as_deref()
-        .ok_or_else(|| {
-            anyhow::anyhow!("firecracker runtime requires a registry_ref (image to convert)")
-        })?;
-    let layout = pull_oci_layout(reff, &out_dir, runner).await?;
-    let config = read_oci_config_from_layout(&layout)?;
-    let entry = Entrypoint::from_oci(&config);
+    // is baked in.
+    let entry = Entrypoint::from_oci(config);
     let init = render_init(&entry)?; // shell-form → clear error (D3)
 
     build_rootfs_ext4_inner(
-        &layout,
-        &config,
+        layout,
+        config,
         &out_dir,
         fetched.manifest.runtime.memory_mb,
         Some(&init),
         runner,
     )
     .await
-}
-
-/// `docker inspect --format '{{json .Config}}' <tag>` → typed
-/// [`oci_spec::image::ImageConfiguration`]. `docker inspect` writes its JSON to
-/// STDOUT and has NO `-o` flag, so we capture the runner's returned stdout bytes
-/// and parse those directly — we do NOT pass `-o` and we do NOT read a file off
-/// disk. Production shells `docker inspect` and pipes stdout; tests inject a
-/// fake runner that returns the canned config JSON as its stdout.
-///
-/// `{{json .Config}}` prints ONLY the image's execution config object
-/// (`Entrypoint`/`Cmd`/`Env`/`WorkingDir`, PascalCase) — NOT a full OCI image
-/// configuration (it carries no `architecture`/`os`/`rootfs`). So we parse it
-/// into [`oci_spec::image::Config`] and wrap it in a default
-/// [`oci_spec::image::ImageConfiguration`], which is what [`Entrypoint::from_oci`]
-/// reads its entrypoint from.
-///
-/// Requires the image to be present locally — callers MUST pull it first
-/// (see [`run_firecracker_build`], spec §7 step 1).
-#[allow(dead_code)] // docker-based config read; removed by fc-dl-6 (docker-less)
-async fn read_oci_config(
-    image_tag: &str,
-    runner: &FcBuildRunner,
-) -> Result<oci_spec::image::ImageConfiguration> {
-    let (ok, stdout) = (runner)(vec![
-        "docker".to_owned(),
-        "inspect".to_owned(),
-        "--format".to_owned(),
-        "{{json .Config}}".to_owned(),
-        image_tag.to_owned(),
-    ])
-    .await;
-    if !ok {
-        bail!("docker inspect of image {image_tag} (OCI config) failed");
-    }
-    let text = std::str::from_utf8(&stdout)
-        .with_context(|| format!("docker inspect {image_tag}: stdout is not UTF-8"))?;
-    let config: oci_spec::image::Config =
-        serde_json::from_str(text).with_context(|| "parse OCI image config (.Config)")?;
-    let mut image_config = oci_spec::image::ImageConfiguration::default();
-    image_config.set_config(Some(config));
-    Ok(image_config)
 }
 
 /// Resolve `<layout>/index.json` → first image-manifest descriptor → manifest
@@ -689,10 +636,10 @@ async fn remove_any(path: &Path) -> Result<()> {
 }
 
 /// Production [`FcBuildRunner`]: spawns `argv[0] argv[1..]`, captures STDOUT,
-/// and returns `(exit_ok, stdout_bytes)`. STDOUT capture is required because
-/// `docker inspect` writes its OCI config JSON there (it has no `-o` flag);
-/// callers that ignore stdout (export/tar/mkfs) just drop the second tuple
-/// element. Used by the `"firecracker"` arm in [`crate::build`].
+/// and returns `(exit_ok, stdout_bytes)`. The DOCKER-LESS conversion
+/// (`oras copy`/`tar`/`mkfs.ext4`) ignores STDOUT — the OCI config is read from
+/// the pulled layout on disk, not from a command's output — so callers just drop
+/// the second tuple element. Used by the `"firecracker"` arm in [`crate::build`].
 #[must_use]
 pub fn production_fc_build_runner() -> FcBuildRunner {
     use tokio::process::Command;
@@ -715,43 +662,6 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
         });
         fut
     })
-}
-
-/// Pull the deployed OCI image from the mesh registry and alias it under the
-/// supervisor's versioned local tag, the same `docker pull <reff>` +
-/// `docker tag <reff> <vtag>` sequence as [`crate::docker::push::pull_and_tag`].
-///
-/// CRITICAL — argv contract. The [`FcBuildRunner`] (and its production form,
-/// [`production_fc_build_runner`]) spawns `Command::new(argv[0]).args(argv[1..])`,
-/// so the program MUST be argv[0]. The `protocol::{pull_args, tag_args}` builders
-/// return argv WITHOUT the binary (`["pull", reff]` / `["tag", reff, vtag]`)
-/// because they're consumed by the docker module's `production_command_runner`,
-/// which bakes `docker` in via `Command::new(docker_bin).args(args)`. Feeding
-/// those raw into the FC runner would spawn nonexistent `pull`/`tag`
-/// executables. So we prepend `"docker"` here to honour the FC runner contract.
-///
-/// # Errors
-/// A failing `docker pull` or `docker tag`.
-#[allow(dead_code)] // docker-based pull+tag; removed by fc-dl-6 (docker-less)
-async fn pull_and_tag(reff: &str, vtag: &str, runner: &FcBuildRunner) -> Result<()> {
-    // `protocol::pull_args(reff)` = `["pull", reff]`; prepend the binary so the
-    // FcBuildRunner spawns `docker pull <reff>` (program at argv[0]).
-    let mut pull = vec!["docker".to_owned()];
-    pull.extend(crate::docker::protocol::pull_args(reff));
-    let (pulled, _) = (runner)(pull).await;
-    if !pulled {
-        bail!("docker pull of registry_ref {reff:?} from mesh registry failed");
-    }
-
-    // `protocol::tag_args(reff, vtag)` = `["tag", reff, vtag]`; prepend the
-    // binary so the FcBuildRunner spawns `docker tag <reff> <vtag>`.
-    let mut tag = vec!["docker".to_owned()];
-    tag.extend(crate::docker::protocol::tag_args(reff, vtag));
-    let (tagged, _) = (runner)(tag).await;
-    if !tagged {
-        bail!("docker tag {reff:?} -> {vtag} failed");
-    }
-    Ok(())
 }
 
 /// Pull the deployed OCI image from the mesh registry into `<out_dir>/oci` as a
@@ -826,14 +736,20 @@ pub async fn run_firecracker_build(
         )
     })?;
 
-    // DOCKER-LESS: the conversion no longer touches the local docker daemon, so
-    // there is no `docker pull`/`docker tag` here. `resolve_rootfs` pulls the
-    // image straight from the mesh registry as an OCI LAYOUT via the `oras` seam
-    // (`pull_oci_layout`), reads its config from that layout
-    // (`read_oci_config_from_layout`, no `docker inspect`) and unpacks its layers
-    // with `tar` (`unpack_oci_layers`, no `docker create`/`export`). On a digest
-    // cache hit (fc-3) it skips the pull and conversion entirely.
-    let rootfs = resolve_rootfs(uuid, fetched, digest, data_dir, runner).await?;
+    let rootfs = if rootfs_is_cached(data_dir, uuid, digest) {
+        cached_rootfs_path(data_dir, uuid, digest)
+    } else {
+        // DOCKER-LESS: pull the image as an OCI layout, read its config from the
+        // layout, then convert. The layout lands under the digest-keyed work dir.
+        // No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
+        let work = cached_rootfs_path(data_dir, uuid, digest)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
+            .to_path_buf();
+        let layout = pull_oci_layout(reff, &work, runner).await?;
+        let config = read_oci_config_from_layout(&layout)?;
+        resolve_rootfs(uuid, fetched, &layout, &config, digest, data_dir, runner).await?
+    };
 
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         &rootfs,
