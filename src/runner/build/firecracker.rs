@@ -1,10 +1,51 @@
-//! Generic Firecracker runtime-build: convert an OCI image into a
-//! `rootfs.ext4` + a minimal PID-1 init, then boot it via the existing
-//! `FirecrackerRuntime` contract.
+//! Generic Firecracker runtime-build: convert ANY OCI image into a bootable
+//! `rootfs.ext4` + a minimal PID-1 init, then hand it to the existing
+//! [`crate::firecracker::FirecrackerRuntime`] (guest `172.31.0.2:8080`, kernel
+//! `/opt/tabbify/vmlinux`, per-uuid pidfile + warm-snapshot). Invoked from the
+//! `"firecracker"` arm of [`crate::build::build_runtime`] — this is a
+//! RUNTIME-build helper, NOT the CI-build pipeline in the sibling `docker.rs` /
+//! `wasm.rs` (clone → build → push).
 //!
-//! This is a RUNTIME-build helper (OCI image → bootable rootfs), invoked from
-//! [`crate::build::build_runtime`] — NOT the CI-build pipeline in the sibling
-//! `docker.rs` / `wasm.rs` (clone → build → push). See plan 04.
+//! ## OCI → ext4 contract
+//! 1. PULL (spec §7 step 1): `run_firecracker_build` pulls the deployed image
+//!    from the mesh OCI registry by its `registry_ref` and tags it locally as
+//!    `tbf-img-<uuid>-v<N>`, reusing the existing docker-pull argv builders
+//!    (`docker::protocol::pull_args` + `tag_args` — the same `docker pull` +
+//!    `docker tag` sequence as `docker::push::pull_and_tag`). This MUST happen
+//!    before the OCI-config read and export, both of which hit the LOCAL daemon.
+//!    Skipped iff the rootfs is already cached by digest.
+//! 2. CONVERT (cached by IMMUTABLE digest under `<data_dir>/apps/<uuid>/fc/
+//!    <digest>/rootfs.ext4`):
+//!    a. Read the image's OCI config via `docker inspect --format
+//!    '{{json .Config}}'` — captured from STDOUT (no `-o` flag exists);
+//!    translate ENTRYPOINT/CMD/ENV/WORKDIR into a PID-1 `/init` script
+//!    (EXEC-FORM only — D3).
+//!    b. `docker export` the image filesystem → a flat tar → untar into a
+//!    staging dir (ROOTLESS); inject `/init` before mkfs.
+//!    c. `mkfs.ext4 -d <staging> rootfs.ext4` — populates a fresh ext4 from the
+//!    staging contents with NO loop device and NO root (e2fsprogs ≥ 1.43).
+//! 3. BOOT: `FirecrackerRuntime::launch_with_uuid` with the converted rootfs.
+//!    The kernel `ip=` boot-arg already configures `eth0`/`172.31.0.2`; the
+//!    init only verifies it, then `exec`s the image entrypoint so the same
+//!    image that runs under `runtime=docker` also runs under
+//!    `runtime=firecracker`.
+//!
+//! ## Risks (spec §7)
+//! - **OCI-config → init translation.** ENTRYPOINT/CMD/ENV/WORKDIR are mapped
+//!   to an exec-form `/init`. Shell-form entrypoints (images that rely on a
+//!   base-image shell) are DEFERRED (D3): [`render_init`] returns a clear error
+//!   rather than guessing `/bin/sh -c`. USER, HEALTHCHECK, and signal semantics
+//!   are NOT yet honoured.
+//! - **Conversion latency.** export + untar + mkfs is seconds-to-minutes for a
+//!   large image. Mitigated by (a) the digest-keyed rootfs cache here (a
+//!   redeploy of an unchanged image skips conversion entirely) and (b) the
+//!   existing FirecrackerRuntime warm-snapshot path (subsequent boots restore
+//!   from `snap.mem`).
+//! - **Image size vs ext4 sizing.** `mkfs.ext4 -d` needs the image to fit the
+//!   sized ext4; we size from `runtime.memory_mb` padded over the unpacked
+//!   size. An under-sized image fails mkfs loudly (better than a silently
+//!   truncated rootfs). A large image inflates both conversion time and the
+//!   on-disk cache.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
