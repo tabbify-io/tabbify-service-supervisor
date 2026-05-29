@@ -1,7 +1,9 @@
 //! KVM-gated end-to-end test for the generic Firecracker runtime.
 //!
-//! Converts a real docker image into a rootfs.ext4, boots it as a microVM via
-//! the production path, and asserts the guest app answers HTTP 200. Requires:
+//! Converts a real OCI image into a rootfs.ext4 (docker-less: `oras` pulls the
+//! image as an OCI layout, the layers are untarred and `mkfs.ext4`'d), boots it
+//! as a microVM via the production path, and asserts the guest app answers HTTP
+//! 200. Requires:
 //!   - `/dev/kvm` (R/W)  — absent on macOS dev hosts and non-nested CI;
 //!   - the `firecracker` binary on `$PATH`;
 //!   - a guest kernel at `/opt/tabbify/vmlinux`.
@@ -14,12 +16,12 @@
 
 use tabbify_supervisor::firecracker::kvm_available;
 
-/// docker image (exec-form ENTRYPOINT serving on :8080) → rootfs.ext4 → boot →
+/// OCI image (exec-form ENTRYPOINT serving on :8080) → rootfs.ext4 → boot →
 /// HTTP 200. Skips itself (passes trivially) when KVM is unavailable so a
 /// `--ignored` run on a non-KVM box doesn't hard-fail.
 #[tokio::test]
 #[ignore = "requires /dev/kvm + firecracker + /opt/tabbify/vmlinux (run on thinkpad)"]
-async fn docker_image_boots_as_firecracker_and_serves_200() {
+async fn oci_image_boots_as_firecracker_and_serves_200() {
     if !kvm_available() {
         eprintln!("SKIP: /dev/kvm unavailable on this host (expected on macOS/CI)");
         return;
@@ -35,9 +37,9 @@ async fn docker_image_boots_as_firecracker_and_serves_200() {
 
     // The test image must be PUSHED to the mesh registry under the ref encoded
     // in the manifest's registry_ref — `run_firecracker_build` pulls it itself
-    // first (spec §7 step 1), then tags it tbf-img-<uuid>-v1 locally. The
-    // thinkpad runbook builds `tabbify/hello-http:exec` and pushes it.
-    // Build a FetchedApp manifest pointing at it by digest.
+    // first as an OCI layout via `oras` (docker-less; no local docker tag), then
+    // converts it. The thinkpad runbook builds `tabbify/hello-http:exec` and
+    // pushes it. Build a FetchedApp manifest pointing at it by digest.
     let digest = std::env::var("FC_TEST_IMAGE_DIGEST")
         .expect("set FC_TEST_IMAGE_DIGEST=sha256:... to the pushed test image");
     let fetched = make_fc_fetched(uuid, &digest);
