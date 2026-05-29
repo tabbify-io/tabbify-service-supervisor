@@ -8,10 +8,17 @@
 //! ## OCI → ext4 contract (docker-less)
 //! 1. PULL: `pull_oci_layout` pulls the deployed image from the mesh OCI
 //!    registry into `<out_dir>/oci` as a spec-compliant OCI LAYOUT via the
-//!    existing `oras` seam (`crate::oras::oras_pull`, `--plain-http`). The layout
-//!    has `index.json` + `blobs/<alg>/<hex>` (probe-verified on a multi-layer
-//!    image — see fc-dl-1 step 0a; current `find_wasm` treats the dir as a flat
-//!    artifact, so the layout assumption was checked against a real pull).
+//!    `oras copy <ref> --to-oci-layout <dir> --from-plain-http` argv form
+//!    (`--from-plain-http` is the SOURCE flag for the plain-HTTP mesh registry,
+//!    NOT `--plain-http`). This is the form the fc-dl-1 step-0a probe PROVED:
+//!    `oras pull -o <dir>` (the `crate::oras::oras_pull_args` argv) does NOT
+//!    produce a layout for a normal container image — `oras` skips layers
+//!    lacking an `org.opencontainers.image.title` annotation (all docker-built
+//!    layers) and leaves the dir EMPTY. The `--to-oci-layout` form yields the
+//!    full layout: `oci-layout` + `index.json` + `blobs/<alg>/<hex>` for
+//!    manifest+config+layers. See the "fc-dl-1 probe outcome" section below for
+//!    the recorded evidence. (`find_wasm` treats its dir as a flat single-artifact
+//!    pull; the FC layout assumption was checked against a real `oras copy`.)
 //! 2. CONFIG: `read_oci_config_from_layout` reads `index.json` → first image
 //!    manifest descriptor → manifest blob → config-blob under
 //!    `blobs/<alg>/<hex>` → typed [`oci_spec::image::ImageConfiguration`]. No
