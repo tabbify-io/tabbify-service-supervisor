@@ -80,6 +80,9 @@ pub struct AppSummary {
     /// Earliest Unix timestamp (seconds) at which the runner is eligible to be
     /// respawned again. `0` means "immediately eligible" (no backoff pending).
     pub next_retry_at: u64,
+    /// Runtime the caller requested as an override (D4 wire string), echoed onto
+    /// the action-response JSON. `None` ⇒ manifest default was used (D10).
+    pub requested_runtime: Option<String>,
 }
 
 impl Orchestrator {
@@ -107,7 +110,7 @@ impl Orchestrator {
     /// shared config's notion of the supervisor's own ULA (currently `None` for
     /// no-mesh runs; see
     /// [`SharedRunnerConfig::parent`](crate::orchestrator::SharedRunnerConfig)).
-    fn spawn_spec_for_uuid(&self, uuid: &str) -> SpawnSpec {
+    fn spawn_spec_for_uuid(&self, uuid: &str, runtime_override: Option<&str>) -> SpawnSpec {
         let shared = self.shared();
         SpawnSpec {
             runner_bin: shared.runner_bin.clone(),
@@ -119,6 +122,7 @@ impl Orchestrator {
             no_mesh: shared.no_mesh,
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
+            runtime_override: runtime_override.map(str::to_owned),
         }
     }
 
@@ -151,7 +155,11 @@ impl Orchestrator {
     /// - `uuid` is not a valid UUID;
     /// - the runner process fails to spawn (binary missing / record write);
     /// - the runner never becomes healthy within [`START_HEALTHY_TIMEOUT`].
-    pub async fn start_app(&self, uuid: &str) -> Result<AppSummary> {
+    pub async fn start_app(
+        &self,
+        uuid: &str,
+        runtime_override: Option<&str>,
+    ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
         // Idempotent: a live runner answering its socket → return it untouched.
@@ -163,11 +171,12 @@ impl Orchestrator {
                 restart_status: restart_status_str(RestartStatus::Running),
                 restart_count: 0,
                 next_retry_at: 0,
+                requested_runtime: runtime_override.map(str::to_owned),
             });
         }
 
         // No live runner. Spawn one DETACHED (it persists its own record).
-        let spec = self.spawn_spec_for_uuid(uuid);
+        let spec = self.spawn_spec_for_uuid(uuid, runtime_override);
         let (handle, _child) = spawn_runner(&spec, self.runner_dir())
             .await
             .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -188,6 +197,7 @@ impl Orchestrator {
             restart_status: restart_status_str(RestartStatus::Running),
             restart_count: 0,
             next_retry_at: 0,
+            requested_runtime: runtime_override.map(str::to_owned),
         })
     }
 
@@ -284,6 +294,8 @@ impl Orchestrator {
                 restart_status,
                 restart_count: rec.restart.consecutive_failures,
                 next_retry_at: rec.restart.next_retry_at,
+                // Read path: no override travels on a snapshot.
+                requested_runtime: None,
             });
         }
         Ok(out)
@@ -320,6 +332,8 @@ impl Orchestrator {
             restart_status,
             restart_count: rec.restart.consecutive_failures,
             next_retry_at: rec.restart.next_retry_at,
+            // Read path: no override travels on a snapshot.
+            requested_runtime: None,
         }))
     }
 
@@ -332,12 +346,17 @@ impl Orchestrator {
     /// - `uuid` is not a valid UUID;
     /// - the control-socket deploy fails (runner returned `Reply::Err`);
     /// - spawning a cold runner fails or it never becomes healthy.
-    pub async fn deploy_app(&self, uuid: &str, reff: &str) -> Result<AppSummary> {
+    pub async fn deploy_app(
+        &self,
+        uuid: &str,
+        reff: &str,
+        runtime_override: Option<&str>,
+    ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
         if self.client_for(uuid).health().await.is_ok() {
             // Live runner: send the Deploy message.
-            match self.client_for(uuid).deploy(reff).await {
+            match self.client_for(uuid).deploy(reff, runtime_override).await {
                 Ok(Reply::Ok) => {}
                 Ok(Reply::Err { message }) => {
                     return Err(anyhow::anyhow!("runner deploy failed: {message}"));
@@ -364,10 +383,11 @@ impl Orchestrator {
                 restart_status: restart_status_str(RestartStatus::Running),
                 restart_count: 0,
                 next_retry_at: 0,
+                requested_runtime: runtime_override.map(str::to_owned),
             })
         } else {
             // No live runner: spawn one pinned to reff.
-            let mut spec = self.spawn_spec_for_uuid(uuid);
+            let mut spec = self.spawn_spec_for_uuid(uuid, runtime_override);
             spec.image_ref = Some(reff.to_owned());
             let (handle, _child) = spawn_runner(&spec, self.runner_dir())
                 .await
@@ -385,6 +405,7 @@ impl Orchestrator {
                 restart_status: restart_status_str(RestartStatus::Running),
                 restart_count: 0,
                 next_retry_at: 0,
+                requested_runtime: runtime_override.map(str::to_owned),
             })
         }
     }
@@ -446,6 +467,8 @@ impl Orchestrator {
             restart_status: restart_status_str(rs),
             restart_count: record.restart.consecutive_failures,
             next_retry_at: record.restart.next_retry_at,
+            // Reset is a read/respawn path with no override.
+            requested_runtime: None,
         })
     }
 
@@ -545,7 +568,7 @@ mod tests {
     #[test]
     fn spawn_spec_carries_derived_sock_and_shared_fields() {
         let o = orch(PathBuf::from("/run/tabbify/runners"));
-        let spec = o.spawn_spec_for_uuid(APP_UUID);
+        let spec = o.spawn_spec_for_uuid(APP_UUID, None);
         assert_eq!(spec.uuid, APP_UUID);
         assert_eq!(spec.control_sock, o.control_sock_for(APP_UUID));
         assert_eq!(spec.s3_base_url, "http://s3.invalid");
@@ -621,6 +644,7 @@ mod tests {
             restart_status: restart_status_str(rs),
             restart_count: loaded.restart.consecutive_failures,
             next_retry_at: loaded.restart.next_retry_at,
+            requested_runtime: None,
         };
 
         assert_eq!(summary.restart_status, "crashloop");
@@ -740,7 +764,7 @@ mod tests {
     async fn deploy_app_rejects_bad_uuid() {
         let o = orch(PathBuf::from("/run/tabbify/runners"));
         assert!(
-            o.deploy_app("not-a-uuid", "reg:5000/a/b:sha")
+            o.deploy_app("not-a-uuid", "reg:5000/a/b:sha", None)
                 .await
                 .is_err(),
             "malformed uuid must be rejected"
@@ -757,7 +781,7 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
 
         // No runner binary → spawn will fail → deploy returns Err.
-        let result = o.deploy_app(APP_UUID, "[fd5a::1]:5000/a/b:sha").await;
+        let result = o.deploy_app(APP_UUID, "[fd5a::1]:5000/a/b:sha", None).await;
         assert!(
             result.is_err(),
             "deploy_app must fail when the runner binary is missing"
@@ -822,7 +846,7 @@ mod tests {
 
         let o = orch(dir.path().to_path_buf());
         let reff = "[fd5a::1]:5000/acme/app:sha256abc";
-        let result = o.deploy_app(APP_UUID, reff).await;
+        let result = o.deploy_app(APP_UUID, reff, None).await;
 
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
         let summary = result.unwrap();

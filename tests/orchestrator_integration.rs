@@ -90,6 +90,7 @@ fn make_spec(s3: &MockServer, sock_path: &Path, data_dir: &Path) -> SpawnSpec {
         parent: Some("fd5a:1f00:1::1".to_owned()),
         no_mesh: true,
         image_ref: None,
+        runtime_override: None,
     }
 }
 

@@ -91,8 +91,20 @@ impl ControlClient {
     /// zero-downtime swap. On success it replies [`Reply::Ok`]; if the new
     /// runtime never became healthy it replies [`Reply::Err`] and the OLD
     /// runtime stays in service (no downtime).
-    pub async fn deploy(&self, reff: impl Into<String>) -> Result<Reply> {
-        self.round_trip(Cmd::Deploy { reff: reff.into() }).await
+    ///
+    /// `runtime_override` (D4 wire string) is forwarded in the `Deploy` command
+    /// so the runner builds THAT runtime instead of the manifest default (D10);
+    /// `None` keeps the manifest-default behaviour.
+    pub async fn deploy(
+        &self,
+        reff: impl Into<String>,
+        runtime_override: Option<&str>,
+    ) -> Result<Reply> {
+        self.round_trip(Cmd::Deploy {
+            reff: reff.into(),
+            runtime: runtime_override.map(str::to_owned),
+        })
+        .await
     }
 
     /// Open a fresh connection to `self.sock`, write `cmd` as a JSON line, read

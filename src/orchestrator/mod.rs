@@ -103,6 +103,9 @@ impl SharedRunnerConfig {
             no_mesh: self.no_mesh,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
+            // A respawn rebuilds from the manifest default; the runtime override
+            // travels in the request body only and is not persisted (D10).
+            runtime_override: None,
         }
     }
 }

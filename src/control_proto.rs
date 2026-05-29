@@ -30,6 +30,10 @@ pub enum Cmd {
     Deploy {
         /// OCI image ref to deploy (e.g. `[fd5a:1f02::1]:5000/acme/app:<sha>`).
         reff: String,
+        /// Optional runtime override (D4 wire string); `None` ⇒ manifest
+        /// default (D10). Travels in the body only, never persisted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
     },
 }
 
@@ -86,6 +90,7 @@ mod tests {
             Cmd::Shutdown,
             Cmd::Deploy {
                 reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
+                runtime: None,
             },
         ] {
             let json = serde_json::to_string(&cmd).unwrap();
@@ -100,6 +105,7 @@ mod tests {
     fn deploy_cmd_carries_reff_on_the_wire() {
         let cmd = Cmd::Deploy {
             reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
+            runtime: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"cmd\":\"deploy\""), "got: {json}");
@@ -107,6 +113,31 @@ mod tests {
             json.contains("[fd5a:1f02::1]:5000/acme/app:sha256abc"),
             "got: {json}"
         );
+        let back: Cmd = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    /// Cmd::Deploy carries the optional runtime override on the wire (D10).
+    #[test]
+    fn deploy_cmd_carries_runtime_override() {
+        let cmd = Cmd::Deploy {
+            reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
+            runtime: Some("docker".to_owned()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"runtime\":\"docker\""), "got: {json}");
+        let back: Cmd = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    /// Deploy without an override omits/None the runtime field.
+    #[test]
+    fn deploy_cmd_runtime_none_round_trips() {
+        let cmd = Cmd::Deploy {
+            reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
+            runtime: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
         let back: Cmd = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
     }

@@ -71,6 +71,10 @@ pub struct SpawnSpec {
     /// [`RunnerHandle::image_ref`](crate::orchestrator::handle::RunnerHandle) on
     /// a respawn; `None` on a fresh spawn.
     pub image_ref: Option<String>,
+    /// Runtime override (D4 wire string) forwarded to the runner as
+    /// `--runtime-override <wire>`, so a cold spawn builds the requested runtime
+    /// instead of the manifest default (D10). `None` = manifest default.
+    pub runtime_override: Option<String>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -119,6 +123,12 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
     if let Some(image_ref) = &spec.image_ref {
         args.push("--image-ref".into());
         args.push(image_ref.as_str().into());
+    }
+    // Forward the runtime override so a cold spawn builds the requested runtime
+    // instead of the manifest default (D10).
+    if let Some(rt) = &spec.runtime_override {
+        args.push("--runtime-override".into());
+        args.push(rt.as_str().into());
     }
     args
 }
@@ -233,6 +243,7 @@ mod tests {
             parent: Some("fd5a:1f00:1::1".to_owned()),
             no_mesh: true,
             image_ref: None,
+            runtime_override: None,
         }
     }
 
@@ -320,6 +331,43 @@ mod tests {
         assert!(
             !joined.iter().any(|a| a == "--image-ref"),
             "no --image-ref when None; got: {joined:?}"
+        );
+    }
+
+    /// runtime_override = Some emits `--runtime-override <wire>`.
+    #[test]
+    fn build_args_includes_runtime_override_when_present() {
+        let mut s = spec();
+        s.runtime_override = Some("docker".to_owned());
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let idx = joined
+            .iter()
+            .position(|a| a == "--runtime-override")
+            .unwrap_or_else(|| panic!("missing --runtime-override in {joined:?}"));
+        assert_eq!(
+            joined.get(idx + 1).map(String::as_str),
+            Some("docker"),
+            "--runtime-override must be followed by the wire string"
+        );
+    }
+
+    /// runtime_override = None emits no `--runtime-override`.
+    #[test]
+    fn build_args_omits_runtime_override_when_none() {
+        let mut s = spec();
+        s.runtime_override = None;
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a == "--runtime-override"),
+            "no --runtime-override when None; got: {joined:?}"
         );
     }
 

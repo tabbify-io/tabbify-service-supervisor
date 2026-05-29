@@ -30,5 +30,6 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         fc: cfg.firecracker.clone(),
         docker: cfg.docker.clone(),
         image_ref: cfg.image_ref.clone(),
+        runtime_override: cfg.runtime_override.clone(),
     }
 }

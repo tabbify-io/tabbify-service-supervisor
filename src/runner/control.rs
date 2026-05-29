@@ -159,14 +159,15 @@ impl RunnerLifecycle {
     ///   never came up) or [`perform_swap`] aborted because the new runtime was
     ///   unhealthy — in both cases the OLD runtime stays in service (no
     ///   downtime).
-    async fn deploy(&self, reff: &str) -> Reply {
+    async fn deploy(&self, reff: &str, runtime_override: Option<&str>) -> Reply {
         // Build the new runtime from the app's manifest with the deploy ref
         // applied. For docker this triggers `docker pull <reff>` instead of a
         // source build; for wasm/firecracker the ref is ignored and the runtime
-        // is rebuilt from the existing (cached) artifact.
+        // is rebuilt from the existing (cached) artifact. A runtime override
+        // (D10) takes precedence over the manifest default when present.
         let next_fetched = fetched_with_ref(&self.fetched, reff);
         let new_runtime = match build_runtime(
-            None,
+            runtime_override,
             &self.uuid,
             &next_fetched,
             &self.fc,
@@ -291,7 +292,7 @@ async fn dispatch(cmd: Cmd, lifecycle: &RunnerLifecycle) -> Reply {
             lifecycle.purge().await;
             Reply::Ok
         }
-        Cmd::Deploy { reff } => lifecycle.deploy(&reff).await,
+        Cmd::Deploy { reff, runtime } => lifecycle.deploy(&reff, runtime.as_deref()).await,
         Cmd::Shutdown => {
             lifecycle.stop().await;
             // Signal the main task to exit cleanly, if a shutdown notifier is
@@ -457,6 +458,7 @@ mod tests {
         let reply = dispatch(
             Cmd::Deploy {
                 reff: "ignored-for-wasm".to_owned(),
+                runtime: None,
             },
             &lc,
         )
@@ -497,6 +499,7 @@ mod tests {
         let reply = dispatch(
             Cmd::Deploy {
                 reff: "[fd5a::1]:5000/acme/app:sha".to_owned(),
+                runtime: None,
             },
             &lc,
         )

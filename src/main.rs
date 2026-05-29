@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     // stop the supervisor from coming up and serving other apps.
     for uuid in &config.apps {
         let uuid_s = uuid.to_string();
-        match orchestrator.start_app(&uuid_s).await {
+        match orchestrator.start_app(&uuid_s, None).await {
             Ok(s) => tracing::info!(uuid = %uuid_s, app_ula = %s.app_ula, "pre-started app runner"),
             Err(e) => tracing::warn!(uuid = %uuid_s, error = %e, "pre-start failed (continuing)"),
         }

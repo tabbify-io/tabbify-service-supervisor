@@ -137,12 +137,17 @@ pub async fn start_app(
     Path(uuid): Path<String>,
     body: Option<Json<StartBody>>,
 ) -> Response {
-    // The optional `{"runtime": ...}` override is parsed here so the API accepts
-    // it; forwarding it through the orchestrator into `build_runtime` is wired in
-    // task A3 (orchestrator signature change). `None`/no-body keeps the historical
-    // manifest-default behaviour (D10).
-    let _runtime_override = body.and_then(|Json(b)| b.runtime).map(|r| r.as_wire().to_owned());
-    match state.orchestrator.start_app(&uuid).await {
+    // The optional `{"runtime": ...}` override (D4 wire string) is forwarded
+    // through the orchestrator into `build_runtime`. `None`/no-body keeps the
+    // historical manifest-default behaviour (D10).
+    let runtime_override = body
+        .and_then(|Json(b)| b.runtime)
+        .map(|r| r.as_wire().to_owned());
+    match state
+        .orchestrator
+        .start_app(&uuid, runtime_override.as_deref())
+        .await
+    {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_response(&e),
     }
@@ -276,11 +281,15 @@ pub async fn deploy_app(
     Path(uuid): Path<String>,
     Json(body): Json<DeployBody>,
 ) -> Response {
-    // The optional `runtime` override is parsed here so the API accepts it;
-    // forwarding it through the orchestrator (and into `Cmd::Deploy.runtime`) is
-    // wired in task A3. `None` keeps the manifest-default behaviour (D10).
-    let _runtime_override = body.runtime.map(|r| r.as_wire().to_owned());
-    match state.orchestrator.deploy_app(&uuid, &body.reff).await {
+    // The optional `runtime` override (D4 wire string) is forwarded through the
+    // orchestrator and into `Cmd::Deploy.runtime`. `None` keeps the
+    // manifest-default behaviour (D10).
+    let runtime_override = body.runtime.map(|r| r.as_wire().to_owned());
+    match state
+        .orchestrator
+        .deploy_app(&uuid, &body.reff, runtime_override.as_deref())
+        .await
+    {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_not_found_or_error(&e),
     }
@@ -409,6 +418,8 @@ fn running_json(s: &AppSummary) -> axum::Json<serde_json::Value> {
         "app_ula": s.app_ula,
         // The runner serves on its OWN ULA, so the bound address is the app-ULA.
         "bound_addr": s.app_ula,
+        // Echo the requested override back (omitted by serde_json when null).
+        "requested_runtime": s.requested_runtime,
     }))
 }
 
