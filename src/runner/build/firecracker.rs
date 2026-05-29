@@ -592,6 +592,11 @@ async fn unpack_oci_layers(
 /// the opaque clear, a path the same layer re-adds always survives even when it
 /// also existed in a lower layer — the bug a prior-membership test could not
 /// avoid.
+///
+/// KNOWN LIMITATION (not fixed here, minor): files are moved in via `rename`, so
+/// two hardlinked entries that land across different layers become INDEPENDENT
+/// copies in the merged tree rather than sharing one inode. This costs disk
+/// space (bloat) but does not break boot, so it is left as-is for now.
 async fn merge_layer(layer_dir: &Path, staging: &Path) -> Result<()> {
     // Walk the layer tree once, classifying entries relative to the layer root.
     let mut stack = vec![layer_dir.to_path_buf()];
@@ -642,6 +647,15 @@ async fn merge_layer(layer_dir: &Path, staging: &Path) -> Result<()> {
     // 3. Overlay this layer's own directories then files on top of `staging`.
     for rel in dirs_rel {
         let dst = staging.join(&rel);
+        // An upper layer may turn a lower-layer regular FILE (or symlink) into a
+        // directory at the same path. `create_dir_all` would fail with
+        // NotADirectory / AlreadyExists against a colliding non-directory, so
+        // remove it first — mirroring the files-loop guard below (FIX 2).
+        if let Ok(meta) = tokio::fs::symlink_metadata(&dst).await
+            && !meta.is_dir()
+        {
+            remove_any(&dst).await.ok();
+        }
         tokio::fs::create_dir_all(&dst)
             .await
             .with_context(|| format!("create merged dir {}", dst.display()))?;

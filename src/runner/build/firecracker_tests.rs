@@ -717,6 +717,42 @@ async fn unpack_oci_layers_opaque_keeps_same_layer_readd() {
     );
 }
 
+/// FIX 2 regression: an upper layer that turns a lower-layer regular FILE into a
+/// DIRECTORY at the same path must succeed. The dirs-overlay loop must first
+/// remove a colliding non-directory at the target (mirroring the files loop's
+/// guard) before `create_dir_all`, or the whole conversion aborts with
+/// NotADirectory / AlreadyExists.
+#[tokio::test]
+async fn unpack_oci_layers_replaces_lower_file_with_upper_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Layer 0: regular file "foo".
+    let l0 = make_tar(&[("foo", b"i am a file")]);
+    // Layer 1: directory "foo/" containing "foo/bar".
+    let l1 = make_tar(&[("foo/bar", b"i am under a dir")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0","sha256:l1"]}
+    });
+    let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+    let staging = tmp.path().join("stage");
+
+    let runner = super::production_fc_build_runner();
+    super::unpack_oci_layers(&layout, &config, &staging, &runner)
+        .await
+        .expect("file-to-dir replacement across layers must succeed");
+
+    assert!(
+        staging.join("foo").is_dir(),
+        "lower-layer file 'foo' must become a directory from the upper layer"
+    );
+    assert!(
+        staging.join("foo/bar").is_file(),
+        "the upper layer's foo/bar must materialize"
+    );
+}
+
 /// A layer count that disagrees with rootfs.diff_ids errors loudly (corrupt
 /// layout) rather than silently unpacking a partial rootfs.
 #[tokio::test]
