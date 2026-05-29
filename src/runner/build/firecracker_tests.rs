@@ -383,6 +383,71 @@ async fn run_fc_build_converts_on_cache_miss() {
     assert!(rootfs.is_file());
 }
 
+/// On a cache MISS `run_firecracker_build` must NOT shell the local docker
+/// daemon: the conversion is DOCKER-LESS (oras layout + manual unpack), so no
+/// `docker pull`/`docker tag` may be issued. The VM boot at the end fails in a
+/// daemonless test env, but every conversion-stage argv is recorded BEFORE the
+/// boot, so we assert no recorded argv starts with `docker` regardless of the
+/// final boot Result. Guards against a redundant `docker pull` lingering in the
+/// FC hot path after the conversion stopped consuming the local daemon image.
+#[tokio::test]
+async fn run_fc_build_issues_no_docker_on_cache_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:fresh02";
+    let fetched = fc_fetched(digest);
+    // Every FcConfig field carries a clap default, so an arg-less parse yields a
+    // usable config without standing up a real Firecracker host.
+    let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-nodocker", digest);
+
+    // Stage a real OCI layout where `pull_oci_layout` would have left it, so the
+    // (faked, no-op) `oras copy` is satisfied and the real host `tar` unpacks it.
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config":{"Entrypoint":["/app/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
+    });
+    let layout_dir = target.parent().unwrap().join("oci");
+    std::fs::create_dir_all(&layout_dir).unwrap();
+    write_min_oci_layout(&layout_dir, &cfg, &[("sha256:l0", &l0)]);
+
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    let target2 = target.clone();
+    let real = super::production_fc_build_runner();
+    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+        calls2.lock().unwrap().push(argv.clone());
+        let target3 = target2.clone();
+        let real = real.clone();
+        Box::pin(async move {
+            match argv.first().map(String::as_str) {
+                Some("mkfs.ext4") => {
+                    std::fs::create_dir_all(target3.parent().unwrap()).ok();
+                    if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
+                        std::fs::write(out, b"\0").unwrap();
+                    }
+                    (true, Vec::new())
+                }
+                Some("oras") => (true, Vec::new()),
+                _ => (real)(argv).await,
+            }
+        })
+    });
+
+    // The VM boot at the end has no real Firecracker/KVM here, so this errors;
+    // the docker-or-not assertion below holds on the recorded argv regardless.
+    let _ = super::run_firecracker_build("uuid-nodocker", &fetched, &fc, tmp.path(), &runner).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        !recorded
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("docker")),
+        "FC conversion is docker-less; no argv may start with `docker`; got {recorded:?}"
+    );
+}
+
 /// The registry pull+tag step of `run_firecracker_build` must issue argv whose
 /// FIRST element is the `docker` binary — the [`super::FcBuildRunner`] contract
 /// (and [`super::production_fc_build_runner`]) spawns `Command::new(argv[0])`,

@@ -6,44 +6,13 @@
 //! RUNTIME-build helper, NOT the CI-build pipeline in the sibling `docker.rs` /
 //! `wasm.rs` (clone → build → push).
 //!
-//! ## OCI → ext4 contract (CURRENT — docker-based)
-//! The implementation in this file shells out to the LOCAL docker daemon. A
-//! docker-less variant is PLANNED (see the "PLANNED / TARGET (fc-dl)" section
-//! below); it is NOT yet implemented, so the functions named there do not exist.
-//! 1. PULL (spec §7 step 1): `run_firecracker_build` pulls the deployed image
-//!    from the mesh OCI registry by its `registry_ref` and tags it locally as
-//!    `tbf-img-<uuid>-v<N>`, reusing the existing docker-pull argv builders
-//!    (`docker::protocol::pull_args` + `tag_args` — the same `docker pull` +
-//!    `docker tag` sequence as `docker::push::pull_and_tag`; see
-//!    `pull_and_tag_image`). This MUST happen before the OCI-config read and
-//!    export, both of which hit the LOCAL daemon. Skipped iff the rootfs is
-//!    already cached by digest.
-//! 2. CONVERT (cached by IMMUTABLE digest under `<data_dir>/apps/<uuid>/fc/
-//!    <digest>/rootfs.ext4`):
-//!    a. Read the image's OCI config via `docker inspect --format
-//!    '{{json .Config}}'` (`read_oci_config`) — captured from STDOUT (no `-o`
-//!    flag exists); translate ENTRYPOINT/CMD/ENV/WORKDIR into a PID-1 `/init`
-//!    script (EXEC-FORM only — D3, see [`render_init`]).
-//!    b. `docker create` + `docker export` the image filesystem → a flat tar →
-//!    untar into a staging dir (ROOTLESS); inject `/init` before mkfs.
-//!    c. `mkfs.ext4 -d <staging> rootfs.ext4` — populates a fresh ext4 from the
-//!    staging contents with NO loop device and NO root (e2fsprogs ≥ 1.43).
-//! 3. BOOT: `FirecrackerRuntime::launch_with_uuid` with the converted rootfs.
-//!    The kernel `ip=` boot-arg already configures `eth0`/`172.31.0.2`; the
-//!    init only verifies it, then `exec`s the image entrypoint so the same
-//!    image that runs under `runtime=docker` also runs under
-//!    `runtime=firecracker`.
-//!
-//! ## PLANNED / TARGET (fc-dl): docker-less OCI → ext4 (NOT IMPLEMENTED)
-//! The goal is to drop the docker-daemon dependency from the FC path so a
-//! bare-metal FC node needs only `oras` + `tar` + `mkfs.ext4`. The functions
-//! named here (`pull_oci_layout`, `read_oci_config_from_layout`,
-//! `unpack_oci_layers`) DO NOT EXIST YET — this section is the target contract,
-//! not a description of the code in this file. When implemented it replaces the
-//! docker steps above:
-//! 1. PULL: `pull_oci_layout` would pull the deployed image from the mesh OCI
+//! ## OCI → ext4 contract (CURRENT — docker-less)
+//! The conversion path no longer shells the LOCAL docker daemon: a bare-metal
+//! FC node needs only `oras` + `tar` + `mkfs.ext4`. `run_firecracker_build`
+//! delegates the pull + config-read + conversion to `resolve_rootfs`.
+//! 1. PULL: `pull_oci_layout` pulls the deployed image from the mesh OCI
 //!    registry into `<out_dir>/oci` as a spec-compliant OCI LAYOUT via the
-//!    `oras copy <ref> --to-oci-layout <dir> --from-plain-http` argv form
+//!    `oras copy --from-plain-http <ref> --to-oci-layout <dir>` argv form
 //!    (`--from-plain-http` is the SOURCE flag for the plain-HTTP mesh registry,
 //!    NOT `--plain-http`). This is the form the fc-dl-1 step-0a probe PROVED:
 //!    `oras pull -o <dir>` (the `crate::oras::oras_pull_args` argv) does NOT
@@ -52,20 +21,33 @@
 //!    layers) and leaves the dir EMPTY. The `--to-oci-layout` form yields the
 //!    full layout: `oci-layout` + `index.json` + `blobs/<alg>/<hex>` for
 //!    manifest+config+layers. See the "fc-dl-1 probe outcome" section below for
-//!    the recorded evidence.
-//! 2. CONFIG: `read_oci_config_from_layout` would read `index.json` → first
-//!    image manifest descriptor → manifest blob → config-blob under
+//!    the recorded evidence. Skipped iff the rootfs is already cached by digest.
+//! 2. CONFIG: `read_oci_config_from_layout` reads `index.json` → first image
+//!    manifest descriptor → manifest blob → config-blob under
 //!    `blobs/<alg>/<hex>` → typed [`oci_spec::image::ImageConfiguration`]. No
-//!    `docker inspect`. ENTRYPOINT/CMD/ENV/WORKDIR → exec-form `/init` (D3).
-//! 3. UNPACK: `unpack_oci_layers` would iterate the manifest's layer
-//!    descriptors in order, `tar -xf <blob> -C <staging>` per layer, then apply
-//!    OCI WHITEOUTS (`.wh.<name>` file-deletes + `.wh..wh..opq` opaque-dir
-//!    clears) after each layer. The diff-id ↔ layer-blob mapping is validated
-//!    against `config.rootfs().diff_ids()`.
-//! 4. EXT4: `mkfs.ext4 -d <staging> rootfs.ext4` (rootless, loopless,
-//!    e2fsprogs ≥ 1.43), with the exec-form `/init` injected BEFORE mkfs (D3).
-//! 5. CACHE: keyed by the IMMUTABLE image digest (fc-3) — unchanged.
+//!    `docker inspect`. ENTRYPOINT/CMD/ENV/WORKDIR → exec-form `/init` (D3, see
+//!    [`render_init`]).
+//! 3. UNPACK: `unpack_oci_layers` iterates the manifest's layer descriptors in
+//!    order, `tar -xf <blob>` per layer (shelled host `tar`, no daemon and no
+//!    `docker create`/`export`), then applies OCI WHITEOUTS (`.wh.<name>`
+//!    file-deletes + `.wh..wh..opq` opaque-dir clears). The diff-id ↔ layer-blob
+//!    mapping is validated against `config.rootfs().diff_ids()`.
+//! 4. EXT4: `mkfs.ext4 -d <staging> rootfs.ext4` — populates a fresh ext4 from
+//!    the staging contents with NO loop device and NO root (e2fsprogs ≥ 1.43),
+//!    with the exec-form `/init` injected BEFORE mkfs (D3).
+//! 5. CACHE: keyed by the IMMUTABLE image digest (fc-3), under
+//!    `<data_dir>/apps/<uuid>/fc/<digest>/rootfs.ext4`. A redeploy of an
+//!    unchanged image skips the pull and conversion entirely.
 //! 6. BOOT: `FirecrackerRuntime::launch_with_uuid` with the converted rootfs.
+//!    The kernel `ip=` boot-arg already configures `eth0`/`172.31.0.2`; the
+//!    init only verifies it, then `exec`s the image entrypoint so the same
+//!    image that runs under `runtime=docker` also runs under
+//!    `runtime=firecracker`.
+//!
+//! The docker-based helpers `read_oci_config` (`docker inspect`) and
+//! `pull_and_tag` (`docker pull`/`docker tag`) are no longer reached by the
+//! conversion; they are dead (`#[allow(dead_code)]`) and slated for deletion in
+//! fc-dl-6.
 //!
 //! ## fc-dl-1 probe outcome (RECORDED — `oras` 1.3.2, real registry)
 //! Step 0a probed `oras` against a real registry (docker.io busybox). RESULT:
@@ -74,18 +56,16 @@
 //! lack an `org.opencontainers.image.title` annotation (all docker-built image
 //! layers) and leaves the output dir EMPTY, printing:
 //! "Skipped pulling layers without file name ... Use 'oras copy ...
-//! --to-oci-layout' to pull all layers." The WORKING form is therefore the
-//! documented FALLBACK: `oras copy <ref> --to-oci-layout <dir>`, which on a
-//! single-platform digest-pinned ref yields a clean layout whose
-//! `index.json.manifests[0]` is an `application/vnd.oci.image.manifest.v1+json`
-//! (plus `oci-layout` + `blobs/sha256/<hex>` for manifest+config+layers).
+//! --to-oci-layout' to pull all layers." The WORKING form is therefore
+//! `oras copy <ref> --to-oci-layout <dir>`, which on a single-platform
+//! digest-pinned ref yields a clean layout whose `index.json.manifests[0]` is an
+//! `application/vnd.oci.image.manifest.v1+json` (plus `oci-layout` +
+//! `blobs/sha256/<hex>` for manifest+config+layers).
 //! NOTE: for a multi-arch TAG, `oras copy --to-oci-layout` leaves a top-level
-//! image-INDEX as `manifests[0]`, so the PLANNED `read_oci_config_from_layout`
-//! must select the image-manifest descriptor (not blindly take the first). For
-//! the plain-HTTP mesh registry `oras copy` uses `--from-plain-http` (the
-//! SOURCE), NOT `--plain-http`. CONSEQUENCE for the PLANNED fc-dl-2: the
-//! `pull_oci_layout` would use the `oras copy ... --to-oci-layout` argv form
-//! (not `oras pull -o`) to obtain a real layout for container images.
+//! image-INDEX as `manifests[0]`, so `read_oci_config_from_layout` selects the
+//! image-manifest descriptor (it does not blindly take the first). For the
+//! plain-HTTP mesh registry `oras copy` uses `--from-plain-http` (the SOURCE),
+//! NOT `--plain-http`.
 //!
 //! ## Risks (spec §7)
 //! - **OCI-config → init translation.** ENTRYPOINT/CMD/ENV/WORKDIR are mapped
@@ -93,7 +73,7 @@
 //!   base-image shell) are DEFERRED (D3): [`render_init`] returns a clear error
 //!   rather than guessing `/bin/sh -c`. USER, HEALTHCHECK, and signal semantics
 //!   are NOT yet honoured.
-//! - **Conversion latency.** export + untar + mkfs is seconds-to-minutes for a
+//! - **Conversion latency.** pull + untar + mkfs is seconds-to-minutes for a
 //!   large image. Mitigated by (a) the digest-keyed rootfs cache here (a
 //!   redeploy of an unchanged image skips conversion entirely) and (b) the
 //!   existing FirecrackerRuntime warm-snapshot path (subsequent boots restore
@@ -752,6 +732,7 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
 ///
 /// # Errors
 /// A failing `docker pull` or `docker tag`.
+#[allow(dead_code)] // docker-based pull+tag; removed by fc-dl-6 (docker-less)
 async fn pull_and_tag(reff: &str, vtag: &str, runner: &FcBuildRunner) -> Result<()> {
     // `protocol::pull_args(reff)` = `["pull", reff]`; prepend the binary so the
     // FcBuildRunner spawns `docker pull <reff>` (program at argv[0]).
@@ -845,17 +826,13 @@ pub async fn run_firecracker_build(
         )
     })?;
 
-    // Spec §7 step 1: PULL the OCI image from the mesh registry FIRST. Both the
-    // OCI-config read (`docker inspect`) and the rootfs export (`docker export`)
-    // operate on the LOCAL daemon, so the image must be present locally before
-    // either runs. The local versioned tag matches what `resolve_rootfs` reads
-    // from (`versioned_image_tag(uuid, version)`).
-    // (Skipped iff the rootfs is already cached by digest — fc-3.)
-    if !rootfs_is_cached(data_dir, uuid, digest) {
-        let vtag = crate::docker::protocol::versioned_image_tag(uuid, fetched.version);
-        pull_and_tag(reff, &vtag, runner).await?;
-    }
-
+    // DOCKER-LESS: the conversion no longer touches the local docker daemon, so
+    // there is no `docker pull`/`docker tag` here. `resolve_rootfs` pulls the
+    // image straight from the mesh registry as an OCI LAYOUT via the `oras` seam
+    // (`pull_oci_layout`), reads its config from that layout
+    // (`read_oci_config_from_layout`, no `docker inspect`) and unpacks its layers
+    // with `tar` (`unpack_oci_layers`, no `docker create`/`export`). On a digest
+    // cache hit (fc-3) it skips the pull and conversion entirely.
     let rootfs = resolve_rootfs(uuid, fetched, digest, data_dir, runner).await?;
 
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
