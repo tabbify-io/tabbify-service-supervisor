@@ -73,6 +73,12 @@ pub struct AppActionResponse {
     /// The bound address (the runner serves on its OWN ULA — the same value).
     #[schema(example = "fd5a:1f02:abcdef::1")]
     pub bound_addr: String,
+    /// The runtime the caller requested as an override (D4 wire string), echoed
+    /// back so a client can confirm the supervisor honored it. `None` (omitted)
+    /// ⇒ the manifest default was used (D10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "docker")]
+    pub requested_runtime: Option<String>,
 }
 
 /// Body of `POST /v1/apps/{uuid}/stop`.
@@ -99,4 +105,34 @@ pub struct AppPurgeResponse {
 pub struct ErrorResponse {
     /// Human-readable error message.
     pub error: String,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_action_response_serializes_requested_runtime() {
+        let resp = AppActionResponse {
+            state: "running".to_owned(),
+            app_ula: "fd5a:1f02:abcdef::1".to_owned(),
+            bound_addr: "fd5a:1f02:abcdef::1".to_owned(),
+            requested_runtime: Some("docker".to_owned()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"requested_runtime\":\"docker\""), "got: {json}");
+    }
+
+    #[test]
+    fn app_action_response_omits_requested_runtime_when_none() {
+        let resp = AppActionResponse {
+            state: "running".to_owned(),
+            app_ula: "fd5a:1f02:abcdef::1".to_owned(),
+            bound_addr: "fd5a:1f02:abcdef::1".to_owned(),
+            requested_runtime: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("requested_runtime"), "got: {json}");
+    }
 }

@@ -131,8 +131,17 @@ pub async fn get_app(State(state): State<SharedState>, Path(uuid): Path<String>)
         (status = 502, description = "S3 fetch failed", body = ErrorResponse),
     ),
 )]
-#[tracing::instrument(skip(state), fields(uuid = %uuid))]
-pub async fn start_app(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+#[tracing::instrument(skip(state, body), fields(uuid = %uuid))]
+pub async fn start_app(
+    State(state): State<SharedState>,
+    Path(uuid): Path<String>,
+    body: Option<Json<StartBody>>,
+) -> Response {
+    // The optional `{"runtime": ...}` override is parsed here so the API accepts
+    // it; forwarding it through the orchestrator into `build_runtime` is wired in
+    // task A3 (orchestrator signature change). `None`/no-body keeps the historical
+    // manifest-default behaviour (D10).
+    let _runtime_override = body.and_then(|Json(b)| b.runtime).map(|r| r.as_wire().to_owned());
     match state.orchestrator.start_app(&uuid).await {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_response(&e),
@@ -213,6 +222,19 @@ pub struct DeployBody {
     #[serde(rename = "ref")]
     #[schema(example = "[fd5a:1f00:0:3::1]:5000/tabbify/0191e7c2-0000-7000-8000-000000000001:sha256abc")]
     pub(super) reff: String,
+    /// Runtime override (D4 wire string); `None` ⇒ manifest default (D10).
+    /// Travels in the body only, never persisted to the manifest.
+    #[serde(default)]
+    pub(super) runtime: Option<crate::runtime::Runtime>,
+}
+
+/// Request body for `POST /v1/apps/:uuid/start`. All fields optional so a
+/// bodyless start (the historical behaviour) still works.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StartBody {
+    /// Runtime override (D4 wire string); `None` ⇒ manifest default (D10).
+    #[serde(default)]
+    pub(super) runtime: Option<crate::runtime::Runtime>,
 }
 
 /// `POST /v1/apps/:uuid/deploy` — zero-downtime swap if a runner is live, or
@@ -254,6 +276,10 @@ pub async fn deploy_app(
     Path(uuid): Path<String>,
     Json(body): Json<DeployBody>,
 ) -> Response {
+    // The optional `runtime` override is parsed here so the API accepts it;
+    // forwarding it through the orchestrator (and into `Cmd::Deploy.runtime`) is
+    // wired in task A3. `None` keeps the manifest-default behaviour (D10).
+    let _runtime_override = body.runtime.map(|r| r.as_wire().to_owned());
     match state.orchestrator.deploy_app(&uuid, &body.reff).await {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => anyhow_to_not_found_or_error(&e),
@@ -456,4 +482,36 @@ pub(super) fn anyhow_to_not_found_or_error(e: &anyhow::Error) -> Response {
 
 fn error_json(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(json!({ "error": msg }))).into_response()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::runtime::Runtime;
+
+    #[test]
+    fn start_body_parses_explicit_runtime() {
+        let b: StartBody = serde_json::from_str(r#"{"runtime":"docker"}"#).unwrap();
+        assert_eq!(b.runtime, Some(Runtime::Docker));
+    }
+
+    #[test]
+    fn start_body_defaults_runtime_to_none_on_empty_object() {
+        let b: StartBody = serde_json::from_str("{}").unwrap();
+        assert!(b.runtime.is_none());
+    }
+
+    #[test]
+    fn deploy_body_parses_runtime_override() {
+        let b: DeployBody =
+            serde_json::from_str(r#"{"ref":"reg/acme/app:sha","runtime":"docker"}"#).unwrap();
+        assert_eq!(b.runtime, Some(Runtime::Docker));
+    }
+
+    #[test]
+    fn deploy_body_runtime_defaults_to_none() {
+        let b: DeployBody = serde_json::from_str(r#"{"ref":"reg/acme/app:sha"}"#).unwrap();
+        assert!(b.runtime.is_none());
+    }
 }
