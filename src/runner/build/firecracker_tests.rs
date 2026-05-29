@@ -157,20 +157,84 @@ fn render_init_exec_form_mounts_env_workdir_and_execs() {
         init.contains("ip link show eth0") || init.contains("/sys/class/net/eth0"),
         "must verify eth0 presence; got:\n{init}"
     );
+    // Env is exported; the value (no special chars) is single-quoted (FIX 1).
     assert!(
-        init.contains("export RUST_LOG=info"),
-        "env exported; got:\n{init}"
+        init.contains("export RUST_LOG='info'"),
+        "env exported (single-quoted value); got:\n{init}"
     );
-    assert!(init.contains("cd /app"), "cd to workdir; got:\n{init}");
-    // exec-form: the entrypoint argv is exec'd as PID 1, args appended.
+    assert!(init.contains("cd '/app'"), "cd to workdir; got:\n{init}");
+    // exec-form: the entrypoint argv is exec'd as PID 1, args appended; each
+    // element single-quoted so the shell re-tokenizes back to the exact argv.
     assert!(
-        init.contains("exec /app/server --port 8080"),
-        "must exec entrypoint+cmd verbatim; got:\n{init}"
+        init.contains("exec '/app/server' '--port' '8080'"),
+        "must exec entrypoint+cmd as single-quoted tokens; got:\n{init}"
     );
     // No shell-wrapping `sh -c` around the entrypoint (exec-form only).
     assert!(
         !init.contains("sh -c \"/app/server"),
         "exec-form must not shell-wrap the entrypoint; got:\n{init}"
+    );
+}
+
+/// FIX 1 regression: argv elements containing whitespace, glob chars (`*` `?`),
+/// `$`, or quotes must be single-quoted in the rendered init so that the
+/// `/bin/sh` running `/init` re-tokenizes them back to the EXACT argv instead of
+/// word-splitting / globbing / `$`-expanding them. The same single-quoting must
+/// apply to env VALUES.
+#[test]
+fn render_init_single_quotes_argv_and_env_values() {
+    let exec = OciExec {
+        entrypoint: vec!["/app/server".to_owned()],
+        cmd: vec![
+            "--msg".to_owned(),
+            "hello world".to_owned(),
+            "*.txt".to_owned(),
+        ],
+        env: vec!["GREETING=hello world".to_owned(), "PATTERN=$HOME/*".to_owned()],
+        workdir: "/app".to_owned(),
+    };
+    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+
+    // Each argv element is wrapped in single quotes verbatim — the shell cannot
+    // word-split, glob, or `$`-expand inside single quotes.
+    assert!(
+        init.contains("exec '/app/server' '--msg' 'hello world' '*.txt'"),
+        "argv elements must be single-quoted so the shell re-tokenizes them \
+         exactly; got:\n{init}"
+    );
+    // A bare (unquoted) "hello world" / "*.txt" would be word-split / globbed.
+    assert!(
+        !init.contains("exec /app/server --msg hello world"),
+        "argv must not be emitted bare; got:\n{init}"
+    );
+    // Env value with a space must be single-quoted too.
+    assert!(
+        init.contains("export GREETING='hello world'"),
+        "env value with a space must be single-quoted; got:\n{init}"
+    );
+    assert!(
+        init.contains("export PATTERN='$HOME/*'"),
+        "env value with $ and glob must be single-quoted (no expansion); \
+         got:\n{init}"
+    );
+}
+
+/// FIX 1 regression: an embedded single quote in an argv element must be escaped
+/// using the POSIX `'\''` idiom (close-quote, escaped quote, reopen-quote) so the
+/// shell still reconstructs the exact byte sequence.
+#[test]
+fn render_init_escapes_embedded_single_quote() {
+    let exec = OciExec {
+        entrypoint: vec!["/bin/echo".to_owned()],
+        cmd: vec!["it's fine".to_owned()],
+        env: Vec::new(),
+        workdir: "/".to_owned(),
+    };
+    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    // it's fine  ->  'it'\''s fine'
+    assert!(
+        init.contains(r#"exec '/bin/echo' 'it'\''s fine'"#),
+        "embedded single quote must use the POSIX '\\'' idiom; got:\n{init}"
     );
 }
 

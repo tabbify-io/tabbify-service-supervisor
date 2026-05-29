@@ -308,13 +308,38 @@ impl Entrypoint {
     }
 }
 
+/// POSIX single-quote a string so the `/bin/sh` running `/init` reads it back as
+/// a SINGLE literal token — no word-splitting, glob, `$`-expansion, or quote
+/// removal. The whole value is wrapped in single quotes; an embedded `'` is
+/// escaped with the standard `'\''` idiom (close-quote, escaped literal quote,
+/// reopen-quote). Used for argv elements, env values, and the workdir path so a
+/// space / `*` / `?` / `$` / quote in any of them survives intact (FIX 1).
+fn sh_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Render the guest PID-1 init script from an [`Entrypoint`].
 ///
 /// The script (run as PID 1 by the kernel `init=/init` arg) mounts the pseudo
 /// filesystems, verifies `eth0` (the kernel `ip=` boot-arg already configured
 /// it to `172.31.0.2` per the existing `FirecrackerRuntime` contract), exports
-/// the OCI env, cd's to the workdir, then `exec`s the entrypoint argv so the
-/// app server becomes PID 1's successor.
+/// the OCI env, ensures the workdir exists and cd's into it, then `exec`s the
+/// entrypoint argv so the app server becomes PID 1's successor.
+///
+/// All shell-interpolated values (argv elements, env VALUES, and the workdir
+/// path) are POSIX single-quoted via [`sh_single_quote`] so the re-tokenizing
+/// `/bin/sh` reconstructs the EXACT bytes — a space / glob / `$` / quote can no
+/// longer mis-execute the entrypoint (FIX 1).
 ///
 /// # Errors
 /// [`Entrypoint::ShellForm`] — shell-form entrypoints are not yet supported
@@ -331,18 +356,32 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
         }
     };
 
-    // Build the exec argv: entrypoint ++ cmd, space-joined verbatim (exec-form).
+    // Build the exec argv: entrypoint ++ cmd. Each element is single-quoted so
+    // the shell re-tokenizes the line back to the EXACT argv (no word-splitting,
+    // glob, or `$`-expansion) — exec-form semantics through a `/bin/sh` PID 1.
     let mut argv = exec.entrypoint.clone();
     argv.extend(exec.cmd.iter().cloned());
-    let exec_line = argv.join(" ");
+    let exec_line = argv
+        .iter()
+        .map(|a| sh_single_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
 
+    // `export KEY=<single-quoted value>`: split only on the FIRST `=` so values
+    // containing `=` stay intact, and single-quote the value so a space / glob /
+    // `$` does not get re-interpreted by the shell. A malformed entry without an
+    // `=` is exported as-is (best effort).
     let env_lines: String = exec
         .env
         .iter()
-        .map(|kv| format!("export {kv}\n"))
+        .map(|kv| match kv.split_once('=') {
+            Some((key, value)) => format!("export {key}={}\n", sh_single_quote(value)),
+            None => format!("export {kv}\n"),
+        })
         .collect();
 
     // POSIX sh init. `set -e` so a failed mount aborts loudly to the console.
+    let workdir = sh_single_quote(&exec.workdir);
     Ok(format!(
         "#!/bin/sh\n\
          set -e\n\
@@ -357,7 +396,6 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
          {env_lines}\
          cd {workdir}\n\
          exec {exec_line}\n",
-        workdir = exec.workdir,
     ))
 }
 
