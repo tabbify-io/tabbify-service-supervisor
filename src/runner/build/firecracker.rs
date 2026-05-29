@@ -578,18 +578,31 @@ async fn pull_and_tag(reff: &str, vtag: &str, runner: &FcBuildRunner) -> Result<
 }
 
 /// Pull the deployed OCI image from the mesh registry into `<out_dir>/oci` as a
-/// spec-compliant OCI LAYOUT (`index.json` + `blobs/<alg>/<hex>`), DOCKER-LESS,
-/// via the existing `oras` seam. Replaces the old `docker pull` + `docker tag`.
+/// spec-compliant OCI LAYOUT (`oci-layout` + `index.json` + `blobs/<alg>/<hex>`),
+/// DOCKER-LESS, via the existing `oras` seam. Replaces the old `docker pull` +
+/// `docker tag`.
 ///
 /// CRITICAL — argv contract: [`FcBuildRunner`] spawns `Command::new(argv[0])`,
-/// so the program MUST be argv[0]. `crate::oras::oras_pull_args` returns argv
-/// WITHOUT the binary (`["pull", "--plain-http", reff, "-o", dir]`), so we
+/// so the program MUST be argv[0]. `crate::oras::oras_copy_to_oci_layout_args`
+/// returns argv WITHOUT the binary
+/// (`["copy", "--from-plain-http", reff, "--to-oci-layout", dir]`), so we
 /// prepend `"oras"`.
+///
+/// CRITICAL — why `oras copy --to-oci-layout`, NOT `oras pull -o`: the fc-dl-1
+/// probe (recorded in this file's header) PROVED that `oras pull -o <dir>` (the
+/// `crate::oras::oras_pull_args` argv) does NOT produce a layout for a normal
+/// docker-built container image — `oras` skips every layer lacking an
+/// `org.opencontainers.image.title` annotation and leaves `<dir>` EMPTY
+/// (`"Skipped pulling layers without file name ... Use 'oras copy ...
+/// --to-oci-layout'"`). An empty layout would silently break the downstream
+/// `read_oci_config_from_layout` / `unpack_oci_layers`. The `oras copy
+/// --to-oci-layout` form yields the full layout. For the plain-HTTP mesh
+/// registry the SOURCE flag is `--from-plain-http`, NOT `--plain-http`.
 ///
 /// Returns the layout directory (`<out_dir>/oci`) for the config-read + unpack.
 ///
 /// # Errors
-/// A failing `oras pull`.
+/// A failing `oras copy`.
 #[allow(dead_code)] // wired into run_firecracker_build by fc-dl-6
 async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> Result<PathBuf> {
     let layout = out_dir.join("oci");
@@ -597,10 +610,13 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
         .await
         .with_context(|| format!("create oci layout dir {}", layout.display()))?;
     let mut argv = vec!["oras".to_owned()];
-    argv.extend(crate::oras::oras_pull_args(reff, &layout.to_string_lossy()));
+    argv.extend(crate::oras::oras_copy_to_oci_layout_args(
+        reff,
+        &layout.to_string_lossy(),
+    ));
     let (ok, _) = (runner)(argv).await;
     if !ok {
-        bail!("oras pull of registry_ref {reff:?} into OCI layout failed");
+        bail!("oras copy of registry_ref {reff:?} into OCI layout failed");
     }
     Ok(layout)
 }

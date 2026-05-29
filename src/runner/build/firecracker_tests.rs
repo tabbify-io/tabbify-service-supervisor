@@ -454,10 +454,12 @@ async fn pull_and_tag_errors_when_pull_fails() {
 }
 
 /// `pull_oci_layout` pulls the ref into `<out>/oci` via the oras seam: argv[0]
-/// is the `oras` binary, contains `pull`, `--plain-http`, the ref, and `-o
-/// <out>/oci`. It does NOT shell docker.
+/// is the `oras` binary, and the argv is the probe-proven layout-producing form
+/// `oras copy --from-plain-http <ref> --to-oci-layout <out>/oci` — NOT the
+/// empty-layout `oras pull -o` form and NOT the `--plain-http` flag. It does NOT
+/// shell docker.
 #[tokio::test]
-async fn pull_oci_layout_uses_oras_into_layout_dir() {
+async fn pull_oci_layout_uses_oras_copy_to_oci_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("work");
     let reff = "[fd5a::1]:5000/acme/vm@sha256:fresh01";
@@ -475,16 +477,25 @@ async fn pull_oci_layout_uses_oras_into_layout_dir() {
     assert_eq!(layout, out.join("oci"), "layout dir is <out>/oci");
 
     let recorded = calls.lock().unwrap().clone();
-    let pull = recorded.first().expect("must issue one oras pull");
+    let pull = recorded.first().expect("must issue one oras copy");
     assert_eq!(pull.first().map(String::as_str), Some("oras"),
         "argv[0] must be the oras binary (FcBuildRunner spawns argv[0]); got {pull:?}");
-    assert!(pull.contains(&"pull".to_owned()), "must be an oras pull; got {pull:?}");
-    assert!(pull.contains(&"--plain-http".to_owned()), "mesh registry is plain http; got {pull:?}");
+    assert!(pull.contains(&"copy".to_owned()),
+        "must be an `oras copy` (probe-proven layout form), not `oras pull`; got {pull:?}");
+    assert!(pull.contains(&"--to-oci-layout".to_owned()),
+        "must copy into an OCI layout; got {pull:?}");
+    assert!(pull.contains(&"--from-plain-http".to_owned()),
+        "mesh registry source is plain http; must use --from-plain-http; got {pull:?}");
+    assert!(!pull.contains(&"--plain-http".to_owned()),
+        "--plain-http is not the copy SOURCE flag; got {pull:?}");
+    assert!(!pull.contains(&"pull".to_owned()) && !pull.contains(&"-o".to_owned()),
+        "must NOT be the empty-layout `oras pull -o` form; got {pull:?}");
     assert!(pull.contains(&reff.to_owned()), "must carry the ref; got {pull:?}");
-    assert!(pull.iter().any(|a| a.ends_with("oci")), "must -o into the layout dir; got {pull:?}");
+    assert!(pull.iter().any(|a| a.ends_with("oci")),
+        "must target the layout dir <out>/oci; got {pull:?}");
 }
 
-/// A failing oras pull surfaces a clear error naming the pull step.
+/// A failing oras copy surfaces a clear error naming the pull step.
 #[tokio::test]
 async fn pull_oci_layout_errors_when_oras_fails() {
     let tmp = tempfile::tempdir().unwrap();
