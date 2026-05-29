@@ -549,12 +549,15 @@ fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
 }
 
 /// Unpack the image's layers (in manifest order) into `staging`, whiteout-aware.
-/// Each layer is untarred via the `tar` seam (shelled host `tar`, no daemon);
-/// OCI whiteouts are then applied IN-PROCESS because shelled `tar` does NOT
-/// honour `.wh.` markers: `.wh..wh..opq` clears the directory's earlier contents
-/// and `.wh.<name>` deletes `<name>`; the markers themselves are removed so they
-/// never leak into the rootfs. The blob↔diff_id mapping is the manifest's layer
-/// order, validated against `config.rootfs().diff_ids()` length.
+/// Each layer is untarred via the `tar` seam (shelled host `tar`, no daemon)
+/// into its OWN per-layer dir — that dir is the authoritative set of paths the
+/// layer wrote, which the merge step needs to apply OCI whiteouts correctly
+/// (shelled `tar` does NOT honour `.wh.` markers). Then [`merge_layer`] overlays
+/// the layer onto `staging`: `.wh..wh..opq` clears the directory's accumulated
+/// lower-layer entries (the same layer's own re-adds are overlaid afterwards and
+/// survive), `.wh.<name>` deletes `<name>`, and markers never leak into the
+/// rootfs. The blob↔diff_id mapping is the manifest's layer order, validated
+/// against `config.rootfs().diff_ids()` length.
 ///
 /// # Errors
 /// A `tar` failure, a layer/diff_id count mismatch, or a filesystem error.
@@ -590,60 +593,71 @@ async fn unpack_oci_layers(
         .await
         .with_context(|| format!("create staging dir {}", staging.display()))?;
 
-    for layer in layers {
-        // Snapshot the merged tree BEFORE this layer's untar so opaque
-        // whiteouts can distinguish entries carried from EARLIER layers (which
-        // an opaque marker hides) from entries this SAME layer adds (which it
-        // must keep) — per the OCI image-spec opaque-whiteout semantics.
-        let prior = collect_paths(staging).await?;
+    // A scratch dir holding each layer's per-layer extraction tree, kept beside
+    // `staging` so it shares the same filesystem (cheap renames) and is removed
+    // afterwards.
+    let scratch = staging.with_file_name(format!(
+        "{}.layers",
+        staging
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "stage".to_owned())
+    ));
+    tokio::fs::create_dir_all(&scratch)
+        .await
+        .with_context(|| format!("create layer scratch dir {}", scratch.display()))?;
+
+    for (i, layer) in layers.iter().enumerate() {
+        // Extract each layer into its OWN dir. That dir is precisely the set of
+        // paths THIS layer wrote — the authoritative "written this layer" set.
+        // Relying on a before/after snapshot of the merged tree cannot tell a
+        // same-layer re-add from a lower-layer carry-over (a re-added path that
+        // also existed below looks identical to a pre-existing one), which is
+        // exactly what an opaque whiteout must distinguish.
+        let layer_dir = scratch.join(format!("layer-{i}"));
+        tokio::fs::create_dir_all(&layer_dir)
+            .await
+            .with_context(|| format!("create layer dir {}", layer_dir.display()))?;
         let blob = blob_path(layout, layer.digest());
         let (ok, _) = (runner)(vec![
             "tar".to_owned(),
             "-xf".to_owned(),
             blob.to_string_lossy().into_owned(),
             "-C".to_owned(),
-            staging.to_string_lossy().into_owned(),
+            layer_dir.to_string_lossy().into_owned(),
         ])
         .await;
         if !ok {
             bail!("untar of OCI layer {} failed", blob.display());
         }
-        apply_whiteouts(staging, &prior).await?;
+        // Apply this layer's whiteouts against the accumulated `staging` tree
+        // (clearing lower-layer entries), then overlay the layer's own files
+        // on top — so a same-layer re-add always survives the opaque clear.
+        merge_layer(&layer_dir, staging).await?;
     }
+
+    tokio::fs::remove_dir_all(&scratch).await.ok();
     Ok(())
 }
 
-/// Recursively collect every path under `root` (files AND directories) into a
-/// set, so a later step can tell which entries pre-existed a layer's untar.
-async fn collect_paths(root: &Path) -> Result<std::collections::HashSet<PathBuf>> {
-    let mut paths = std::collections::HashSet::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&dir).await {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        while let Some(entry) = rd.next_entry().await? {
-            let path = entry.path();
-            if entry.file_type().await?.is_dir() {
-                stack.push(path.clone());
-            }
-            paths.insert(path);
-        }
-    }
-    Ok(paths)
-}
-
-/// Apply the just-untarred layer's OCI whiteout markers under `root` and remove
-/// the markers themselves. `.wh..wh..opq` in a dir is OPAQUE: it hides entries
-/// carried from EARLIER layers (those present in `prior`) but NOT entries this
-/// same layer added; `.wh.<name>` deletes the sibling `<name>` (file or dir).
-async fn apply_whiteouts(root: &Path, prior: &std::collections::HashSet<PathBuf>) -> Result<()> {
-    // Collect first (don't mutate while walking).
-    let mut opaque_dirs: Vec<PathBuf> = Vec::new();
-    let mut file_whiteouts: Vec<(PathBuf, String)> = Vec::new();
-    let mut markers: Vec<PathBuf> = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+/// Merge a single layer's freshly extracted tree (`layer_dir`) onto the
+/// accumulated `staging` tree, honouring OCI whiteouts:
+/// - `.wh..wh..opq` in `layer_dir/<rel>` is OPAQUE: clear ALL of `staging/<rel>`'s
+///   existing (lower-layer) entries before overlaying this layer's entries;
+/// - `.wh.<name>` in `layer_dir/<rel>` deletes `staging/<rel>/<name>`;
+/// - every non-marker entry of the layer is copied/overlaid onto `staging`.
+///
+/// Because the layer's own files come from `layer_dir` and are overlaid AFTER
+/// the opaque clear, a path the same layer re-adds always survives even when it
+/// also existed in a lower layer — the bug a prior-membership test could not
+/// avoid.
+async fn merge_layer(layer_dir: &Path, staging: &Path) -> Result<()> {
+    // Walk the layer tree once, classifying entries relative to the layer root.
+    let mut stack = vec![layer_dir.to_path_buf()];
+    let mut opaque_rel: Vec<PathBuf> = Vec::new();
+    let mut whiteouts: Vec<PathBuf> = Vec::new(); // staging path to delete
+    let mut dirs_rel: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (src, dst)
     while let Some(dir) = stack.pop() {
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
@@ -652,38 +666,56 @@ async fn apply_whiteouts(root: &Path, prior: &std::collections::HashSet<PathBuf>
         while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            let rel_parent = dir
+                .strip_prefix(layer_dir)
+                .unwrap_or_else(|_| Path::new(""))
+                .to_path_buf();
             if entry.file_type().await?.is_dir() {
+                let rel = rel_parent.join(&name);
+                dirs_rel.push(rel);
                 stack.push(path);
             } else if name == ".wh..wh..opq" {
-                opaque_dirs.push(dir.clone());
-                markers.push(path);
+                opaque_rel.push(rel_parent);
             } else if let Some(target) = name.strip_prefix(".wh.") {
-                file_whiteouts.push((dir.clone(), target.to_owned()));
-                markers.push(path);
+                whiteouts.push(staging.join(rel_parent.join(target)));
+            } else {
+                files.push((path, staging.join(rel_parent.join(&name))));
             }
         }
     }
-    // Opaque: remove only siblings carried from EARLIER layers (in `prior`).
-    // Entries this same layer added are NOT in `prior`, so they survive; the
-    // `.wh.*` markers are removed below regardless.
-    for dir in opaque_dirs {
-        let mut rd = tokio::fs::read_dir(&dir).await?;
+    // 1. Opaque dirs: clear the accumulated (lower-layer) contents first.
+    for rel in opaque_rel {
+        let target = staging.join(&rel);
+        let mut rd = match tokio::fs::read_dir(&target).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
         while let Some(entry) = rd.next_entry().await? {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".wh.") {
-                continue; // markers handled below
-            }
-            if prior.contains(&path) {
-                remove_any(&path).await?;
-            }
+            remove_any(&entry.path()).await?;
         }
     }
-    for (dir, target) in file_whiteouts {
-        remove_any(&dir.join(target)).await.ok();
+    // 2. Explicit `.wh.<name>` deletions.
+    for path in whiteouts {
+        remove_any(&path).await.ok();
     }
-    for marker in markers {
-        tokio::fs::remove_file(&marker).await.ok();
+    // 3. Overlay this layer's own directories then files on top of `staging`.
+    for rel in dirs_rel {
+        let dst = staging.join(&rel);
+        tokio::fs::create_dir_all(&dst)
+            .await
+            .with_context(|| format!("create merged dir {}", dst.display()))?;
+    }
+    for (src, dst) in files {
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create parent of {}", dst.display()))?;
+        }
+        // Overwrite any lower-layer file with this layer's version.
+        remove_any(&dst).await.ok();
+        tokio::fs::rename(&src, &dst)
+            .await
+            .with_context(|| format!("overlay {} -> {}", src.display(), dst.display()))?;
     }
     Ok(())
 }

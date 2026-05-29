@@ -631,6 +631,45 @@ async fn unpack_oci_layers_applies_whiteouts_in_order() {
     assert!(!staging.join("b/.wh..wh..opq").exists(), "opq marker must not survive");
 }
 
+/// Regression: an opaque marker hides entries from LOWER layers but MUST keep
+/// entries the SAME layer re-adds, even when that re-added path already existed
+/// in an earlier layer. A `prior`-membership test alone would wrongly delete the
+/// freshly written file; the per-layer written set must protect it.
+#[tokio::test]
+async fn unpack_oci_layers_opaque_keeps_same_layer_readd() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Layer 0: b/keep.txt (old content) + b/old.txt
+    let l0 = make_tar(&[("b/keep.txt", b"old"), ("b/old.txt", b"o")]);
+    // Layer 1: opaque b/ (hides lower b/old.txt) AND re-adds b/keep.txt.
+    // b/keep.txt existed in layer 0, so it IS in `prior`, but layer 1 just
+    // wrote it, so it MUST survive the opaque clear.
+    let l1 = make_tar(&[("b/.wh..wh..opq", b""), ("b/keep.txt", b"new")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0","sha256:l1"]}
+    });
+    let layout = write_min_oci_layout(tmp.path(), &cfg,
+        &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+    let staging = tmp.path().join("stage");
+
+    let runner = super::production_fc_build_runner();
+    super::unpack_oci_layers(&layout, &config, &staging, &runner)
+        .await
+        .expect("unpack must succeed");
+
+    assert!(!staging.join("b/old.txt").exists(),
+        "opaque dir clears the lower layer's b/old.txt");
+    assert!(staging.join("b/keep.txt").is_file(),
+        "same-layer re-add of b/keep.txt must survive the opaque clear");
+    assert_eq!(
+        std::fs::read(staging.join("b/keep.txt")).unwrap(),
+        b"new",
+        "the surviving b/keep.txt must be the layer-1 content, not the lower one",
+    );
+}
+
 /// A layer count that disagrees with rootfs.diff_ids errors loudly (corrupt
 /// layout) rather than silently unpacking a partial rootfs.
 #[tokio::test]
