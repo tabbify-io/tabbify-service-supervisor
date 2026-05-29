@@ -577,6 +577,34 @@ async fn pull_and_tag(reff: &str, vtag: &str, runner: &FcBuildRunner) -> Result<
     Ok(())
 }
 
+/// Pull the deployed OCI image from the mesh registry into `<out_dir>/oci` as a
+/// spec-compliant OCI LAYOUT (`index.json` + `blobs/<alg>/<hex>`), DOCKER-LESS,
+/// via the existing `oras` seam. Replaces the old `docker pull` + `docker tag`.
+///
+/// CRITICAL — argv contract: [`FcBuildRunner`] spawns `Command::new(argv[0])`,
+/// so the program MUST be argv[0]. `crate::oras::oras_pull_args` returns argv
+/// WITHOUT the binary (`["pull", "--plain-http", reff, "-o", dir]`), so we
+/// prepend `"oras"`.
+///
+/// Returns the layout directory (`<out_dir>/oci`) for the config-read + unpack.
+///
+/// # Errors
+/// A failing `oras pull`.
+#[allow(dead_code)] // wired into run_firecracker_build by fc-dl-6
+async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> Result<PathBuf> {
+    let layout = out_dir.join("oci");
+    tokio::fs::create_dir_all(&layout)
+        .await
+        .with_context(|| format!("create oci layout dir {}", layout.display()))?;
+    let mut argv = vec!["oras".to_owned()];
+    argv.extend(crate::oras::oras_pull_args(reff, &layout.to_string_lossy()));
+    let (ok, _) = (runner)(argv).await;
+    if !ok {
+        bail!("oras pull of registry_ref {reff:?} into OCI layout failed");
+    }
+    Ok(layout)
+}
+
 /// Entry point for the `"firecracker"` arm of [`crate::build::build_runtime`]:
 /// resolve (cache or convert) the rootfs, then boot it via the existing
 /// `FirecrackerRuntime` contract (guest `172.31.0.2:8080`, kernel

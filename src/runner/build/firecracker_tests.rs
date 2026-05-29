@@ -452,3 +452,46 @@ async fn pull_and_tag_errors_when_pull_fails() {
         "error must name the failing pull step; got: {err}"
     );
 }
+
+/// `pull_oci_layout` pulls the ref into `<out>/oci` via the oras seam: argv[0]
+/// is the `oras` binary, contains `pull`, `--plain-http`, the ref, and `-o
+/// <out>/oci`. It does NOT shell docker.
+#[tokio::test]
+async fn pull_oci_layout_uses_oras_into_layout_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("work");
+    let reff = "[fd5a::1]:5000/acme/vm@sha256:fresh01";
+
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+        calls2.lock().unwrap().push(argv);
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    let layout = super::pull_oci_layout(reff, &out, &runner)
+        .await
+        .expect("pull must succeed");
+    assert_eq!(layout, out.join("oci"), "layout dir is <out>/oci");
+
+    let recorded = calls.lock().unwrap().clone();
+    let pull = recorded.first().expect("must issue one oras pull");
+    assert_eq!(pull.first().map(String::as_str), Some("oras"),
+        "argv[0] must be the oras binary (FcBuildRunner spawns argv[0]); got {pull:?}");
+    assert!(pull.contains(&"pull".to_owned()), "must be an oras pull; got {pull:?}");
+    assert!(pull.contains(&"--plain-http".to_owned()), "mesh registry is plain http; got {pull:?}");
+    assert!(pull.contains(&reff.to_owned()), "must carry the ref; got {pull:?}");
+    assert!(pull.iter().any(|a| a.ends_with("oci")), "must -o into the layout dir; got {pull:?}");
+}
+
+/// A failing oras pull surfaces a clear error naming the pull step.
+#[tokio::test]
+async fn pull_oci_layout_errors_when_oras_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runner: super::FcBuildRunner = Arc::new(|_| Box::pin(async { (false, Vec::new()) }));
+    let err = super::pull_oci_layout("reg/img@sha256:x", tmp.path(), &runner)
+        .await
+        .expect_err("must error when oras pull fails");
+    assert!(err.to_string().to_lowercase().contains("oras"),
+        "error must name the oras pull step; got: {err}");
+}
