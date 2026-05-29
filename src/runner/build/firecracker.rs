@@ -763,5 +763,9 @@ pub async fn run_firecracker_build(
 }
 
 #[cfg(test)]
+#[path = "oci_fixtures.rs"]
+mod oci_fixtures;
+
+#[cfg(test)]
 #[path = "firecracker_tests.rs"]
 mod tests;
