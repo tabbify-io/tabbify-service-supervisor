@@ -374,6 +374,7 @@ mod tests {
                     entry: "app.wasm".to_owned(),
                     fuel_per_request: crate::runtime::DEFAULT_FUEL_PER_REQUEST,
                     memory_mb: 64,
+                    vcpus: None,
                     kernel: None,
                     registry_ref: None,
                 },

@@ -12,6 +12,7 @@ fn rt_app_port_uses_config() {
         entry: "context.tar.gz".to_owned(),
         fuel_per_request: 0,
         memory_mb: 0,
+        vcpus: None,
         kernel: None,
         registry_ref: None,
     };

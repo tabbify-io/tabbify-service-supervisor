@@ -85,6 +85,11 @@ pub struct Runtime {
     /// firecracker.
     #[serde(default = "default_mem")]
     pub memory_mb: u32,
+    /// vCPU count override (firecracker only). `None` → the supervisor's
+    /// configured default (`FcConfig::vcpus`). Optional + forward-compat: a
+    /// future schema field never breaks parsing (no `deny_unknown_fields`).
+    #[serde(default)]
+    pub vcpus: Option<u32>,
     /// Guest kernel image path/name (firecracker only). `None` → the
     /// supervisor's configured default kernel.
     #[serde(default)]
@@ -223,6 +228,47 @@ memory_mb = 512
         assert_eq!(m.runtime.entry, "rootfs.ext4");
         assert_eq!(m.runtime.kernel.as_deref(), Some("vmlinux-6.1"));
         assert_eq!(m.runtime.memory_mb, 512);
+    }
+
+    /// A firecracker manifest may carry an optional `vcpus` override; absent ⇒
+    /// `None` (runner falls back to `FcConfig::vcpus`).
+    #[test]
+    fn parses_firecracker_runtime_with_vcpus() {
+        let src = r#"
+[app]
+name = "vm-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type      = "firecracker"
+entry     = "rootfs.ext4"
+memory_mb = 1024
+vcpus     = 2
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.runtime.r#type, "firecracker");
+        assert_eq!(m.runtime.memory_mb, 1024);
+        assert_eq!(m.runtime.vcpus, Some(2));
+    }
+
+    /// When `vcpus` is omitted it defaults to `None` (runner uses FcConfig).
+    #[test]
+    fn firecracker_vcpus_defaults_to_none() {
+        let src = r#"
+[app]
+name = "vm-app"
+
+[lifecycle]
+mode = "always_on"
+
+[runtime]
+type  = "firecracker"
+entry = "rootfs.ext4"
+"#;
+        let m: AppManifest = toml::from_str(src).unwrap();
+        assert!(m.runtime.vcpus.is_none());
     }
 
     /// A firecracker manifest without an explicit `kernel` leaves it `None`

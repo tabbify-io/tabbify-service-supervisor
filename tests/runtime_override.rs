@@ -44,6 +44,7 @@ fn docker_manifest_with_wasm_bytes() -> FetchedApp {
                 entry: "context.tar.gz".to_owned(),
                 fuel_per_request: 0,
                 memory_mb: 64,
+                vcpus: None,
                 kernel: None,
                 registry_ref: None,
             },

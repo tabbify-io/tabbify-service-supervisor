@@ -44,6 +44,7 @@ async fn real_vm_boots_and_serves() {
         entry: "rootfs.ext4".to_owned(),
         fuel_per_request: 0,
         memory_mb: 256,
+        vcpus: None,
         kernel: None,
         registry_ref: None,
     };
