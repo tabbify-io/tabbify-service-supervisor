@@ -581,3 +581,72 @@ fn read_oci_config_from_layout_errors_on_empty_index() {
     assert!(err.to_string().to_lowercase().contains("manifest"),
         "must name the missing manifest; got: {err}");
 }
+
+/// Build an uncompressed tar (`application/vnd.oci.image.layer.v1.tar`) in
+/// memory from (path, bytes) entries, using the `tar` dev-dependency.
+fn make_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut ar = tar::Builder::new(Vec::new());
+    for (name, data) in entries {
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(data.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        ar.append_data(&mut hdr, name, *data as &[u8]).unwrap();
+    }
+    ar.into_inner().unwrap()
+}
+
+/// `unpack_oci_layers` untars layers in order and applies OCI whiteouts:
+/// - `.wh.<name>` removes `<name>` carried by an earlier layer,
+/// - `.wh..wh..opq` clears the directory's earlier contents,
+/// and the `.wh.*` markers themselves never survive into the staging tree.
+#[tokio::test]
+async fn unpack_oci_layers_applies_whiteouts_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Layer 0: a/keep.txt, a/drop.txt, b/old.txt
+    let l0 = make_tar(&[("a/keep.txt", b"k"), ("a/drop.txt", b"d"), ("b/old.txt", b"o")]);
+    // Layer 1: whiteout a/drop.txt + opaque b/ + b/new.txt
+    let l1 = make_tar(&[("a/.wh.drop.txt", b""), ("b/.wh..wh..opq", b""), ("b/new.txt", b"n")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0","sha256:l1"]}
+    });
+    let layout = write_min_oci_layout(tmp.path(), &cfg,
+        &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+    let staging = tmp.path().join("stage");
+
+    // Real `tar` via the runner (shells the host tar binary).
+    let runner = super::production_fc_build_runner();
+    super::unpack_oci_layers(&layout, &config, &staging, &runner)
+        .await
+        .expect("unpack must succeed");
+
+    assert!(staging.join("a/keep.txt").is_file(), "kept file survives");
+    assert!(!staging.join("a/drop.txt").exists(), ".wh.drop.txt must delete it");
+    assert!(!staging.join("b/old.txt").exists(), "opaque dir clears earlier b/ contents");
+    assert!(staging.join("b/new.txt").is_file(), "new file in opaque layer survives");
+    assert!(!staging.join("a/.wh.drop.txt").exists(), "wh marker must not survive");
+    assert!(!staging.join("b/.wh..wh..opq").exists(), "opq marker must not survive");
+}
+
+/// A layer count that disagrees with rootfs.diff_ids errors loudly (corrupt
+/// layout) rather than silently unpacking a partial rootfs.
+#[tokio::test]
+async fn unpack_oci_layers_errors_on_diffid_count_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let l0 = make_tar(&[("f", b"x")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux","config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":["sha256:a","sha256:b"]}  // 2 != 1 layer
+    });
+    let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:a", &l0)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+    let runner = super::production_fc_build_runner();
+    let err = super::unpack_oci_layers(&layout, &config, &tmp.path().join("s"), &runner)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("layer"),
+        "must name the layer/diff_id mismatch; got: {err}");
+}

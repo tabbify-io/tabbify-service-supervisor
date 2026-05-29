@@ -99,3 +99,7 @@ wiremock = "0.6"
 # Test-only: generate content-addressed blob names for synthetic OCI layouts
 # (the docker-less FC fixtures). Not a production dependency.
 sha2 = "0.10"
+# Test-only: build synthetic OCI layer tarballs for the docker-less FC unpack
+# fixtures. Production layer unpack shells the host `tar` via the seam, not this
+# crate.
+tar = "0.4"

@@ -548,6 +548,160 @@ fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
         .join(digest.digest())
 }
 
+/// Unpack the image's layers (in manifest order) into `staging`, whiteout-aware.
+/// Each layer is untarred via the `tar` seam (shelled host `tar`, no daemon);
+/// OCI whiteouts are then applied IN-PROCESS because shelled `tar` does NOT
+/// honour `.wh.` markers: `.wh..wh..opq` clears the directory's earlier contents
+/// and `.wh.<name>` deletes `<name>`; the markers themselves are removed so they
+/// never leak into the rootfs. The blob↔diff_id mapping is the manifest's layer
+/// order, validated against `config.rootfs().diff_ids()` length.
+///
+/// # Errors
+/// A `tar` failure, a layer/diff_id count mismatch, or a filesystem error.
+#[allow(dead_code)] // wired into build_rootfs_ext4_inner by fc-dl-5
+async fn unpack_oci_layers(
+    layout: &Path,
+    config: &oci_spec::image::ImageConfiguration,
+    staging: &Path,
+    runner: &FcBuildRunner,
+) -> Result<()> {
+    let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
+        .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
+    let man_desc = index
+        .manifests()
+        .iter()
+        .find(|d| matches!(d.media_type(), oci_spec::image::MediaType::ImageManifest))
+        .or_else(|| index.manifests().first())
+        .ok_or_else(|| anyhow::anyhow!("OCI index.json has no image manifest descriptor"))?;
+    let manifest = oci_spec::image::ImageManifest::from_file(blob_path(layout, man_desc.digest()))
+        .context("read OCI image manifest blob")?;
+
+    let layers = manifest.layers();
+    let diff_ids = config.rootfs().diff_ids();
+    if layers.len() != diff_ids.len() {
+        bail!(
+            "OCI layer count {} disagrees with rootfs diff_ids {} (corrupt layout)",
+            layers.len(),
+            diff_ids.len()
+        );
+    }
+
+    tokio::fs::create_dir_all(staging)
+        .await
+        .with_context(|| format!("create staging dir {}", staging.display()))?;
+
+    for layer in layers {
+        // Snapshot the merged tree BEFORE this layer's untar so opaque
+        // whiteouts can distinguish entries carried from EARLIER layers (which
+        // an opaque marker hides) from entries this SAME layer adds (which it
+        // must keep) — per the OCI image-spec opaque-whiteout semantics.
+        let prior = collect_paths(staging).await?;
+        let blob = blob_path(layout, layer.digest());
+        let (ok, _) = (runner)(vec![
+            "tar".to_owned(),
+            "-xf".to_owned(),
+            blob.to_string_lossy().into_owned(),
+            "-C".to_owned(),
+            staging.to_string_lossy().into_owned(),
+        ])
+        .await;
+        if !ok {
+            bail!("untar of OCI layer {} failed", blob.display());
+        }
+        apply_whiteouts(staging, &prior).await?;
+    }
+    Ok(())
+}
+
+/// Recursively collect every path under `root` (files AND directories) into a
+/// set, so a later step can tell which entries pre-existed a layer's untar.
+async fn collect_paths(root: &Path) -> Result<std::collections::HashSet<PathBuf>> {
+    let mut paths = std::collections::HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                stack.push(path.clone());
+            }
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+/// Apply the just-untarred layer's OCI whiteout markers under `root` and remove
+/// the markers themselves. `.wh..wh..opq` in a dir is OPAQUE: it hides entries
+/// carried from EARLIER layers (those present in `prior`) but NOT entries this
+/// same layer added; `.wh.<name>` deletes the sibling `<name>` (file or dir).
+async fn apply_whiteouts(root: &Path, prior: &std::collections::HashSet<PathBuf>) -> Result<()> {
+    // Collect first (don't mutate while walking).
+    let mut opaque_dirs: Vec<PathBuf> = Vec::new();
+    let mut file_whiteouts: Vec<(PathBuf, String)> = Vec::new();
+    let mut markers: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().await?.is_dir() {
+                stack.push(path);
+            } else if name == ".wh..wh..opq" {
+                opaque_dirs.push(dir.clone());
+                markers.push(path);
+            } else if let Some(target) = name.strip_prefix(".wh.") {
+                file_whiteouts.push((dir.clone(), target.to_owned()));
+                markers.push(path);
+            }
+        }
+    }
+    // Opaque: remove only siblings carried from EARLIER layers (in `prior`).
+    // Entries this same layer added are NOT in `prior`, so they survive; the
+    // `.wh.*` markers are removed below regardless.
+    for dir in opaque_dirs {
+        let mut rd = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".wh.") {
+                continue; // markers handled below
+            }
+            if prior.contains(&path) {
+                remove_any(&path).await?;
+            }
+        }
+    }
+    for (dir, target) in file_whiteouts {
+        remove_any(&dir.join(target)).await.ok();
+    }
+    for marker in markers {
+        tokio::fs::remove_file(&marker).await.ok();
+    }
+    Ok(())
+}
+
+/// Remove a path whether it's a file or a directory tree (idempotent).
+async fn remove_any(path: &Path) -> Result<()> {
+    let meta = match tokio::fs::symlink_metadata(path).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    if meta.is_dir() {
+        tokio::fs::remove_dir_all(path).await.ok();
+    } else {
+        tokio::fs::remove_file(path).await.ok();
+    }
+    Ok(())
+}
+
 /// Production [`FcBuildRunner`]: spawns `argv[0] argv[1..]`, captures STDOUT,
 /// and returns `(exit_ok, stdout_bytes)`. STDOUT capture is required because
 /// `docker inspect` writes its OCI config JSON there (it has no `-o` flag);
