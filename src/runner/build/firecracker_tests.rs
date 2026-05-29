@@ -45,58 +45,51 @@ fn oci_spec_parses_image_config_json() {
     );
 }
 
-/// `build_rootfs_ext4` must:
-/// 1. `docker export` the image's filesystem into a staging dir (rootless),
-/// 2. invoke `mkfs.ext4 -d <staging> <out>` (the `-d` content path — no loop,
-///    no root),
-/// returning the path to the produced rootfs.ext4.
+/// `build_rootfs_ext4` must untar the layout's layers into a staging dir, then
+/// `mkfs.ext4 -d <staging> <out>` (the rootless `-d` content path). No docker
+/// export anywhere in the argv.
 #[tokio::test]
-async fn build_rootfs_runs_export_then_mkfs_with_d_flag() {
+async fn build_rootfs_unpacks_layers_then_mkfs_with_d_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().join("out");
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/server"]},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
+    });
+    let layout = write_min_oci_layout(&out_dir, &cfg, &[("sha256:l0", &l0)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
 
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let calls2 = calls.clone();
-    let out_dir2 = out_dir.clone();
-
-    // Fake runner: records argv. For the `mkfs.ext4` call, touch the output
-    // file so the function's post-condition (rootfs exists) holds. Returns
-    // `(exit_ok, stdout)`; fc-1 commands ignore stdout so it stays empty.
-    let runner: FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+    // Real tar (host) for unpack; fake mkfs that touches the output file.
+    let real = super::production_fc_build_runner();
+    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
         calls2.lock().unwrap().push(argv.clone());
-        let out_dir3 = out_dir2.clone();
+        let real = real.clone();
         Box::pin(async move {
             if argv.first().map(String::as_str) == Some("mkfs.ext4") {
-                std::fs::create_dir_all(&out_dir3).ok();
-                // rootfs.ext4 is the mkfs output path (NOT the trailing size arg)
                 if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
                     std::fs::write(out, b"\0").unwrap();
                 }
+                (true, Vec::new())
+            } else {
+                (real)(argv).await
             }
-            (true, Vec::new())
         })
     });
 
-    let rootfs = build_rootfs_ext4(
-        "tbf-img-acme-app-v3", // local docker image tag to export
-        &out_dir,
-        64, // size_mib hint
-        &runner,
-    )
-    .await
-    .expect("build rootfs");
-
+    let rootfs = super::build_rootfs_ext4(&layout, &config, &out_dir, 64, &runner)
+        .await
+        .expect("build rootfs");
     assert_eq!(rootfs, out_dir.join("rootfs.ext4"));
-    assert!(rootfs.is_file(), "rootfs.ext4 must exist on disk");
+    assert!(rootfs.is_file());
 
     let recorded = calls.lock().unwrap().clone();
-    // First external call: a `docker export` (via `docker create` + export).
     assert!(
-        recorded.iter().any(|c| c.iter().any(|a| a == "export")),
-        "must run a docker export; got {recorded:?}"
+        !recorded.iter().any(|c| c.iter().any(|a| a == "export")),
+        "docker export must be gone; got {recorded:?}"
     );
-    // Second: mkfs.ext4 with the `-d <staging>` content-population flag and
-    // NO loop device / NO sudo.
     let mkfs = recorded
         .iter()
         .find(|c| c.first().map(String::as_str) == Some("mkfs.ext4"))
@@ -107,27 +100,34 @@ async fn build_rootfs_runs_export_then_mkfs_with_d_flag() {
     );
     assert!(
         !mkfs.iter().any(|a| a == "sudo" || a.contains("loop")),
-        "mkfs path must be rootless + loopless; got {mkfs:?}"
+        "rootless + loopless; got {mkfs:?}"
     );
-    // The mkfs output path is the produced rootfs.ext4.
     assert_eq!(
         mkfs.last().map(String::as_str),
         Some(out_dir.join("rootfs.ext4").to_str().unwrap())
     );
 }
 
-/// A failing external runner (export OR mkfs) surfaces a clear error and
+/// A failing external runner (untar OR mkfs) surfaces a clear error and
 /// produces no rootfs.
 #[tokio::test]
 async fn build_rootfs_errors_when_runner_fails() {
     let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/server"]},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
+    });
+    let layout = write_min_oci_layout(&out_dir, &cfg, &[("sha256:l0", &l0)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
     let runner: FcBuildRunner = Arc::new(|_| Box::pin(async { (false, Vec::new()) }));
-    let err = build_rootfs_ext4("img", &tmp.path().join("out"), 64, &runner)
+    let err = build_rootfs_ext4(&layout, &config, &out_dir, 64, &runner)
         .await
         .expect_err("must error when a step fails");
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("export") || msg.contains("mkfs"),
+        msg.contains("tar") || msg.contains("layer") || msg.contains("mkfs"),
         "error must name the failing step; got: {err}"
     );
 }
@@ -327,44 +327,39 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
     );
 }
 
-/// On a cache MISS the conversion runs in the REAL order — `docker inspect`
-/// (OCI config) → `docker export` → `tar` → `mkfs.ext4` — and the resulting
-/// rootfs lands at the digest-keyed path.
+/// On a cache MISS the conversion runs DOCKER-LESS — pull the OCI layout, read
+/// its config from the layout, untar its layers, then `mkfs.ext4` — and the
+/// resulting rootfs lands at the digest-keyed path. No `docker inspect`/`export`.
 ///
-/// The fake runner must produce BOTH side-effects, the same structural way:
-/// - for `docker inspect` it returns a minimal-but-valid OCI image config as
-///   STDOUT (this is what `read_oci_config` parses — bug-fix: previously the
-///   miss test seeded only `mkfs.ext4`, so `read_oci_config` ran first
-///   against a runner returning `true` with EMPTY stdout → parse failed),
-/// - for `mkfs.ext4` it writes the rootfs.ext4 file on disk.
-/// This exercises read_oci_config → render_init → build_rootfs_ext4_inner →
-/// mkfs end-to-end without a real docker/mkfs.
+/// `resolve_rootfs` pulls the layout into `<digest-dir>/oci`; we pre-stage a
+/// real layout there (the fake `oras copy` is a no-op success) and use the real
+/// host `tar` for the layer unpack, faking only `mkfs.ext4` to touch the output.
 #[tokio::test]
 async fn run_fc_build_converts_on_cache_miss() {
     let tmp = tempfile::tempdir().unwrap();
     let digest = "sha256:fresh01";
     let fetched = fc_fetched(digest);
     let target = super::cached_rootfs_path(tmp.path(), "uuid-miss", digest);
+
+    // Stage a real OCI layout where `pull_oci_layout` would have left it
+    // (`<digest-dir>/oci`), with an exec-form entrypoint so render_init succeeds.
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config":{"Entrypoint":["/app/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
+        "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
+    });
+    let layout_dir = target.parent().unwrap().join("oci");
+    std::fs::create_dir_all(&layout_dir).unwrap();
+    write_min_oci_layout(&layout_dir, &cfg, &[("sha256:l0", &l0)]);
+
     let target2 = target.clone();
-
-    // Minimal valid OCI image config with an exec-form entrypoint so
-    // render_init succeeds (shell-form would be rejected, D3). Serialized as
-    // the `{{json .Config}}` shape `docker inspect` prints to STDOUT.
-    let oci_config_json = serde_json::to_vec(&serde_json::json!({
-        "Entrypoint": ["/app/server"],
-        "Cmd": serde_json::Value::Null,
-        "Env": ["PATH=/usr/bin"],
-        "WorkingDir": "/app"
-    }))
-    .unwrap();
-
+    let real = super::production_fc_build_runner();
     let runner: super::FcBuildRunner = std::sync::Arc::new(move |argv: Vec<String>| {
         let target3 = target2.clone();
-        let oci = oci_config_json.clone();
+        let real = real.clone();
         Box::pin(async move {
             match argv.first().map(String::as_str) {
-                // `docker inspect` → OCI config on STDOUT (NOT a file).
-                Some("docker") if argv.iter().any(|a| a == "inspect") => (true, oci),
                 // `mkfs.ext4` → produce the rootfs file at the cache path.
                 Some("mkfs.ext4") => {
                     std::fs::create_dir_all(target3.parent().unwrap()).ok();
@@ -373,8 +368,10 @@ async fn run_fc_build_converts_on_cache_miss() {
                     }
                     (true, Vec::new())
                 }
-                // export / tar succeed with no stdout.
-                _ => (true, Vec::new()),
+                // `oras` copy is a no-op (layout pre-staged); real host tar for
+                // the layer unpack.
+                Some("oras") => (true, Vec::new()),
+                _ => (real)(argv).await,
             }
         })
     });

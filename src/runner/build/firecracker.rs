@@ -128,15 +128,15 @@ pub type FcBuildRunner =
 /// Name of the produced rootfs image inside the output dir.
 const ROOTFS_NAME: &str = "rootfs.ext4";
 
-/// Convert a local OCI image (already pulled + tagged as `image_tag`) into a
-/// bootable `rootfs.ext4` under `out_dir`, ROOTLESS and LOOPLESS.
+/// Convert an OCI image (already pulled as a LAYOUT under `layout`, with its
+/// typed `config` read from that layout) into a bootable `rootfs.ext4` under
+/// `out_dir`, ROOTLESS and LOOPLESS, DOCKER-LESS.
 ///
 /// ## OCI → ext4 contract (see fc-8 for the full risk write-up)
-/// 1. `docker create <image_tag>` → a stopped container whose filesystem is the
-///    image's merged layers.
-/// 2. `docker export <cid>` → a flat tar of that filesystem, untarred into a
-///    staging dir (no overlay, no daemon mounts needed at boot).
-/// 3. `mkfs.ext4 -d <staging> <out_dir>/rootfs.ext4` — the `-d` flag populates a
+/// 1. `unpack_oci_layers` untars the image's layers (in manifest order) into a
+///    staging dir, whiteout-aware (`.wh.<name>` + `.wh..wh..opq`) — no docker
+///    `create`/`export`, no daemon, no overlay.
+/// 2. `mkfs.ext4 -d <staging> <out_dir>/rootfs.ext4` — the `-d` flag populates a
 ///    fresh ext4 image from the staging dir's contents WITHOUT a loop device
 ///    and WITHOUT root (e2fsprogs ≥ 1.43). This is the crux of the rootless
 ///    path: no `mount`, no `losetup`, no `sudo`.
@@ -144,40 +144,42 @@ const ROOTFS_NAME: &str = "rootfs.ext4";
 /// `size_mib` sizes the ext4 image; callers pad it over the unpacked size.
 ///
 /// # Errors
-/// A failing `docker create`/`export`, untar failure, or a failing `mkfs.ext4`.
+/// A failing layer untar, a layer/diff_id mismatch, or a failing `mkfs.ext4`.
 // The production path (`resolve_rootfs`, fc-5) calls `build_rootfs_ext4_inner`
 // with `Some(&init)` directly; this no-init (`None`) wrapper is exercised only
 // by the fc-1 unit tests, hence still `#[allow(dead_code)]`.
 #[allow(dead_code)]
 pub async fn build_rootfs_ext4(
-    image_tag: &str,
+    layout: &Path,
+    config: &oci_spec::image::ImageConfiguration,
     out_dir: &Path,
     size_mib: u32,
     runner: &FcBuildRunner,
 ) -> Result<PathBuf> {
-    // fc-1 is the no-init form: export → untar → mkfs with nothing injected.
-    // The fc-5 init path calls the same primitive with `Some(init)`. Keeping a
-    // single primitive means the export/tar/mkfs argv shape has ONE source of
-    // truth (no drift between fc-1 and fc-5).
-    build_rootfs_ext4_inner(image_tag, out_dir, size_mib, None, runner).await
+    // fc-1 is the no-init form: unpack → mkfs with nothing injected. The fc-5
+    // init path calls the same primitive with `Some(init)`. Keeping a single
+    // primitive means the unpack/mkfs argv shape has ONE source of truth (no
+    // drift between fc-1 and fc-5).
+    build_rootfs_ext4_inner(layout, config, out_dir, size_mib, None, runner).await
 }
 
 /// Shared OCI→ext4 primitive — the SINGLE source of truth for the
-/// export → untar → (optional init inject) → `mkfs.ext4 -d` argv sequence.
+/// unpack → (optional init inject) → `mkfs.ext4 -d` sequence.
 ///
 /// `init`:
 /// - `None`  → fc-1 form (no PID-1 init written; raw image filesystem),
 /// - `Some(s)` → fc-5 form: write `s` to `<staging>/init` (mode 0755) AFTER the
-///   untar and BEFORE `mkfs.ext4` so the rendered PID-1 init is baked in.
+///   unpack and BEFORE `mkfs.ext4` so the rendered PID-1 init is baked in.
 ///
 /// Both [`build_rootfs_ext4`] (fc-1) and the fc-5 conversion call this; neither
 /// re-inlines the argv, so the shape can never drift.
 ///
 /// # Errors
-/// A failing `docker export`, untar failure, init-write failure, or a failing
-/// `mkfs.ext4`.
+/// A failing layer untar, a layer/diff_id mismatch, init-write failure, or a
+/// failing `mkfs.ext4`.
 async fn build_rootfs_ext4_inner(
-    image_tag: &str,
+    layout: &Path,
+    config: &oci_spec::image::ImageConfiguration,
     out_dir: &Path,
     size_mib: u32,
     init: Option<&str>,
@@ -186,44 +188,13 @@ async fn build_rootfs_ext4_inner(
     tokio::fs::create_dir_all(out_dir)
         .await
         .with_context(|| format!("create rootfs out dir {}", out_dir.display()))?;
-
     let staging = out_dir.join("stage");
-    tokio::fs::create_dir_all(&staging)
-        .await
-        .with_context(|| format!("create staging dir {}", staging.display()))?;
-    let tar_path = out_dir.join("fs.tar");
 
-    // 1+2. `docker create` → `docker export <cid> -o <tar>`. We model both as a
-    //      single `export` argv for the seam; production wiring (fc-5) supplies
-    //      a runner that runs `docker create` then `docker export`. (`docker
-    //      export` DOES support `-o <file>` — unlike `docker inspect`.)
-    let (exported, _) = (runner)(vec![
-        "docker".to_owned(),
-        "export".to_owned(),
-        image_tag.to_owned(),
-        "-o".to_owned(),
-        tar_path.to_string_lossy().into_owned(),
-    ])
-    .await;
-    if !exported {
-        bail!("docker export of image {image_tag} failed");
-    }
+    // 1+2. DOCKER-LESS: untar the OCI layout's layers into the staging dir,
+    //      whiteout-aware (replaces `docker create` + `docker export` + flat untar).
+    unpack_oci_layers(layout, config, &staging, runner).await?;
 
-    // 2b. Untar the exported filesystem into the staging dir (rootless).
-    let (untarred, _) = (runner)(vec![
-        "tar".to_owned(),
-        "-xf".to_owned(),
-        tar_path.to_string_lossy().into_owned(),
-        "-C".to_owned(),
-        staging.to_string_lossy().into_owned(),
-    ])
-    .await;
-    if !untarred {
-        bail!("untar of exported image {image_tag} failed");
-    }
-
-    // 2c. fc-5 only: inject the rendered PID-1 init into the staging dir, AFTER
-    //     untar and BEFORE mkfs, so it is baked into the ext4 image.
+    // 2c. fc-5 only: inject the rendered PID-1 init AFTER unpack, BEFORE mkfs.
     if let Some(script) = init {
         inject_init(&staging, script).await?;
     }
@@ -257,7 +228,7 @@ async fn build_rootfs_ext4_inner(
     ])
     .await;
     if !made {
-        bail!("mkfs.ext4 -d for image {image_tag} failed");
+        bail!("mkfs.ext4 -d failed for OCI layout {}", layout.display());
     }
     if !rootfs.is_file() {
         bail!(
@@ -446,24 +417,29 @@ pub async fn resolve_rootfs(
         .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
         .to_path_buf();
 
-    // Image tag the conversion reads from. The registry-pull done by
-    // `run_firecracker_build` (spec §7 step 1 — same pull+tag argv as
-    // `docker::push::pull_and_tag`) has left the image present locally under
-    // this versioned tag.
-    let image_tag = crate::docker::protocol::versioned_image_tag(uuid, fetched.version);
-
-    // Read OCI config from `docker inspect` STDOUT (no -o, no temp file), then
-    // render the PID-1 init from its entrypoint (fc-2). The conversion itself
-    // (export → untar → inject_init → mkfs) is the SINGLE shared primitive
+    // DOCKER-LESS: pull the deployed image into an OCI layout via the `oras`
+    // seam, read its config FROM the layout (no `docker inspect`), then render
+    // the PID-1 init from its entrypoint (fc-2). The conversion itself
+    // (unpack → inject_init → mkfs) is the SINGLE shared primitive
     // `build_rootfs_ext4_inner` (fc-1) — we just pass `Some(&init)` so the init
-    // is baked in. No re-inlined argv here; the argv shape has one source of
-    // truth in fc-1.
-    let oci = read_oci_config(&image_tag, runner).await?;
-    let entry = Entrypoint::from_oci(&oci);
+    // is baked in. (fc-dl-6 will lift the pull/config-read into
+    // `run_firecracker_build` and pass `layout`/`config` in directly.)
+    let reff = fetched
+        .manifest
+        .runtime
+        .registry_ref
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("firecracker runtime requires a registry_ref (image to convert)")
+        })?;
+    let layout = pull_oci_layout(reff, &out_dir, runner).await?;
+    let config = read_oci_config_from_layout(&layout)?;
+    let entry = Entrypoint::from_oci(&config);
     let init = render_init(&entry)?; // shell-form → clear error (D3)
 
     build_rootfs_ext4_inner(
-        &image_tag,
+        &layout,
+        &config,
         &out_dir,
         fetched.manifest.runtime.memory_mb,
         Some(&init),
@@ -488,6 +464,7 @@ pub async fn resolve_rootfs(
 ///
 /// Requires the image to be present locally — callers MUST pull it first
 /// (see [`run_firecracker_build`], spec §7 step 1).
+#[allow(dead_code)] // docker-based config read; removed by fc-dl-6 (docker-less)
 async fn read_oci_config(
     image_tag: &str,
     runner: &FcBuildRunner,
@@ -519,7 +496,6 @@ async fn read_oci_config(
 ///
 /// # Errors
 /// Missing/garbled `index.json`, no image manifest, or an unreadable blob.
-#[allow(dead_code)] // wired into resolve_rootfs by fc-dl-6
 fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageConfiguration> {
     let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
         .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
@@ -540,7 +516,6 @@ fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageCo
 }
 
 /// `blobs/<alg>/<hex>` path for a content-addressed [`oci_spec::image::Digest`].
-#[allow(dead_code)] // used by read_oci_config_from_layout + unpack_oci_layers (fc-dl-4)
 fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
     layout
         .join("blobs")
@@ -561,7 +536,6 @@ fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
 ///
 /// # Errors
 /// A `tar` failure, a layer/diff_id count mismatch, or a filesystem error.
-#[allow(dead_code)] // wired into build_rootfs_ext4_inner by fc-dl-5
 async fn unpack_oci_layers(
     layout: &Path,
     config: &oci_spec::image::ImageConfiguration,
@@ -825,7 +799,6 @@ async fn pull_and_tag(reff: &str, vtag: &str, runner: &FcBuildRunner) -> Result<
 ///
 /// # Errors
 /// A failing `oras copy`.
-#[allow(dead_code)] // wired into run_firecracker_build by fc-dl-6
 async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> Result<PathBuf> {
     let layout = out_dir.join("oci");
     tokio::fs::create_dir_all(&layout)
