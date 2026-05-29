@@ -166,6 +166,7 @@ impl RunnerLifecycle {
         // is rebuilt from the existing (cached) artifact.
         let next_fetched = fetched_with_ref(&self.fetched, reff);
         let new_runtime = match build_runtime(
+            None,
             &self.uuid,
             &next_fetched,
             &self.fc,

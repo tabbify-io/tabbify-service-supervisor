@@ -224,7 +224,7 @@ impl RunnerServe {
         }
 
         let initial_runtime =
-            build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.docker, &cfg.data_dir)
+            build_runtime(None, &cfg.uuid, &fetched, &cfg.fc, &cfg.docker, &cfg.data_dir)
                 .await
                 .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 

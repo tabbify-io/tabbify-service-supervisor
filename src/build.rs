@@ -13,7 +13,9 @@ use crate::firecracker::FirecrackerRuntime;
 use crate::oras::{find_wasm, oras_pull, production_oras_runner};
 use crate::runtime::{AppRuntime, WasmRuntime};
 
-/// Build the [`AppRuntime`] for a fetched app from `manifest.runtime.type`:
+/// Build the [`AppRuntime`] for a fetched app from the EFFECTIVE runtime, which
+/// is `runtime_override` (the request-body override, contract D10) when present,
+/// otherwise `manifest.runtime.type`:
 /// - `wasm-http`   → in-process [`WasmRuntime`]; when `manifest.runtime.registry_ref`
 ///   is set, the WASM bytes are pulled from the mesh OCI registry via `oras pull`
 ///   (using `docker.oras_bin`). Falls back to S3 bytes if the pull fails or no
@@ -24,6 +26,8 @@ use crate::runtime::{AppRuntime, WasmRuntime};
 ///   tarball (errors if no Docker daemon)
 /// - anything else → hard error (no silent fallback)
 ///
+/// `runtime_override` is the D4 wire string (`docker` | `firecracker` |
+/// `wasm-http`); `None` ⇒ the manifest default is used (D10).
 /// `uuid` makes the docker image tag + container name deterministic, and
 /// drives the firecracker pidfile path for stale-VM reconciliation.
 /// `data_dir` is the local cache root used to write / read the fc pidfile.
@@ -33,6 +37,7 @@ use crate::runtime::{AppRuntime, WasmRuntime};
 /// boot failure), a docker launch failure (no daemon / build / run failure),
 /// or an unknown runtime type.
 pub async fn build_runtime(
+    runtime_override: Option<&str>,
     uuid: &str,
     fetched: &FetchedApp,
     fc: &FcConfig,
@@ -40,6 +45,7 @@ pub async fn build_runtime(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     build_runtime_with_oras(
+        runtime_override,
         uuid,
         fetched,
         fc,
@@ -52,7 +58,9 @@ pub async fn build_runtime(
 
 /// Like [`build_runtime`] but accepts an injectable [`CommandRunner`] for the
 /// `oras pull` step. Used by unit tests to avoid invoking a real `oras` binary.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_runtime_with_oras(
+    runtime_override: Option<&str>,
     uuid: &str,
     fetched: &FetchedApp,
     fc: &FcConfig,
@@ -61,7 +69,10 @@ pub async fn build_runtime_with_oras(
     oras_runner: &CommandRunner,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     let rt = &fetched.manifest.runtime;
-    match rt.r#type.as_str() {
+    // Override wins over the manifest default (D10). The manifest's runtime
+    // type is the fallback when no override travels in the request body.
+    let effective = runtime_override.unwrap_or(rt.r#type.as_str());
+    match effective {
         "wasm-http" => {
             // AOT cache: <data_dir>/apps/<uuid>/v<N>/app.cwasm
             // The parent directory is created by `load_cached_or_compile` if
@@ -235,6 +246,7 @@ mod tests {
         });
 
         let rt = build_runtime_with_oras(
+            None,
             "uuid-no-ref",
             &fetched,
             &FcConfig::default(),
@@ -283,6 +295,7 @@ mod tests {
         });
 
         let rt = build_runtime_with_oras(
+            None,
             "uuid-oras-ref",
             &fetched,
             &FcConfig::default(),
@@ -322,6 +335,7 @@ mod tests {
         let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
 
         let rt = build_runtime_with_oras(
+            None,
             "uuid-fallback",
             &fetched,
             &FcConfig::default(),
@@ -365,6 +379,54 @@ mod tests {
             wasm: Bytes::new(),
             cached_path: PathBuf::from("/cache/apps/u/v7/context.tar.gz"),
         }
+    }
+
+    /// `runtime_override = Some("wasm-http")` over a docker manifest builds a
+    /// wasm runtime (the override wins over `manifest.runtime.type`, D10).
+    #[tokio::test]
+    async fn override_wins_over_manifest_runtime_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Docker manifest, but the wasm bytes live in the S3 field — overriding
+        // to wasm-http forces the wasm arm.
+        let mut fetched = docker_fetched(None);
+        fetched.wasm = Bytes::from_static(HELLO_WASM);
+        let cfg = DockerConfig::default();
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+
+        let rt = build_runtime_with_oras(
+            Some("wasm-http"),
+            "uuid-override-wasm",
+            &fetched,
+            &FcConfig::default(),
+            &cfg,
+            tmp.path(),
+            &runner,
+        )
+        .await
+        .expect("override to wasm-http must build a wasm runtime");
+        assert!(Arc::strong_count(&rt) > 0);
+    }
+
+    /// `runtime_override = None` builds from the manifest default (wasm-http here).
+    #[tokio::test]
+    async fn none_override_uses_manifest_runtime_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetched = wasm_fetched(None, Bytes::from_static(HELLO_WASM));
+        let cfg = DockerConfig::default();
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+
+        let rt = build_runtime_with_oras(
+            None,
+            "uuid-none",
+            &fetched,
+            &FcConfig::default(),
+            &cfg,
+            tmp.path(),
+            &runner,
+        )
+        .await
+        .expect("None override must use manifest default (wasm-http)");
+        assert!(Arc::strong_count(&rt) > 0);
     }
 
     /// `fetched_with_ref` sets the docker `registry_ref` to the deploy ref so a
