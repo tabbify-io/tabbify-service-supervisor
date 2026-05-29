@@ -35,6 +35,7 @@ pub mod api;
 pub mod app_ula;
 pub mod build;
 pub mod build_backend;
+pub mod capability_tags;
 pub mod config;
 pub mod control_proto;
 pub mod docker;

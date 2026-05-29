@@ -37,24 +37,19 @@ async fn main() -> anyhow::Result<()> {
     // Runtime capability gates. Each capable runtime advertises a mesh tag so
     // the coordinator/node route an app of that runtime to a supervisor that can
     // host it; WASM is always available. A host advertises only what it can run.
-    let mut capability_tags: Vec<String> = Vec::new();
-
     let kvm = kvm_available();
+    let docker = docker_available();
+    let capability_tags = tabbify_supervisor::capability_tags::capability_tags(kvm, docker);
     if kvm {
         tracing::info!("KVM available (/dev/kvm) — advertising `firecracker` capability");
-        capability_tags.push("firecracker".to_owned());
     } else {
         tracing::info!("no /dev/kvm — firecracker apps unsupported on this host");
     }
-
-    let docker = docker_available();
     if docker {
         tracing::info!("Docker daemon reachable — advertising `docker` capability");
-        capability_tags.push("docker".to_owned());
     } else {
         tracing::info!("no Docker daemon — docker apps unsupported on this host");
     }
-
     if capability_tags.is_empty() {
         tracing::info!("WASM-only supervisor (no firecracker / docker capability)");
     }
