@@ -2,9 +2,12 @@
 //! PID-1 init render).
 #![allow(clippy::unwrap_used)]
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use super::{Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, render_init};
+use super::{
+    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, render_init,
+};
 
 /// `oci-spec` links and parses an OCI image config's entrypoint/cmd/env/
 /// workdir. This proves the dependency is wired before we build on it.
@@ -209,4 +212,45 @@ fn entrypoint_from_oci_classifies_exec_vs_shell_form() {
     let cfg2: oci_spec::image::ImageConfiguration =
         serde_json::from_str(empty).unwrap();
     assert!(matches!(Entrypoint::from_oci(&cfg2), Entrypoint::ShellForm));
+}
+
+/// The cache path is keyed by the IMMUTABLE digest (sha256:…), not the tag,
+/// and sanitizes the `:` so it's a valid single path segment.
+#[test]
+fn cached_rootfs_path_is_keyed_by_digest_under_data_dir() {
+    let data_dir = Path::new("/var/lib/tabbify");
+    let p = cached_rootfs_path(
+        data_dir,
+        "0191e7c2-1111-7222-8333-444455556666",
+        "sha256:deadbeefcafe",
+    );
+    assert_eq!(
+        p,
+        Path::new(
+            "/var/lib/tabbify/apps/0191e7c2-1111-7222-8333-444455556666/fc/sha256-deadbeefcafe/rootfs.ext4"
+        )
+    );
+}
+
+/// Two different digests for the same app yield distinct cache dirs (a new
+/// build never clobbers the old rootfs — immutable-by-digest).
+#[test]
+fn cached_rootfs_path_differs_per_digest() {
+    let d = Path::new("/data");
+    let a = cached_rootfs_path(d, "app", "sha256:aaaa");
+    let b = cached_rootfs_path(d, "app", "sha256:bbbb");
+    assert_ne!(a, b);
+    assert!(a.parent().unwrap().ends_with("sha256-aaaa"));
+}
+
+/// `rootfs_is_cached` is true iff the digest-keyed rootfs.ext4 exists.
+#[test]
+fn rootfs_is_cached_reflects_presence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:abc123";
+    assert!(!super::rootfs_is_cached(tmp.path(), "app", digest));
+    let p = cached_rootfs_path(tmp.path(), "app", digest);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, b"\0").unwrap();
+    assert!(super::rootfs_is_cached(tmp.path(), "app", digest));
 }

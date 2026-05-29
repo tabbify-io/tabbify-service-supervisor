@@ -195,6 +195,34 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
     Ok(())
 }
 
+/// On-disk cache path for an app's converted rootfs, keyed by the IMMUTABLE
+/// image digest (`sha256:…`) — NOT the tag. The same digest always maps to the
+/// same path, so a redeploy of an unchanged image skips the (slow) OCI→ext4
+/// conversion entirely. A new digest gets a fresh dir, never clobbering the old
+/// rootfs (immutable-by-content).
+///
+/// Layout mirrors the wasm `.cwasm` / fc snapshot caches:
+/// `<data_dir>/apps/<uuid>/fc/<digest-sanitized>/rootfs.ext4`.
+/// The `:` in the digest is replaced with `-` so it's a single path segment.
+#[must_use]
+#[allow(dead_code)] // first non-test caller arrives in fc-5
+pub fn cached_rootfs_path(data_dir: &Path, uuid: &str, digest: &str) -> PathBuf {
+    let sanitized = digest.replace(':', "-");
+    data_dir
+        .join("apps")
+        .join(uuid)
+        .join("fc")
+        .join(sanitized)
+        .join(ROOTFS_NAME)
+}
+
+/// Is the digest-keyed rootfs already converted + on disk?
+#[must_use]
+#[allow(dead_code)] // first non-test caller arrives in fc-5
+pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str) -> bool {
+    cached_rootfs_path(data_dir, uuid, digest).is_file()
+}
+
 /// The exec-form entrypoint distilled from an OCI image config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // first non-test caller arrives in fc-5
