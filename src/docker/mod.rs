@@ -32,7 +32,7 @@
 use crate::config::DockerConfig;
 
 mod build;
-mod protocol;
+pub(crate) mod protocol;
 mod push;
 mod runtime;
 

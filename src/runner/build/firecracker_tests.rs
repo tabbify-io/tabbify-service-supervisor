@@ -254,3 +254,134 @@ fn rootfs_is_cached_reflects_presence() {
     std::fs::write(&p, b"\0").unwrap();
     assert!(super::rootfs_is_cached(tmp.path(), "app", digest));
 }
+
+use crate::fetcher::FetchedApp;
+use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
+use bytes::Bytes;
+
+fn fc_fetched(digest: &str) -> FetchedApp {
+    FetchedApp {
+        version: 3,
+        manifest: AppManifest {
+            app: AppMeta {
+                id: None,
+                name: "vm-app".to_owned(),
+                version: String::new(),
+                kind: "headless".to_owned(),
+                description: String::new(),
+            },
+            lifecycle: Lifecycle {
+                mode: LifecycleMode::AlwaysOn,
+                idle_timeout_sec: 300,
+            },
+            runtime: Runtime {
+                r#type: "firecracker".to_owned(),
+                entry: "rootfs.ext4".to_owned(),
+                fuel_per_request: 0,
+                memory_mb: 128,
+                vcpus: Some(2),
+                kernel: None,
+                registry_ref: Some(format!("[fd5a::1]:5000/acme/vm@{digest}")),
+            },
+            routes: Routes::default(),
+        },
+        wasm: Bytes::new(),
+        cached_path: std::path::PathBuf::from("/cache/apps/u/v3/rootfs.ext4"),
+    }
+}
+
+/// When the digest-keyed rootfs is ALREADY cached, `run_firecracker_build`
+/// must NOT run any conversion command (no docker export / mkfs) — it
+/// reuses the cached rootfs. We assert the conversion runner is untouched;
+/// the actual VM boot is exercised only by the KVM-gated fc-7 test, so here
+/// we stop at "would boot with this rootfs" by checking the cache hit path
+/// via `rootfs_is_cached` before calling.
+#[tokio::test]
+async fn run_fc_build_skips_conversion_on_cache_hit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:cached00";
+    let fetched = fc_fetched(digest);
+
+    // Pre-seed the digest-keyed cache so conversion is unnecessary.
+    let cached = super::cached_rootfs_path(tmp.path(), "uuid-cache", digest);
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    std::fs::write(&cached, b"\0").unwrap();
+
+    let called = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let called2 = called.clone();
+    let runner: super::FcBuildRunner = std::sync::Arc::new(move |_argv| {
+        *called2.lock().unwrap() = true;
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    // resolve_rootfs is the conversion-or-cache step extracted from
+    // run_firecracker_build so it's testable without a real VM boot.
+    let rootfs = super::resolve_rootfs("uuid-cache", &fetched, digest, tmp.path(), &runner)
+        .await
+        .unwrap();
+
+    assert_eq!(rootfs, cached, "cache hit must return the cached rootfs");
+    assert!(
+        !*called.lock().unwrap(),
+        "no conversion command may run on a cache hit"
+    );
+}
+
+/// On a cache MISS the conversion runs in the REAL order — `docker inspect`
+/// (OCI config) → `docker export` → `tar` → `mkfs.ext4` — and the resulting
+/// rootfs lands at the digest-keyed path.
+///
+/// The fake runner must produce BOTH side-effects, the same structural way:
+/// - for `docker inspect` it returns a minimal-but-valid OCI image config as
+///   STDOUT (this is what `read_oci_config` parses — bug-fix: previously the
+///   miss test seeded only `mkfs.ext4`, so `read_oci_config` ran first
+///   against a runner returning `true` with EMPTY stdout → parse failed),
+/// - for `mkfs.ext4` it writes the rootfs.ext4 file on disk.
+/// This exercises read_oci_config → render_init → build_rootfs_ext4_inner →
+/// mkfs end-to-end without a real docker/mkfs.
+#[tokio::test]
+async fn run_fc_build_converts_on_cache_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:fresh01";
+    let fetched = fc_fetched(digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-miss", digest);
+    let target2 = target.clone();
+
+    // Minimal valid OCI image config with an exec-form entrypoint so
+    // render_init succeeds (shell-form would be rejected, D3). Serialized as
+    // the `{{json .Config}}` shape `docker inspect` prints to STDOUT.
+    let oci_config_json = serde_json::to_vec(&serde_json::json!({
+        "Entrypoint": ["/app/server"],
+        "Cmd": serde_json::Value::Null,
+        "Env": ["PATH=/usr/bin"],
+        "WorkingDir": "/app"
+    }))
+    .unwrap();
+
+    let runner: super::FcBuildRunner = std::sync::Arc::new(move |argv: Vec<String>| {
+        let target3 = target2.clone();
+        let oci = oci_config_json.clone();
+        Box::pin(async move {
+            match argv.first().map(String::as_str) {
+                // `docker inspect` → OCI config on STDOUT (NOT a file).
+                Some("docker") if argv.iter().any(|a| a == "inspect") => (true, oci),
+                // `mkfs.ext4` → produce the rootfs file at the cache path.
+                Some("mkfs.ext4") => {
+                    std::fs::create_dir_all(target3.parent().unwrap()).ok();
+                    if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
+                        std::fs::write(out, b"\0").unwrap();
+                    }
+                    (true, Vec::new())
+                }
+                // export / tar succeed with no stdout.
+                _ => (true, Vec::new()),
+            }
+        })
+    });
+
+    let rootfs = super::resolve_rootfs("uuid-miss", &fetched, digest, tmp.path(), &runner)
+        .await
+        .unwrap();
+    assert_eq!(rootfs, target);
+    assert!(rootfs.is_file());
+}

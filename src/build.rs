@@ -9,7 +9,6 @@ use std::sync::Arc;
 use crate::config::{DockerConfig, FcConfig};
 use crate::docker::{CommandRunner, DockerRuntime};
 use crate::fetcher::FetchedApp;
-use crate::firecracker::FirecrackerRuntime;
 use crate::oras::{find_wasm, oras_pull, production_oras_runner};
 use crate::runtime::{AppRuntime, WasmRuntime};
 
@@ -20,8 +19,8 @@ use crate::runtime::{AppRuntime, WasmRuntime};
 ///   is set, the WASM bytes are pulled from the mesh OCI registry via `oras pull`
 ///   (using `docker.oras_bin`). Falls back to S3 bytes if the pull fails or no
 ///   ref is set.
-/// - `firecracker` → KVM-gated [`FirecrackerRuntime`] microVM (errors clearly on
-///   non-Linux / no `/dev/kvm`)
+/// - `firecracker` → KVM-gated [`FirecrackerRuntime`](crate::firecracker::FirecrackerRuntime)
+///   microVM (errors clearly on non-Linux / no `/dev/kvm`)
 /// - `docker`      → [`DockerRuntime`] container built from the cached context
 ///   tarball (errors if no Docker daemon)
 /// - anything else → hard error (no silent fallback)
@@ -146,10 +145,15 @@ pub async fn build_runtime_with_oras(
             Ok(Arc::new(wasm))
         }
         "firecracker" => {
-            let vm =
-                FirecrackerRuntime::launch_with_uuid(&fetched.cached_path, rt, fc, uuid, data_dir)
-                    .await?;
-            Ok(Arc::new(vm))
+            // Generic Firecracker (D11): convert the deployed OCI image into a
+            // rootfs.ext4 (cached by digest) + a PID-1 init, then boot it via
+            // the existing FirecrackerRuntime contract. The conversion shells
+            // out to docker/tar/mkfs.ext4 via the production runner.
+            let runner = crate::runner::build::firecracker::production_fc_build_runner();
+            crate::runner::build::firecracker::run_firecracker_build(
+                uuid, fetched, fc, data_dir, &runner,
+            )
+            .await
         }
         "docker" => {
             // Registry-pull is docker-only; wasm uses oras (above).

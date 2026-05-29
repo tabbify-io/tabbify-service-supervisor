@@ -13,13 +13,6 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::runtime::BoxFut;
 
-// The OCI→ext4 building blocks below get their first non-test caller when fc-5
-// wires `run_firecracker_build` into the `"firecracker"` arm of
-// `crate::build::build_runtime`. Until then they are exercised only by this
-// module's unit tests, so each carries `#[allow(dead_code)]` to keep the build
-// warning-clean (CI denies warnings via `cargo clippy --all-targets -- -D
-// warnings`); the attribute drops out as the chain becomes live in fc-5.
-
 /// External-command seam for the OCI→ext4 conversion (`docker pull`,
 /// `docker inspect`, `docker export`, `tar`, `mkfs.ext4`). Receives the full
 /// argv (first element = program) and returns `(exit_ok, stdout_bytes)`:
@@ -31,12 +24,10 @@ use crate::runtime::BoxFut;
 /// because `docker inspect` writes its OCI config to STDOUT (it has NO `-o`
 /// flag). Unit tests inject a fake runner that returns canned stdout for
 /// `inspect` and side-effects the rootfs file for `mkfs.ext4`.
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 pub type FcBuildRunner =
     Arc<dyn Fn(Vec<String>) -> BoxFut<'static, (bool, Vec<u8>)> + Send + Sync>;
 
 /// Name of the produced rootfs image inside the output dir.
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 const ROOTFS_NAME: &str = "rootfs.ext4";
 
 /// Convert a local OCI image (already pulled + tagged as `image_tag`) into a
@@ -56,7 +47,10 @@ const ROOTFS_NAME: &str = "rootfs.ext4";
 ///
 /// # Errors
 /// A failing `docker create`/`export`, untar failure, or a failing `mkfs.ext4`.
-#[allow(dead_code)] // first non-test caller arrives in fc-5
+// The production path (`resolve_rootfs`, fc-5) calls `build_rootfs_ext4_inner`
+// with `Some(&init)` directly; this no-init (`None`) wrapper is exercised only
+// by the fc-1 unit tests, hence still `#[allow(dead_code)]`.
+#[allow(dead_code)]
 pub async fn build_rootfs_ext4(
     image_tag: &str,
     out_dir: &Path,
@@ -84,7 +78,6 @@ pub async fn build_rootfs_ext4(
 /// # Errors
 /// A failing `docker export`, untar failure, init-write failure, or a failing
 /// `mkfs.ext4`.
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 async fn build_rootfs_ext4_inner(
     image_tag: &str,
     out_dir: &Path,
@@ -179,7 +172,6 @@ async fn build_rootfs_ext4_inner(
 
 /// Write the rendered init to `<staging>/init` with mode 0755 so the kernel can
 /// `init=/init` it as PID 1.
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 async fn inject_init(staging: &Path, script: &str) -> Result<()> {
     let path = staging.join("init");
     tokio::fs::write(&path, script.as_bytes())
@@ -205,7 +197,6 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
 /// `<data_dir>/apps/<uuid>/fc/<digest-sanitized>/rootfs.ext4`.
 /// The `:` in the digest is replaced with `-` so it's a single path segment.
 #[must_use]
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 pub fn cached_rootfs_path(data_dir: &Path, uuid: &str, digest: &str) -> PathBuf {
     let sanitized = digest.replace(':', "-");
     data_dir
@@ -218,14 +209,12 @@ pub fn cached_rootfs_path(data_dir: &Path, uuid: &str, digest: &str) -> PathBuf 
 
 /// Is the digest-keyed rootfs already converted + on disk?
 #[must_use]
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str) -> bool {
     cached_rootfs_path(data_dir, uuid, digest).is_file()
 }
 
 /// The exec-form entrypoint distilled from an OCI image config.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 pub struct OciExec {
     /// `config.Entrypoint` — the program + leading args (PID 1).
     pub entrypoint: Vec<String>,
@@ -239,7 +228,6 @@ pub struct OciExec {
 
 /// How the image declares its process. Phase-1 supports EXEC-FORM only (D3).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 pub enum Entrypoint {
     /// A concrete argv to `exec` as PID 1.
     Exec(OciExec),
@@ -256,7 +244,6 @@ impl Entrypoint {
     /// (deferred): a bare `Cmd` that is meant for a shell base image can't be
     /// distinguished safely in Phase-1, so empty argv ⇒ ShellForm.
     #[must_use]
-    #[allow(dead_code)] // first non-test caller arrives in fc-5
     pub fn from_oci(cfg: &oci_spec::image::ImageConfiguration) -> Self {
         let Some(inner) = cfg.config().as_ref() else {
             return Entrypoint::ShellForm;
@@ -289,7 +276,6 @@ impl Entrypoint {
 /// # Errors
 /// [`Entrypoint::ShellForm`] — shell-form entrypoints are not yet supported
 /// (D3); the error message says so clearly.
-#[allow(dead_code)] // first non-test caller arrives in fc-5
 pub fn render_init(entry: &Entrypoint) -> Result<String> {
     let exec = match entry {
         Entrypoint::Exec(e) => e,
@@ -330,6 +316,194 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
          exec {exec_line}\n",
         workdir = exec.workdir,
     ))
+}
+
+/// Resolve the bootable rootfs for an app: cache-hit by digest (fc-3) → return
+/// the cached `rootfs.ext4`; cache-miss → parse the OCI config, render the
+/// PID-1 init (fc-2), and convert image → `rootfs.ext4` (fc-1) at the
+/// digest-keyed path. Extracted from [`run_firecracker_build`] so the
+/// cache/convert decision is unit-testable without a VM boot.
+///
+/// # Errors
+/// OCI-config parse failure, shell-form entrypoint (D3), or conversion failure.
+pub async fn resolve_rootfs(
+    uuid: &str,
+    fetched: &crate::fetcher::FetchedApp,
+    digest: &str,
+    data_dir: &Path,
+    runner: &FcBuildRunner,
+) -> Result<PathBuf> {
+    let cached = cached_rootfs_path(data_dir, uuid, digest);
+    if rootfs_is_cached(data_dir, uuid, digest) {
+        tracing::info!(
+            uuid,
+            digest,
+            "firecracker rootfs cache hit; skipping conversion"
+        );
+        return Ok(cached);
+    }
+
+    let out_dir = cached
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
+        .to_path_buf();
+
+    // Image tag the conversion reads from. The registry-pull done by
+    // `run_firecracker_build` (spec §7 step 1 — same pull+tag argv as
+    // `docker::push::pull_and_tag`) has left the image present locally under
+    // this versioned tag.
+    let image_tag = crate::docker::protocol::versioned_image_tag(uuid, fetched.version);
+
+    // Read OCI config from `docker inspect` STDOUT (no -o, no temp file), then
+    // render the PID-1 init from its entrypoint (fc-2). The conversion itself
+    // (export → untar → inject_init → mkfs) is the SINGLE shared primitive
+    // `build_rootfs_ext4_inner` (fc-1) — we just pass `Some(&init)` so the init
+    // is baked in. No re-inlined argv here; the argv shape has one source of
+    // truth in fc-1.
+    let oci = read_oci_config(&image_tag, runner).await?;
+    let entry = Entrypoint::from_oci(&oci);
+    let init = render_init(&entry)?; // shell-form → clear error (D3)
+
+    build_rootfs_ext4_inner(
+        &image_tag,
+        &out_dir,
+        fetched.manifest.runtime.memory_mb,
+        Some(&init),
+        runner,
+    )
+    .await
+}
+
+/// `docker inspect --format '{{json .Config}}' <tag>` → typed
+/// [`oci_spec::image::ImageConfiguration`]. `docker inspect` writes its JSON to
+/// STDOUT and has NO `-o` flag, so we capture the runner's returned stdout bytes
+/// and parse those directly — we do NOT pass `-o` and we do NOT read a file off
+/// disk. Production shells `docker inspect` and pipes stdout; tests inject a
+/// fake runner that returns the canned config JSON as its stdout.
+///
+/// `{{json .Config}}` prints ONLY the image's execution config object
+/// (`Entrypoint`/`Cmd`/`Env`/`WorkingDir`, PascalCase) — NOT a full OCI image
+/// configuration (it carries no `architecture`/`os`/`rootfs`). So we parse it
+/// into [`oci_spec::image::Config`] and wrap it in a default
+/// [`oci_spec::image::ImageConfiguration`], which is what [`Entrypoint::from_oci`]
+/// reads its entrypoint from.
+///
+/// Requires the image to be present locally — callers MUST pull it first
+/// (see [`run_firecracker_build`], spec §7 step 1).
+async fn read_oci_config(
+    image_tag: &str,
+    runner: &FcBuildRunner,
+) -> Result<oci_spec::image::ImageConfiguration> {
+    let (ok, stdout) = (runner)(vec![
+        "docker".to_owned(),
+        "inspect".to_owned(),
+        "--format".to_owned(),
+        "{{json .Config}}".to_owned(),
+        image_tag.to_owned(),
+    ])
+    .await;
+    if !ok {
+        bail!("docker inspect of image {image_tag} (OCI config) failed");
+    }
+    let text = std::str::from_utf8(&stdout)
+        .with_context(|| format!("docker inspect {image_tag}: stdout is not UTF-8"))?;
+    let config: oci_spec::image::Config =
+        serde_json::from_str(text).with_context(|| "parse OCI image config (.Config)")?;
+    let mut image_config = oci_spec::image::ImageConfiguration::default();
+    image_config.set_config(Some(config));
+    Ok(image_config)
+}
+
+/// Production [`FcBuildRunner`]: spawns `argv[0] argv[1..]`, captures STDOUT,
+/// and returns `(exit_ok, stdout_bytes)`. STDOUT capture is required because
+/// `docker inspect` writes its OCI config JSON there (it has no `-o` flag);
+/// callers that ignore stdout (export/tar/mkfs) just drop the second tuple
+/// element. Used by the `"firecracker"` arm in [`crate::build`].
+#[must_use]
+pub fn production_fc_build_runner() -> FcBuildRunner {
+    use tokio::process::Command;
+    Arc::new(move |argv: Vec<String>| {
+        let fut: BoxFut<'static, (bool, Vec<u8>)> = Box::pin(async move {
+            let Some((prog, rest)) = argv.split_first() else {
+                return (false, Vec::new());
+            };
+            match Command::new(prog)
+                .args(rest)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await
+            {
+                Ok(out) => (out.status.success(), out.stdout),
+                Err(_) => (false, Vec::new()),
+            }
+        });
+        fut
+    })
+}
+
+/// Entry point for the `"firecracker"` arm of [`crate::build::build_runtime`]:
+/// resolve (cache or convert) the rootfs, then boot it via the existing
+/// `FirecrackerRuntime` contract (guest `172.31.0.2:8080`, kernel
+/// `/opt/tabbify/vmlinux`, per-uuid pidfile + warm-snapshot).
+///
+/// # Errors
+/// Conversion failure (see [`resolve_rootfs`]) or a VM launch failure.
+pub async fn run_firecracker_build(
+    uuid: &str,
+    fetched: &crate::fetcher::FetchedApp,
+    fc: &crate::config::FcConfig,
+    data_dir: &Path,
+    runner: &FcBuildRunner,
+) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
+    // The deployed image ref carries the immutable digest after the `@`.
+    let reff = fetched
+        .manifest
+        .runtime
+        .registry_ref
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("firecracker runtime requires a registry_ref (image to convert)")
+        })?;
+    let digest = reff.rsplit_once('@').map(|(_, d)| d).ok_or_else(|| {
+        anyhow::anyhow!(
+            "registry_ref {reff:?} has no @<digest>; need an immutable digest for the rootfs cache"
+        )
+    })?;
+
+    // Spec §7 step 1: PULL the OCI image from the mesh registry FIRST. Both the
+    // OCI-config read (`docker inspect`) and the rootfs export (`docker export`)
+    // operate on the LOCAL daemon, so the image must be present locally before
+    // either runs. We reuse the existing docker registry-pull argv builders
+    // (`protocol::pull_args` + `protocol::tag_args`) — the same `docker pull
+    // <reff>` + `docker tag <reff> <vtag>` sequence as `docker::push::pull_and_tag`
+    // — issued through the FcBuildRunner seam. The local versioned tag matches
+    // what `resolve_rootfs` reads from (`versioned_image_tag(uuid, version)`).
+    // (Skipped iff the rootfs is already cached by digest — fc-3.)
+    if !rootfs_is_cached(data_dir, uuid, digest) {
+        let vtag = crate::docker::protocol::versioned_image_tag(uuid, fetched.version);
+        let (pulled, _) = (runner)(crate::docker::protocol::pull_args(reff)).await;
+        if !pulled {
+            bail!("docker pull of registry_ref {reff:?} from mesh registry failed");
+        }
+        let (tagged, _) = (runner)(crate::docker::protocol::tag_args(reff, &vtag)).await;
+        if !tagged {
+            bail!("docker tag {reff:?} -> {vtag} failed");
+        }
+    }
+
+    let rootfs = resolve_rootfs(uuid, fetched, digest, data_dir, runner).await?;
+
+    let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
+        &rootfs,
+        &fetched.manifest.runtime,
+        fc,
+        uuid,
+        data_dir,
+    )
+    .await?;
+    Ok(std::sync::Arc::new(vm))
 }
 
 #[cfg(test)]
