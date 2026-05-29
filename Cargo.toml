@@ -96,3 +96,6 @@ tokio = { version = "1.52", features = ["full", "test-util"] }
 http-body-util = "0.1"
 # Local mock HTTP server to stand in for S3 in fetcher tests.
 wiremock = "0.6"
+# Test-only: generate content-addressed blob names for synthetic OCI layouts
+# (the docker-less FC fixtures). Not a production dependency.
+sha2 = "0.10"

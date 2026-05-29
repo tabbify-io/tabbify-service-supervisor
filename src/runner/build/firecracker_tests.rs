@@ -506,3 +506,78 @@ async fn pull_oci_layout_errors_when_oras_fails() {
     assert!(err.to_string().to_lowercase().contains("oras"),
         "error must name the oras pull step; got: {err}");
 }
+
+/// Write a minimal spec-compliant OCI layout under `dir`: a config blob, an
+/// image manifest referencing it (+ given layer descriptors), and an index.json
+/// pointing at the manifest. Returns the layout dir. `layers` = (digest, bytes).
+fn write_min_oci_layout(
+    dir: &Path,
+    config_json: &serde_json::Value,
+    layers: &[(&str, &[u8])],
+) -> std::path::PathBuf {
+    use sha2::{Digest as _, Sha256};
+    let blobs = dir.join("blobs").join("sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let put = |bytes: &[u8]| -> String {
+        let hex = format!("{:x}", Sha256::digest(bytes));
+        std::fs::write(blobs.join(&hex), bytes).unwrap();
+        hex
+    };
+    let cfg_bytes = serde_json::to_vec(config_json).unwrap();
+    let cfg_hex = put(&cfg_bytes);
+    let layer_descs: Vec<serde_json::Value> = layers.iter().map(|(d, b)| {
+        let hex = put(b);
+        serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": format!("sha256:{hex}"), "size": b.len(),
+            "annotations": {"diffid": *d}
+        })
+    }).collect();
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType":"application/vnd.oci.image.config.v1+json",
+                   "digest": format!("sha256:{cfg_hex}"), "size": cfg_bytes.len()},
+        "layers": layer_descs
+    });
+    let man_bytes = serde_json::to_vec(&manifest).unwrap();
+    let man_hex = put(&man_bytes);
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{"mediaType":"application/vnd.oci.image.manifest.v1+json",
+                       "digest": format!("sha256:{man_hex}"), "size": man_bytes.len()}]
+    });
+    std::fs::write(dir.join("index.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    std::fs::write(dir.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+    dir.to_path_buf()
+}
+
+/// `read_oci_config_from_layout` resolves index → manifest → config blob and
+/// parses the exec config (entrypoint/env/workdir), WITHOUT docker inspect.
+#[test]
+fn read_oci_config_from_layout_parses_entrypoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config":{"Entrypoint":["/app/server"],"Cmd":["--port","8080"],
+                  "Env":["RUST_LOG=info"],"WorkingDir":"/app"},
+        "rootfs":{"type":"layers","diff_ids":["sha256:aaaa"]}
+    });
+    let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:aaaa", b"layer0")]);
+    let parsed = super::read_oci_config_from_layout(&layout).expect("read config");
+    let inner = parsed.config().as_ref().unwrap();
+    assert_eq!(inner.entrypoint().as_ref().unwrap(), &vec!["/app/server".to_owned()]);
+    assert_eq!(inner.working_dir().as_ref().unwrap(), "/app");
+    assert_eq!(parsed.rootfs().diff_ids(), &vec!["sha256:aaaa".to_owned()]);
+}
+
+/// A layout with no image manifest in index.json errors clearly.
+#[test]
+fn read_oci_config_from_layout_errors_on_empty_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("index.json"),
+        br#"{"schemaVersion":2,"manifests":[]}"#).unwrap();
+    let err = super::read_oci_config_from_layout(tmp.path()).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("manifest"),
+        "must name the missing manifest; got: {err}");
+}

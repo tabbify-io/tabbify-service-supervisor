@@ -512,6 +512,42 @@ async fn read_oci_config(
     Ok(image_config)
 }
 
+/// Resolve `<layout>/index.json` → first image-manifest descriptor → manifest
+/// blob → config blob (`blobs/<alg>/<hex>`) → typed
+/// [`oci_spec::image::ImageConfiguration`]. DOCKER-LESS replacement for the old
+/// `docker inspect --format '{{json .Config}}'` path.
+///
+/// # Errors
+/// Missing/garbled `index.json`, no image manifest, or an unreadable blob.
+#[allow(dead_code)] // wired into resolve_rootfs by fc-dl-6
+fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageConfiguration> {
+    let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
+        .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
+    let man_desc = index
+        .manifests()
+        .iter()
+        .find(|d| matches!(d.media_type(), oci_spec::image::MediaType::ImageManifest))
+        .or_else(|| index.manifests().first())
+        .ok_or_else(|| anyhow::anyhow!("OCI index.json has no image manifest descriptor"))?;
+    let manifest = oci_spec::image::ImageManifest::from_file(blob_path(layout, man_desc.digest()))
+        .context("read OCI image manifest blob")?;
+    let cfg = oci_spec::image::ImageConfiguration::from_file(blob_path(
+        layout,
+        manifest.config().digest(),
+    ))
+    .context("read OCI image config blob")?;
+    Ok(cfg)
+}
+
+/// `blobs/<alg>/<hex>` path for a content-addressed [`oci_spec::image::Digest`].
+#[allow(dead_code)] // used by read_oci_config_from_layout + unpack_oci_layers (fc-dl-4)
+fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
+    layout
+        .join("blobs")
+        .join(digest.algorithm().as_ref())
+        .join(digest.digest())
+}
+
 /// Production [`FcBuildRunner`]: spawns `argv[0] argv[1..]`, captures STDOUT,
 /// and returns `(exit_ok, stdout_bytes)`. STDOUT capture is required because
 /// `docker inspect` writes its OCI config JSON there (it has no `-o` flag);

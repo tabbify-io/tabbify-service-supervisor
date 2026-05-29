@@ -2976,6 +2976,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tabbify-mesh-joiner",
  "tempfile",
  "thiserror 2.0.18",
