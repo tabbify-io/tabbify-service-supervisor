@@ -167,6 +167,16 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {bind_addr}"))?;
     tracing::info!(%bind_addr, "listening");
 
+    // Signal systemd readiness EXACTLY ONCE, now that the control listener is
+    // bound and (unless --no-mesh) the mesh is joined — i.e. the supervisor can
+    // actually serve. The NixOS unit is `Type=notify` with TimeoutStartSec=60,
+    // so without this the unit hangs to timeout and fails on every (re)start,
+    // bricking a self-update restart. Best-effort: a no-op when NOTIFY_SOCKET is
+    // unset (dev / --no-mesh / non-systemd), and any real error is logged and
+    // swallowed inside `notify_ready`. The probe (`--check`) path returns early
+    // above and never reaches here, so readiness is emitted only on real boot.
+    tabbify_supervisor::readiness::notify_ready();
+
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())

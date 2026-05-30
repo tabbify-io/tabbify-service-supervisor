@@ -81,6 +81,11 @@ clap = { version = "4.6", features = ["derive", "env"] }
 # POSIX syscalls (kill(2) for fc pidfile stale-process cleanup)
 libc = "0.2"
 
+# systemd readiness notification (sd_notify(READY=1)) for the `Type=notify`
+# unit. Best-effort: a no-op when NOTIFY_SOCKET is unset (dev / --no-mesh /
+# non-systemd runs), so it never affects local runs.
+sd-notify = "0.5"
+
 # Errors
 anyhow = "1"
 thiserror = "2"

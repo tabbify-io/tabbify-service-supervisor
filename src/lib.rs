@@ -32,6 +32,8 @@
 //! - [`api`] — axum control HTTP API (contract §5).
 //! - [`selfupdate`] — health-gated self-update engine: versioned fetch +
 //!   sha256 verify, out-of-band probe, atomic symlink swap, watchdog rollback.
+//! - [`readiness`] — `sd_notify(READY=1)` for the `Type=notify` systemd unit,
+//!   emitted once after bind + mesh-join; best-effort no-op off systemd.
 
 pub mod api;
 pub mod app_ula;
@@ -50,6 +52,7 @@ pub mod mesh;
 pub mod openapi;
 pub mod oras;
 pub mod orchestrator;
+pub mod readiness;
 pub mod runner;
 pub mod runtime;
 pub mod selfupdate;
