@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             &capability_tags,
             tabbify_supervisor::mesh::JoinMetadata {
                 identity_path: Some(config.mesh_identity_path()),
+                software_version: Some(tabbify_supervisor::version::binary_version().to_owned()),
                 ..Default::default()
             },
         )
@@ -134,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
 
     let state = SupervisorState::new(orchestrator, fetcher, supervisor_id, ula_str)
+        .with_version(tabbify_supervisor::version::binary_version().to_owned())
         .with_firecracker(kvm)
         .with_docker(docker);
     let app = router(state);

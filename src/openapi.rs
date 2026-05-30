@@ -13,8 +13,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api::{
-    AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse, AppStopResponse, BuildBody,
-    DeployBody, ErrorResponse, HealthResponse, SupervisorState,
+    AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
+    AppStopResponse, BuildBody, DeployBody, ErrorResponse, HealthResponse, SupervisorState,
 };
 use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
 
@@ -30,6 +30,7 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
     ),
     paths(
         crate::api::health,
+        crate::api::about,
         crate::api::list_apps,
         crate::api::get_app,
         crate::api::start_app,
@@ -41,6 +42,7 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
     ),
     components(schemas(
         HealthResponse,
+        AboutResponse,
         AppPresence,
         AppListResponse,
         AppActionResponse,
@@ -78,6 +80,7 @@ mod tests {
         let paths = &doc.paths.paths;
         for expected in [
             "/health",
+            "/v1/about",
             "/v1/apps",
             "/v1/apps/{uuid}",
             "/v1/apps/{uuid}/start",

@@ -13,8 +13,8 @@ use utoipa::ToSchema;
 
 use super::SharedState;
 use super::dto::{
-    AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse, AppStopResponse,
-    ErrorResponse, HealthResponse,
+    AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
+    AppStopResponse, ErrorResponse, HealthResponse,
 };
 use crate::fetcher::FetchError;
 use crate::orchestrator::{AppState, AppSummary};
@@ -36,8 +36,32 @@ pub async fn health(State(state): State<SharedState>) -> Response {
         "status": "ok",
         "supervisor_id": state.supervisor_id,
         "ula": state.ula,
+        "version": state.version,
         "firecracker": state.firecracker,
         "docker": state.docker,
+    }))
+    .into_response()
+}
+
+/// Self-identification for the self-update control plane: running version,
+/// peer id, mesh status, uptime.
+#[utoipa::path(
+    get,
+    path = "/v1/about",
+    responses((status = 200, description = "Supervisor self-identification", body = AboutResponse)),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn about(State(state): State<SharedState>) -> Response {
+    let mesh_status = if state.ula.contains(':') && !state.ula.starts_with("0.0.0.0") {
+        "joined"
+    } else {
+        "no_mesh"
+    };
+    axum::Json(json!({
+        "version": state.version,
+        "peer_id": state.supervisor_id,
+        "mesh_status": mesh_status,
+        "uptime_secs": state.started_at.elapsed().as_secs(),
     }))
     .into_response()
 }
@@ -500,6 +524,23 @@ fn error_json(status: StatusCode, msg: &str) -> Response {
 mod tests {
     use super::*;
     use crate::runtime::Runtime;
+
+    /// `AboutResponse` serializes the self-identification fields the self-update
+    /// control plane reads: version / peer_id / mesh_status / uptime_secs.
+    #[test]
+    fn about_response_serializes_all_fields() {
+        let resp = AboutResponse {
+            version: "1.4.0".to_owned(),
+            peer_id: "0191e7c2-1111-7222-8333-444455556666".to_owned(),
+            mesh_status: "joined".to_owned(),
+            uptime_secs: 42,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"version\":\"1.4.0\""), "got: {json}");
+        assert!(json.contains("\"peer_id\":"), "got: {json}");
+        assert!(json.contains("\"mesh_status\":\"joined\""), "got: {json}");
+        assert!(json.contains("\"uptime_secs\":42"), "got: {json}");
+    }
 
     #[test]
     fn start_body_parses_explicit_runtime() {

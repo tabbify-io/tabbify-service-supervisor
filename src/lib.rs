@@ -50,6 +50,7 @@ pub mod oras;
 pub mod orchestrator;
 pub mod runner;
 pub mod runtime;
+pub mod version;
 
 pub use config::Config;
 pub use runner::RunnerConfig;

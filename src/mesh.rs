@@ -41,6 +41,9 @@ pub struct JoinMetadata {
     pub app_uuid: Option<String>,
     /// Path to a persistent identity file (`{private_key, ula}`).
     pub identity_path: Option<std::path::PathBuf>,
+    /// The peer's running binary release version (`build.rs`-embedded). `None`
+    /// means unknown and MUST never be treated as a downgrade trigger.
+    pub software_version: Option<String>,
 }
 
 impl MeshMembership {
@@ -74,6 +77,13 @@ impl MeshMembership {
             identity_path: metadata.identity_path,
             ..Default::default()
         };
+        // software_version rides onto the wire via JoinConfig once the mesh
+        // joiner gains the field (план 08, coordinator-first rollout). Until
+        // the pinned mesh rev exposes `JoinConfig.software_version`, we keep it
+        // on JoinMetadata only — populate is unit-tested above; wire activation
+        // is a one-line follow-up after the rev bump:
+        //   config.software_version = metadata.software_version;
+        let _ = &metadata.software_version; // keep the field live, no dead-code warn
         Self::from_config(config, "join mesh as supervisor").await
     }
 
@@ -118,5 +128,23 @@ impl MeshMembership {
     #[must_use]
     pub fn mesh_host(&self) -> Arc<dyn MeshHost> {
         self.joiner.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// JoinMetadata carries the supervisor's software_version so it can ride
+    /// onto the mesh join (and every heartbeat) once the joiner wires it.
+    #[test]
+    fn join_metadata_carries_software_version() {
+        let md = JoinMetadata {
+            software_version: Some("1.4.0".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(md.software_version.as_deref(), Some("1.4.0"));
+        // Default omits it (None = unknown, never a downgrade trigger).
+        assert!(JoinMetadata::default().software_version.is_none());
     }
 }

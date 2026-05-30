@@ -41,12 +41,12 @@ mod handlers;
 // ── Public re-exports — must remain stable for `crate::openapi` + tests. ─────
 
 pub use dto::{
-    AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse, AppStopResponse,
-    ErrorResponse, HealthResponse,
+    AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
+    AppStopResponse, ErrorResponse, HealthResponse,
 };
 pub use handlers::{
-    BuildBody, DeployBody, build_app, deploy_app, get_app, health, list_apps, purge_app, reset_app,
-    start_app, stop_app,
+    BuildBody, DeployBody, about, build_app, deploy_app, get_app, health, list_apps, purge_app,
+    reset_app, start_app, stop_app,
 };
 
 // utoipa's `#[utoipa::path]` macro generates `__path_<fn>` types in the SAME
@@ -54,8 +54,8 @@ pub use handlers::{
 // looks for them under `crate::api`, so we re-export each one here.
 #[doc(hidden)]
 pub use handlers::{
-    __path_build_app, __path_deploy_app, __path_get_app, __path_health, __path_list_apps,
-    __path_purge_app, __path_reset_app, __path_start_app, __path_stop_app,
+    __path_about, __path_build_app, __path_deploy_app, __path_get_app, __path_health,
+    __path_list_apps, __path_purge_app, __path_reset_app, __path_start_app, __path_stop_app,
 };
 
 /// Shared handler state.
@@ -77,6 +77,11 @@ pub struct SupervisorState {
     /// Whether this host can run Docker containers (daemon reachable). Surfaced
     /// on `/health` alongside `firecracker`.
     pub docker: bool,
+    /// Running binary's release version (`build.rs`-embedded), surfaced on
+    /// `/health` + `/v1/about`. Empty until set via [`Self::with_version`].
+    pub version: String,
+    /// When this process started serving — drives `/v1/about` uptime.
+    pub started_at: std::time::Instant,
 }
 
 impl SupervisorState {
@@ -97,7 +102,17 @@ impl SupervisorState {
             ula,
             firecracker: false,
             docker: false,
+            version: String::new(),
+            started_at: std::time::Instant::now(),
         }
+    }
+
+    /// Set the running binary's release version reported on `/health` +
+    /// `/v1/about`.
+    #[must_use]
+    pub fn with_version(mut self, version: String) -> Self {
+        self.version = version;
+        self
     }
 
     /// Set the Firecracker (KVM) capability reported on `/health`.
@@ -121,6 +136,7 @@ impl SupervisorState {
 pub fn router(state: SupervisorState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/about", get(about))
         .route("/v1/apps", get(list_apps))
         .route("/v1/apps/:uuid", get(get_app))
         .route("/v1/apps/:uuid/start", post(start_app))

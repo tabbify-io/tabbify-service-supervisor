@@ -6,6 +6,8 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Tabbify app-layer supervisor: joins the mesh, fetches WASM apps from S3 by UUID, runs them per a TOML lifecycle, serves them over the mesh."
 publish = false
+# Embed the release version at build time (see build.rs).
+build = "build.rs"
 
 # Thin binary entrypoints; all logic lives in the library.
 [[bin]]

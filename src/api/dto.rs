@@ -22,10 +22,29 @@ pub struct HealthResponse {
     /// This supervisor's control ULA (peer-ULA).
     #[schema(example = "fd5a:1f00:0:3::1")]
     pub ula: String,
+    /// Running binary's release version (`build.rs`-embedded) — readiness.
+    #[schema(example = "1.4.0")]
+    pub version: String,
     /// Whether this host can run Firecracker microVMs (`/dev/kvm` present).
     pub firecracker: bool,
     /// Whether this host can run Docker containers (daemon reachable).
     pub docker: bool,
+}
+
+/// `GET /v1/about` body — self-identification for the self-update control plane.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AboutResponse {
+    /// Running binary's release version (`build.rs`-embedded).
+    #[schema(example = "1.4.0")]
+    pub version: String,
+    /// Coordinator-assigned peer id (or a local placeholder w/o mesh).
+    #[schema(example = "0191e7c2-1111-7222-8333-444455556666")]
+    pub peer_id: String,
+    /// `"joined"` when bound on a mesh ULA, `"no_mesh"` otherwise.
+    #[schema(example = "joined")]
+    pub mesh_status: String,
+    /// Seconds since this process started serving.
+    pub uptime_secs: u64,
 }
 
 /// One row of `GET /v1/apps` — a snapshot of one app in the live runner fleet.
