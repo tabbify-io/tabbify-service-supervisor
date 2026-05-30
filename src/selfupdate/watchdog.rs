@@ -11,14 +11,9 @@ use anyhow::{Context, Result, bail};
 use crate::orchestrator::restart::{BackoffParams, RestartState, RestartStatus, status};
 
 use super::swap::{
-    RestartRunner, VersionFile, read_version_file, repoint_symlink, write_version_file,
+    RestartRunner, SUPERVISOR_UNIT, SWAP_BINARIES, VersionFile, read_version_file, repoint_symlink,
+    write_version_file,
 };
-
-/// The two binaries whose symlinks a rollback re-points (mirrors the swap set).
-const SWAP_BINARIES: [&str; 2] = ["supervisord", "tabbify-runner"];
-
-/// systemd unit re-started after a rollback re-points the symlinks.
-const SUPERVISOR_UNIT: &str = "tabbify-supervisor";
 
 /// One watchdog observation snapshot.
 #[derive(Debug, Clone, Copy)]

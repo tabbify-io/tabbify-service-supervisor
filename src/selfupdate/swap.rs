@@ -13,14 +13,17 @@ use tokio::process::Command;
 
 use crate::runtime::BoxFut;
 
-/// The two binaries whose symlinks the swap re-points.
-const SWAP_BINARIES: [&str; 2] = ["supervisord", "tabbify-runner"];
+/// The binaries whose symlinks the swap re-points. Single source of truth: the
+/// watchdog rolls back this exact set, so adding a binary here keeps rollback in
+/// sync automatically.
+pub(crate) const SWAP_BINARIES: [&str; 2] = ["supervisord", "tabbify-runner"];
 
 /// How many previous-good versions the [`VersionFile`] keeps as rollback targets.
 const KEEP_PREVIOUS: usize = 3;
 
-/// systemd unit re-started after the symlinks are re-pointed.
-const SUPERVISOR_UNIT: &str = "tabbify-supervisor";
+/// systemd unit re-started after the symlinks are re-pointed. Single source of
+/// truth shared with the watchdog's rollback restart.
+pub(crate) const SUPERVISOR_UNIT: &str = "tabbify-supervisor";
 
 /// Restart-trigger seam: given `systemctl` arguments (e.g.
 /// `["restart", "tabbify-supervisor"]`), run the command and return whether it
