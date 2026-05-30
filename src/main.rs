@@ -176,17 +176,35 @@ async fn main() -> anyhow::Result<()> {
 /// 3-part gate outcome. The candidate joins the mesh with a TRANSIENT identity
 /// (`candidate_identity_path`), binds an alternate ephemeral loopback control
 /// addr, serves the router, then gathers the three gate signals: joined mesh
-/// (membership Ok), `GET /health` 200, and control liveness (a router-level
-/// `/health` round-trip — the candidate has no per-app runners, so the plan
-/// folds pong into router liveness).
+/// (membership Ok), `GET /health` 200, and control liveness — a `GET /v1/about`
+/// round-trip on a DISTINCT route/handler (the candidate has no per-app runners
+/// to answer the control `Cmd::Ping → Pong`, so the plan folds pong into router
+/// liveness; we keep it honestly distinct from `/health`).
 ///
 /// All of this is bounded by the self-update gate timeout. The candidate NEVER
-/// claims the sticky ULA: it joins with its own `candidate_identity_path`.
+/// claims the sticky ULA: it joins with its own `candidate_identity_path`, and
+/// this entrypoint fails closed if that transient identity is absent.
 async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::probe::ProbeOutcome {
-    use tabbify_supervisor::selfupdate::probe::{GateInputs, evaluate_gate};
+    use tabbify_supervisor::selfupdate::probe::{GateInputs, ProbeOutcome, evaluate_gate};
 
     let gate_timeout = tabbify_supervisor::selfupdate::SelfUpdateConfig::default().gate_timeout;
     let started = std::time::Instant::now();
+
+    // Fail closed if `--check` was passed without a TRANSIENT identity. Without
+    // `--candidate-identity-path` the pinned joiner (mesh-joiner de17a58,
+    // `resolve_identity`) falls through to the legacy keypair-only path
+    // (`~/.tabbify-mesh/keypair`, `sticky_ula = None`), so the sticky ULA is not
+    // claimed only *incidentally* — the safety hinges on an implicit caller
+    // contract. SU-3 requires a transient identity (spec §4); enforce it here so
+    // the "candidate never claims the sticky ULA" invariant is guaranteed, not
+    // accidental, rather than silently joining via the ambient keypair path.
+    if candidate_identity_required(config.check_mode, config.candidate_identity_path.is_some()) {
+        return ProbeOutcome::Fail(
+            "candidate (--check) requires --candidate-identity-path (transient identity); \
+             refusing to join via the ambient keypair path"
+                .to_owned(),
+        );
+    }
 
     // The candidate always binds a loopback ephemeral addr for its self-check —
     // it must NOT contend for the sticky ULA / production bind.
@@ -274,19 +292,39 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
     evaluate_gate(inputs, gate_timeout.as_secs())
 }
 
-/// Self-check the candidate's router: `GET /health` must return 200 (gate part
-/// 2), and a second round-trip stands in for the control liveness (gate part 3,
-/// router-level since the candidate has no per-app runners). Bounded by
+/// Whether the probe entrypoint must fail closed before joining the mesh.
+///
+/// `--check` declares an out-of-band candidate that MUST join with a TRANSIENT
+/// identity (`--candidate-identity-path`). With no transient identity the pinned
+/// joiner silently uses the ambient keypair path, so refusing here keeps the
+/// "candidate never claims the sticky ULA" invariant enforced rather than
+/// incidental. Returns `true` when the entrypoint must abort.
+#[must_use]
+fn candidate_identity_required(check_mode: bool, has_candidate_identity: bool) -> bool {
+    check_mode && !has_candidate_identity
+}
+
+/// The two DISTINCT router routes the self-check probes, one per gate signal:
+/// gate part 2 (`health_200`) hits `/health`, gate part 3 (`pong`) hits a
+/// genuinely different liveness route (`/v1/about`). Returning them from one
+/// place keeps the gate honestly 3-part: each part exercises its own handler.
+const HEALTH_PATH: &str = "/health";
+const LIVENESS_PATH: &str = "/v1/about";
+
+/// Self-check the candidate's router with two DISTINCT liveness signals so the
+/// gate stays honestly 3-part: gate part 2 (`health_200`) probes `/health`, and
+/// gate part 3 (`pong`) probes `/v1/about` — a different route and handler
+/// (`about` vs `health`), standing in for the control `Cmd::Ping → Pong` the
+/// candidate has no per-app runner to answer. Both must return 2xx. Bounded by
 /// `timeout`.
 async fn self_check(addr: SocketAddr, timeout: std::time::Duration) -> (bool, bool) {
-    let url = format!("http://{addr}/health");
     let client = reqwest::Client::new();
     let probe = |c: reqwest::Client, u: String| async move {
         matches!(c.get(&u).send().await, Ok(r) if r.status().is_success())
     };
     let both = async {
-        let health_200 = probe(client.clone(), url.clone()).await;
-        let pong = health_200 && probe(client.clone(), url.clone()).await;
+        let health_200 = probe(client.clone(), format!("http://{addr}{HEALTH_PATH}")).await;
+        let pong = probe(client.clone(), format!("http://{addr}{LIVENESS_PATH}")).await;
         (health_200, pong)
     };
     tokio::time::timeout(timeout, both)
@@ -301,4 +339,85 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(true)
         .init();
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use tabbify_supervisor::api::{SupervisorState, router};
+
+    // ── Fix 1: candidate must fail closed without a transient identity ──────
+
+    #[test]
+    fn check_mode_without_candidate_identity_requires_failing_closed() {
+        // `--check` set, but no `--candidate-identity-path` → must abort before
+        // joining via the ambient keypair path.
+        assert!(candidate_identity_required(true, false));
+    }
+
+    #[test]
+    fn check_mode_with_candidate_identity_is_allowed() {
+        assert!(!candidate_identity_required(true, true));
+    }
+
+    #[test]
+    fn non_check_mode_never_requires_failing_closed() {
+        // Production boot (no --check) is unaffected regardless of the identity flag.
+        assert!(!candidate_identity_required(false, false));
+        assert!(!candidate_identity_required(false, true));
+    }
+
+    // ── Fix 2: gate part 3 (pong) probes a DISTINCT route from part 2 ───────
+
+    #[test]
+    fn liveness_probe_is_a_distinct_route_from_health() {
+        assert_eq!(HEALTH_PATH, "/health");
+        assert_eq!(LIVENESS_PATH, "/v1/about");
+        assert_ne!(
+            HEALTH_PATH, LIVENESS_PATH,
+            "gate part 3 must exercise a different route than part 2"
+        );
+    }
+
+    /// End-to-end: the candidate router answers BOTH gate routes 2xx, and each is
+    /// a genuinely distinct signal — `self_check` returns `(true, true)` because
+    /// `/health` AND `/v1/about` each succeed on their own handler.
+    #[tokio::test]
+    async fn self_check_exercises_both_distinct_routes() {
+        let tmp = std::env::temp_dir().join(format!("su3-selfcheck-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let shared = SharedRunnerConfig {
+            runner_bin: default_runner_bin(),
+            s3_base_url: "http://127.0.0.1:1/none".to_owned(),
+            data_dir: tmp.clone(),
+            parent: None,
+            no_mesh: true,
+        };
+        let orchestrator = Orchestrator::new(shared, tmp.join("runners"));
+        let fetcher = S3Fetcher::new("http://127.0.0.1:1/none", &tmp);
+        let state = SupervisorState::new(
+            orchestrator,
+            fetcher,
+            "candidate".to_owned(),
+            "127.0.0.1".to_owned(),
+        )
+        .with_version("0.0.0-test".to_owned());
+        let app = router(state);
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (health_200, pong) = self_check(addr, std::time::Duration::from_secs(5)).await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(health_200, "/health must answer 200");
+        assert!(pong, "/v1/about must answer 200 as the distinct part-3 signal");
+    }
 }
