@@ -153,6 +153,45 @@ jobs:
             "target/${{ matrix.target }}/release/tabbify-runner" \
             "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/${{ matrix.arch }}/tabbify-runner"
 
+      - name: Derive SEMVER from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          # The workflow runs on `v*` tags; strip the leading `v`. On a branch
+          # push (main) fall back to the Cargo.toml package version so the job
+          # still produces a deterministic versioned key.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            SEMVER="${GITHUB_REF_NAME#v}"
+          else
+            SEMVER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "semver=${SEMVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload versioned binaries to S3
+        run: |
+          set -euo pipefail
+          V="v${{ steps.ver.outputs.semver }}"
+          BASE="s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/${V}/${{ matrix.arch }}"
+          aws s3 cp "target/${{ matrix.target }}/release/supervisord"    "${BASE}/supervisord"
+          aws s3 cp "target/${{ matrix.target }}/release/tabbify-runner" "${BASE}/tabbify-runner"
+
+      - name: Publish supervisor/latest manifest (x86_64 leader)
+        # Compute sha256 of the just-uploaded binaries + write the sibling
+        # `latest` manifest. Run once (x86_64) so a single source of truth lists
+        # both binaries' checksums.
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          V="v${{ steps.ver.outputs.semver }}"
+          SUP_SHA="$(sha256sum target/${{ matrix.target }}/release/supervisord | awk '{print $1}')"
+          RUN_SHA="$(sha256sum target/${{ matrix.target }}/release/tabbify-runner | awk '{print $1}')"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat > /tmp/latest.json <<EOF
+          {"latest":"${V}","versions":["${V}"],"sha256":{"supervisord":"${SUP_SHA}","tabbify-runner":"${RUN_SHA}"},"ts":"${TS}"}
+          EOF
+          jq -e . /tmp/latest.json > /dev/null   # fail the build on malformed JSON
+          aws s3 cp /tmp/latest.json "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/latest" --content-type application/json
+
       - name: Upload supervisord to S3 (legacy un-prefixed key)
         # Only x86_64 sets legacy_key. Keeps the pre-existing
         # supervisor/supervisord key working for the Phase-1 runbook + any
