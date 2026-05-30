@@ -63,27 +63,7 @@ impl MeshMembership {
         extra_tags: &[String],
         metadata: JoinMetadata,
     ) -> anyhow::Result<Self> {
-        let mut tags = vec!["supervisor".to_owned()];
-        tags.extend_from_slice(extra_tags);
-        let config = JoinConfig {
-            coordinator_url: coordinator_url.to_owned(),
-            display_name: display_name.to_owned(),
-            tags,
-            insecure_no_mtls: true,
-            requested_ula: metadata.requested_ula,
-            kind: metadata.kind,
-            parent: metadata.parent,
-            app_uuid: metadata.app_uuid,
-            identity_path: metadata.identity_path,
-            ..Default::default()
-        };
-        // software_version rides onto the wire via JoinConfig once the mesh
-        // joiner gains the field (план 08, coordinator-first rollout). Until
-        // the pinned mesh rev exposes `JoinConfig.software_version`, we keep it
-        // on JoinMetadata only — populate is unit-tested above; wire activation
-        // is a one-line follow-up after the rev bump:
-        //   config.software_version = metadata.software_version;
-        let _ = &metadata.software_version; // keep the field live, no dead-code warn
+        let config = build_supervisor_join_config(coordinator_url, display_name, extra_tags, metadata);
         Self::from_config(config, "join mesh as supervisor").await
     }
 
@@ -131,12 +111,44 @@ impl MeshMembership {
     }
 }
 
+/// Build the supervisor's [`JoinConfig`] from its identity + per-app-runner
+/// [`JoinMetadata`]. Pure (no I/O), so the field wiring — notably
+/// `software_version` riding onto the wire — is unit-testable without joining
+/// the mesh. Mirrors the runner's
+/// [`crate::runner::serve::build_runner_join_config`] seam.
+fn build_supervisor_join_config(
+    coordinator_url: &str,
+    display_name: &str,
+    extra_tags: &[String],
+    metadata: JoinMetadata,
+) -> JoinConfig {
+    let mut tags = vec!["supervisor".to_owned()];
+    tags.extend_from_slice(extra_tags);
+    JoinConfig {
+        coordinator_url: coordinator_url.to_owned(),
+        display_name: display_name.to_owned(),
+        tags,
+        insecure_no_mtls: true,
+        requested_ula: metadata.requested_ula,
+        kind: metadata.kind,
+        parent: metadata.parent,
+        app_uuid: metadata.app_uuid,
+        identity_path: metadata.identity_path,
+        // Ride the host's binary version onto the wire: the coordinator
+        // surfaces it as the roster `software_version` (spec P0 OBSERVE) so
+        // version drift is visible. `None` stays back-compatible (the joiner
+        // never invents a value).
+        software_version: metadata.software_version,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// JoinMetadata carries the supervisor's software_version so it can ride
-    /// onto the mesh join (and every heartbeat) once the joiner wires it.
+    /// JoinMetadata carries the supervisor's software_version so it rides onto
+    /// the mesh join (and every heartbeat) via `JoinConfig.software_version`.
     #[test]
     fn join_metadata_carries_software_version() {
         let md = JoinMetadata {
@@ -146,5 +158,33 @@ mod tests {
         assert_eq!(md.software_version.as_deref(), Some("1.4.0"));
         // Default omits it (None = unknown, never a downgrade trigger).
         assert!(JoinMetadata::default().software_version.is_none());
+    }
+
+    /// The supervisor's software_version is wired onto `JoinConfig` so it rides
+    /// to the coordinator roster — the fix for the `software_version=null` bug.
+    #[test]
+    fn build_config_wires_software_version_onto_join_config() {
+        let md = JoinMetadata {
+            software_version: Some("1.4.0".to_owned()),
+            ..Default::default()
+        };
+        let config = build_supervisor_join_config("http://coord:8888", "node-1", &[], md);
+        assert_eq!(config.software_version.as_deref(), Some("1.4.0"));
+        // The supervisor tag is always present; metadata fields ride through.
+        assert!(config.tags.contains(&"supervisor".to_owned()));
+    }
+
+    /// A `None` software_version stays `None` on the config (back-compat: the
+    /// joiner never invents a value, so it is never a downgrade trigger).
+    #[test]
+    fn build_config_omits_absent_software_version() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &["firecracker".to_owned()],
+            JoinMetadata::default(),
+        );
+        assert!(config.software_version.is_none());
+        assert!(config.tags.contains(&"firecracker".to_owned()));
     }
 }
