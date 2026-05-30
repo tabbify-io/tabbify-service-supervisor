@@ -568,6 +568,129 @@ async fn monitor_tick_respawns_dead_runner() {
     wait_unreachable(&client, Duration::from_secs(5)).await;
 }
 
+/// THE image_ref-preservation guard: a runner whose record carries a deployed
+/// `image_ref` (set by a prior successful `Deploy`) MUST come back on that SAME
+/// version after a respawn — otherwise a crashed deployed app would silently
+/// revert to the S3 manifest default, undoing the deploy.
+///
+/// This exercises the WHOLE respawn chain that carries the ref end-to-end:
+///   record.image_ref
+///     → `SharedRunnerConfig::spawn_spec_for` clones it into `SpawnSpec.image_ref`
+///     → `spawn_runner`'s `build_args` emits `--image-ref <ref>` on the runner argv
+///     → `spawn_runner` copies it onto the freshly written `RunnerHandle`
+/// driven through the real `tick()` → `reconcile_record` → `do_respawn` path
+/// (the exact code a live monitor pass runs), not a hand-rolled shortcut.
+///
+/// A future regression at ANY link (e.g. `spawn_spec_for` dropping the field, or
+/// `build_args`/`spawn_runner` no longer forwarding it) breaks this test.
+#[tokio::test]
+async fn monitor_tick_respawns_with_image_ref_preserved() {
+    /// The deployed image ref the respawn must preserve.
+    const DEPLOYED_REF: &str = "deployed-ref:v1";
+
+    let s3 = mock_s3(ON_REQUEST_MANIFEST).await;
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let runner_dir = tempfile::tempdir().expect("runner dir");
+    let sock_dir = tempfile::tempdir().expect("sock dir");
+    let sock_path = sock_dir.path().join(format!("{APP_UUID}.sock"));
+
+    // Spawn the original runner (a fresh spawn carries image_ref = None).
+    let spec = make_spec(&s3, &sock_path, data_dir.path());
+    let (handle, child) = spawn_runner(&spec, runner_dir.path())
+        .await
+        .expect("spawn_runner");
+    let original_pid = handle.pid;
+
+    // Cleanup guard: kill BOTH the original and whatever the monitor respawns.
+    let runner_dir_path = runner_dir.path().to_path_buf();
+    let uuid = APP_UUID.to_owned();
+    let _guard = scopeguard(move || {
+        force_kill(original_pid);
+        if let Ok(Some(h)) = RunnerHandle::load(&runner_dir_path, &uuid) {
+            if h.pid != original_pid {
+                force_kill(h.pid);
+            }
+        }
+    });
+
+    let client = ControlClient::new(&sock_path);
+
+    // The original runner becomes reachable.
+    let reply = wait_health(&client, Duration::from_secs(20)).await;
+    assert!(
+        matches!(reply, Reply::Health { ref state, .. } if state == "running"),
+        "original runner should be running, got {reply:?}"
+    );
+
+    // --- Stamp a deployed image_ref onto the on-disk record, exactly as a
+    // successful `Deploy{reff}` does (see orchestrator::api::deploy). The pid is
+    // left at the live original so the record describes the running process. ---
+    let mut deployed_record = RunnerHandle::load(runner_dir.path(), APP_UUID)
+        .expect("load record")
+        .expect("record present");
+    deployed_record.image_ref = Some(DEPLOYED_REF.to_owned());
+    deployed_record
+        .save(runner_dir.path())
+        .expect("persist deployed image_ref onto record");
+
+    // The shared config rebuilds the spec from that record on respawn. Assert the
+    // spec carries the ref forward (the first link: spawn_spec_for → SpawnSpec),
+    // so a regression here is pinned independently of the live spawn below.
+    let shared = make_shared(&s3, data_dir.path());
+    let respawn_spec = shared.spawn_spec_for(&deployed_record);
+    assert_eq!(
+        respawn_spec.image_ref.as_deref(),
+        Some(DEPLOYED_REF),
+        "spawn_spec_for must carry the record's image_ref into the SpawnSpec"
+    );
+
+    // --- SIMULATE A CRASH: drop the child handle, SIGKILL the pid, wait for the
+    // socket to die. ---
+    drop(child);
+    force_kill(original_pid);
+    let gone = wait_unreachable(&client, Duration::from_secs(10)).await;
+    assert!(gone, "killed runner should become unreachable");
+
+    // --- ONE MONITOR TICK → detect dead + respawn through the real path. ---
+    let orch = Orchestrator::new(shared, runner_dir.path().to_path_buf());
+    let respawned = orch.tick().await.expect("monitor tick");
+    assert!(
+        respawned.contains(&APP_UUID.to_owned()),
+        "tick must respawn the dead runner, got respawned: {respawned:?}"
+    );
+
+    // --- The respawned record carries a NEW pid AND the SAME image_ref. ---
+    let new_handle = wait_pid_changed(
+        runner_dir.path(),
+        APP_UUID,
+        original_pid,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_ne!(
+        new_handle.pid, original_pid,
+        "respawned runner must have a different pid"
+    );
+    assert_eq!(
+        new_handle.image_ref.as_deref(),
+        Some(DEPLOYED_REF),
+        "respawned runner MUST keep the deployed image_ref (not revert to None)"
+    );
+
+    // The respawned runner is reachable again (proving the --image-ref argv it
+    // was launched with is a valid, runnable invocation — not just a string the
+    // handle happens to carry).
+    let reply = wait_health(&client, Duration::from_secs(20)).await;
+    assert!(
+        matches!(reply, Reply::Health { ref state, .. } if state == "running"),
+        "respawned runner should be running, got {reply:?}"
+    );
+
+    // Clean up: shut the respawned runner down.
+    client.shutdown().await.ok();
+    wait_unreachable(&client, Duration::from_secs(5)).await;
+}
+
 // ── Task 2.5: re-adopt living runners on supervisor restart ──────────────────
 
 /// A second app UUID, used for the runner whose record is pre-seeded dead so
