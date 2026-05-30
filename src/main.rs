@@ -28,6 +28,17 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
 
+    // ── self-update subcommand (production self-update flow, spec §3-§6) ─────
+    // `supervisord self-update --to <ver>` is the SINGLE real self-update path:
+    // it fetches + sha256-verifies the release, probes the candidate out-of-band
+    // behind the 3-part gate, and on PASS swaps the symlinks + restarts (the
+    // next boot's self-watchdog confirms or reverts). It runs to completion and
+    // exits — it never falls through to the daemon boot below.
+    if let Some(tabbify_supervisor::config::Command::SelfUpdate { to }) = &config.command {
+        let code = run_self_update(to).await;
+        std::process::exit(code);
+    }
+
     // ── Probe entrypoint (self-update candidate, spec §4) ───────────────────
     // If `--check` is set, this process is an OUT-OF-BAND candidate: it joins
     // the mesh with a TRANSIENT identity, runs the 3-part health gate against
@@ -177,9 +188,96 @@ async fn main() -> anyhow::Result<()> {
     // above and never reaches here, so readiness is emitted only on real boot.
     tabbify_supervisor::readiness::notify_ready();
 
+    // ── Post-restart self-watchdog (spec §7) ────────────────────────────────
+    // If a prior `self-update` swap stamped a pending-confirm marker in VERSION,
+    // THIS boot is running an UNCONFIRMED binary. Spawn the audited watchdog
+    // over the stability window against the LIVE local control addr: healthy
+    // through the window -> clear the marker (confirm); failure -> roll the
+    // symlinks back to previous-good + restart. This is how the engine's
+    // watchdog/rollback actually runs in production. Skipped on `--no-mesh`
+    // (the bind addr is not self-connectable; self-update is a meshed-node
+    // concern). Best-effort: a watchdog spawn must never block serving.
+    if !config.no_mesh {
+        spawn_post_restart_watchdog(bind_addr);
+    }
+
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
+}
+
+/// Run the production `self-update --to <version>` flow and return the process
+/// exit code: 0 on a successful swap (or a no-op when already current), 1 on a
+/// fetch / gate / swap failure (so the NixOS `tabbify-update` oneshot reports
+/// the failure and leaves the live install untouched). Wires the REAL candidate
+/// probe (spawn `supervisord --check`) + systemctl restart seams.
+async fn run_self_update(to: &str) -> i32 {
+    use tabbify_supervisor::selfupdate::SelfUpdateConfig;
+    use tabbify_supervisor::selfupdate::run::{
+        SelfUpdateOutcome, production_candidate_probe, self_update_to,
+    };
+    use tabbify_supervisor::selfupdate::swap::production_restart_runner;
+
+    let cfg = SelfUpdateConfig::default();
+    let probe = production_candidate_probe();
+    let restart = production_restart_runner();
+
+    match self_update_to(to, &cfg, &probe, &restart).await {
+        Ok(SelfUpdateOutcome::AlreadyCurrent(v)) => {
+            tracing::info!(version = %v, "self-update: already current, nothing to do");
+            0
+        }
+        Ok(SelfUpdateOutcome::Swapped(v)) => {
+            tracing::info!(version = %v, "self-update: swapped + restart triggered (watchdog will confirm/revert)");
+            0
+        }
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "self-update failed; live install left untouched");
+            1
+        }
+    }
+}
+
+/// Spawn the post-restart self-watchdog if VERSION records a pending-confirm
+/// swap. The watchdog polls the live local `/health` + `/v1/about` over the
+/// stability window; on confirm it clears the marker, on failure it rolls back
+/// to previous-good + restarts. No-op (returns immediately) when there is no
+/// pending swap — the steady-state boot path.
+fn spawn_post_restart_watchdog(bind_addr: SocketAddr) {
+    use tabbify_supervisor::selfupdate::SelfUpdateConfig;
+    use tabbify_supervisor::selfupdate::confirm::{
+        confirm_or_revert, live_local_observe, pending_swap,
+    };
+    use tabbify_supervisor::selfupdate::swap::production_restart_runner;
+
+    let cfg = SelfUpdateConfig::default();
+    let Some(pending) = pending_swap(&cfg.install_dir) else {
+        return; // steady state: nothing to confirm
+    };
+    tracing::info!(version = %pending, "post-restart self-watchdog: confirming pending swap");
+
+    tokio::spawn(async move {
+        let restart = production_restart_runner();
+        let observe = live_local_observe(bind_addr);
+        // Poll every 2s through the stability window (default 45s < heartbeat).
+        let poll = std::time::Duration::from_secs(2);
+        match confirm_or_revert(
+            &cfg.install_dir,
+            &cfg.releases_dir,
+            cfg.stability_window,
+            poll,
+            observe,
+            &restart,
+        )
+        .await
+        {
+            Ok(None) => tracing::info!("self-update confirmed by watchdog"),
+            Ok(Some(rolled_back)) => {
+                tracing::warn!(%rolled_back, "self-update reverted by watchdog")
+            }
+            Err(e) => tracing::error!(error = %format!("{e:#}"), "post-restart watchdog error"),
+        }
+    });
 }
 
 /// Run the out-of-band candidate probe (`--check`, spec §4) and return the

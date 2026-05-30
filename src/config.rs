@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 /// Prod coordinator control-plane URL (baked default, contract §5).
@@ -87,6 +87,29 @@ pub struct Config {
     /// `docker` app on a host with a reachable Docker daemon).
     #[command(flatten)]
     pub docker: DockerConfig,
+
+    /// Optional subcommand. With NONE the binary runs as the daemon (the default
+    /// `supervisord` boot). With [`Command::SelfUpdate`] it runs the one-shot
+    /// production self-update flow and exits. Optional so the existing flat
+    /// invocation (`supervisord [--flags]`) and the `--check` candidate both
+    /// keep working unchanged.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Top-level subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Run the health-gated production self-update flow to `--to <version>` and
+    /// exit: fetch + sha256-verify the release, probe the candidate out-of-band
+    /// behind the 3-part gate, and on PASS swap the symlinks + restart (the next
+    /// boot's self-watchdog confirms or reverts). Replaces the legacy bash
+    /// fetch/probe/swap reimplementation in the NixOS `tabbify-update` unit.
+    SelfUpdate {
+        /// The target release version to update to, e.g. `v1.4.0`.
+        #[arg(long = "to", value_name = "VERSION")]
+        to: String,
+    },
 }
 
 /// Default firecracker binary (looked up on `$PATH`).
@@ -369,6 +392,32 @@ mod tests {
             cfg.mesh_identity_path(),
             PathBuf::from("/var/lib/tabbify/mesh-identity.json")
         );
+    }
+
+    #[test]
+    fn no_subcommand_runs_as_daemon() {
+        // The bare invocation (and `--check`) must leave `command` as None so the
+        // daemon / candidate paths are unchanged by adding the subcommand.
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert!(cfg.command.is_none());
+        let chk = Config::try_parse_from(["supervisord", "--check"]).unwrap();
+        assert!(chk.command.is_none());
+        assert!(chk.check_mode);
+    }
+
+    #[test]
+    fn parses_self_update_subcommand_with_to_version() {
+        let cfg = Config::try_parse_from(["supervisord", "self-update", "--to", "v1.4.0"]).unwrap();
+        match cfg.command {
+            Some(Command::SelfUpdate { to }) => assert_eq!(to, "v1.4.0"),
+            other => panic!("expected SelfUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_update_requires_to_version() {
+        // `self-update` with no `--to` is a usage error, not a silent no-op.
+        assert!(Config::try_parse_from(["supervisord", "self-update"]).is_err());
     }
 
     #[test]

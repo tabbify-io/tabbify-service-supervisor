@@ -132,6 +132,9 @@ pub async fn revert_to_previous(
         &VersionFile {
             current: previous.clone(),
             previous: remaining,
+            // A completed rollback IS a confirmed state — the rolled-back
+            // version is known-good, so drop any pending-confirm marker.
+            pending_confirm: None,
         },
     )
     .context("write VERSION after rollback")?;
@@ -312,6 +315,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -352,6 +356,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec![],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -417,6 +422,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -470,6 +476,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -532,6 +539,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -629,6 +637,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -677,6 +686,7 @@ mod tests {
             &VersionFile {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.5.0".into(), "v1.0.0".into()],
+                pending_confirm: None,
             },
         )
         .unwrap();

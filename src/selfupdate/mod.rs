@@ -20,9 +20,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod confirm;
 pub mod fetch;
 pub mod manifest;
 pub mod probe;
+pub mod run;
 pub mod swap;
 pub mod watchdog;
 

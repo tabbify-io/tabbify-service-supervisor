@@ -19,7 +19,7 @@ use crate::runtime::BoxFut;
 pub(crate) const SWAP_BINARIES: [&str; 2] = ["supervisord", "tabbify-runner"];
 
 /// How many previous-good versions the [`VersionFile`] keeps as rollback targets.
-const KEEP_PREVIOUS: usize = 3;
+pub(crate) const KEEP_PREVIOUS: usize = 3;
 
 /// systemd unit re-started after the symlinks are re-pointed. Single source of
 /// truth shared with the watchdog's rollback restart.
@@ -32,12 +32,35 @@ pub(crate) const SUPERVISOR_UNIT: &str = "tabbify-supervisor";
 pub type RestartRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
 
 /// The `/opt/tabbify/VERSION` ledger: the live version + previous-good history.
+///
+/// `pending_confirm` is the post-restart self-watchdog marker (spec §7): when a
+/// `self-update` swap re-points the symlinks it records the just-installed
+/// version here, so the NEXT normal supervisord boot knows it is running an
+/// UNCONFIRMED swap and must run the stability-window watchdog before clearing
+/// the marker (confirm) or rolling back (revert). It is absent on a steady-state
+/// install, so a ledger written by the bash bootstrap (no field) still parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionFile {
     /// The version the symlinks currently point at (`"v2.0.0"`).
     pub current: String,
     /// Previous-good versions, newest first (rollback targets).
     pub previous: Vec<String>,
+    /// Set by a `self-update` swap to the just-installed version; the next boot
+    /// runs the watchdog and clears it on confirm. Absent in steady state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_confirm: Option<String>,
+}
+
+impl Default for VersionFile {
+    /// An empty ledger (no current, no history, no pending swap) — the seed a
+    /// `read_version_file` falls back to when no `VERSION` exists yet.
+    fn default() -> Self {
+        Self {
+            current: String::new(),
+            previous: Vec::new(),
+            pending_confirm: None,
+        }
+    }
 }
 
 /// Whether `<version_dir>/<bin>` exists as a regular file (following symlinks)
@@ -104,6 +127,9 @@ pub fn read_version_file(install_dir: &Path) -> Result<VersionFile> {
 }
 
 /// Promote the old current into `previous` (capped at `keep`) and set `new`.
+///
+/// The returned ledger carries `pending_confirm = None`; callers that perform a
+/// `self-update` swap set the marker afterwards via [`mark_pending_confirm`].
 #[must_use]
 pub fn push_version(mut vf: VersionFile, new: &str, keep: usize) -> VersionFile {
     if !vf.current.is_empty() && vf.current != new {
@@ -111,6 +137,30 @@ pub fn push_version(mut vf: VersionFile, new: &str, keep: usize) -> VersionFile 
         vf.previous.truncate(keep);
     }
     vf.current = new.to_owned();
+    vf.pending_confirm = None;
+    vf
+}
+
+/// Stamp `version` as the post-restart confirm marker on a ledger (pure). The
+/// next normal boot reads this via [`take_pending_confirm`] and runs the
+/// stability-window watchdog before clearing it.
+#[must_use]
+pub fn mark_pending_confirm(mut vf: VersionFile, version: &str) -> VersionFile {
+    vf.pending_confirm = Some(version.to_owned());
+    vf
+}
+
+/// The pending-confirm marker, if the ledger records an unconfirmed self-update
+/// swap. `None` in steady state (pure read helper).
+#[must_use]
+pub fn pending_confirm_of(vf: &VersionFile) -> Option<&str> {
+    vf.pending_confirm.as_deref()
+}
+
+/// Clear the pending-confirm marker (pure), returning the confirmed ledger.
+#[must_use]
+pub fn clear_pending_confirm(mut vf: VersionFile) -> VersionFile {
+    vf.pending_confirm = None;
     vf
 }
 
@@ -159,10 +209,7 @@ pub async fn swap_to(
         repoint_symlink(install_dir, bin, &version_dir.join(bin))?;
     }
 
-    let current = read_version_file(install_dir).unwrap_or(VersionFile {
-        current: String::new(),
-        previous: Vec::new(),
-    });
+    let current = read_version_file(install_dir).unwrap_or_default();
     let next = push_version(current, version, KEEP_PREVIOUS);
     write_version_file(install_dir, &next)?;
 
@@ -250,6 +297,7 @@ mod tests {
         let vf = VersionFile {
             current: "v2.0.0".into(),
             previous: vec!["v1.0.0".into()],
+            pending_confirm: None,
         };
         write_version_file(install, &vf).unwrap();
 
@@ -265,6 +313,7 @@ mod tests {
         let before = VersionFile {
             current: "v1.0.0".into(),
             previous: vec![],
+            pending_confirm: None,
         };
         let after = push_version(before, "v2.0.0", 3);
         assert_eq!(after.current, "v2.0.0");
@@ -287,6 +336,7 @@ mod tests {
             &VersionFile {
                 current: "v1.0.0".into(),
                 previous: vec![],
+                pending_confirm: None,
             },
         )
         .unwrap();
@@ -335,5 +385,84 @@ mod tests {
             *calls,
             vec![vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]],
         );
+    }
+
+    // ── pending-confirm marker (post-restart self-watchdog, spec §7) ────────
+
+    /// A `self-update` swap stamps the just-installed version as the pending
+    /// marker; the next boot reads it via `pending_confirm_of`, then clears it.
+    #[test]
+    fn pending_confirm_round_trips_through_the_ledger() {
+        let vf = VersionFile {
+            current: "v2.0.0".into(),
+            previous: vec!["v1.0.0".into()],
+            pending_confirm: None,
+        };
+        // Steady state: no marker.
+        assert_eq!(pending_confirm_of(&vf), None);
+
+        // Mark it (what the swap path does after re-pointing the symlinks).
+        let marked = mark_pending_confirm(vf, "v2.0.0");
+        assert_eq!(pending_confirm_of(&marked), Some("v2.0.0"));
+
+        // Confirm it (what the next healthy boot does).
+        let confirmed = clear_pending_confirm(marked);
+        assert_eq!(pending_confirm_of(&confirmed), None);
+        // Clearing the marker leaves current + history untouched.
+        assert_eq!(confirmed.current, "v2.0.0");
+        assert_eq!(confirmed.previous, vec!["v1.0.0".to_owned()]);
+    }
+
+    /// The pending marker survives the on-disk round-trip (write -> read), and a
+    /// ledger written WITHOUT the field (e.g. by the legacy bash bootstrap)
+    /// still parses with `pending_confirm = None` thanks to `#[serde(default)]`.
+    #[test]
+    fn pending_confirm_persists_and_legacy_ledger_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+
+        write_version_file(
+            install,
+            &mark_pending_confirm(
+                VersionFile {
+                    current: "v2.0.0".into(),
+                    previous: vec!["v1.0.0".into()],
+                    pending_confirm: None,
+                },
+                "v2.0.0",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_version_file(install).unwrap().pending_confirm.as_deref(),
+            Some("v2.0.0"),
+        );
+
+        // A legacy VERSION with no `pending_confirm` key parses to None.
+        std::fs::write(
+            install.join("VERSION"),
+            r#"{"current":"v3.0.0","previous":[]}"#,
+        )
+        .unwrap();
+        let legacy = read_version_file(install).unwrap();
+        assert_eq!(legacy.current, "v3.0.0");
+        assert_eq!(legacy.pending_confirm, None);
+    }
+
+    /// `push_version` always returns a ledger with NO pending marker — the swap
+    /// path adds it explicitly afterwards, so the promotion helper stays the
+    /// single place that rotates history and never leaks a stale marker.
+    #[test]
+    fn push_version_clears_any_pending_marker() {
+        let before = mark_pending_confirm(
+            VersionFile {
+                current: "v1.0.0".into(),
+                previous: vec![],
+                pending_confirm: None,
+            },
+            "v1.0.0",
+        );
+        let after = push_version(before, "v2.0.0", 3);
+        assert_eq!(after.pending_confirm, None);
     }
 }
