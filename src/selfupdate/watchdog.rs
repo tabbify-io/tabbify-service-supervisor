@@ -1,7 +1,17 @@
-//! Post-swap watchdog (spec §7): a ~90s stability window (< coordinator
-//! heartbeat-timeout) polling /health + control Ping, crash-loop aware via
-//! restart.rs. On failure: re-point the symlink to previous-good + restart.
-//! Rollback touches ONLY the binary symlink — never data_dir / runner_dir.
+//! Post-swap watchdog (spec §7): a stability window held UNDER the coordinator
+//! heartbeat-timeout (default 45s < 60s — see
+//! [`super::DEFAULT_STABILITY_WINDOW`]) polling /health + control Ping,
+//! crash-loop aware via restart.rs. The window must close before the
+//! coordinator GC's a bad node from the roster, so it can never outrun the
+//! heartbeat-timeout.
+//!
+//! Revert is PROMPT: a crash / health-fail / no-pong observation on ANY poll
+//! tick reverts immediately ([`decide_revert`] checks failures before the
+//! window); only the all-healthy path waits for the window to elapse before
+//! committing [`RevertDecision::KeepNewVersion`].
+//!
+//! On failure: re-point the symlink to previous-good + restart. Rollback
+//! touches ONLY the binary symlink — never data_dir / runner_dir.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -22,7 +32,7 @@ pub struct WatchdogObservations {
     pub health_200: bool,
     /// Control `Cmd::Ping` returned `Reply::Pong` on the latest poll.
     pub pong: bool,
-    /// The ~90s stability window has fully elapsed.
+    /// The stability window (default 45s, < heartbeat-timeout) has elapsed.
     pub window_elapsed: bool,
     /// Restart/backoff state of the freshly-swapped supervisor (restart.rs).
     pub restart: RestartState,
@@ -158,6 +168,11 @@ pub async fn run_watchdog(
     mut observe: ObserveFn<'_>,
     restart: &RestartRunner,
 ) -> Result<Option<String>> {
+    // Floor the poll cadence so a misconfigured `poll_interval == 0` cannot turn
+    // the watch loop into a CPU-spinning busy-loop while still inside the
+    // window. The window is the safety bound for total wait time; this only
+    // bounds the per-tick wait.
+    let poll_interval = poll_interval.max(MIN_POLL_INTERVAL);
     let started = Instant::now();
     loop {
         let mut snapshot = observe().await;
@@ -174,6 +189,9 @@ pub async fn run_watchdog(
         }
     }
 }
+
+/// Per-poll floor so a `poll_interval` of zero cannot busy-loop the watch loop.
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -429,6 +447,144 @@ mod tests {
         assert_eq!(rolled_back, Some("v1.0.0".to_owned()));
         assert_eq!(read_version_file(install).unwrap().current, "v1.0.0");
         assert_eq!(calls.lock().unwrap().len(), 1, "rollback triggers one restart");
+    }
+
+    /// I3: a failing observation reverts PROMPTLY — on the very first poll tick
+    /// — and is NOT deferred to the end of the (long) stability window. With a
+    /// 90s window, if revert waited for window-elapse this test would hang /
+    /// not roll back; instead it must roll back after exactly ONE observation.
+    #[tokio::test]
+    async fn run_watchdog_reverts_on_first_failing_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage_release(&releases, ver);
+        }
+        for bin in SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+            },
+        )
+        .unwrap();
+
+        // Count how many times the watchdog sampled health before reverting.
+        let observations = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&observations);
+        let observe: ObserveFn<'_> = Box::new(move || {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                *counter.lock().unwrap() += 1;
+                WatchdogObservations {
+                    health_200: false, // failing from the very first tick
+                    pong: true,
+                    window_elapsed: false, // overwritten; window is NOT yet elapsed
+                    restart: RestartState::default(),
+                }
+            })
+        });
+
+        let (restart, calls) = recording_restart();
+        let rolled_back = run_watchdog(
+            install,
+            &releases,
+            // A window far larger than any test wall-clock: if the revert were
+            // gated on window-elapse, it could never fire here.
+            Duration::from_secs(90),
+            Duration::from_millis(1),
+            observe,
+            &restart,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rolled_back, Some("v1.0.0".to_owned()));
+        assert_eq!(
+            *observations.lock().unwrap(),
+            1,
+            "revert must fire on the FIRST failing observation, not wait for the window",
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one rollback restart");
+    }
+
+    /// A crash-loop seen on the first tick (mid-window) reverts immediately via
+    /// run_watchdog, mirroring the pure decide_revert crash-loop case.
+    #[tokio::test]
+    async fn run_watchdog_reverts_on_first_crash_loop_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage_release(&releases, ver);
+        }
+        for bin in SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+            },
+        )
+        .unwrap();
+
+        let observations = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&observations);
+        let observe: ObserveFn<'_> = Box::new(move || {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                *counter.lock().unwrap() += 1;
+                WatchdogObservations {
+                    health_200: true,
+                    pong: true,
+                    window_elapsed: false,
+                    restart: RestartState {
+                        consecutive_failures: 5, // >= crashloop threshold
+                        ..Default::default()
+                    },
+                }
+            })
+        });
+
+        let (restart, _calls) = recording_restart();
+        let rolled_back = run_watchdog(
+            install,
+            &releases,
+            Duration::from_secs(90),
+            Duration::from_millis(1),
+            observe,
+            &restart,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rolled_back, Some("v1.0.0".to_owned()));
+        assert_eq!(
+            *observations.lock().unwrap(),
+            1,
+            "crash-loop revert must fire on the first observation",
+        );
+    }
+
+    /// I3 constant invariant: the default stability window is held strictly
+    /// under the documented coordinator heartbeat-timeout, so a bad node is
+    /// reverted before the coordinator GC's it from the roster.
+    #[test]
+    fn default_stability_window_under_heartbeat_timeout() {
+        assert!(
+            super::super::DEFAULT_STABILITY_WINDOW < super::super::COORDINATOR_HEARTBEAT_TIMEOUT,
+            "stability window {:?} must be < heartbeat-timeout {:?}",
+            super::super::DEFAULT_STABILITY_WINDOW,
+            super::super::COORDINATOR_HEARTBEAT_TIMEOUT,
+        );
     }
 
     /// Resolve `<install>/<bin>` as a symlink and assert it does NOT dangle: the
