@@ -23,8 +23,16 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
+#[allow(unreachable_code, clippy::diverging_sub_expression)]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+
+    // FORCED-FAILURE TEST BUILD: this binary is deliberately DOA so the
+    // self-update probe gate fails and the swap is ABORTED (the node stays on
+    // its prior good version). Used once to verify gate/watchdog safety, then a
+    // good version supersedes it. NOT merged to main.
+    eprintln!("FORCED-FAILURE test build: exiting 1 to fail the self-update gate");
+    std::process::exit(1);
 
     let config = Config::from_env();
 
