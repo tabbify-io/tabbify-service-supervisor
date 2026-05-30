@@ -27,6 +27,28 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Config::from_env();
+
+    // ── Probe entrypoint (self-update candidate, spec §4) ───────────────────
+    // If `--check` is set, this process is an OUT-OF-BAND candidate: it joins
+    // the mesh with a TRANSIENT identity, runs the 3-part health gate against
+    // itself, and exits 0 (pass) / 1 (fail). It never claims the sticky ULA and
+    // never serves real traffic. This branch must come BEFORE any sticky-ULA
+    // join / orchestrator setup so the two modes are completely disjoint.
+    if config.check_mode {
+        let outcome = run_check_mode(&config).await;
+        match outcome {
+            tabbify_supervisor::selfupdate::probe::ProbeOutcome::Pass => {
+                tracing::info!("candidate gate PASSED");
+                std::process::exit(0);
+            }
+            tabbify_supervisor::selfupdate::probe::ProbeOutcome::Fail(reason) => {
+                tracing::error!(%reason, "candidate gate FAILED");
+                std::process::exit(1);
+            }
+        }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     tracing::info!(
         coordinator = %config.coordinator_url,
         s3 = %config.s3_base_url,
@@ -148,6 +170,128 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
+}
+
+/// Run the out-of-band candidate probe (`--check`, spec §4) and return the
+/// 3-part gate outcome. The candidate joins the mesh with a TRANSIENT identity
+/// (`candidate_identity_path`), binds an alternate ephemeral loopback control
+/// addr, serves the router, then gathers the three gate signals: joined mesh
+/// (membership Ok), `GET /health` 200, and control liveness (a router-level
+/// `/health` round-trip — the candidate has no per-app runners, so the plan
+/// folds pong into router liveness).
+///
+/// All of this is bounded by the self-update gate timeout. The candidate NEVER
+/// claims the sticky ULA: it joins with its own `candidate_identity_path`.
+async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::probe::ProbeOutcome {
+    use tabbify_supervisor::selfupdate::probe::{GateInputs, evaluate_gate};
+
+    let gate_timeout = tabbify_supervisor::selfupdate::SelfUpdateConfig::default().gate_timeout;
+    let started = std::time::Instant::now();
+
+    // The candidate always binds a loopback ephemeral addr for its self-check —
+    // it must NOT contend for the sticky ULA / production bind.
+    let bind_addr = config
+        .bind
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+
+    // 1. Join the mesh with the TRANSIENT identity (separate file, OS-ephemeral
+    //    WG port via the joiner default). On a host without root/TUN this fails
+    //    and the gate fails closed.
+    let capability_tags = tabbify_supervisor::capability_tags::capability_tags(
+        tabbify_supervisor::firecracker::kvm_available(),
+        tabbify_supervisor::docker::docker_available(),
+    );
+    let joined_mesh = if config.no_mesh {
+        true
+    } else {
+        match MeshMembership::join(
+            &config.coordinator_url,
+            &config.display_name,
+            &capability_tags,
+            tabbify_supervisor::mesh::JoinMetadata {
+                identity_path: config.candidate_identity_path.clone(),
+                software_version: Some(
+                    tabbify_supervisor::version::binary_version().to_owned(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(_membership) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "candidate failed to join mesh with transient identity");
+                false
+            }
+        }
+    };
+
+    // 2 & 3. Bring up the router on the alt bind and self-check `/health`.
+    let runner_dir = config.data_dir.join("candidate-runners");
+    if let Err(e) = std::fs::create_dir_all(&runner_dir) {
+        return tabbify_supervisor::selfupdate::probe::ProbeOutcome::Fail(format!(
+            "candidate runner dir: {e}"
+        ));
+    }
+    let shared = SharedRunnerConfig {
+        runner_bin: default_runner_bin(),
+        s3_base_url: config.s3_base_url.clone(),
+        data_dir: config.data_dir.clone(),
+        parent: None,
+        no_mesh: true,
+    };
+    let orchestrator = Orchestrator::new(shared, runner_dir);
+    let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
+    let state = SupervisorState::new(orchestrator, fetcher, "candidate".to_owned(), bind_addr.ip().to_string())
+        .with_version(tabbify_supervisor::version::binary_version().to_owned());
+    let app = router(state);
+
+    let (health_200, pong) = match TcpListener::bind(bind_addr).await {
+        Ok(listener) => {
+            let local = listener.local_addr().ok();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let result = match local {
+                Some(addr) => self_check(addr, gate_timeout).await,
+                None => (false, false),
+            };
+            server.abort();
+            result
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %bind_addr, "candidate failed to bind control addr");
+            (false, false)
+        }
+    };
+
+    let inputs = GateInputs {
+        joined_mesh,
+        health_200,
+        pong,
+        elapsed_secs: started.elapsed().as_secs(),
+    };
+    evaluate_gate(inputs, gate_timeout.as_secs())
+}
+
+/// Self-check the candidate's router: `GET /health` must return 200 (gate part
+/// 2), and a second round-trip stands in for the control liveness (gate part 3,
+/// router-level since the candidate has no per-app runners). Bounded by
+/// `timeout`.
+async fn self_check(addr: SocketAddr, timeout: std::time::Duration) -> (bool, bool) {
+    let url = format!("http://{addr}/health");
+    let client = reqwest::Client::new();
+    let probe = |c: reqwest::Client, u: String| async move {
+        matches!(c.get(&u).send().await, Ok(r) if r.status().is_success())
+    };
+    let both = async {
+        let health_200 = probe(client.clone(), url.clone()).await;
+        let pong = health_200 && probe(client.clone(), url.clone()).await;
+        (health_200, pong)
+    };
+    tokio::time::timeout(timeout, both)
+        .await
+        .unwrap_or((false, false))
 }
 
 fn init_tracing() {

@@ -19,6 +19,7 @@ use std::time::Duration;
 
 pub mod fetch;
 pub mod manifest;
+pub mod probe;
 
 /// Default release base URL (same public bucket as the app artifacts). SU-3
 /// promotes this to a dedicated `--release-base-url` flag / const in `config`.

@@ -16,6 +16,10 @@ pub const DEFAULT_COORDINATOR_URL: &str = "http://3.124.69.92:8888";
 /// Anonymous public-read base for app artifacts (contract §2).
 pub const DEFAULT_S3_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
 
+/// Anonymous public-read base for versioned release binaries (self-update,
+/// spec §3): the supervisor fetches `<base>/supervisor/v<VER>/<arch>/...`.
+pub const DEFAULT_RELEASE_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
+
 /// Default control/serve bind addr. `[::]:8730` so loopback tests work without
 /// a live mesh; in production the binary rebinds to `[my_ula]:8730` once the
 /// joiner reports its ULA (unless `--bind` is set explicitly).
@@ -59,6 +63,24 @@ pub struct Config {
     /// S3 base URL for anonymous artifact fetch (overridable for tests).
     #[arg(long, env = "SUPERVISOR_S3_BASE_URL", default_value = DEFAULT_S3_BASE_URL)]
     pub s3_base_url: String,
+
+    /// Versioned release base URL the self-update engine fetches binaries from
+    /// (`<base>/supervisor/v<VER>/<arch>/...`). Overridable for tests.
+    #[arg(long, env = "SUPERVISOR_RELEASE_BASE_URL", default_value = DEFAULT_RELEASE_BASE_URL)]
+    pub release_base_url: String,
+
+    /// Probe entrypoint: when set, this process is an out-of-band self-update
+    /// CANDIDATE. It joins the mesh with a TRANSIENT identity
+    /// (`--candidate-identity-path`), runs the 3-part health gate against
+    /// itself, and exits 0 (gate passed) or 1 (gate failed) — it never claims
+    /// the sticky ULA and never serves traffic.
+    #[arg(long = "check", env = "SUPERVISOR_CHECK", default_value_t = false)]
+    pub check_mode: bool,
+
+    /// Transient identity file the candidate (`--check`) joins with — NEVER the
+    /// sticky `mesh-identity.json`. Ignored unless `--check` is set.
+    #[arg(long, env = "SUPERVISOR_CANDIDATE_IDENTITY")]
+    pub candidate_identity_path: Option<PathBuf>,
 
     /// Pre-register an app by UUID at boot (repeatable). `always_on` apps spawn
     /// immediately; `on_request` apps are fetched lazily on first request.
