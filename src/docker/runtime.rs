@@ -56,7 +56,15 @@ pub(super) type ExitWatcher = Arc<dyn Fn() -> BoxFut<'static, ExitReason> + Send
 
 /// Command-runner seam for [`DockerRuntime::shutdown`] and the push/pull
 /// paths: given a list of `docker` sub-command arguments (e.g.
-/// `["stop", "tbf-abc-0"]`), run the command and return whether it succeeded.
+/// `["stop", "tbf-abc-0"]`), run the command and return `Ok(())` on success
+/// or `Err(diagnostic)` carrying the captured stderr on failure.
+///
+/// The `Err(String)` payload is the load-bearing change: a `docker push`
+/// failure surfaces the registry's stderr (e.g. `unauthorized:
+/// authentication required`) instead of being collapsed to a bare `false`,
+/// so callers can bail with the real diagnostic. Best-effort consumers that
+/// only need success/failure (shutdown, oras pull/push) map `Err` → their
+/// existing `bool` contract via `.is_ok()`.
 ///
 /// Production: the real `docker` binary via [`tokio::process::Command`].
 /// Tests: an injected closure that records which commands were issued without
@@ -65,7 +73,8 @@ pub(super) type ExitWatcher = Arc<dyn Fn() -> BoxFut<'static, ExitReason> + Send
 ///
 /// Re-exported at the module level so [`crate::build_backend`] can reuse the
 /// same seam for the host-docker build backend.
-pub(crate) type CommandRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
+pub(crate) type CommandRunner =
+    Arc<dyn Fn(Vec<String>) -> BoxFut<'static, Result<(), String>> + Send + Sync>;
 
 /// Image-inspect runner seam for the W2 build-cache check: given a list of
 /// `docker image inspect` arguments, run the command and return `true` iff
@@ -80,28 +89,72 @@ pub(super) type InspectRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool>
 /// Tests: an injected closure that records calls without a real daemon.
 pub(super) type TarLoadRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
 
-/// Build the production [`CommandRunner`]: spawns `<docker_bin> <args>` and
-/// returns `true` iff the process exits 0. Best-effort: a spawn failure or
-/// non-zero exit both yield `false` (the shutdown path logs and continues).
+/// Build the production [`CommandRunner`]: spawns `<docker_bin> <args>`,
+/// captures stderr, and returns `Ok(())` iff the process exits 0. On a
+/// non-zero exit the captured stderr (trimmed) is returned in `Err` so a
+/// `docker push` failure surfaces the registry diagnostic; a spawn failure
+/// returns the OS error in `Err`.
 ///
 /// Re-exported at the module level so [`crate::build_backend`] can construct
 /// a production runner for the host-docker build backend.
 pub(crate) fn production_command_runner(docker_bin: String) -> CommandRunner {
     Arc::new(move |args: Vec<String>| {
         let docker_bin = docker_bin.clone();
-        let fut: BoxFut<'static, bool> = Box::pin(async move {
+        let fut: BoxFut<'static, Result<(), String>> = Box::pin(async move {
             match Command::new(&docker_bin)
                 .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .stderr(Stdio::piped())
+                .output()
                 .await
             {
-                Ok(s) => s.success(),
-                Err(_) => false,
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stderr = stderr.trim();
+                    let code = out
+                        .status
+                        .code()
+                        .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+                    let argv = args.join(" ");
+                    Err(if stderr.is_empty() {
+                        format!("`{docker_bin} {argv}` exited with status {code}")
+                    } else {
+                        format!("`{docker_bin} {argv}` exited with status {code}: {stderr}")
+                    })
+                }
+                Err(e) => Err(format!(
+                    "failed to spawn `{docker_bin} {}`: {e}",
+                    args.join(" ")
+                )),
             }
         });
+        fut
+    })
+}
+
+/// Build a production [`InspectRunner`]: wraps the Result-typed
+/// [`production_command_runner`] and maps `Ok(())` → `true` (image present),
+/// `Err(_)` → `false`. The W2 cache check only needs presence/absence, so the
+/// stderr is intentionally dropped here.
+fn production_inspect_runner(docker_bin: String) -> InspectRunner {
+    let inner = production_command_runner(docker_bin);
+    Arc::new(move |args: Vec<String>| {
+        let inner = inner.clone();
+        let fut: BoxFut<'static, bool> = Box::pin(async move { (inner)(args).await.is_ok() });
+        fut
+    })
+}
+
+/// Build a production [`TarLoadRunner`]: wraps the Result-typed
+/// [`production_command_runner`] and maps `Ok(())` → `true` (load succeeded),
+/// `Err(_)` → `false` (fall through to the W2 build/cache path).
+fn production_tar_load_runner(docker_bin: String) -> TarLoadRunner {
+    let inner = production_command_runner(docker_bin);
+    Arc::new(move |args: Vec<String>| {
+        let inner = inner.clone();
+        let fut: BoxFut<'static, bool> = Box::pin(async move { (inner)(args).await.is_ok() });
         fut
     })
 }
@@ -235,17 +288,18 @@ impl DockerRuntime {
         // it before the registry-pull and W2 cache check. After a successful
         // load the image `tbf-img-<uuid>-v<N>` exists, so all later steps
         // short-circuit via the W2 inspect.
-        let tar_load_runner =
-            production_command_runner(cfg.docker_bin.clone()) as TarLoadRunner;
+        let cmd_runner = production_command_runner(cfg.docker_bin.clone());
         let app_dir = context.parent().unwrap_or(context);
         let tar_path = app_dir.join("image.tar.gz");
         if tar_path.is_file() {
             let tar_str = tar_path.to_string_lossy().into_owned();
-            let loaded = (tar_load_runner)(load_args(&tar_str)).await;
-            if loaded {
-                tracing::info!(tag = %vtag, path = %tar_str, "docker image loaded from prebuilt tar (warm start)");
-            } else {
-                tracing::warn!(tag = %vtag, path = %tar_str, "docker load failed — falling through to registry pull / W2 build path");
+            match (cmd_runner)(load_args(&tar_str)).await {
+                Ok(()) => {
+                    tracing::info!(tag = %vtag, path = %tar_str, "docker image loaded from prebuilt tar (warm start)");
+                }
+                Err(e) => {
+                    tracing::warn!(tag = %vtag, path = %tar_str, error = %e, "docker load failed — falling through to registry pull / W2 build path");
+                }
             }
         }
 
@@ -302,7 +356,13 @@ impl DockerRuntime {
         .await
         .context("docker run")?;
 
-        let inspect_runner = production_command_runner(cfg.docker_bin.clone());
+        // The `inspect_runner` / `tar_load_runner` fields back the
+        // `should_skip_build` / `load_image_tar` test seams (the production
+        // launch path checks the W2 cache inline via `run_docker_check` and
+        // loads the W3 tar above), so wrap the Result-typed command runner as
+        // the bool-typed seams those methods expect.
+        let inspect_runner = production_inspect_runner(cfg.docker_bin.clone());
+        let tar_load_runner = production_tar_load_runner(cfg.docker_bin.clone());
         let me = Self {
             container: container.clone(),
             docker_bin: cfg.docker_bin.clone(),
@@ -334,7 +394,7 @@ impl DockerRuntime {
         // tests that only care about the probe are unaffected.
         let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
         // Default shutdown runner: no-op (records nothing, returns true).
-        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
         // Default inspect runner: no-op (image absent by default, won't be called in health tests).
         let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
         // Default tar-load runner: no-op (no tar in health tests).
@@ -364,7 +424,7 @@ impl DockerRuntime {
         probe: TcpProbe,
         exit_watcher: ExitWatcher,
     ) -> Self {
-        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
         let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
         let tar_load_runner: TarLoadRunner = Arc::new(|_args| Box::pin(async { false }));
         Self {
@@ -429,7 +489,7 @@ impl DockerRuntime {
     ) -> Self {
         let probe: TcpProbe = Arc::new(|_addr: &str| true);
         let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
-        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
         let tar_load_runner: TarLoadRunner = Arc::new(|_args| Box::pin(async { false }));
         Self {
             container: container.to_owned(),
@@ -461,7 +521,7 @@ impl DockerRuntime {
     ) -> Self {
         let probe: TcpProbe = Arc::new(|_addr: &str| true);
         let exit_watcher: ExitWatcher = Arc::new(|| Box::pin(std::future::pending()));
-        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+        let shutdown_runner: CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
         let inspect_runner: InspectRunner = Arc::new(|_args| Box::pin(async { false }));
         Self {
             container: container.to_owned(),
@@ -588,18 +648,18 @@ impl AppRuntime for DockerRuntime {
         let runner = self.shutdown_runner.clone();
         Box::pin(async move {
             // Step 1: graceful stop (SIGTERM → SIGKILL). Best-effort.
-            let stop_ok = (runner)(stop_args(&container)).await;
-            if !stop_ok {
+            if let Err(e) = (runner)(stop_args(&container)).await {
                 tracing::warn!(
                     container = %container,
+                    error = %e,
                     "docker stop returned non-zero or failed (container may already be gone)"
                 );
             }
             // Step 2: remove the container record. Best-effort.
-            let rm_ok = (runner)(rm_args(&container)).await;
-            if !rm_ok {
+            if let Err(e) = (runner)(rm_args(&container)).await {
                 tracing::warn!(
                     container = %container,
+                    error = %e,
                     "docker rm failed during shutdown (container may already be removed)"
                 );
             }

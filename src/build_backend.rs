@@ -67,9 +67,9 @@ pub trait BuildBackend: Send + Sync {
 /// [`BuildBackend::build`] call: it wires `docker tag <local_tag> <registry_ref>`
 /// then `docker push <registry_ref>` via the injectable [`CommandRunner`].
 ///
-/// Returns `true` only if BOTH commands succeed; `false` on any failure (the
-/// caller should treat a push failure as a non-fatal warning — the image was
-/// built successfully, just not yet distributed to the registry).
+/// Returns `Ok(())` only if BOTH commands succeed; `Err(stderr)` on any
+/// failure, carrying the captured registry diagnostic so the caller can bail
+/// with the real reason instead of just the image ref.
 ///
 /// Wraps [`crate::docker::push_image`] for direct use by the build-runner
 /// orchestration layer (P3.4) so it has a single import point in this module.
@@ -86,7 +86,7 @@ pub(crate) async fn push_to_registry(
     local_tag: &str,
     registry_ref: &str,
     runner: &CommandRunner,
-) -> bool {
+) -> Result<(), String> {
     push_image(docker_bin, local_tag, registry_ref, runner).await
 }
 
@@ -130,16 +130,14 @@ impl BuildBackend for HostDockerBackend {
     fn build<'a>(&'a self, context_dir: &'a Path, tag: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let args = build_dir_args(tag, context_dir);
-            let ok = (self.runner)(args).await;
-            if ok {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "`{} build -t {} {}` failed",
+            match (self.runner)(args).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!(
+                    "`{} build -t {} {}` failed: {e}",
                     self.docker_bin,
                     tag,
                     context_dir.display()
-                ))
+                )),
             }
         })
     }
@@ -190,7 +188,7 @@ mod tests {
 
         let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
             issued2.lock().unwrap().push(args);
-            let fut: BoxFut<'static, bool> = Box::pin(async { true });
+            let fut: BoxFut<'static, Result<(), String>> = Box::pin(async { Ok(()) });
             fut
         });
 
@@ -214,12 +212,14 @@ mod tests {
         );
     }
 
-    /// When the injected runner returns false (build failed), `build` must
+    /// When the injected runner returns `Err` (build failed), `build` must
     /// return an `Err`.
     #[tokio::test]
     async fn host_docker_backend_build_returns_err_on_runner_failure() {
-        let runner: CommandRunner =
-            Arc::new(|_args: Vec<String>| Box::pin(async { false }) as BoxFut<'static, bool>);
+        let runner: CommandRunner = Arc::new(|_args: Vec<String>| {
+            Box::pin(async { Err("docker build failed".to_owned()) })
+                as BoxFut<'static, Result<(), String>>
+        });
 
         let backend = HostDockerBackend::with_runner("docker".to_owned(), runner);
         let dir = PathBuf::from("/work/repo");
@@ -235,7 +235,7 @@ mod tests {
     /// object-safety of the trait.
     #[tokio::test]
     async fn host_docker_backend_build_works_via_trait_object() {
-        let runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+        let runner: CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
         let backend: Box<dyn BuildBackend> =
             Box::new(HostDockerBackend::with_runner("docker".to_owned(), runner));
 
@@ -248,7 +248,7 @@ mod tests {
     /// the trait is usable in the orchestration pattern.
     #[tokio::test]
     async fn host_docker_backend_build_works_via_arc_trait_object() {
-        let runner: CommandRunner = Arc::new(|_args| Box::pin(async { true }));
+        let runner: CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
         let backend: Arc<dyn BuildBackend> =
             Arc::new(HostDockerBackend::with_runner("docker".to_owned(), runner));
 
@@ -263,7 +263,7 @@ mod tests {
     // ---- push_to_registry (docker push seam) ---------------------------------
 
     /// `push_to_registry` must issue `["tag", <local_tag>, <reff>]` then
-    /// `["push", <reff>]` in order and return `true` when the runner succeeds.
+    /// `["push", <reff>]` in order and return `Ok(())` when the runner succeeds.
     #[tokio::test]
     async fn push_to_registry_issues_tag_then_push_on_success() {
         let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -271,11 +271,11 @@ mod tests {
 
         let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
             issued2.lock().unwrap().push(args);
-            let fut: BoxFut<'static, bool> = Box::pin(async { true });
+            let fut: BoxFut<'static, Result<(), String>> = Box::pin(async { Ok(()) });
             fut
         });
 
-        let ok = push_to_registry(
+        let result = push_to_registry(
             "docker",
             "tbf-img-uuid-v3",
             "[fd5a::1]:5000/acme/app:sha",
@@ -283,7 +283,10 @@ mod tests {
         )
         .await;
 
-        assert!(ok, "runner success → push_to_registry must return true");
+        assert!(
+            result.is_ok(),
+            "runner success → push_to_registry must return Ok"
+        );
 
         let cmds = issued.lock().unwrap();
         assert_eq!(cmds.len(), 2, "must issue exactly 2 commands (tag + push)");
@@ -303,20 +306,21 @@ mod tests {
         );
     }
 
-    /// When the tag step fails, `push_to_registry` must return `false` without
-    /// issuing the push command.
+    /// When the tag step fails, `push_to_registry` must return `Err` carrying
+    /// the runner's stderr without issuing the push command.
     #[tokio::test]
-    async fn push_to_registry_returns_false_on_tag_failure() {
+    async fn push_to_registry_returns_err_on_tag_failure() {
         let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let cc = call_count.clone();
 
         let runner: CommandRunner = Arc::new(move |_args| {
             *cc.lock().unwrap() += 1;
-            let fut: BoxFut<'static, bool> = Box::pin(async { false });
+            let fut: BoxFut<'static, Result<(), String>> =
+                Box::pin(async { Err("tag failed".to_owned()) });
             fut
         });
 
-        let ok = push_to_registry(
+        let result = push_to_registry(
             "docker",
             "tbf-img-uuid-v4",
             "[fd5a::1]:5000/acme/app:sha",
@@ -324,7 +328,11 @@ mod tests {
         )
         .await;
 
-        assert!(!ok, "tag failure → push_to_registry must return false");
+        let err = result.expect_err("tag failure → push_to_registry must return Err");
+        assert!(
+            err.contains("tag failed"),
+            "Err must surface the runner stderr; got: {err}"
+        );
         assert_eq!(
             *call_count.lock().unwrap(),
             1,

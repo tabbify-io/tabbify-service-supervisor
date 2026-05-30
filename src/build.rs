@@ -370,7 +370,7 @@ mod tests {
         let called2 = called.clone();
         let runner: CommandRunner = Arc::new(move |_| {
             *called2.lock().unwrap() = true;
-            Box::pin(async { false })
+            Box::pin(async { Err("oras pull failed".to_owned()) })
         });
 
         let rt = build_runtime_with_oras(
@@ -418,7 +418,7 @@ mod tests {
             Box::pin(async move {
                 std::fs::create_dir_all(&dir).ok();
                 std::fs::write(dir.join("app.wasm"), HELLO_WASM).unwrap();
-                true
+                Ok(())
             })
         });
 
@@ -460,7 +460,8 @@ mod tests {
         let cfg = DockerConfig::default();
 
         // Runner always fails.
-        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+        let runner: CommandRunner =
+            Arc::new(|_| Box::pin(async { Err("oras pull failed".to_owned()) }));
 
         let rt = build_runtime_with_oras(
             None,
@@ -520,7 +521,8 @@ mod tests {
         let mut fetched = docker_fetched(None);
         fetched.wasm = Bytes::from_static(HELLO_WASM);
         let cfg = DockerConfig::default();
-        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+        let runner: CommandRunner =
+            Arc::new(|_| Box::pin(async { Err("oras pull failed".to_owned()) }));
 
         let rt = build_runtime_with_oras(
             Some("wasm-http"),
@@ -542,7 +544,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fetched = wasm_fetched(None, Bytes::from_static(HELLO_WASM));
         let cfg = DockerConfig::default();
-        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+        let runner: CommandRunner =
+            Arc::new(|_| Box::pin(async { Err("oras pull failed".to_owned()) }));
 
         let rt = build_runtime_with_oras(
             None,

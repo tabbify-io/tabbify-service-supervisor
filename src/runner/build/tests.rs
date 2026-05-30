@@ -43,25 +43,31 @@
     }
 
     /// A [`CommandRunner`] that records every argv list it receives and returns
-    /// `true` (success) for all calls.
+    /// `Ok(())` (success) for all calls.
     fn record_runner(store: Arc<Mutex<Vec<Vec<String>>>>) -> CommandRunner {
         Arc::new(move |args: Vec<String>| {
             store.lock().unwrap().push(args);
-            let fut: BoxFut<'static, bool> = Box::pin(async { true });
+            let fut: BoxFut<'static, Result<(), String>> = Box::pin(async { Ok(()) });
             fut
         })
     }
 
-    /// A [`CommandRunner`] that always returns `false` (failure).
+    /// A [`CommandRunner`] that always returns `Err` (failure), carrying a
+    /// stderr-like diagnostic.
     fn fail_runner() -> CommandRunner {
-        Arc::new(|_args: Vec<String>| Box::pin(async { false }) as BoxFut<'static, bool>)
+        Arc::new(|_args: Vec<String>| {
+            Box::pin(async { Err("command failed".to_owned()) })
+                as BoxFut<'static, Result<(), String>>
+        })
     }
 
-    /// A no-op [`CommandRunner`] (returns `true`, records nothing). Used for the
+    /// A no-op [`CommandRunner`] (returns `Ok(())`, records nothing). Used for the
     /// runner the active build path ignores (e.g. the oras runner on a docker
     /// build, or the docker push runner on a wasm build).
     fn noop_runner() -> CommandRunner {
-        Arc::new(|_args: Vec<String>| Box::pin(async { true }) as BoxFut<'static, bool>)
+        Arc::new(|_args: Vec<String>| {
+            Box::pin(async { Ok(()) }) as BoxFut<'static, Result<(), String>>
+        })
     }
 
     /// A no-op [`BuildCmdRunner`] (returns `true`, runs nothing). Used as the

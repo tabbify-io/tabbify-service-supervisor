@@ -40,7 +40,9 @@ pub fn oras_pull_args(reff: &str, out_dir: &str) -> Vec<String> {
 /// `runner`. Returns `true` iff the command exits successfully.
 ///
 /// The injectable [`CommandRunner`] (same type as in [`crate::docker`]) lets
-/// tests record the exact argv without invoking a real `oras` binary.
+/// tests record the exact argv without invoking a real `oras` binary. The
+/// runner's `Err(stderr)` is mapped to `false`: a failed pull is non-fatal
+/// (the caller falls back to the S3 bytes), so only success/failure matters.
 pub async fn oras_pull(oras_bin: &str, reff: &str, out_dir: &Path, runner: &CommandRunner) -> bool {
     let out_dir_str = out_dir.to_string_lossy().into_owned();
     // Prepend the binary name as the first element so a production runner
@@ -49,7 +51,7 @@ pub async fn oras_pull(oras_bin: &str, reff: &str, out_dir: &Path, runner: &Comm
     // symmetry and so a recording test runner can assert the full argv.
     let _ = oras_bin; // oras_bin is used by the production_oras_runner, not the seam args
     let args = oras_pull_args(reff, &out_dir_str);
-    (runner)(args).await
+    (runner)(args).await.is_ok()
 }
 
 /// Build the `oras copy --to-oci-layout` argument list (sans the leading binary
@@ -133,7 +135,7 @@ pub async fn oras_push(
 ) -> bool {
     let _ = oras_bin; // oras_bin is used by production_oras_runner, not the seam args
     let args = oras_push_args(reff, artifact_path);
-    (runner)(args).await
+    (runner)(args).await.is_ok()
 }
 
 /// Scan `dir` for the first `*.wasm` file and return its path.
@@ -156,7 +158,9 @@ pub fn find_wasm(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Build a production [`CommandRunner`] for `oras`: spawns
-/// `<oras_bin> <args>` and returns `true` iff the process exits 0.
+/// `<oras_bin> <args>`, captures stderr, and returns `Ok(())` iff the process
+/// exits 0; on a non-zero exit the captured stderr (trimmed) is returned in
+/// `Err`, and a spawn failure returns the OS error in `Err`.
 ///
 /// Re-uses the same `Arc<dyn Fn(…) -> BoxFut<…>>` shape as
 /// [`crate::docker::production_command_runner`] so the oras and docker seams
@@ -169,17 +173,34 @@ pub fn production_oras_runner(oras_bin: String) -> CommandRunner {
 
     Arc::new(move |args: Vec<String>| {
         let oras_bin = oras_bin.clone();
-        let fut: BoxFut<'static, bool> = Box::pin(async move {
+        let fut: BoxFut<'static, Result<(), String>> = Box::pin(async move {
             match Command::new(&oras_bin)
                 .args(&args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
+                .stderr(std::process::Stdio::piped())
+                .output()
                 .await
             {
-                Ok(s) => s.success(),
-                Err(_) => false,
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stderr = stderr.trim();
+                    let code = out
+                        .status
+                        .code()
+                        .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+                    let argv = args.join(" ");
+                    Err(if stderr.is_empty() {
+                        format!("`{oras_bin} {argv}` exited with status {code}")
+                    } else {
+                        format!("`{oras_bin} {argv}` exited with status {code}: {stderr}")
+                    })
+                }
+                Err(e) => Err(format!(
+                    "failed to spawn `{oras_bin} {}`: {e}",
+                    args.join(" ")
+                )),
             }
         });
         fut
@@ -318,7 +339,7 @@ mod tests {
         let cap2 = captured.clone();
         let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
             cap2.lock().unwrap().push(args);
-            Box::pin(async { true })
+            Box::pin(async { Ok(()) })
         });
 
         let reff = "[fd5a::1]:5000/myapp:latest";
@@ -343,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn oras_pull_returns_false_on_runner_failure() {
         use std::sync::Arc;
-        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { Err("oras failed".to_owned()) }));
         let ok = oras_pull("oras", "reg/app:v1", Path::new("/tmp/x"), &runner).await;
         assert!(!ok);
     }
@@ -407,7 +428,7 @@ mod tests {
         let cap2 = captured.clone();
         let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
             cap2.lock().unwrap().push(args);
-            Box::pin(async { true })
+            Box::pin(async { Ok(()) })
         });
 
         let reff = "[fd5a::1]:5000/myapp:latest";
@@ -437,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn oras_push_returns_false_on_runner_failure() {
         use std::sync::Arc;
-        let runner: CommandRunner = Arc::new(|_| Box::pin(async { false }));
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { Err("oras failed".to_owned()) }));
         let ok = oras_push("oras", "reg/app:v1", "/tmp/x/app.wasm", &runner).await;
         assert!(!ok);
     }

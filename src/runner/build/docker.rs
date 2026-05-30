@@ -38,10 +38,11 @@ pub(super) async fn run_docker_build(
         .await
         .context("build image")?;
 
-    // Tag + push to the mesh registry.
-    let pushed = crate::docker::push_image(docker_bin, &local_tag, &reff, push_runner).await;
-    if !pushed {
-        anyhow::bail!("push to registry failed: {reff}");
+    // Tag + push to the mesh registry. On failure bail with the captured
+    // registry stderr (e.g. `unauthorized: authentication required`) so the
+    // diagnostic survives instead of being collapsed to just the image ref.
+    if let Err(e) = crate::docker::push_image(docker_bin, &local_tag, &reff, push_runner).await {
+        anyhow::bail!("push to registry failed: {reff}: {e}");
     }
 
     Ok(ArtifactRef { reff, digest: None })

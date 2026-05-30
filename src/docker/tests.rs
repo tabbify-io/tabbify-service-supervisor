@@ -328,12 +328,11 @@ async fn docker_shutdown_issues_stop_then_rm() {
     let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let issued2 = issued.clone();
 
-    let shutdown_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |args: Vec<String>| {
-            issued2.lock().unwrap().push(args);
-            let fut: BoxFut<'static, bool> = Box::pin(async { true });
-            fut
-        });
+    let shutdown_runner: super::CommandRunner = Arc::new(move |args: Vec<String>| {
+        issued2.lock().unwrap().push(args);
+        let fut: BoxFut<'static, Result<(), String>> = Box::pin(async { Ok(()) });
+        fut
+    });
 
     let rt = super::DockerRuntime::with_shutdown_for_test(
         "http://127.0.0.1:49999",
@@ -372,13 +371,13 @@ async fn docker_shutdown_is_idempotent() {
     let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let cc = call_count.clone();
 
-    let shutdown_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |_args: Vec<String>| {
-            *cc.lock().unwrap() += 1;
-            // Simulate "no such container" on the second pass by returning false.
-            let fut: BoxFut<'static, bool> = Box::pin(async { false });
-            fut
-        });
+    let shutdown_runner: super::CommandRunner = Arc::new(move |_args: Vec<String>| {
+        *cc.lock().unwrap() += 1;
+        // Simulate "no such container" by returning Err (best-effort shutdown).
+        let fut: BoxFut<'static, Result<(), String>> =
+            Box::pin(async { Err("no such container".to_owned()) });
+        fut
+    });
 
     let rt = super::DockerRuntime::with_shutdown_for_test(
         "http://127.0.0.1:49999",
@@ -409,12 +408,11 @@ async fn docker_shutdown_via_trait_object_issues_stop_then_rm() {
     let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let issued2 = issued.clone();
 
-    let shutdown_runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |args: Vec<String>| {
-            issued2.lock().unwrap().push(args);
-            let fut: BoxFut<'static, bool> = Box::pin(async { true });
-            fut
-        });
+    let shutdown_runner: super::CommandRunner = Arc::new(move |args: Vec<String>| {
+        issued2.lock().unwrap().push(args);
+        let fut: BoxFut<'static, Result<(), String>> = Box::pin(async { Ok(()) });
+        fut
+    });
 
     let rt: Arc<dyn AppRuntime> = Arc::new(super::DockerRuntime::with_shutdown_for_test(
         "http://127.0.0.1:49999",
@@ -672,17 +670,15 @@ fn pull_decision_uses_ref_when_present_else_skips() {
 /// return `true`.
 #[tokio::test]
 async fn pull_and_tag_issues_pull_then_tag_on_success() {
-    use crate::runtime::BoxFut;
     use std::sync::{Arc, Mutex};
 
     let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let issued2 = issued.clone();
 
-    let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |args: Vec<String>| {
-            issued2.lock().unwrap().push(args);
-            Box::pin(async { true })
-        });
+    let runner: super::CommandRunner = Arc::new(move |args: Vec<String>| {
+        issued2.lock().unwrap().push(args);
+        Box::pin(async { Ok(()) })
+    });
 
     let ok = super::pull_and_tag_for_test(
         "docker",
@@ -716,17 +712,15 @@ async fn pull_and_tag_issues_pull_then_tag_on_success() {
 /// NOT issue the tag command.
 #[tokio::test]
 async fn pull_and_tag_returns_false_and_skips_tag_on_pull_failure() {
-    use crate::runtime::BoxFut;
     use std::sync::{Arc, Mutex};
 
     let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let cc = call_count.clone();
 
-    let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |_args: Vec<String>| {
-            *cc.lock().unwrap() += 1;
-            Box::pin(async { false }) // pull fails
-        });
+    let runner: super::CommandRunner = Arc::new(move |_args: Vec<String>| {
+        *cc.lock().unwrap() += 1;
+        Box::pin(async { Err("pull failed".to_owned()) }) // pull fails
+    });
 
     let ok = super::pull_and_tag_for_test(
         "docker",
@@ -751,19 +745,17 @@ async fn pull_and_tag_returns_false_and_skips_tag_on_pull_failure() {
 /// return `true`.
 #[tokio::test]
 async fn push_image_issues_tag_then_push_on_success() {
-    use crate::runtime::BoxFut;
     use std::sync::{Arc, Mutex};
 
     let issued: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let issued2 = issued.clone();
 
-    let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |args: Vec<String>| {
-            issued2.lock().unwrap().push(args);
-            Box::pin(async { true })
-        });
+    let runner: super::CommandRunner = Arc::new(move |args: Vec<String>| {
+        issued2.lock().unwrap().push(args);
+        Box::pin(async { Ok(()) })
+    });
 
-    let ok = super::push_image_for_test(
+    let result = super::push_image_for_test(
         "docker",
         "tbf-img-uuid-v1",
         "[fd5a::1]:5000/acme/app:sha",
@@ -771,7 +763,7 @@ async fn push_image_issues_tag_then_push_on_success() {
     )
     .await;
 
-    assert!(ok, "both tag + push succeed → must return true");
+    assert!(result.is_ok(), "both tag + push succeed → must return Ok");
 
     let cmds = issued.lock().unwrap();
     assert_eq!(cmds.len(), 2, "must issue exactly 2 commands (tag + push)");
@@ -791,23 +783,21 @@ async fn push_image_issues_tag_then_push_on_success() {
     );
 }
 
-/// When the runner fails on the tag step, `push_image` must return `false`
+/// When the runner fails on the tag step, `push_image` must return `Err`
 /// and NOT issue the push command.
 #[tokio::test]
-async fn push_image_returns_false_and_skips_push_on_tag_failure() {
-    use crate::runtime::BoxFut;
+async fn push_image_returns_err_and_skips_push_on_tag_failure() {
     use std::sync::{Arc, Mutex};
 
     let call_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let cc = call_count.clone();
 
-    let runner: Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync> =
-        Arc::new(move |_args: Vec<String>| {
-            *cc.lock().unwrap() += 1;
-            Box::pin(async { false }) // tag fails
-        });
+    let runner: super::CommandRunner = Arc::new(move |_args: Vec<String>| {
+        *cc.lock().unwrap() += 1;
+        Box::pin(async { Err("tag failed".to_owned()) }) // tag fails
+    });
 
-    let ok = super::push_image_for_test(
+    let result = super::push_image_for_test(
         "docker",
         "tbf-img-uuid-v2",
         "[fd5a::1]:5000/acme/app:sha",
@@ -815,10 +805,122 @@ async fn push_image_returns_false_and_skips_push_on_tag_failure() {
     )
     .await;
 
-    assert!(!ok, "tag fails → must return false");
+    assert!(result.is_err(), "tag fails → must return Err");
     assert_eq!(
         *call_count.lock().unwrap(),
         1,
         "must issue only the tag command (push must NOT be called on tag failure)"
+    );
+}
+
+/// When the push step fails, `push_image` must surface the runner's exact
+/// stderr text in the returned `Err` (so the build runner can bail with the
+/// real registry diagnostic instead of just the image ref). The tag step
+/// succeeds; the push step returns `Err("unauthorized: authentication
+/// required")`, and that exact text must appear in the propagated error.
+#[tokio::test]
+async fn push_image_surfaces_push_stderr_in_err() {
+    use crate::runtime::BoxFut;
+    use std::sync::Arc;
+
+    let runner: super::CommandRunner = Arc::new(move |args: Vec<String>| {
+        // tag succeeds; push fails with a registry auth error.
+        let fut: BoxFut<'static, Result<(), String>> =
+            if args.first().map(String::as_str) == Some("push") {
+                Box::pin(async { Err("unauthorized: authentication required".to_owned()) })
+            } else {
+                Box::pin(async { Ok(()) })
+            };
+        fut
+    });
+
+    let result = super::push_image_for_test(
+        "docker",
+        "tbf-img-uuid-v9",
+        "[fd5a::1]:5000/acme/app:sha",
+        &runner,
+    )
+    .await;
+
+    let err = result.expect_err("push failure → push_image must return Err");
+    assert!(
+        err.contains("unauthorized: authentication required"),
+        "push_image Err must surface the runner's exact stderr; got: {err}"
+    );
+}
+
+/// The build runner's docker path must bail with the registry stderr (not just
+/// the image ref) when `push_image` fails — confirming the diagnostic survives
+/// all the way to the `run_docker_build` caller.
+#[tokio::test]
+async fn run_docker_build_bails_with_push_stderr() {
+    use crate::build_backend::HostDockerBackend;
+    use crate::git::GitRun;
+    use crate::runner::build::{BuildJob, BuildKind, run_build};
+    use crate::runtime::BoxFut;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Clone creates the src dir + a Dockerfile so the docker path proceeds.
+    let git: GitRun = Arc::new(move |args: Vec<String>, _env| {
+        let dest = args.last().cloned().unwrap_or_default();
+        Box::pin(async move {
+            std::fs::create_dir_all(&dest).ok();
+            std::fs::write(format!("{dest}/Dockerfile"), "FROM scratch\n").unwrap();
+            Ok(())
+        })
+    });
+
+    // Build backend succeeds (image built locally).
+    let build_runner: super::CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
+    let backend = HostDockerBackend::with_runner("docker".to_owned(), build_runner);
+
+    // Push runner: tag succeeds, push fails with the auth stderr.
+    let push_runner: super::CommandRunner = Arc::new(|args: Vec<String>| {
+        let fut: BoxFut<'static, Result<(), String>> =
+            if args.first().map(String::as_str) == Some("push") {
+                Box::pin(async { Err("unauthorized: authentication required".to_owned()) })
+            } else {
+                Box::pin(async { Ok(()) })
+            };
+        fut
+    });
+
+    let oras_runner: super::CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
+    let build_cmd_runner: crate::runner::build::BuildCmdRunner =
+        Arc::new(|_cmd, _cwd| Box::pin(async { true }));
+
+    let job = BuildJob {
+        repo_url: "https://github.com/acme/app".into(),
+        git_ref: "abc123".into(),
+        tenant: "acme".into(),
+        app_uuid: "u".into(),
+        registry_ula: "[fd5a::1]:5000".into(),
+        clone_token: None,
+        push_token: None,
+        build_kind: BuildKind::Docker,
+        build_cmd: None,
+        artifact_path: None,
+    };
+
+    let err = run_build(
+        &job,
+        &backend,
+        &git,
+        &push_runner,
+        "docker",
+        &oras_runner,
+        &build_cmd_runner,
+        "oras",
+        dir.path(),
+    )
+    .await
+    .expect_err("push failure → run_build must bail")
+    .to_string();
+
+    assert!(
+        err.contains("unauthorized: authentication required"),
+        "run_build must bail with the registry stderr, not just the ref; got: {err}"
     );
 }

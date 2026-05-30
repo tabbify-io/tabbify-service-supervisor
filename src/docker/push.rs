@@ -20,18 +20,19 @@ use super::runtime::CommandRunner;
 /// W2 / build path).
 ///
 /// Uses the injectable [`CommandRunner`] so tests can record the issued
-/// commands without a real Docker daemon.
+/// commands without a real Docker daemon. The runner's `Err(stderr)` is mapped
+/// to `false` here: a failed registry pull is non-fatal (the caller falls
+/// through to the W2 / build path), so only success/failure matters.
 pub(crate) async fn pull_and_tag(
     _docker_bin: &str,
     reff: &str,
     vtag: &str,
     runner: &CommandRunner,
 ) -> bool {
-    let pull_ok = (runner)(pull_args(reff)).await;
-    if !pull_ok {
+    if (runner)(pull_args(reff)).await.is_err() {
         return false;
     }
-    (runner)(tag_args(reff, vtag)).await
+    (runner)(tag_args(reff, vtag)).await.is_ok()
 }
 
 /// Tag `local_tag` as `reff` and push `reff` to the mesh OCI registry.
@@ -41,10 +42,11 @@ pub(crate) async fn pull_and_tag(
 /// aliases it as the registry ref, and pushes it so other supervisors can
 /// pull it.
 ///
-/// Returns `true` only if BOTH `docker tag <local_tag> <reff>` AND
-/// `docker push <reff>` succeed; `false` on any failure (the caller should
-/// treat a push failure as a non-fatal warning — the image was built
-/// locally, just not yet distributed).
+/// Returns `Ok(())` only if BOTH `docker tag <local_tag> <reff>` AND
+/// `docker push <reff>` succeed; `Err(stderr)` on any failure, carrying the
+/// captured registry diagnostic (e.g. `unauthorized: authentication
+/// required`) so the build runner can bail with the real reason instead of
+/// just the image ref.
 ///
 /// Uses the injectable [`CommandRunner`] so tests can record the issued
 /// commands without a real Docker daemon.
@@ -56,10 +58,7 @@ pub(crate) async fn push_image(
     local_tag: &str,
     reff: &str,
     runner: &CommandRunner,
-) -> bool {
-    let tag_ok = (runner)(tag_args(local_tag, reff)).await;
-    if !tag_ok {
-        return false;
-    }
+) -> Result<(), String> {
+    (runner)(tag_args(local_tag, reff)).await?;
     (runner)(push_args(reff)).await
 }
