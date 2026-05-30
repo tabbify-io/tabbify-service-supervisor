@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+#[cfg(test)]
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -93,6 +95,13 @@ fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
 /// concurrently-hosted firecracker apps don't collide on tap devices/links.
 static VM_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Probe type: given a `host:port` string returns `true` iff the guest app is
+/// reachable. Production `health()` does a real HTTP GET to `guest_base`; this
+/// injectable seam lets unit tests fake the result so no real microVM is
+/// needed. Mirrors `DockerRuntime`'s `TcpProbe`.
+#[cfg(test)]
+type TcpProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// A booted Firecracker microVM hosting one app. Owns the firecracker child
 /// process + the host tap device; [`Drop`] tears both down.
 pub struct FirecrackerRuntime {
@@ -104,6 +113,11 @@ pub struct FirecrackerRuntime {
     /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
     guest_base: String,
     client: reqwest::Client,
+    /// Test-only injectable reachability probe. Production leaves this `None`
+    /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
+    /// closure via [`Self::with_probe_for_test`] so no real microVM is needed.
+    #[cfg(test)]
+    probe: Option<TcpProbe>,
 }
 
 impl FirecrackerRuntime {
@@ -188,6 +202,8 @@ impl FirecrackerRuntime {
             api_sock: api_sock.clone(),
             guest_base,
             client: reqwest::Client::new(),
+            #[cfg(test)]
+            probe: None,
         };
 
         // Configure + boot the VM, then wait for the guest app. On any
@@ -351,6 +367,8 @@ impl FirecrackerRuntime {
             api_sock: api_sock.clone(),
             guest_base,
             client: reqwest::Client::new(),
+            #[cfg(test)]
+            probe: None,
         };
 
         // Wait for the API socket, then load the snapshot (resume_vm=true).
@@ -556,6 +574,27 @@ impl FirecrackerRuntime {
             }
         }
     }
+
+    /// Build a `FirecrackerRuntime` with an injectable reachability probe for
+    /// unit tests. `guest_base` is `http://<guest_ip>:<port>` (the proxy target
+    /// base); `probe` is the reachability check that `health()` will call
+    /// instead of the real HTTP GET.
+    ///
+    /// There is no live child or tap here — `child` is `None` and `tap_name`
+    /// is a sentinel — so `health()` can be exercised without a real microVM.
+    /// This constructor is `#[cfg(test)]`-only so it never surfaces in
+    /// production code (mirrors `DockerRuntime::with_probe_for_test`).
+    #[cfg(test)]
+    pub fn with_probe_for_test(guest_base: &str, probe: TcpProbe) -> Self {
+        Self {
+            child: None,
+            tap_name: "fc-tap-test".to_owned(),
+            api_sock: PathBuf::from("/tmp/firecracker-test.sock"),
+            guest_base: guest_base.to_owned(),
+            client: reqwest::Client::new(),
+            probe: Some(probe),
+        }
+    }
 }
 
 impl AppRuntime for FirecrackerRuntime {
@@ -565,6 +604,26 @@ impl AppRuntime for FirecrackerRuntime {
     }
 
     fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+        // Test seam: when an injectable probe is present (set only by
+        // `with_probe_for_test`), use it instead of a real HTTP GET so health
+        // can be exercised without a live microVM. The probe receives the
+        // `host:port` (with the `http://` scheme stripped), mirroring
+        // `DockerRuntime::health`.
+        #[cfg(test)]
+        if let Some(probe) = self.probe.clone() {
+            let hp = self
+                .guest_base
+                .trim_start_matches("http://")
+                .to_owned();
+            return Box::pin(async move {
+                if (probe)(&hp) {
+                    RuntimeHealth::Serving
+                } else {
+                    RuntimeHealth::Unavailable(format!("guest {hp} unreachable (probe)"))
+                }
+            });
+        }
+
         // The app is healthy iff its guest HTTP server answers (any status).
         Box::pin(async move {
             match self
