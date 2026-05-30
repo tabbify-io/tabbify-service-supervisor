@@ -28,16 +28,27 @@ pub mod run;
 pub mod swap;
 pub mod watchdog;
 
-/// Default release base URL (same public bucket as the app artifacts). The
-/// self-update fetch engine ([`SelfUpdateConfig::fetcher`]) is its only reader;
-/// it will become operator-overridable once a live consumer is wired in.
+/// Default release base URL (same public bucket as the app artifacts).
+/// Overridable via `TABBIFY_RELEASE_BASE_URL` so an operator / NixOS unit can
+/// point the engine at the node's release bucket (the versioned-S3 layout is
+/// `<base>/supervisor/v<VER>/<arch>/{supervisord,tabbify-runner}` + a sibling
+/// `supervisor/latest` manifest).
 const DEFAULT_RELEASE_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
 
-/// Default install dir holding the live binary symlinks + `VERSION`.
+/// Env var overriding [`DEFAULT_RELEASE_BASE_URL`].
+const ENV_RELEASE_BASE_URL: &str = "TABBIFY_RELEASE_BASE_URL";
+
+/// Default install dir holding the live binary symlinks + `VERSION`. Overridable
+/// via `TABBIFY_INSTALL_DIR` (the releases dir + candidate identity default
+/// under it).
 const DEFAULT_INSTALL_DIR: &str = "/opt/tabbify";
 
-/// Default dir under which each fetched version is staged (`v<VER>/`).
-const DEFAULT_RELEASES_DIR: &str = "/opt/tabbify/releases";
+/// Env var overriding [`DEFAULT_INSTALL_DIR`].
+const ENV_INSTALL_DIR: &str = "TABBIFY_INSTALL_DIR";
+
+/// Env var overriding the staging dir (default `<install_dir>/releases`), under
+/// which each fetched version lands as `v<VER>/{supervisord,tabbify-runner}`.
+const ENV_RELEASES_DIR: &str = "TABBIFY_RELEASES_DIR";
 
 /// Coordinator heartbeat-timeout: how long the coordinator waits before it
 /// garbage-collects a silent node from the mesh roster. Every self-update
@@ -97,14 +108,45 @@ pub struct SelfUpdateConfig {
 }
 
 impl Default for SelfUpdateConfig {
+    /// Build the engine config, honouring the `TABBIFY_RELEASE_BASE_URL`,
+    /// `TABBIFY_INSTALL_DIR`, and `TABBIFY_RELEASES_DIR` env overrides so the
+    /// NixOS `tabbify-update` unit (different release bucket + install layout)
+    /// can drive the binary without changing the code. With no env set the
+    /// baked `/opt/tabbify` + public-bucket defaults apply.
     fn default() -> Self {
+        Self::from_locations(
+            std::env::var(ENV_RELEASE_BASE_URL).ok(),
+            std::env::var(ENV_INSTALL_DIR).ok(),
+            std::env::var(ENV_RELEASES_DIR).ok(),
+        )
+    }
+}
+
+impl SelfUpdateConfig {
+    /// Pure derivation of the layout fields from the three optional env values
+    /// (release base URL, install dir, releases dir), so the override logic is
+    /// unit-testable without mutating the process environment:
+    /// - install dir defaults to `/opt/tabbify`,
+    /// - releases dir defaults to `<install_dir>/releases`,
+    /// - the candidate identity always lives under the install dir,
+    /// - the release base URL defaults to the public app bucket.
+    #[must_use]
+    fn from_locations(
+        release_base_url: Option<String>,
+        install_dir: Option<String>,
+        releases_dir: Option<String>,
+    ) -> Self {
+        let install_dir =
+            install_dir.map_or_else(|| PathBuf::from(DEFAULT_INSTALL_DIR), PathBuf::from);
+        let releases_dir =
+            releases_dir.map_or_else(|| install_dir.join("releases"), PathBuf::from);
         Self {
-            release_base_url: DEFAULT_RELEASE_BASE_URL.to_owned(),
+            release_base_url: release_base_url
+                .unwrap_or_else(|| DEFAULT_RELEASE_BASE_URL.to_owned()),
             arch: std::env::consts::ARCH.to_owned(),
-            releases_dir: PathBuf::from(DEFAULT_RELEASES_DIR),
-            install_dir: PathBuf::from(DEFAULT_INSTALL_DIR),
-            candidate_identity_path: PathBuf::from(DEFAULT_INSTALL_DIR)
-                .join("candidate-identity.json"),
+            releases_dir,
+            candidate_identity_path: install_dir.join("candidate-identity.json"),
+            install_dir,
             gate_timeout: DEFAULT_GATE_TIMEOUT,
             stability_window: DEFAULT_STABILITY_WINDOW,
         }
@@ -140,6 +182,54 @@ mod tests {
             DEFAULT_GATE_TIMEOUT < COORDINATOR_HEARTBEAT_TIMEOUT,
             "gate timeout {DEFAULT_GATE_TIMEOUT:?} must be < heartbeat-timeout \
              {COORDINATOR_HEARTBEAT_TIMEOUT:?}",
+        );
+    }
+
+    /// The env-override derivation: with all three values supplied the engine
+    /// targets the operator's bucket + install layout, with the releases dir +
+    /// candidate identity rooted under the install dir.
+    #[test]
+    fn from_locations_honours_overrides() {
+        let cfg = SelfUpdateConfig::from_locations(
+            Some("https://tabbify-releases-leo.s3.eu-central-1.amazonaws.com".to_owned()),
+            Some("/opt/tabbify".to_owned()),
+            Some("/opt/tabbify/releases".to_owned()),
+        );
+        assert_eq!(
+            cfg.release_base_url,
+            "https://tabbify-releases-leo.s3.eu-central-1.amazonaws.com"
+        );
+        assert_eq!(cfg.install_dir, PathBuf::from("/opt/tabbify"));
+        assert_eq!(cfg.releases_dir, PathBuf::from("/opt/tabbify/releases"));
+        assert_eq!(
+            cfg.candidate_identity_path,
+            PathBuf::from("/opt/tabbify/candidate-identity.json")
+        );
+    }
+
+    /// With nothing set the baked defaults apply, and the releases dir + the
+    /// candidate identity derive under the install dir.
+    #[test]
+    fn from_locations_defaults_when_unset() {
+        let cfg = SelfUpdateConfig::from_locations(None, None, None);
+        assert_eq!(cfg.release_base_url, DEFAULT_RELEASE_BASE_URL);
+        assert_eq!(cfg.install_dir, PathBuf::from(DEFAULT_INSTALL_DIR));
+        assert_eq!(cfg.releases_dir, PathBuf::from(DEFAULT_INSTALL_DIR).join("releases"));
+        assert_eq!(
+            cfg.candidate_identity_path,
+            PathBuf::from(DEFAULT_INSTALL_DIR).join("candidate-identity.json"),
+        );
+    }
+
+    /// A custom install dir relocates the derived releases dir + candidate
+    /// identity under it (the releases-dir override still wins when present).
+    #[test]
+    fn from_locations_derives_releases_dir_under_custom_install_dir() {
+        let cfg = SelfUpdateConfig::from_locations(None, Some("/srv/tabbify".to_owned()), None);
+        assert_eq!(cfg.releases_dir, PathBuf::from("/srv/tabbify/releases"));
+        assert_eq!(
+            cfg.candidate_identity_path,
+            PathBuf::from("/srv/tabbify/candidate-identity.json"),
         );
     }
 
