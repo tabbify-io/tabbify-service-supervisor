@@ -20,6 +20,7 @@ use std::time::Duration;
 pub mod fetch;
 pub mod manifest;
 pub mod probe;
+pub mod swap;
 
 /// Default release base URL (same public bucket as the app artifacts). The
 /// self-update fetch engine ([`SelfUpdateConfig::fetcher`]) is its only reader;

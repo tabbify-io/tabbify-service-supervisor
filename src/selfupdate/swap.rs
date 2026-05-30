@@ -1,0 +1,200 @@
+//! Health-gated atomic swap (spec §5): re-point the binary symlinks + write the
+//! VERSION ledger atomically, then trigger a unit restart. The swap touches
+//! ONLY symlinks + VERSION — never data_dir / runner_dir / mesh-identity.json.
+
+use std::os::unix::fs::symlink;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+
+use crate::runtime::BoxFut;
+
+/// The two binaries whose symlinks the swap re-points.
+const SWAP_BINARIES: [&str; 2] = ["supervisord", "tabbify-runner"];
+
+/// How many previous-good versions the [`VersionFile`] keeps as rollback targets.
+const KEEP_PREVIOUS: usize = 3;
+
+/// systemd unit re-started after the symlinks are re-pointed.
+const SUPERVISOR_UNIT: &str = "tabbify-supervisor";
+
+/// Restart-trigger seam: given `systemctl` arguments (e.g.
+/// `["restart", "tabbify-supervisor"]`), run the command and return whether it
+/// succeeded. Production: the real `systemctl` via [`production_restart_runner`].
+/// Tests: an injected no-op closure so no real unit is poked.
+pub type RestartRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, bool> + Send + Sync>;
+
+/// The `/opt/tabbify/VERSION` ledger: the live version + previous-good history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionFile {
+    /// The version the symlinks currently point at (`"v2.0.0"`).
+    pub current: String,
+    /// Previous-good versions, newest first (rollback targets).
+    pub previous: Vec<String>,
+}
+
+/// Atomically point `<install_dir>/<name>` at `target` (overwriting any prior
+/// symlink): create a temp symlink alongside, then `rename` over the live one.
+///
+/// # Errors
+/// A filesystem error creating the temp symlink or renaming it into place.
+pub fn repoint_symlink(install_dir: &Path, name: &str, target: &Path) -> Result<()> {
+    let link = install_dir.join(name);
+    let tmp = install_dir.join(format!(".{name}.swap"));
+    let _ = std::fs::remove_file(&tmp);
+    symlink(target, &tmp).with_context(|| format!("symlink {tmp:?} -> {target:?}"))?;
+    std::fs::rename(&tmp, &link).with_context(|| format!("rename {tmp:?} -> {link:?}"))?;
+    Ok(())
+}
+
+/// Atomically write the VERSION ledger (tempfile + rename).
+///
+/// # Errors
+/// A serialisation or filesystem error.
+pub fn write_version_file(install_dir: &Path, vf: &VersionFile) -> Result<()> {
+    let path = install_dir.join("VERSION");
+    let tmp = install_dir.join(".VERSION.swap");
+    let json = serde_json::to_string_pretty(vf).context("serialize VERSION")?;
+    std::fs::write(&tmp, json).with_context(|| format!("write {tmp:?}"))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
+    Ok(())
+}
+
+/// Read the VERSION ledger (errors if absent / malformed).
+///
+/// # Errors
+/// The file is missing or its JSON does not parse as a [`VersionFile`].
+pub fn read_version_file(install_dir: &Path) -> Result<VersionFile> {
+    let path = install_dir.join("VERSION");
+    let json = std::fs::read_to_string(&path).with_context(|| format!("read {path:?}"))?;
+    serde_json::from_str(&json).with_context(|| format!("parse {path:?}"))
+}
+
+/// Promote the old current into `previous` (capped at `keep`) and set `new`.
+#[must_use]
+pub fn push_version(mut vf: VersionFile, new: &str, keep: usize) -> VersionFile {
+    if !vf.current.is_empty() && vf.current != new {
+        vf.previous.insert(0, vf.current.clone());
+        vf.previous.truncate(keep);
+    }
+    vf.current = new.to_owned();
+    vf
+}
+
+/// Build the production [`RestartRunner`]: spawns `systemctl <args>` and returns
+/// `true` iff the process exits 0. A spawn failure or non-zero exit yields
+/// `false` (the swap path logs and lets the watchdog catch a stuck unit).
+#[must_use]
+pub fn production_restart_runner() -> RestartRunner {
+    Arc::new(move |args: Vec<String>| {
+        let fut: BoxFut<'static, bool> = Box::pin(async move {
+            match Command::new("systemctl")
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+            {
+                Ok(s) => s.success(),
+                Err(_) => false,
+            }
+        });
+        fut
+    })
+}
+
+/// Health-gated atomic swap to `version` (staged under `version_dir`): re-point
+/// the `supervisord` + `tabbify-runner` symlinks under `install_dir`, promote
+/// the prior version into the VERSION ledger's `previous` list, then trigger a
+/// unit restart via `restart`.
+///
+/// Touches ONLY the binary symlinks + VERSION — never `data_dir` / `runner_dir`
+/// / `mesh-identity.json` (spec invariant #2). The full process restart (not an
+/// in-process hot-swap) is what re-loads the mesh fabric (spec invariant #1).
+///
+/// # Errors
+/// A symlink re-point or VERSION write failure. A failed restart trigger is NOT
+/// fatal here — the post-swap watchdog observes liveness and rolls back.
+pub async fn swap_to(
+    version_dir: &Path,
+    version: &str,
+    install_dir: &Path,
+    restart: &RestartRunner,
+) -> Result<()> {
+    for bin in SWAP_BINARIES {
+        repoint_symlink(install_dir, bin, &version_dir.join(bin))?;
+    }
+
+    let current = read_version_file(install_dir).unwrap_or(VersionFile {
+        current: String::new(),
+        previous: Vec::new(),
+    });
+    let next = push_version(current, version, KEEP_PREVIOUS);
+    write_version_file(install_dir, &next)?;
+
+    if !restart(vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]).await {
+        tracing::warn!(unit = SUPERVISOR_UNIT, "restart trigger reported failure");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// repoint_symlink atomically points <install>/supervisord at the version
+    /// dir's binary, overwriting any pre-existing symlink.
+    #[test]
+    fn repoint_symlink_points_at_versioned_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let v1 = install.join("releases/v1.0.0");
+        let v2 = install.join("releases/v2.0.0");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v1.join("supervisord"), b"v1").unwrap();
+        std::fs::write(v2.join("supervisord"), b"v2").unwrap();
+
+        repoint_symlink(install, "supervisord", &v1.join("supervisord")).unwrap();
+        assert_eq!(std::fs::read(install.join("supervisord")).unwrap(), b"v1");
+
+        // Re-point to v2 — must overwrite, not error.
+        repoint_symlink(install, "supervisord", &v2.join("supervisord")).unwrap();
+        assert_eq!(std::fs::read(install.join("supervisord")).unwrap(), b"v2");
+    }
+
+    /// write_version_file atomically writes VERSION and keeps the previous list.
+    #[test]
+    fn write_version_file_records_current_and_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let vf = VersionFile {
+            current: "v2.0.0".into(),
+            previous: vec!["v1.0.0".into()],
+        };
+        write_version_file(install, &vf).unwrap();
+
+        let loaded = read_version_file(install).unwrap();
+        assert_eq!(loaded.current, "v2.0.0");
+        assert_eq!(loaded.previous, vec!["v1.0.0".to_owned()]);
+    }
+
+    /// push_version derives the next VersionFile: old current becomes the head
+    /// of previous (capped at N), new current is set.
+    #[test]
+    fn push_version_promotes_old_current_into_previous() {
+        let before = VersionFile {
+            current: "v1.0.0".into(),
+            previous: vec![],
+        };
+        let after = push_version(before, "v2.0.0", 3);
+        assert_eq!(after.current, "v2.0.0");
+        assert_eq!(after.previous, vec!["v1.0.0".to_owned()]);
+    }
+}
