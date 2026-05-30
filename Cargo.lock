@@ -2978,6 +2978,7 @@ dependencies = [
  "bytes",
  "clap",
  "dashmap",
+ "hex",
  "http",
  "http-body-util",
  "libc",

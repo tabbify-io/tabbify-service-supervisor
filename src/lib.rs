@@ -30,6 +30,8 @@
 //!   own ULA + a unix-socket control plane.
 //! - [`mesh`] — mesh join wiring (contract §5).
 //! - [`api`] — axum control HTTP API (contract §5).
+//! - [`selfupdate`] — health-gated self-update engine: versioned fetch +
+//!   sha256 verify, out-of-band probe, atomic symlink swap, watchdog rollback.
 
 pub mod api;
 pub mod app_ula;
@@ -50,6 +52,7 @@ pub mod oras;
 pub mod orchestrator;
 pub mod runner;
 pub mod runtime;
+pub mod selfupdate;
 pub mod version;
 
 pub use config::Config;
