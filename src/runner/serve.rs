@@ -354,15 +354,43 @@ impl RunnerServe {
     }
 }
 
+/// Per-uuid path for a runner's persistent WireGuard keypair, under `data_dir`.
+///
+/// Scheme: `<data_dir>/runners/<uuid>.meshkey`. Each per-app runner MUST own a
+/// DISTINCT keypair so it presents a UNIQUE public key to the coordinator —
+/// otherwise multiple runners sharing the ambient `$HOME/.tabbify-mesh/keypair`
+/// all hit the coordinator's by-pubkey re-registration path, get assigned the
+/// SAME ULA (whichever runner registered that pubkey first), and collide:
+/// their distinct `requested_ula = derive_app_ula(uuid)` is ignored, so only
+/// one app is reachable at a time and routing flaps across respawns.
+///
+/// Keying the path by uuid makes the keypair (a) unique per app → the
+/// coordinator takes the first-time path and honours `requested_ula`, and (b)
+/// persistent across respawns (the file is loaded if present), so the runner's
+/// pubkey — and therefore its assigned app-ULA — stays sticky.
+#[must_use]
+pub fn runner_keypair_path(data_dir: &std::path::Path, uuid: &str) -> PathBuf {
+    data_dir.join("runners").join(format!("{uuid}.meshkey"))
+}
+
 /// Build the [`mesh_joiner::JoinConfig`] the runner uses to join the mesh.
 ///
 /// This is the runner's defining mesh contract (per-app-runner arch §0.2/§0.1):
 /// - `requested_ula = derive_app_ula(uuid)` — the runner claims its app-ULA so
 ///   the coordinator routes it straight to this peer (its peer-ULA == app-ULA);
+/// - `keypair_path` — a per-uuid persistent WireGuard keypair (see
+///   [`runner_keypair_path`]) so EACH runner is a DISTINCT mesh peer with a
+///   UNIQUE pubkey; this is what makes the coordinator honour each runner's
+///   distinct `requested_ula` instead of collapsing them all onto one ULA;
 /// - `kind = "runner"` — tags this peer as a per-app runner in the roster;
 /// - `parent` — the spawning supervisor's ULA (so the node can build the
 ///   supervisor → runners topology); `None` for a standalone runner;
 /// - `app_uuid` — the app this runner serves.
+///
+/// `identity_path` is left `None`: the ULA is derived deterministically from
+/// the uuid via `derive_app_ula` and requested explicitly, so the richer
+/// `{keypair, ULA}` identity file is not needed (and setting it would override
+/// `requested_ula`, which we want to stay explicit).
 ///
 /// Extracted as a pure function so the construction is unit-testable without a
 /// live mesh join (which needs a real TUN/root + coordinator — exercised in the
@@ -382,6 +410,8 @@ pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
         tags: vec!["runner".to_owned()],
         insecure_no_mtls: true,
         requested_ula: Some(app_ula.to_string()),
+        // Per-uuid keypair → unique pubkey → coordinator honours requested_ula.
+        keypair_path: Some(runner_keypair_path(&cfg.data_dir, &cfg.uuid)),
         kind: Some("runner".to_owned()),
         parent: cfg.parent.clone(),
         app_uuid: Some(cfg.uuid.clone()),
@@ -442,8 +472,49 @@ mod tests {
             "app_uuid must be the served app's uuid"
         );
         assert_eq!(join.coordinator_url, "http://10.0.0.1:8888");
-        // Runners derive their ULA directly; identity persistence is unused.
+        // Each runner gets its OWN persistent WireGuard keypair under data_dir,
+        // keyed by uuid — so it presents a UNIQUE pubkey and the coordinator
+        // honours its distinct `requested_ula` (the per-app-ULA collision fix).
+        // Identity persistence (the richer {keypair, ULA} file) stays unused:
+        // the ULA is derived deterministically from the uuid, not persisted.
+        let kp_path = join
+            .keypair_path
+            .as_ref()
+            .expect("runner must carry a per-uuid keypair_path");
+        assert!(
+            kp_path.starts_with(&cfg.data_dir),
+            "keypair_path must live under data_dir, got {kp_path:?}"
+        );
+        assert!(
+            kp_path.to_string_lossy().contains(APP_UUID),
+            "keypair_path must contain the app uuid, got {kp_path:?}"
+        );
         assert!(join.identity_path.is_none());
+    }
+
+    /// Distinct uuids must yield distinct keypair paths — otherwise two runners
+    /// would share a keypair, present the same pubkey, and collide on one ULA
+    /// (the exact production bug this fix addresses).
+    #[test]
+    fn runner_keypair_path_is_unique_per_uuid() {
+        let data_dir = PathBuf::from("/tmp/tabbify-runner-test");
+        let uuid_a = "0191e7c2-1111-7222-8333-444455556666";
+        let uuid_b = "019e7903-aaaa-7bbb-8ccc-ddddeeeeffff";
+
+        let path_a = runner_keypair_path(&data_dir, uuid_a);
+        let path_b = runner_keypair_path(&data_dir, uuid_b);
+
+        assert_ne!(
+            path_a, path_b,
+            "two uuids must produce two distinct keypair paths"
+        );
+        assert_eq!(
+            path_a,
+            data_dir.join("runners").join(format!("{uuid_a}.meshkey")),
+            "path scheme must be <data_dir>/runners/<uuid>.meshkey"
+        );
+        assert!(path_a.starts_with(&data_dir));
+        assert!(path_a.to_string_lossy().contains(uuid_a));
     }
 
     /// In mesh mode the runner binds its OWN ULA (== app-ULA) with no separate
