@@ -40,6 +40,32 @@ pub struct VersionFile {
     pub previous: Vec<String>,
 }
 
+/// Whether `<version_dir>/<bin>` exists as a regular file (following symlinks)
+/// and carries at least one executable bit. A symlink target is resolved, so a
+/// dangling staged binary counts as missing.
+fn staged_binary_is_runnable(version_dir: &Path, bin: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // `metadata` follows symlinks, so a staged symlink whose target is gone
+    // (a dangling stage) is reported as missing — exactly what we want.
+    match std::fs::metadata(version_dir.join(bin)) {
+        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+/// Whether a staged release directory is a safe rollback target: BOTH
+/// [`SWAP_BINARIES`] exist under `<version_dir>/` as runnable regular files.
+///
+/// Rolling the symlinks back to a directory missing either binary would install
+/// a dangling symlink and brick the node, so the watchdog must skip such an
+/// entry instead. This is the guard for that decision.
+#[must_use]
+pub fn release_is_complete(version_dir: &Path) -> bool {
+    SWAP_BINARIES
+        .iter()
+        .all(|bin| staged_binary_is_runnable(version_dir, bin))
+}
+
 /// Atomically point `<install_dir>/<name>` at `target` (overwriting any prior
 /// symlink): create a temp symlink alongside, then `rename` over the live one.
 ///
@@ -170,6 +196,50 @@ mod tests {
         // Re-point to v2 — must overwrite, not error.
         repoint_symlink(install, "supervisord", &v2.join("supervisord")).unwrap();
         assert_eq!(std::fs::read(install.join("supervisord")).unwrap(), b"v2");
+    }
+
+    /// release_is_complete is the rollback guard: true only when BOTH binaries
+    /// exist as runnable regular files. A dir missing a binary, or one staged
+    /// without an executable bit, is rejected — that is what stops the watchdog
+    /// from re-pointing a symlink at a missing target.
+    #[test]
+    fn release_is_complete_requires_both_runnable_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v1.0.0");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty dir: incomplete.
+        assert!(!release_is_complete(&dir));
+
+        // Only one binary staged: still incomplete.
+        let runner = dir.join("tabbify-runner");
+        std::fs::write(&runner, b"runner").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!release_is_complete(&dir));
+
+        // Second binary present but NOT executable: rejected.
+        let sup = dir.join("supervisord");
+        std::fs::write(&sup, b"sup").unwrap();
+        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!release_is_complete(&dir), "non-executable binary must be rejected");
+
+        // Both present and executable: complete.
+        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(release_is_complete(&dir));
+    }
+
+    /// A dangling staged symlink (target gone) counts as missing, so a release
+    /// dir whose binary is a broken symlink is NOT a valid rollback target.
+    #[test]
+    fn release_is_complete_rejects_dangling_staged_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v1.0.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        // tabbify-runner -> nonexistent target.
+        symlink(tmp.path().join("gone"), dir.join("tabbify-runner")).unwrap();
+        std::fs::write(dir.join("supervisord"), b"sup").unwrap();
+        assert!(!release_is_complete(&dir));
     }
 
     /// write_version_file atomically writes VERSION and keeps the previous list.
