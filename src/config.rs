@@ -16,10 +16,6 @@ pub const DEFAULT_COORDINATOR_URL: &str = "http://3.124.69.92:8888";
 /// Anonymous public-read base for app artifacts (contract §2).
 pub const DEFAULT_S3_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
 
-/// Anonymous public-read base for versioned release binaries (self-update,
-/// spec §3): the supervisor fetches `<base>/supervisor/v<VER>/<arch>/...`.
-pub const DEFAULT_RELEASE_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
-
 /// Default control/serve bind addr. `[::]:8730` so loopback tests work without
 /// a live mesh; in production the binary rebinds to `[my_ula]:8730` once the
 /// joiner reports its ULA (unless `--bind` is set explicitly).
@@ -63,11 +59,6 @@ pub struct Config {
     /// S3 base URL for anonymous artifact fetch (overridable for tests).
     #[arg(long, env = "SUPERVISOR_S3_BASE_URL", default_value = DEFAULT_S3_BASE_URL)]
     pub s3_base_url: String,
-
-    /// Versioned release base URL the self-update engine fetches binaries from
-    /// (`<base>/supervisor/v<VER>/<arch>/...`). Overridable for tests.
-    #[arg(long, env = "SUPERVISOR_RELEASE_BASE_URL", default_value = DEFAULT_RELEASE_BASE_URL)]
-    pub release_base_url: String,
 
     /// Probe entrypoint: when set, this process is an out-of-band self-update
     /// CANDIDATE. It joins the mesh with a TRANSIENT identity
@@ -351,6 +342,23 @@ mod tests {
         assert_eq!(cfg.docker.oras_bin, "/usr/local/bin/oras");
         assert_eq!(cfg.docker.app_port, 3000);
         assert_eq!(cfg.docker.build_timeout_secs, 600);
+    }
+
+    #[test]
+    fn release_base_url_flag_is_not_exposed() {
+        // SU-3 had promoted a `--release-base-url` flag, but nothing in this
+        // crate reads `Config::release_base_url` (the self-update fetch engine
+        // builds its own `SelfUpdateConfig::release_base_url`). A flag with no
+        // reader is dead wiring; it stays dropped until a live consumer exists.
+        assert!(
+            Config::try_parse_from(["supervisord", "--release-base-url", "http://localhost:9"])
+                .is_err(),
+            "--release-base-url must not be a parseable flag (no reader)"
+        );
+        assert!(
+            Config::try_parse_from(["supervisord", "--check"]).is_ok(),
+            "candidate flags must still parse"
+        );
     }
 
     #[test]

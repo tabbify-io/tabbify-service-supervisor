@@ -21,8 +21,9 @@ pub mod fetch;
 pub mod manifest;
 pub mod probe;
 
-/// Default release base URL (same public bucket as the app artifacts). SU-3
-/// promotes this to a dedicated `--release-base-url` flag / const in `config`.
+/// Default release base URL (same public bucket as the app artifacts). The
+/// self-update fetch engine ([`SelfUpdateConfig::fetcher`]) is its only reader;
+/// it will become operator-overridable once a live consumer is wired in.
 const DEFAULT_RELEASE_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
 
 /// Default install dir holding the live binary symlinks + `VERSION`.
