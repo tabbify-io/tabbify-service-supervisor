@@ -260,6 +260,19 @@ async fn health_reports_ok_with_identity() {
     assert_eq!(body["ula"], "fd5a:1f00:1::1");
 }
 
+#[tokio::test]
+async fn about_reports_version_and_mesh_status() {
+    // The harness binds a real IPv6 ULA, so `about` must derive `mesh_status:
+    // "joined"` from it (the only new branching logic in this handler).
+    let harness = Harness::new("http://unused.invalid");
+
+    let (status, body) = call(harness.router(), get_req("/v1/about")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peer_id"], "test-supervisor");
+    assert_eq!(body["mesh_status"], "joined");
+    assert!(body["uptime_secs"].is_u64(), "got: {body}");
+}
+
 // ---------------------------------------------------------------------------
 // CONTROL API: GET /v1/apps/:uuid  (present / absent against the mocked S3)
 // ---------------------------------------------------------------------------
