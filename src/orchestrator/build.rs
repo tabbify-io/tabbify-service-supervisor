@@ -154,6 +154,17 @@ impl Orchestrator {
 
         let output = result.context("build runner invocation")?;
 
+        // Persist the captured build output (stdout + stderr) to a per-app log
+        // BEFORE branching on success: a failed build is exactly when the
+        // operator needs the log. Writing is best-effort — a log-write failure
+        // must not mask the build result.
+        write_build_log(
+            &self.shared().data_dir,
+            &job.app_uuid,
+            &output.stdout,
+            &output.stderr,
+        );
+
         if !output.success {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("build runner exited non-zero; stderr: {}", stderr.trim());
@@ -202,6 +213,48 @@ fn write_spec_file(base_dir: &Path, data: &[u8]) -> anyhow::Result<std::path::Pa
         .with_context(|| format!("write build spec file {}", path.display()))?;
 
     Ok(path)
+}
+
+/// Append the captured build output to `<data_dir>/build/<app_uuid>.log`.
+///
+/// Writes `stdout`, a `--- stderr ---` separator, then `stderr`. Best-effort:
+/// any failure (dir create / open / write) is logged and swallowed so it never
+/// changes the build's success/failure result. Append mode keeps prior build
+/// runs for the same app rather than clobbering them.
+fn write_build_log(data_dir: &Path, app_uuid: &str, stdout: &[u8], stderr: &[u8]) {
+    use std::io::Write as _;
+
+    let log_dir = data_dir.join("build");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        tracing::warn!(app_uuid, error = %e, "could not create build log dir; skipping build log");
+        return;
+    }
+    let log_path = log_dir.join(format!("{app_uuid}.log"));
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(app_uuid, error = %e, "could not open build log; skipping build log");
+            return;
+        }
+    };
+
+    // One combined write attempt; on partial failure we just warn.
+    let res = (|| -> std::io::Result<()> {
+        f.write_all(stdout)?;
+        f.write_all(b"\n--- stderr ---\n")?;
+        f.write_all(stderr)?;
+        f.write_all(b"\n")?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        tracing::warn!(app_uuid, error = %e, "failed writing build log");
+        return;
+    }
+    tracing::info!(app_uuid, path = %log_path.display(), "captured build output to log");
 }
 
 #[cfg(test)]
@@ -574,6 +627,101 @@ mod tests {
         assert!(
             argv.contains(&format!("--build-spec {}", spec_file.to_string_lossy())),
             "argv must contain `--build-spec <path>`; got: {argv:?}"
+        );
+    }
+
+    /// A spawner that returns caller-supplied stdout + stderr with a chosen exit
+    /// status. Used to assert the build log captures BOTH streams.
+    struct StreamsSpawner {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        success: bool,
+    }
+    impl BuildSpawner for StreamsSpawner {
+        fn run<'a>(
+            &'a self,
+            _spec_path: &'a Path,
+            _app_uuid: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<BuildOutput>> + Send + 'a>> {
+            let stdout = self.stdout.clone();
+            let stderr = self.stderr.clone();
+            let success = self.success;
+            Box::pin(async move {
+                Ok(BuildOutput {
+                    stdout,
+                    stderr,
+                    success,
+                })
+            })
+        }
+    }
+
+    /// On a SUCCESSFUL build the captured stdout AND stderr are written to
+    /// `<data_dir>/build/<app_uuid>.log`.
+    #[tokio::test]
+    async fn spawn_build_writes_build_log_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = orch(dir.path().to_path_buf(), dir.path().to_path_buf());
+
+        let spawner = StreamsSpawner {
+            stdout: br#"BUILD_STDOUT_NOISE
+{"reff":"[fd5a::1]:5000/acme/u:abc","digest":null}"#
+                .to_vec(),
+            stderr: b"BUILD_STDERR_NOISE".to_vec(),
+            success: true,
+        };
+
+        let mut job = test_job();
+        job.app_uuid = "0191e7c2-dddd-7222-8333-444455556666".into();
+        o.spawn_build_with(&job, &spawner).await.unwrap();
+
+        let log_path = dir
+            .path()
+            .join("build")
+            .join(format!("{}.log", job.app_uuid));
+        let contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("build log {log_path:?} should exist: {e}"));
+        assert!(
+            contents.contains("BUILD_STDOUT_NOISE"),
+            "build log must contain captured stdout; got: {contents:?}"
+        );
+        assert!(
+            contents.contains("BUILD_STDERR_NOISE"),
+            "build log must contain captured stderr; got: {contents:?}"
+        );
+    }
+
+    /// On a FAILED build the captured stdout AND stderr are still written to the
+    /// build log (this is exactly when the output matters most).
+    #[tokio::test]
+    async fn spawn_build_writes_build_log_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = orch(dir.path().to_path_buf(), dir.path().to_path_buf());
+
+        let spawner = StreamsSpawner {
+            stdout: b"PARTIAL_BUILD_OUTPUT".to_vec(),
+            stderr: b"COMPILER_ERROR_E0277".to_vec(),
+            success: false,
+        };
+
+        let mut job = test_job();
+        job.app_uuid = "0191e7c2-eeee-7222-8333-444455556666".into();
+        // The call returns an error (non-zero exit) but the log is still written.
+        let _ = o.spawn_build_with(&job, &spawner).await;
+
+        let log_path = dir
+            .path()
+            .join("build")
+            .join(format!("{}.log", job.app_uuid));
+        let contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("build log {log_path:?} should exist: {e}"));
+        assert!(
+            contents.contains("PARTIAL_BUILD_OUTPUT"),
+            "build log must contain captured stdout on failure; got: {contents:?}"
+        );
+        assert!(
+            contents.contains("COMPILER_ERROR_E0277"),
+            "build log must contain captured stderr on failure; got: {contents:?}"
         );
     }
 

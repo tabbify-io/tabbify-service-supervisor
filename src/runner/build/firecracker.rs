@@ -102,6 +102,51 @@ pub type FcBuildRunner =
 /// Name of the produced rootfs image inside the output dir.
 const ROOTFS_NAME: &str = "rootfs.ext4";
 
+/// Map the HOST CPU architecture (`std::env::consts::ARCH`) to the OCI image
+/// architecture name that [`oci_spec::image::Arch`] uses
+/// (`x86_64 -> amd64`, `aarch64 -> arm64`). Any other host falls back to the
+/// raw `ARCH` string so the guard can still report it verbatim. This is the
+/// value the architecture guard compares `config.architecture()` against.
+#[must_use]
+fn host_oci_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Fail FAST when an OCI image's declared architecture does not match the host.
+///
+/// A Firecracker guest can only execute binaries of the host CPU architecture,
+/// so converting (the slow `oras` pull + layer unpack + `mkfs.ext4`) and then
+/// booting a cross-arch image is doomed. This guard runs BEFORE any of that —
+/// the moment the typed config is available — so a mismatch surfaces a clear
+/// error naming BOTH the image arch and the host arch instead of wasting the
+/// conversion and failing opaquely at boot. The image architecture is always
+/// logged at `info` for diagnostics.
+///
+/// # Errors
+/// The image's `config.architecture()` (mapped to its OCI name) differs from
+/// [`host_oci_arch`].
+fn guard_arch_matches_host(config: &oci_spec::image::ImageConfiguration) -> Result<()> {
+    let image_arch = config.architecture().to_string();
+    let host_arch = host_oci_arch();
+    tracing::info!(
+        image_arch = %image_arch,
+        host_arch,
+        "firecracker rootfs build: OCI image architecture"
+    );
+    if image_arch != host_arch {
+        bail!(
+            "OCI image architecture {image_arch:?} does not match host architecture \
+             {host_arch:?}; a firecracker guest can only run host-architecture \
+             binaries — deploy an image built for {host_arch:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Convert an OCI image (already pulled as a LAYOUT under `layout`, with its
 /// typed `config` read from that layout) into a bootable `rootfs.ext4` under
 /// `out_dir`, ROOTLESS and LOOPLESS, DOCKER-LESS.
@@ -431,6 +476,12 @@ pub async fn resolve_rootfs(
         );
         return Ok(cached);
     }
+
+    // Fail FAST on an architecture mismatch BEFORE the slow unpack + mkfs: a
+    // firecracker guest can only run host-architecture binaries, so a cross-arch
+    // image is rejected here rather than after a wasted conversion. Also logs the
+    // image architecture at info.
+    guard_arch_matches_host(config)?;
 
     let out_dir = cached
         .parent()

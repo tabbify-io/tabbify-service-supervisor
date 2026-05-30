@@ -111,3 +111,11 @@ wiremock = "0.6"
 # fixtures. Production layer unpack shells the host `tar` via the seam, not this
 # crate.
 tar = "0.4"
+# Test-only: compress synthetic OCI layer tarballs (gzip / zstd) so the
+# real-conversion integration test can stage layers carrying the compressed OCI
+# media types and exercise the real host `tar -z`/`--zstd` unpack path. Both are
+# already in the dependency graph (flate2 via utoipa-swagger-ui, zstd via
+# wasmtime-cache), so this adds no new build cost. flate2's default backend is
+# pure-Rust (miniz_oxide), keeping the fixtures musl-clean.
+flate2 = "1"
+zstd = "0.13"

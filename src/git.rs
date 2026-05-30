@@ -51,13 +51,85 @@ pub fn real_git_run(git_bin: String) -> GitRun {
             for (k, v) in &env {
                 cmd.env(k, v);
             }
-            let status = cmd.status().await.context("spawn git")?;
-            if !status.success() {
-                bail!("git {:?} failed: {status}", args.first());
+            // Capture stderr (via `output`) instead of inheriting it, so a
+            // non-zero exit can surface git's own diagnostic in the bailed
+            // error rather than an opaque status string.
+            let output = cmd.output().await.context("spawn git")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!(format_git_error(&args, output.status.code(), &stderr));
             }
             Ok(())
         })
     })
+}
+
+/// Maximum number of bytes of git stderr to keep in an error message. We keep
+/// the *tail* because git prints its decisive `fatal:`/`error:` line last.
+const MAX_STDERR_TAIL: usize = 2_000;
+
+/// Format a non-opaque error for a failed git invocation.
+///
+/// The argv we build always starts with either a global flag (`-C <dest>`) or
+/// the subcommand itself (`init`). The old code printed `args.first()`, which
+/// surfaced the meaningless `Some("-C")`. This instead picks the *meaningful*
+/// subcommand (the first argv element that is neither the `-C` global flag, its
+/// path operand, nor any dash-prefixed flag) and appends the exit code plus the
+/// tail of git's stderr — e.g.
+///
+/// ```text
+/// git fetch failed (128): fatal: Repository not found
+/// ```
+///
+/// The token never reaches argv (it lives only in the askpass file), so the
+/// argv is safe to echo. git's stderr likewise does not carry the token (the
+/// askpass script `cat`s it directly to git's password prompt, not to stderr).
+fn format_git_error(args: &[String], code: Option<i32>, stderr: &str) -> String {
+    let subcommand = git_subcommand(args);
+    let code_str = match code {
+        Some(c) => c.to_string(),
+        None => "signal".to_owned(),
+    };
+
+    let trimmed = stderr.trim();
+    // Keep only the tail of large stderr so the message stays bounded.
+    let tail: String = if trimmed.len() > MAX_STDERR_TAIL {
+        let start = trimmed.len() - MAX_STDERR_TAIL;
+        // Snap to a char boundary so slicing never panics on multibyte input.
+        let start = (start..=trimmed.len())
+            .find(|&i| trimmed.is_char_boundary(i))
+            .unwrap_or(trimmed.len());
+        format!("…{}", &trimmed[start..])
+    } else {
+        trimmed.to_owned()
+    };
+
+    if tail.is_empty() {
+        format!("git {subcommand} failed ({code_str})")
+    } else {
+        format!("git {subcommand} failed ({code_str}): {tail}")
+    }
+}
+
+/// Extract the meaningful git subcommand from the argv we construct.
+///
+/// Skips the `-C` global flag and its directory operand, and skips any other
+/// dash-prefixed flag, returning the first plain token (e.g. `fetch`,
+/// `checkout`, `init`, `remote`). Falls back to `"?"` if none is found.
+fn git_subcommand(args: &[String]) -> &str {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-C" {
+            // The `-C` flag takes a path operand; skip it too.
+            iter.next();
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return arg;
+    }
+    "?"
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -271,6 +343,149 @@ fn write_secret_file(path: &Path, content: &str, mode: u32) -> Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // -- format_git_error ------------------------------------------------------
+
+    /// The error must name the meaningful git subcommand (e.g. `fetch`), not the
+    /// first argv element which is the `-C` global flag. The old code printed
+    /// `git Some("-C") failed`, which was opaque.
+    #[test]
+    fn format_git_error_names_subcommand_not_dash_c() {
+        let args = vec![
+            "-C".to_owned(),
+            "/tmp/dest".to_owned(),
+            "fetch".to_owned(),
+            "--depth".to_owned(),
+            "1".to_owned(),
+            "origin".to_owned(),
+            "deadbeef".to_owned(),
+        ];
+        let msg = format_git_error(&args, Some(128), "fatal: Repository not found\n");
+        assert!(
+            msg.contains("git fetch"),
+            "error must name the `fetch` subcommand: {msg}"
+        );
+        assert!(
+            !msg.contains("Some(\"-C\")"),
+            "error must NOT contain the opaque `Some(\"-C\")`: {msg}"
+        );
+    }
+
+    /// The exit code and the git stderr text must both be surfaced.
+    #[test]
+    fn format_git_error_includes_code_and_stderr() {
+        let args = vec![
+            "-C".to_owned(),
+            "/tmp/dest".to_owned(),
+            "fetch".to_owned(),
+            "origin".to_owned(),
+            "main".to_owned(),
+        ];
+        let msg = format_git_error(&args, Some(128), "fatal: Repository not found\n");
+        assert!(msg.contains("128"), "error must include the exit code: {msg}");
+        assert!(
+            msg.contains("Repository not found"),
+            "error must include the git stderr text: {msg}"
+        );
+    }
+
+    /// A signal-terminated process (no exit code) must still format cleanly.
+    #[test]
+    fn format_git_error_handles_missing_code() {
+        let args = vec!["init".to_owned(), "-q".to_owned(), "/tmp/dest".to_owned()];
+        let msg = format_git_error(&args, None, "some failure\n");
+        assert!(msg.contains("git init"), "must still name the subcommand: {msg}");
+        assert!(
+            msg.contains("some failure"),
+            "must still include stderr: {msg}"
+        );
+        assert!(
+            !msg.contains("Some("),
+            "must not leak a debug-formatted Option: {msg}"
+        );
+    }
+
+    /// Empty stderr must not crash and must produce a still-useful message.
+    #[test]
+    fn format_git_error_handles_empty_stderr() {
+        let args = vec![
+            "-C".to_owned(),
+            "/tmp/dest".to_owned(),
+            "checkout".to_owned(),
+            "FETCH_HEAD".to_owned(),
+        ];
+        let msg = format_git_error(&args, Some(1), "");
+        assert!(
+            msg.contains("git checkout"),
+            "must name the subcommand even with empty stderr: {msg}"
+        );
+        assert!(msg.contains('1'), "must include the exit code: {msg}");
+    }
+
+    /// Only the tail of a very long stderr is kept (bounded message size).
+    #[test]
+    fn format_git_error_keeps_stderr_tail() {
+        let args = vec!["-C".to_owned(), "/d".to_owned(), "fetch".to_owned()];
+        let long = format!("{}TAIL_MARKER_END", "x".repeat(10_000));
+        let msg = format_git_error(&args, Some(128), &long);
+        assert!(
+            msg.contains("TAIL_MARKER_END"),
+            "the tail of stderr (where git's final fatal: line lives) must survive: {msg}"
+        );
+        assert!(
+            msg.len() < 5_000,
+            "the message must be bounded, not echo the full 10k stderr: len={}",
+            msg.len()
+        );
+    }
+
+    /// The propagated error from a failing fetch must read meaningfully through
+    /// `clone()`'s `.context("git fetch")` wrapper — never `git Some("-C")`.
+    /// This drives `clone()` with a stub returning an error carrying git stderr
+    /// and asserts the whole chain stays readable.
+    #[tokio::test]
+    async fn clone_propagates_meaningful_subcommand_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stub runner: fail any `fetch` call with a formatted, stderr-bearing
+        // error mirroring what `real_git_run` now produces.
+        let runner: GitRun = std::sync::Arc::new(|args: Vec<String>, _env| {
+            let is_fetch = args.iter().any(|a| a == "fetch");
+            Box::pin(async move {
+                if is_fetch {
+                    bail!(format_git_error(
+                        &args,
+                        Some(128),
+                        "fatal: Repository not found\n"
+                    ));
+                }
+                Ok(())
+            })
+        });
+
+        let err = clone(
+            "https://github.com/acme/missing.git",
+            "deadbeef",
+            None,
+            &dir.path().join("src"),
+            &runner,
+        )
+        .await
+        .expect_err("clone must fail when fetch fails");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("git fetch"),
+            "propagated error must name the failing subcommand: {chain}"
+        );
+        assert!(
+            chain.contains("Repository not found"),
+            "propagated error must carry the git stderr: {chain}"
+        );
+        assert!(
+            !chain.contains("Some(\"-C\")"),
+            "propagated error must NOT be the opaque `Some(\"-C\")`: {chain}"
+        );
+    }
 
     // -- inject_username -------------------------------------------------------
 

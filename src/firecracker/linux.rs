@@ -3,6 +3,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::fs::OpenOptions;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,6 +35,60 @@ const READY_POLL: Duration = Duration::from_millis(250);
 /// How long to wait for one firecracker API call over the unix socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Env flag enabling live-boot debugging: when truthy, the firecracker child's
+/// stdout+stderr (including the guest serial console, `console=ttyS0`) are
+/// appended to `<data_dir>/fc/<uuid>.console.log` instead of discarded, so a
+/// guest kernel panic / boot failure can be inspected post-mortem.
+const FC_DEBUG_ENV: &str = "SUPERVISOR_FC_DEBUG";
+
+/// Read [`FC_DEBUG_ENV`] and decide whether console capture is on. Truthy
+/// values: `1`, `true`, `yes`, `on` (case-insensitive). Anything else (incl.
+/// unset) keeps the default silent (`/dev/null`) behavior.
+fn fc_debug_enabled() -> bool {
+    std::env::var(FC_DEBUG_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Decide the firecracker child's `(stdout, stderr)` redirection.
+///
+/// Default (debug flag off, or no console path available): both `/dev/null`
+/// — byte-for-byte identical to the historical behavior. When debugging is
+/// enabled AND a `console_log` path is supplied, the file is opened in append
+/// mode (its parent dir created best-effort) and both streams are pointed at
+/// it so the serial console is captured. If the file can't be opened we log a
+/// warning and fall back to `/dev/null` (never fail the boot over logging).
+fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
+    let null = || (Stdio::null(), Stdio::null());
+    if !fc_debug_enabled() {
+        return null();
+    }
+    let Some(path) = console_log else {
+        return null();
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(path = %path.display(), error = %e, "fc debug: cannot create console-log dir; logging to /dev/null");
+            return null();
+        }
+    }
+    let open = || OpenOptions::new().create(true).append(true).open(path);
+    match (open(), open()) {
+        (Ok(out), Ok(err)) => {
+            tracing::info!(console_log = %path.display(), "fc debug: capturing microVM stdout+stderr (serial console)");
+            (Stdio::from(out), Stdio::from(err))
+        }
+        (out, err) => {
+            let e = out.err().or(err.err());
+            tracing::warn!(path = %path.display(), error = ?e, "fc debug: cannot open console log; logging to /dev/null");
+            null()
+        }
+    }
+}
+
 /// Monotonic per-process counter → a unique tap name + /30 offset per VM, so
 /// concurrently-hosted firecracker apps don't collide on tap devices/links.
 static VM_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -64,16 +119,20 @@ impl FirecrackerRuntime {
     /// REST configuration call failing, or the guest app not answering
     /// within [`READY_TIMEOUT`].
     pub async fn launch(rootfs: &Path, rt: &Runtime, cfg: &FcConfig) -> Result<Self> {
-        Self::cold_boot(rootfs, rt, cfg, None).await
+        Self::cold_boot(rootfs, rt, cfg, None, None).await
     }
 
     /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
     /// after first boot (best-effort) and stored there for future warm starts.
+    /// `console_log` — when `Some` and `SUPERVISOR_FC_DEBUG` is truthy, the
+    /// firecracker child's stdout+stderr are appended there; otherwise both go
+    /// to `/dev/null` (the default, unchanged behavior).
     async fn cold_boot(
         rootfs: &Path,
         rt: &Runtime,
         cfg: &FcConfig,
         cache_dir: Option<&Path>,
+        console_log: Option<&Path>,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -87,21 +146,39 @@ impl FirecrackerRuntime {
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let tap_name = format!("fc-tap{seq}");
         let guest_mac = derive_guest_mac(seq);
+        let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
+        tracing::debug!(
+            seq,
+            %host_ip,
+            %guest_ip,
+            %tap_name,
+            %guest_mac,
+            %guest_base,
+            "fc cold boot: derived /30 link + tap + guest MAC"
+        );
 
         // Host tap + /30 link (design §4.2). Best-effort cleanup of a stale
         // tap of the same name first (ignore failure — it may not exist).
         let _ = run_ip(&["link", "del", &tap_name]).await;
-        setup_tap(&tap_name, host_ip).await?;
+        setup_tap(&tap_name, host_ip).await.map_err(|e| {
+            tracing::error!(
+                %tap_name, %host_ip, error = %e,
+                "fc cold boot: tap setup failed (need CAP_NET_ADMIN/root for `ip tuntap`; EPERM ⇒ run supervisor with the net-admin capability)"
+            );
+            e
+        })?;
+        tracing::debug!(%tap_name, %host_ip, "fc cold boot: tap up");
 
         // Spawn firecracker with its API socket. Clean any stale socket.
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
         let _ = std::fs::remove_file(&api_sock);
+        let (stdout, stderr) = console_stdio(console_log);
         let child = Command::new(&cfg.bin)
             .arg("--api-sock")
             .arg(&api_sock)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn()
             .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
 
@@ -109,7 +186,7 @@ impl FirecrackerRuntime {
             child: Some(child),
             tap_name,
             api_sock: api_sock.clone(),
-            guest_base: format!("http://{guest_ip}:{}", cfg.app_port),
+            guest_base,
             client: reqwest::Client::new(),
         };
 
@@ -164,12 +241,15 @@ impl FirecrackerRuntime {
         // Per-app snapshot cache: <data_dir>/apps/<uuid>/cache/
         // (mirrors the wasm .cwasm cache directory layout)
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
+        // Per-app console log: <data_dir>/fc/<uuid>.console.log. Only written
+        // when SUPERVISOR_FC_DEBUG is truthy (see `console_stdio`).
+        let console_log = pidfile::console_log_path(data_dir, uuid);
 
         let vm = if snapshot::files_present(&cache_dir) {
             // Warm path: try to restore from a previously-taken snapshot.
             // Fall back to cold boot on any failure (corrupt files, kernel
             // mismatch, etc.) so the app always comes up eventually.
-            match Self::launch_from_snapshot(&cache_dir, cfg).await {
+            match Self::launch_from_snapshot(&cache_dir, cfg, Some(&console_log)).await {
                 Ok(warm_vm) => {
                     tracing::info!(uuid, "warm start from snapshot");
                     warm_vm
@@ -180,12 +260,12 @@ impl FirecrackerRuntime {
                         error = %e,
                         "snapshot load failed; falling back to cold boot"
                     );
-                    Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir)).await?
+                    Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log)).await?
                 }
             }
         } else {
             // Cold path: first boot — take a snapshot on the way out.
-            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir)).await?
+            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log)).await?
         };
 
         // Record the new child PID so a future restart can clean it up.
@@ -209,7 +289,11 @@ impl FirecrackerRuntime {
     /// # Errors
     /// Tap setup failure, firecracker spawn failure, snapshot load API failure,
     /// or the guest app failing to answer within [`READY_TIMEOUT`].
-    async fn launch_from_snapshot(cache_dir: &Path, cfg: &FcConfig) -> Result<Self> {
+    async fn launch_from_snapshot(
+        cache_dir: &Path,
+        cfg: &FcConfig,
+        console_log: Option<&Path>,
+    ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
         }
@@ -229,18 +313,35 @@ impl FirecrackerRuntime {
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let tap_name = format!("fc-tap{seq}");
+        let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
+        tracing::debug!(
+            seq,
+            %host_ip,
+            %guest_ip,
+            %tap_name,
+            %guest_base,
+            "fc warm start: derived /30 link + tap for snapshot restore"
+        );
 
         let _ = run_ip(&["link", "del", &tap_name]).await;
-        setup_tap(&tap_name, host_ip).await?;
+        setup_tap(&tap_name, host_ip).await.map_err(|e| {
+            tracing::error!(
+                %tap_name, %host_ip, error = %e,
+                "fc warm start: tap setup failed (need CAP_NET_ADMIN/root for `ip tuntap`; EPERM ⇒ run supervisor with the net-admin capability)"
+            );
+            e
+        })?;
+        tracing::debug!(%tap_name, %host_ip, "fc warm start: tap up");
 
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
         let _ = std::fs::remove_file(&api_sock);
+        let (stdout, stderr) = console_stdio(console_log);
         let child = Command::new(&cfg.bin)
             .arg("--api-sock")
             .arg(&api_sock)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn()
             .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
 
@@ -248,13 +349,14 @@ impl FirecrackerRuntime {
             child: Some(child),
             tap_name,
             api_sock: api_sock.clone(),
-            guest_base: format!("http://{guest_ip}:{}", cfg.app_port),
+            guest_base,
             client: reqwest::Client::new(),
         };
 
         // Wait for the API socket, then load the snapshot (resume_vm=true).
         // This replaces the full configure_and_boot sequence.
         wait_for_socket(&me.api_sock).await?;
+        tracing::debug!(path = "/snapshot/load", "fc warm start: PUT snapshot load");
         me.api_put(
             "/snapshot/load",
             &snapshot_load_body(vmstate_str, mem_str, true),
@@ -324,6 +426,7 @@ impl FirecrackerRuntime {
             tokio::time::timeout(API_TIMEOUT, unix_http_put(&self.api_sock, path, &payload))
                 .await
                 .map_err(|_| anyhow!("firecracker API timed out on PUT {path}"))??;
+        tracing::debug!(verb = "PUT", path, status, "fc API call");
         if !(200..300).contains(&status) {
             bail!("firecracker API PUT {path} returned HTTP {status}");
         }
@@ -340,6 +443,7 @@ impl FirecrackerRuntime {
             tokio::time::timeout(API_TIMEOUT, unix_http_patch(&self.api_sock, path, &payload))
                 .await
                 .map_err(|_| anyhow!("firecracker API timed out on PATCH {path}"))??;
+        tracing::debug!(verb = "PATCH", path, status, "fc API call");
         if !(200..300).contains(&status) {
             bail!("firecracker API PATCH {path} returned HTTP {status}");
         }
@@ -406,8 +510,11 @@ impl FirecrackerRuntime {
     /// Poll the guest app's HTTP server until it answers (any status) or
     /// [`READY_TIMEOUT`] elapses.
     async fn wait_until_ready(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let start = tokio::time::Instant::now();
+        let deadline = start + READY_TIMEOUT;
+        let mut attempt: u32 = 0;
         loop {
+            attempt += 1;
             match self
                 .client
                 .get(&self.guest_base)
@@ -415,11 +522,35 @@ impl FirecrackerRuntime {
                 .send()
                 .await
             {
-                Ok(_) => return Ok(()),
-                Err(_) if tokio::time::Instant::now() < deadline => {
+                Ok(_) => {
+                    tracing::debug!(
+                        guest_base = %self.guest_base,
+                        attempt,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "fc boot: guest app answered; ready"
+                    );
+                    return Ok(());
+                }
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    // Previously a silent loop — log each failed poll so a
+                    // slow/never-booting guest is visible in the boot trace.
+                    tracing::debug!(
+                        guest_base = %self.guest_base,
+                        attempt,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        error = %e,
+                        "fc boot: guest app not ready yet; retrying"
+                    );
                     tokio::time::sleep(READY_POLL).await;
                 }
                 Err(e) => {
+                    tracing::error!(
+                        guest_base = %self.guest_base,
+                        attempt,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        error = %e,
+                        "fc boot: guest app never became ready (timeout); if tap setup hit EPERM the guest has no network — run the supervisor with CAP_NET_ADMIN/root"
+                    );
                     bail!("guest app at {} never became ready: {e}", self.guest_base)
                 }
             }

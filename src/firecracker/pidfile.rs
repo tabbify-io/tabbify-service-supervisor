@@ -35,6 +35,18 @@ pub fn path(dir: &Path, uuid: &str) -> PathBuf {
     dir.join(format!("tabbify-fc-{}.pid", sanitize(uuid)))
 }
 
+/// Deterministic console-log path for app `uuid` under `dir`.
+/// Format: `<dir>/fc/<sanitized_uuid>.console.log`
+///
+/// When console capture is enabled (see `SUPERVISOR_FC_DEBUG` in the linux
+/// runtime) the firecracker child's stdout+stderr — including the guest
+/// kernel serial console (`console=ttyS0`) — is appended here instead of
+/// discarded, so a guest panic / boot failure is recoverable post-mortem.
+pub fn console_log_path(dir: &Path, uuid: &str) -> PathBuf {
+    dir.join("fc")
+        .join(format!("{}.console.log", sanitize(uuid)))
+}
+
 /// Write `pid` to the pidfile for `uuid` under `dir` (best-effort; logs on
 /// failure). Called after a successful `firecracker` spawn.
 pub fn write(dir: &Path, uuid: &str, pid: u32) {
@@ -104,6 +116,24 @@ mod tests {
         assert_eq!(
             p2,
             std::path::PathBuf::from("/tmp/tabbify-fc-my-app-v2.pid")
+        );
+    }
+
+    #[test]
+    fn console_log_path_is_deterministic_and_sanitized() {
+        let dir = std::path::Path::new("/var/lib/tabbify");
+        let p = console_log_path(dir, "0191e7c2-1111-7222-8333-444455556666");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from(
+                "/var/lib/tabbify/fc/0191e7c2-1111-7222-8333-444455556666.console.log"
+            )
+        );
+        // Uppercase + slashes/colons are sanitized to match the pidfile rules.
+        let p2 = console_log_path(dir, "My/App:v2");
+        assert_eq!(
+            p2,
+            std::path::PathBuf::from("/var/lib/tabbify/fc/my-app-v2.console.log")
         );
     }
 

@@ -439,6 +439,134 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
     );
 }
 
+/// The host OCI arch name for the test machine, and an arch name guaranteed to
+/// MISMATCH it. Used so the architecture-guard tests are portable across an
+/// amd64 CI runner and an arm64 dev box: the matching fixture uses the host
+/// arch, the mismatching fixture uses the "other" one.
+fn host_and_other_arch() -> (&'static str, &'static str) {
+    match super::host_oci_arch() {
+        "arm64" => ("arm64", "amd64"),
+        host => (host, "arm64"),
+    }
+}
+
+/// Architecture guard: a cache-miss conversion of an image whose architecture
+/// does NOT match the host must FAIL FAST — before the slow layer unpack +
+/// `mkfs.ext4` — with an error naming BOTH the image arch and the host arch.
+/// The external runner must never be invoked (no `oras`/`tar`/`mkfs`).
+#[tokio::test]
+async fn resolve_rootfs_rejects_arch_mismatch_before_conversion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:archmism";
+    let fetched = fc_fetched(digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-arch", digest);
+
+    let (_host, other) = host_and_other_arch();
+    // An image built for the "other" (non-host) architecture must be rejected.
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture": other, "os": "linux",
+        "config": {"Entrypoint": ["/bin/server"]},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
+    });
+    let work = target.parent().unwrap().to_path_buf();
+    let layout = write_min_oci_layout(&work, &cfg, &[("sha256:l0", &l0)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
+    // The guard must short-circuit BEFORE any external command: assert the
+    // runner is never invoked.
+    let called: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let called2 = called.clone();
+    let runner: super::FcBuildRunner = Arc::new(move |_argv| {
+        *called2.lock().unwrap() = true;
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    let err = super::resolve_rootfs(
+        "uuid-arch", &fetched, &layout, &config, digest, tmp.path(), &runner,
+    )
+    .await
+    .expect_err("arch mismatch must fail fast");
+
+    let msg = err.to_string();
+    let host = super::host_oci_arch();
+    assert!(
+        msg.contains(other),
+        "error must name the image arch {other:?}; got: {err}"
+    );
+    assert!(
+        msg.contains(host),
+        "error must name the host arch {host:?}; got: {err}"
+    );
+    assert!(
+        !*called.lock().unwrap(),
+        "no conversion command may run on an arch mismatch (fail fast before unpack/mkfs)"
+    );
+    assert!(
+        !target.is_file(),
+        "no rootfs may be produced on an arch mismatch"
+    );
+}
+
+/// `host_oci_arch` maps the host `std::env::consts::ARCH` to the OCI arch name
+/// (`x86_64 -> amd64`, `aarch64 -> arm64`), matching what the guard compares
+/// `config.architecture()` against.
+#[test]
+fn host_oci_arch_maps_known_targets() {
+    let h = super::host_oci_arch();
+    match std::env::consts::ARCH {
+        "x86_64" => assert_eq!(h, "amd64"),
+        "aarch64" => assert_eq!(h, "arm64"),
+        // On any other host the mapping falls back to the raw ARCH string.
+        other => assert_eq!(h, other),
+    }
+}
+
+/// A matching architecture must NOT be rejected by the guard: a cache-miss
+/// conversion of a host-arch image proceeds into the unpack/mkfs path (here the
+/// `mkfs.ext4` is faked) and produces the rootfs.
+#[tokio::test]
+async fn resolve_rootfs_allows_matching_host_arch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:archok01";
+    let fetched = fc_fetched(digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-archok", digest);
+
+    let (host, _other) = host_and_other_arch();
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture": host, "os": "linux",
+        "config": {"Entrypoint": ["/bin/server"], "WorkingDir": "/app"},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
+    });
+    let work = target.parent().unwrap().to_path_buf();
+    let layout = write_min_oci_layout(&work, &cfg, &[("sha256:l0", &l0)]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
+    let real = super::production_fc_build_runner();
+    let runner: super::FcBuildRunner = std::sync::Arc::new(move |argv: Vec<String>| {
+        let real = real.clone();
+        Box::pin(async move {
+            if argv.first().map(String::as_str) == Some("mkfs.ext4") {
+                if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
+                    std::fs::write(out, b"\0").unwrap();
+                }
+                (true, Vec::new())
+            } else {
+                (real)(argv).await
+            }
+        })
+    });
+
+    let rootfs = super::resolve_rootfs(
+        "uuid-archok", &fetched, &layout, &config, digest, tmp.path(), &runner,
+    )
+    .await
+    .expect("matching host arch must convert");
+    assert_eq!(rootfs, target);
+    assert!(rootfs.is_file());
+}
+
 /// On a cache MISS the conversion runs DOCKER-LESS — pull the OCI layout, read
 /// its config from the layout, untar its layers, then `mkfs.ext4` — and the
 /// resulting rootfs lands at the digest-keyed path. No `docker inspect`/`export`.
@@ -453,10 +581,12 @@ async fn run_fc_build_converts_on_cache_miss() {
     let fetched = fc_fetched(digest);
     let target = super::cached_rootfs_path(tmp.path(), "uuid-miss", digest);
 
-    // Stage a real OCI layout where `pull_oci_layout` would have left it.
+    // Stage a real OCI layout where `pull_oci_layout` would have left it. The
+    // image is built for the HOST arch so the architecture guard lets it
+    // through (this test exercises the conversion path, not the guard).
     let l0 = make_tar(&[("bin/server", b"elf")]);
     let cfg = serde_json::json!({
-        "architecture":"amd64","os":"linux",
+        "architecture": super::host_oci_arch(),"os":"linux",
         "config":{"Entrypoint":["/bin/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
         "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
     });
@@ -513,9 +643,10 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
 
     // Stage a real OCI layout where `pull_oci_layout` would have left it, so the
     // (faked, no-op) `oras copy` is satisfied and the real host `tar` unpacks it.
+    // Built for the HOST arch so the architecture guard lets it through.
     let l0 = make_tar(&[("bin/server", b"elf")]);
     let cfg = serde_json::json!({
-        "architecture":"amd64","os":"linux",
+        "architecture": super::host_oci_arch(),"os":"linux",
         "config":{"Entrypoint":["/app/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
         "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
     });
@@ -842,4 +973,204 @@ async fn unpack_oci_layers_errors_on_diffid_count_mismatch() {
         .unwrap_err();
     assert!(err.to_string().to_lowercase().contains("layer"),
         "must name the layer/diff_id mismatch; got: {err}");
+}
+
+use super::oci_fixtures::{
+    MEDIA_TAR_GZIP, MEDIA_TAR_ZSTD, make_tar_gzip, make_tar_gzip_modes, make_tar_zstd,
+    write_min_oci_layout_typed,
+};
+
+/// PORTABLE (all-OS) prerequisite for the linux-gated real-conversion test: the
+/// new compressed-layer fixtures must (a) emit REAL gzip/zstd bytes a host `tar`
+/// could inflate, (b) stage a spec-compliant layout whose layer descriptors
+/// carry the gzip/zstd OCI media type, and (c) be wired so the PRODUCTION
+/// `tar_decompress_flag` selects the matching `-z`/`--zstd` flag for those
+/// layers. This compiles + runs everywhere (so macOS CI exercises the fixtures);
+/// the actual `tar -z` unpack + real `mkfs.ext4` is the linux-gated `#[ignore]`
+/// test below.
+#[test]
+fn compressed_layer_fixtures_stage_real_oci_layout() {
+    use oci_spec::image::MediaType;
+
+    // (a) The gzip fixture is REAL gzip: a gzip member starts with 0x1f 0x8b and
+    //     inflates back to a tar whose header names the entry. zstd starts with
+    //     its 0x28 0xb5 0x2f 0xfd magic.
+    let gz = make_tar_gzip(&[("bin/server", b"elf-bytes")]);
+    assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip layer must carry the gzip magic");
+    let zst = make_tar_zstd(&[("bin/server", b"elf-bytes")]);
+    assert_eq!(
+        &zst[..4],
+        &[0x28, 0xb5, 0x2f, 0xfd],
+        "zstd layer must carry the zstd magic"
+    );
+    // gzip inflates to the original tar (whose ustar magic + entry name survive).
+    let inflated = {
+        use std::io::Read as _;
+        let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        out
+    };
+    assert!(
+        inflated.windows(7).any(|w| w == b"ustar\0\0") || inflated.len() >= 512,
+        "inflated gzip must be a tar archive"
+    );
+    assert!(
+        inflated.windows(10).any(|w| w == b"bin/server"),
+        "inflated gzip tar must contain the staged entry path"
+    );
+
+    // (b) A layout staged with the gzip media type carries it on the descriptor.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os": "linux",
+        "config": {"Entrypoint": ["/bin/server"]},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
+    });
+    let layout = write_min_oci_layout_typed(
+        tmp.path(),
+        &cfg,
+        &[("sha256:l0", &gz, MEDIA_TAR_GZIP)],
+    );
+    let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json")).unwrap();
+    let man_desc = index.manifests().first().unwrap();
+    let blob = layout
+        .join("blobs")
+        .join(man_desc.digest().algorithm().as_ref())
+        .join(man_desc.digest().digest());
+    let manifest = oci_spec::image::ImageManifest::from_file(blob).unwrap();
+    let layer_mt = manifest.layers()[0].media_type().to_string();
+    assert_eq!(
+        layer_mt, MEDIA_TAR_GZIP,
+        "the staged layer descriptor must carry the gzip OCI media type"
+    );
+
+    // (c) The production decompress-flag selector keys off that media type.
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::from(MEDIA_TAR_GZIP)),
+        Some("-z"),
+        "gzip layer media type must select tar -z"
+    );
+    assert_eq!(
+        super::tar_decompress_flag(&MediaType::from(MEDIA_TAR_ZSTD)),
+        Some("--zstd"),
+        "zstd layer media type must select tar --zstd"
+    );
+
+    // The explicit-mode gzip fixture (used for the 0o755 /init + entrypoint in
+    // the linux test) also emits real gzip.
+    let gz_modes = make_tar_gzip_modes(&[("init", b"#!/bin/sh\n", 0o755)]);
+    assert_eq!(&gz_modes[..2], &[0x1f, 0x8b]);
+}
+
+/// REAL end-to-end conversion (linux-gated, `#[ignore]`): drive the PRODUCTION
+/// [`super::build_rootfs_ext4`] with the PRODUCTION
+/// [`super::production_fc_build_runner`] against a layout whose layers carry the
+/// gzip OCI media type — so the real host `tar -z` inflates the layers and the
+/// real `mkfs.ext4 -F -d` (e2fsprogs) populates the ext4 — then inspect the
+/// produced `rootfs.ext4` with `dumpe2fs`/`debugfs` to assert it is a VALID ext4
+/// containing `/init` at mode 0755, the entrypoint binary, and that an OCI
+/// whiteout from an upper layer was applied (the deleted file is absent).
+///
+/// Gated to Linux + e2fsprogs (`mkfs.ext4`/`dumpe2fs`/`debugfs`) and `#[ignore]`
+/// so it runs only on the FC node (ThinkPad / CI), never on the macOS dev box.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux + e2fsprogs (mkfs.ext4/dumpe2fs/debugfs)"]
+async fn real_conversion_gzip_layers_and_mkfs_ext4_produces_valid_rootfs() {
+    // Two GZIP layers exercising the real `tar -z` unpack + an OCI whiteout:
+    //  - layer 0: an executable /init (0o755), the entrypoint binary /bin/server
+    //    (0o755), and a file /etc/drop.me that an upper layer must delete.
+    //  - layer 1: a `.wh.drop.me` whiteout under /etc removing the lower file.
+    let init_script = b"#!/bin/sh\nexec /bin/server\n";
+    let server_bin = b"\x7fELF-fake-entrypoint-binary";
+    let l0 = make_tar_gzip_modes(&[
+        ("init", init_script, 0o755),
+        ("bin/server", server_bin, 0o755),
+        ("etc/drop.me", b"delete me", 0o644),
+    ]);
+    let l1 = make_tar_gzip(&[("etc/.wh.drop.me", b"")]);
+
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os": "linux",
+        "config": {"Entrypoint": ["/bin/server"], "WorkingDir": "/"},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:l0", "sha256:l1"]}
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("out");
+    let layout = write_min_oci_layout_typed(
+        &out_dir,
+        &cfg,
+        &[
+            ("sha256:l0", &l0, MEDIA_TAR_GZIP),
+            ("sha256:l1", &l1, MEDIA_TAR_GZIP),
+        ],
+    );
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
+    // PRODUCTION runner: real host `tar -z` unpack + real `mkfs.ext4 -F -d`.
+    let runner = super::production_fc_build_runner();
+    let rootfs = super::build_rootfs_ext4(&layout, &config, &out_dir, 64, &runner)
+        .await
+        .expect("real OCI gzip-layer -> ext4 conversion must succeed");
+    assert!(rootfs.is_file(), "rootfs.ext4 must exist");
+
+    // 1. dumpe2fs proves it's a valid ext4 superblock (the filesystem magic is
+    //    parseable by e2fsprogs).
+    let dump = std::process::Command::new("dumpe2fs")
+        .arg(&rootfs)
+        .output()
+        .expect("dumpe2fs must run on the FC node");
+    assert!(
+        dump.status.success(),
+        "dumpe2fs must accept the produced image as a valid ext4; stderr: {}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let dump_out = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        dump_out.contains("Filesystem volume name")
+            || dump_out.contains("Inode count")
+            || dump_out.to_lowercase().contains("ext"),
+        "dumpe2fs output must describe an ext filesystem; got:\n{dump_out}"
+    );
+
+    // 2. debugfs introspects the contents WITHOUT mounting (rootless): `stat`
+    //    each path and read the directory listings.
+    let debugfs = |cmd: &str| -> String {
+        let out = std::process::Command::new("debugfs")
+            .args(["-R", cmd])
+            .arg(&rootfs)
+            .output()
+            .expect("debugfs must run on the FC node");
+        // debugfs prints diagnostics to stderr; the answer is on stdout.
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // /init exists at mode 0755 (the injected PID-1 init must be executable).
+    let stat_init = debugfs("stat /init");
+    assert!(
+        stat_init.contains("Mode:  0755") || stat_init.contains("0100755"),
+        "/init must be present at mode 0755; debugfs stat /init:\n{stat_init}"
+    );
+
+    // The entrypoint binary survived the gzip-layer unpack at mode 0755.
+    let stat_server = debugfs("stat /bin/server");
+    assert!(
+        stat_server.contains("Mode:  0755") || stat_server.contains("0100755"),
+        "/bin/server entrypoint must survive at mode 0755; debugfs stat /bin/server:\n{stat_server}"
+    );
+
+    // 3. The OCI whiteout was applied: /etc/drop.me from the lower layer is GONE.
+    let ls_etc = debugfs("ls -l /etc");
+    assert!(
+        !ls_etc.contains("drop.me"),
+        "the upper layer's .wh.drop.me whiteout must have removed /etc/drop.me; \
+         debugfs ls -l /etc:\n{ls_etc}"
+    );
+    // ...and the whiteout marker itself never leaked into the rootfs.
+    assert!(
+        !ls_etc.contains(".wh."),
+        "no .wh. whiteout marker may survive into the rootfs; debugfs ls -l /etc:\n{ls_etc}"
+    );
 }

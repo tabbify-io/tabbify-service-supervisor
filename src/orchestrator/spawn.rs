@@ -176,11 +176,42 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         });
     }
 
-    // Detach stdio: the runner has its own logging; don't tie its fds to the
-    // supervisor's (and don't block on inherited pipes).
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // Detach stdio. stdin is always null (the runner reads no input). stdout +
+    // stderr are redirected to a per-app append log under
+    // `<data_dir>/runners/<uuid>.log` so a crashed / detached runner's output is
+    // not lost (it would otherwise go to /dev/null). Logging is BEST-EFFORT: if
+    // the file cannot be opened we fall back to `Stdio::null()` so an app start
+    // never fails just because we could not open its log.
+    cmd.stdin(Stdio::null());
+    match open_runner_log(&spec.data_dir, &spec.uuid) {
+        Ok(file) => {
+            // The child needs an independent fd for stderr; `try_clone` dups the
+            // underlying OS handle (separate offset, same append semantics).
+            match file.try_clone() {
+                Ok(file_err) => {
+                    cmd.stdout(Stdio::from(file)).stderr(Stdio::from(file_err));
+                    // `cmd` now owns both fds (they are dup'd into the child on
+                    // spawn); nothing else holds the parent handles.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        uuid = %spec.uuid,
+                        error = %e,
+                        "could not clone runner log fd; runner stdio -> /dev/null"
+                    );
+                    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                uuid = %spec.uuid,
+                error = %e,
+                "could not open runner log file; runner stdio -> /dev/null"
+            );
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
 
     // NOTE: we intentionally leave `kill_on_drop` at its default (`false`).
     // Dropping the returned `Child` must NOT kill the detached runner.
@@ -224,6 +255,24 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
     );
 
     Ok((handle, child))
+}
+
+/// Open (creating as needed) the per-app runner log at
+/// `<data_dir>/runners/<uuid>.log` for APPEND, returning the file handle.
+///
+/// Creates the `runners/` subdirectory if missing. The caller redirects the
+/// detached runner's stdout + stderr into this file (cloning the handle for the
+/// second fd), so each (re)spawn's output is retained across restarts rather
+/// than discarded to `/dev/null`. Append mode means a respawn does not clobber
+/// the previous run's log.
+fn open_runner_log(data_dir: &Path, uuid: &str) -> std::io::Result<std::fs::File> {
+    let log_dir = data_dir.join("runners");
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("{uuid}.log"));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
 }
 
 #[cfg(test)]
@@ -369,6 +418,127 @@ mod tests {
             !joined.iter().any(|a| a == "--runtime-override"),
             "no --runtime-override when None; got: {joined:?}"
         );
+    }
+
+    /// Write an executable shell wrapper that prints `out_text` to stdout and
+    /// `err_text` to stderr, then exits 0. Returns its path. Used by the
+    /// log-capture tests below: pointing `SpawnSpec.runner_bin` at it lets us
+    /// drive the real detached spawn without a real `tabbify-runner`.
+    fn write_echo_wrapper(dir: &Path, name: &str, out_text: &str, err_text: &str) -> PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let wrapper = dir.join(name);
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            // `"$@"` is ignored; we only care about the captured stdio.
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf '%s\\n' '{out_text}'\nprintf '%s\\n' '{err_text}' 1>&2\n"
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+        wrapper
+    }
+
+    /// A spawned runner's stdout AND stderr are captured to
+    /// `<data_dir>/runners/<uuid>.log`.
+    #[tokio::test]
+    async fn spawn_runner_captures_stdout_and_stderr_to_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = write_echo_wrapper(
+            dir.path(),
+            "echo-runner.sh",
+            "RUNNER_STDOUT_LINE",
+            "RUNNER_STDERR_LINE",
+        );
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-aaaa-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        // Await the wrapper so it has written and flushed before we read the log.
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("runner log {log_path:?} should exist: {e}"));
+        assert!(
+            contents.contains("RUNNER_STDOUT_LINE"),
+            "log must contain captured stdout; got: {contents:?}"
+        );
+        assert!(
+            contents.contains("RUNNER_STDERR_LINE"),
+            "log must contain captured stderr; got: {contents:?}"
+        );
+    }
+
+    /// A second spawn for the same uuid APPENDS to the existing log (both runs
+    /// retained), it does not truncate.
+    #[tokio::test]
+    async fn spawn_runner_appends_to_existing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper_a = write_echo_wrapper(dir.path(), "a.sh", "FIRST_RUN_OUT", "FIRST_RUN_ERR");
+        let wrapper_b = write_echo_wrapper(dir.path(), "b.sh", "SECOND_RUN_OUT", "SECOND_RUN_ERR");
+
+        let mut s = spec();
+        s.uuid = "0191e7c2-bbbb-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        s.runner_bin = wrapper_a;
+        let (_h1, mut c1) = spawn_runner(&s, dir.path()).await.unwrap();
+        c1.wait().await.unwrap();
+
+        s.runner_bin = wrapper_b;
+        let (_h2, mut c2) = spawn_runner(&s, dir.path()).await.unwrap();
+        c2.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        for needle in [
+            "FIRST_RUN_OUT",
+            "FIRST_RUN_ERR",
+            "SECOND_RUN_OUT",
+            "SECOND_RUN_ERR",
+        ] {
+            assert!(
+                contents.contains(needle),
+                "appended log must retain {needle}; got: {contents:?}"
+            );
+        }
+    }
+
+    /// If the log file cannot be opened, the spawn still succeeds (logging is
+    /// best-effort and must never block an app from starting). Here `data_dir`
+    /// is a FILE, so `runners/` cannot be created under it.
+    #[tokio::test]
+    async fn spawn_runner_falls_back_to_null_when_log_open_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = write_echo_wrapper(dir.path(), "echo.sh", "OUT", "ERR");
+
+        // data_dir points at an existing regular file → create_dir_all fails.
+        let bogus_data = dir.path().join("not-a-dir");
+        std::fs::write(&bogus_data, b"i am a file").unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-cccc-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = bogus_data;
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path())
+            .await
+            .expect("spawn must succeed even when log dir cannot be created");
+        child.wait().await.unwrap();
     }
 
     /// The prod binary path resolves next to the current executable (not the

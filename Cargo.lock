@@ -2985,6 +2985,7 @@ dependencies = [
  "bytes",
  "clap",
  "dashmap",
+ "flate2",
  "hex",
  "http",
  "http-body-util",
@@ -3012,6 +3013,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wiremock",
+ "zstd",
 ]
 
 [[package]]
