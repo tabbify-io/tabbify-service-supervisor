@@ -197,4 +197,70 @@ mod tests {
         assert_eq!(after.current, "v2.0.0");
         assert_eq!(after.previous, vec!["v1.0.0".to_owned()]);
     }
+
+    /// swap_to composes the leaf helpers: it re-points BOTH binary symlinks at
+    /// the staged version dir, promotes the prior current into the VERSION
+    /// ledger's previous list, and triggers the restart exactly once with the
+    /// systemctl arguments. The restart side-effect itself is not unit-tested —
+    /// here a no-op closure (the [`RestartRunner`] seam) only records the call.
+    #[tokio::test]
+    async fn swap_to_repoints_symlinks_records_version_and_triggers_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+
+        // A pre-existing live version so the promotion path is exercised.
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v1.0.0".into(),
+                previous: vec![],
+            },
+        )
+        .unwrap();
+
+        // Stage the new version's binaries under releases/v2.0.0.
+        let v2 = install.join("releases/v2.0.0");
+        std::fs::create_dir_all(&v2).unwrap();
+        for bin in SWAP_BINARIES {
+            std::fs::write(v2.join(bin), format!("v2-{bin}")).unwrap();
+        }
+
+        // No-op restart seam: record every invocation instead of poking systemd.
+        let calls: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+        let recorded = Arc::clone(&calls);
+        let restart: RestartRunner = Arc::new(move |args: Vec<String>| {
+            let recorded = Arc::clone(&recorded);
+            Box::pin(async move {
+                recorded.lock().unwrap().push(args);
+                true
+            })
+        });
+
+        swap_to(&v2, "v2.0.0", install, &restart).await.unwrap();
+
+        // Both symlinks now resolve to the freshly staged binaries.
+        for bin in SWAP_BINARIES {
+            assert_eq!(
+                std::fs::read(install.join(bin)).unwrap(),
+                format!("v2-{bin}").into_bytes(),
+                "{bin} symlink must point at the new version dir",
+            );
+            assert_eq!(
+                std::fs::read_link(install.join(bin)).unwrap(),
+                v2.join(bin),
+            );
+        }
+
+        // VERSION ledger: new current, old current promoted to previous.
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v2.0.0");
+        assert_eq!(vf.previous, vec!["v1.0.0".to_owned()]);
+
+        // Restart triggered exactly once with the expected systemctl arguments.
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]],
+        );
+    }
 }
