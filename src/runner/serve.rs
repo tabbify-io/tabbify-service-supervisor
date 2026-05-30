@@ -210,22 +210,38 @@ impl RunnerServe {
         let app_ula = derive_app_ula(parsed_uuid);
 
         let fetcher = S3Fetcher::new(&cfg.s3_base_url, &cfg.data_dir);
-        let mut fetched = fetcher
-            .fetch(&cfg.uuid)
-            .await
-            .with_context(|| format!("fetch app {}", cfg.uuid))?;
+        let fetch_result = fetcher.fetch(&cfg.uuid).await;
 
-        // If a deployed image ref was passed (`--image-ref`, set by the
-        // orchestrator on a respawn), apply it to the manifest's docker
-        // `registry_ref` so the INITIAL build comes up on the deployed version
-        // (a `docker pull <ref>` instead of a source build). The override is
-        // also reflected in the `fetched` we store for later `Deploy` calls, so
-        // the runner's baseline version is the deployed one. Ignored for
-        // wasm/firecracker (`build_runtime` does not read `registry_ref` there).
-        if let Some(reff) = cfg.image_ref.as_deref() {
-            fetched = crate::build::fetched_with_ref(&fetched, reff);
-            tracing::info!(uuid = %cfg.uuid, %reff, "applied deployed image ref to manifest for initial build");
+        // Resolve the FetchedApp the initial build runs from.
+        //
+        // - S3 fetch SUCCEEDS (tcli-push apps + wasm/firecracker): when an
+        //   `--image-ref` was passed (orchestrator respawn), apply it to the
+        //   manifest's docker `registry_ref` so the INITIAL build comes up on
+        //   the deployed version (a `docker pull <ref>` instead of a source
+        //   build). The override is also reflected in the `fetched` stored for
+        //   later `Deploy` calls. Ignored for wasm/firecracker. This is the
+        //   unchanged historical behavior.
+        // - S3 fetch FAILS but an `--image-ref` is present: this is a
+        //   BUILD-pipeline app (`POST /v1/deploy` with a repo_url) — its image
+        //   is in the mesh registry and it has NO S3 manifest. Synthesize a
+        //   minimal docker manifest from the ref and run the deployed image
+        //   directly instead of crash-looping on the absent S3 fetch.
+        // - S3 fetch FAILS with no image-ref: propagate the error (a genuine
+        //   missing app).
+        if fetch_result.is_err() && cfg.image_ref.is_some() {
+            tracing::info!(
+                uuid = %cfg.uuid,
+                image_ref = ?cfg.image_ref,
+                "no S3 manifest for app — running deployed image from registry ref directly"
+            );
         }
+        let fetched = crate::build::resolve_fetched(
+            fetch_result,
+            &cfg.uuid,
+            cfg.image_ref.as_deref(),
+            &cfg.data_dir,
+        )
+        .with_context(|| format!("fetch app {}", cfg.uuid))?;
 
         let initial_runtime = build_runtime(
             cfg.runtime_override.as_deref(),
