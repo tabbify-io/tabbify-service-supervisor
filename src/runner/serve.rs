@@ -22,9 +22,16 @@
 //! claiming `requested_ula = derive_app_ula(uuid)` and declaring its
 //! `parent` + `app_uuid`. Because the coordinator routes that ULA straight to
 //! this peer, the runner binds its OWN ULA via [`AppHost::mesh_self`] — it does
-//! NOT need the separate `host_app_ula` app-route layer (that advertised
-//! app-ULAs distinct from a peer's own ULA, used by the old multi-app
-//! supervisor).
+//! NOT need the separate `host_app_ula` app-route layer for *routing* (that
+//! advertised app-ULAs distinct from a peer's own ULA, used by the old
+//! multi-app supervisor).
+//!
+//! It does, however, advertise that own ULA as a hosted app via
+//! [`MeshMembership::host_own_ula`] so the joiner's heartbeat carries it in
+//! `hosted_app_ulas` (FIX #9) — otherwise `GET /v1/supervisors` reports the
+//! runner hosts nothing even though its app serves 200. The advertise call's
+//! `/128` TUN alias re-assert is idempotent for the peer's already-assigned
+//! own ULA.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -283,11 +290,22 @@ impl RunnerServe {
                 .await
                 .context("join mesh as runner")?;
             let my_ula = membership.my_ula();
+            // FIX #9: advertise our OWN peer-ULA (== app-ULA) as a hosted app on
+            // the joiner so it rides every heartbeat. `mesh_self` binds the ULA
+            // directly with NO MeshHost joiner, so without this the joiner's
+            // hosted set stays empty and `GET /v1/supervisors` reports
+            // `hosted_app_ulas` empty even though the app serves 200. The
+            // underlying `host_app_ula` re-asserts the /128 TUN alias, which is
+            // idempotent for our already-assigned own ULA.
+            membership
+                .host_own_ula()
+                .await
+                .context("advertise runner own ULA as hosted app")?;
             tracing::info!(
                 %my_ula,
                 peer_id = %membership.peer_id(),
                 %app_ula,
-                "runner joined mesh; binding own ULA"
+                "runner joined mesh; advertised own ULA as hosted app; binding own ULA"
             );
             (AppHost::mesh_self(my_ula, cfg.port), Some(membership))
         };

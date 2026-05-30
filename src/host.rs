@@ -44,7 +44,7 @@ use crate::runtime::AppRuntime;
 /// [`MeshHost`] methods (avoids pulling in `async-trait`). The per-app listener
 /// binds the same port 8730 as the control API (config default); the app-ULA
 /// prefix disambiguates control vs app traffic.
-type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The slice of the mesh joiner the hosting layer needs. Implemented for the
 /// real [`mesh_joiner::Joiner`]; faked in unit tests so we can assert the

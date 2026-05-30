@@ -109,6 +109,44 @@ impl MeshMembership {
     pub fn mesh_host(&self) -> Arc<dyn MeshHost> {
         self.joiner.clone()
     }
+
+    /// Advertise this runner's OWN peer-ULA as a hosted app-ULA on the joiner
+    /// (FIX #9).
+    ///
+    /// A per-app runner joins claiming `requested_ula = derive_app_ula(uuid)`,
+    /// so the coordinator routes that ULA straight to this peer and its OWN
+    /// peer-ULA *is* the app-ULA — already reachable. But the runner binds it
+    /// via [`crate::host::AppHost::mesh_self`] (no [`MeshHost`] joiner), so the
+    /// joiner's locally-hosted set stays empty and the heartbeat carries an
+    /// empty `hosted_app_ulas` — making `GET /v1/supervisors` report no hosted
+    /// apps even though the app serves 200.
+    ///
+    /// This records `my_ula` in the joiner's hosted set so it rides every
+    /// heartbeat. The underlying `host_app_ula` also re-asserts the `/128` TUN
+    /// alias, which is idempotent for the peer's own ULA (already assigned on
+    /// join), so the call is a harmless no-op on the interface side.
+    ///
+    /// # Errors
+    /// Propagates a joiner `host_app_ula` failure (e.g. no TUN), so the caller
+    /// can decide whether an un-advertised runner is fatal.
+    pub async fn host_own_ula(&self) -> anyhow::Result<()> {
+        let mesh = self.mesh_host();
+        advertise_own_ula(&mesh, self.my_ula).await
+    }
+}
+
+/// Advertise `my_ula` as a hosted app-ULA on the given mesh handle (FIX #9).
+///
+/// Pure seam over [`MeshHost::mesh_host_ula`] (the joiner's `host_app_ula`) so
+/// the advertise-own-ULA behaviour is unit-testable with a fake `MeshHost` —
+/// no real TUN, no live join. Used by [`MeshMembership::host_own_ula`].
+///
+/// # Errors
+/// Propagates the joiner's `host_app_ula` failure surface.
+pub async fn advertise_own_ula(mesh: &Arc<dyn MeshHost>, my_ula: Ipv6Addr) -> anyhow::Result<()> {
+    mesh.mesh_host_ula(my_ula)
+        .await
+        .with_context(|| format!("joiner host_app_ula(own ULA {my_ula})"))
 }
 
 /// Build the supervisor's [`JoinConfig`] from its identity + per-app-runner
@@ -145,7 +183,59 @@ fn build_supervisor_join_config(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use dashmap::DashMap;
+
     use super::*;
+    use crate::host::{BoxFut, MeshHost};
+
+    /// A fake [`MeshHost`] that records the app-ULAs it was asked to host, so a
+    /// test can assert the advertise-own-ULA call fires without a real TUN.
+    #[derive(Default)]
+    struct FakeMeshHost {
+        hosted: DashMap<Ipv6Addr, ()>,
+    }
+
+    impl MeshHost for FakeMeshHost {
+        fn tun_iface(&self) -> Option<String> {
+            Some("utun-fake".to_owned())
+        }
+        fn mesh_host_ula(&self, app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>> {
+            self.hosted.insert(app_ula, ());
+            Box::pin(async { Ok(()) })
+        }
+        fn mesh_unhost_ula(&self, _app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// FIX #9: the per-app runner's OWN peer-ULA (== its app-ULA) must be
+    /// advertised as a hosted app on the joiner so it rides every heartbeat —
+    /// otherwise `GET /v1/supervisors` reports `hosted_app_ulas` empty even
+    /// though the app serves 200. `advertise_own_ula` routes the runner's own
+    /// ULA through the joiner's `host_app_ula` (idempotent re-assert of the
+    /// already-assigned alias) and records it in the advertised set.
+    #[tokio::test]
+    async fn advertise_own_ula_hosts_the_runners_ula_on_the_joiner() {
+        let fake: Arc<dyn MeshHost> = Arc::new(FakeMeshHost::default());
+        let my_ula: Ipv6Addr = "fd5a:1f02:dead:beef:cafe::1".parse().unwrap();
+
+        advertise_own_ula(&fake, my_ula)
+            .await
+            .expect("advertise own ula");
+
+        // Downcast-free assertion: re-run against a concrete fake we keep.
+        let concrete = Arc::new(FakeMeshHost::default());
+        let dynh: Arc<dyn MeshHost> = concrete.clone();
+        advertise_own_ula(&dynh, my_ula).await.expect("advertise");
+        assert!(
+            concrete.hosted.contains_key(&my_ula),
+            "advertise_own_ula must host the runner's own ULA on the joiner"
+        );
+    }
 
     /// JoinMetadata carries the supervisor's software_version so it rides onto
     /// the mesh join (and every heartbeat) via `JoinConfig.software_version`.
