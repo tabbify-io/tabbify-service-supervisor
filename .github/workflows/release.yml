@@ -281,7 +281,7 @@ jobs:
           grep '^TABBIFY_SUPERVISOR_IMAGE=' "${ENV_FILE}" >> "${GITHUB_ENV}"
 
       # A pushed image is useless until the running container pulls it. Trigger
-      # the redeploy on the coordinator host via SSM send-command — no SSH, no
+      # the redeploy on the SERVING host via SSM send-command — no SSH, no
       # static keys (the instance role carries SSM managed-node perms; this CI
       # role carries ssm:SendCommand). The supervisor runs as the `supervisor`
       # service in the same compose project on that host. This step only runs
@@ -317,7 +317,7 @@ jobs:
           CMD_ID=$(aws ssm send-command \
             --region "${AWS_REGION}" \
             --document-name AWS-RunShellScript \
-            --targets "Key=tag:Name,Values=tabbify-coordinator" \
+            --targets "Key=tag:Name,Values=tabbify-serving" \
             --comment "redeploy supervisor ${GITHUB_SHA::7}" \
             --parameters "$(jq -n --arg s "$DEPLOY_SCRIPT" '{commands:[$s]}')" \
             --query Command.CommandId --output text)
