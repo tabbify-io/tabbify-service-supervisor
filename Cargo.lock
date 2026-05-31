@@ -824,6 +824,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2763,6 +2769,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2936,7 +2953,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-fabric"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=d8fd8b7cfe02e9fe22e1985d7a6d813526e631d1#d8fd8b7cfe02e9fe22e1985d7a6d813526e631d1"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=e3a8bd85c33920401a7ffefca08bc84cec608b45#e3a8bd85c33920401a7ffefca08bc84cec608b45"
 dependencies = [
  "async-trait",
  "boringtun",
@@ -2953,7 +2970,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-joiner"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=d8fd8b7cfe02e9fe22e1985d7a6d813526e631d1#d8fd8b7cfe02e9fe22e1985d7a6d813526e631d1"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=e3a8bd85c33920401a7ffefca08bc84cec608b45#e3a8bd85c33920401a7ffefca08bc84cec608b45"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2961,17 +2978,29 @@ dependencies = [
  "dashmap",
  "eventsource-stream",
  "futures",
+ "futures-util",
  "parking_lot",
  "rand_core 0.6.4",
  "reqwest",
  "serde",
  "serde_json",
  "tabbify-mesh-fabric",
+ "tabbify-mesh-log",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "x25519-dalek",
+]
+
+[[package]]
+name = "tabbify-mesh-log"
+version = "0.1.0"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=e3a8bd85c33920401a7ffefca08bc84cec608b45#e3a8bd85c33920401a7ffefca08bc84cec608b45"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3179,6 +3208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3360,6 +3401,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.8.6",
+ "sha1",
+ "thiserror 1.0.69",
+ "utf-8",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3416,6 +3475,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
