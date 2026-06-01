@@ -154,6 +154,11 @@ pub struct FcConfig {
         default_value_t = 8080
     )]
     pub app_port: u16,
+
+    /// Directory holding the prebuilt NixOS node image (`vmlinux` + `rootfs.ext4`)
+    /// for the `node-firecracker` runtime. Host-local for now; S3 fetch comes later.
+    #[arg(long = "node-image-dir", env = "SUPERVISOR_NODE_IMAGE_DIR", default_value = "/opt/tabbify/node-images/default")]
+    pub node_image_dir: std::path::PathBuf,
 }
 
 impl Default for FcConfig {
@@ -166,6 +171,7 @@ impl Default for FcConfig {
             vcpus: 1,
             tap_subnet: DEFAULT_FC_TAP_SUBNET.to_owned(),
             app_port: 8080,
+            node_image_dir: "/opt/tabbify/node-images/default".into(),
         }
     }
 }
@@ -300,6 +306,14 @@ mod tests {
         assert_eq!(parsed.vcpus, dflt.vcpus);
         assert_eq!(parsed.tap_subnet, dflt.tap_subnet);
         assert_eq!(parsed.app_port, dflt.app_port);
+    }
+
+    #[test]
+    fn firecracker_node_image_dir_default() {
+        assert_eq!(
+            FcConfig::default().node_image_dir,
+            PathBuf::from("/opt/tabbify/node-images/default")
+        );
     }
 
     #[test]

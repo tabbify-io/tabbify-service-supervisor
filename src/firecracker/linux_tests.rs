@@ -19,6 +19,30 @@ fn guest_mac_is_locally_administered_and_deterministic() {
     assert_eq!(derive_guest_mac(1), "02:FC:01:00:00:00");
 }
 
+/// node-firecracker `health()` reports liveness from the shared `exited` flag
+/// (not an HTTP probe): `Serving` until the flag is set, `Unavailable` after.
+#[tokio::test]
+async fn node_fc_health_serving_until_exit_flag_set() {
+    use crate::runtime::{AppRuntime, RuntimeHealth};
+    let rt = FirecrackerRuntime::test_node_fc();
+    assert!(matches!(rt.health().await, RuntimeHealth::Serving));
+    rt.exited.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(rt.health().await, RuntimeHealth::Unavailable(_)));
+}
+
+/// node-firecracker `handle()` returns 502: the VM is reached over the mesh by
+/// its own ULA, never proxied over the tap.
+#[tokio::test]
+async fn node_fc_handle_returns_502() {
+    use crate::runtime::AppRuntime;
+    let rt = FirecrackerRuntime::test_node_fc();
+    let req = http::Request::builder().body(bytes::Bytes::new()).unwrap();
+    assert_eq!(
+        rt.handle(req).await.unwrap().status(),
+        http::StatusCode::BAD_GATEWAY
+    );
+}
+
 /// REAL microVM boot — Linux + `/dev/kvm` + a provisioned kernel + a
 /// rootfs only. `#[ignore]`d so CI / the macOS dev host never runs it;
 /// run it by hand on a KVM box (e.g. Leo's Lima Ubuntu):

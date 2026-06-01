@@ -7,10 +7,9 @@ use std::fs::OpenOptions;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-#[cfg(test)]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -26,7 +25,7 @@ use super::protocol::{
     snapshot_load_body,
 };
 use super::snapshot;
-use super::{FcConfig, kvm_available};
+use super::{FcConfig, RuntimeMode, kvm_available};
 use crate::manifest::Runtime;
 use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
 
@@ -36,6 +35,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL: Duration = Duration::from_millis(250);
 /// How long to wait for one firecracker API call over the unix socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Guest RAM (MiB) for a `node-firecracker` microVM. A recursive tabbify-node
+/// runs systemd + a tabbify-supervisor + dockerd + the mesh joiner, so it needs
+/// far more than a single OCI app; 2 GiB is a sane floor for the POC.
+const NODE_FC_MEMORY_MB: u32 = 2048;
 
 /// Env flag enabling live-boot debugging: when truthy, the firecracker child's
 /// stdout+stderr (including the guest serial console, `console=ttyS0`) are
@@ -113,6 +117,15 @@ pub struct FirecrackerRuntime {
     /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
     guest_base: String,
     client: reqwest::Client,
+    /// How this VM behaves: `Generic` (OCI-app, HTTP-proxied over the tap) or
+    /// `NodeFc` (recursive tabbify-node, reached over the mesh by its own ULA —
+    /// never proxied/probed over the tap). Set at construction.
+    mode: RuntimeMode,
+    /// Liveness flag for `NodeFc` mode: `watch_for_exit`'s `waitpid(WNOHANG)`
+    /// loop sets this `true` when the firecracker child exits, and `health()`
+    /// reads it (the in-VM supervisor binds its own ULA, so the tap-IP HTTP
+    /// probe can't reach it). Shared so `health()` works on `&self`.
+    exited: Arc<AtomicBool>,
     /// Test-only injectable reachability probe. Production leaves this `None`
     /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
     /// closure via [`Self::with_probe_for_test`] so no real microVM is needed.
@@ -202,6 +215,8 @@ impl FirecrackerRuntime {
             api_sock: api_sock.clone(),
             guest_base,
             client: reqwest::Client::new(),
+            mode: RuntimeMode::Generic,
+            exited: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             probe: None,
         };
@@ -291,6 +306,110 @@ impl FirecrackerRuntime {
         Ok(vm)
     }
 
+    /// Cold-boot a prebuilt NixOS node image (kernel + single self-contained
+    /// ext4 rootfs) as a recursive tabbify-node microVM. No OCI→ext4, no
+    /// snapshot.
+    ///
+    /// Returns as soon as `InstanceStart` succeeds (seconds) so the runner's
+    /// control socket binds within the orchestrator's 30s gate; the deep NixOS
+    /// boot + mesh-join are verified out-of-band. The in-VM supervisor binds its
+    /// own mesh ULA (NOT the tap), so this path does NOT HTTP-probe the guest
+    /// over the tap (`wait_until_ready` is skipped). Liveness is tracked in
+    /// `exited`, set by `watch_for_exit`'s `waitpid(WNOHANG)` loop.
+    ///
+    /// # Errors
+    /// `!kvm_available()`, kernel/rootfs not a file, tap setup failure,
+    /// firecracker spawn failure, or any REST configuration call failing.
+    pub async fn launch_node_with_uuid(
+        kernel: &Path,
+        rootfs: &Path,
+        cfg: &FcConfig,
+        uuid: &str,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        if !kvm_available() {
+            bail!("node-firecracker requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
+        }
+        if !kernel.is_file() {
+            bail!("node image kernel not found at {}", kernel.display());
+        }
+        if !rootfs.is_file() {
+            bail!("node image rootfs not found at {}", rootfs.display());
+        }
+
+        // Reconcile: kill any stale VM for this uuid before spawning fresh.
+        if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
+            pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
+        }
+
+        let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
+        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
+            .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
+        let tap_name = format!("fc-tap{seq}");
+        let guest_mac = derive_guest_mac(seq);
+        // The node VM is reached over the mesh by its own ULA, not via this
+        // base — but keep it populated for trace/symmetry with generic VMs.
+        let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
+        tracing::debug!(
+            seq,
+            %host_ip,
+            %guest_ip,
+            %tap_name,
+            %guest_mac,
+            uuid,
+            "node-fc cold boot: derived /30 link + tap + guest MAC"
+        );
+
+        // Host tap + /30 link. Best-effort cleanup of a stale tap first.
+        let _ = run_ip(&["link", "del", &tap_name]).await;
+        setup_tap(&tap_name, host_ip).await.map_err(|e| {
+            tracing::error!(
+                %tap_name, %host_ip, error = %e,
+                "node-fc cold boot: tap setup failed (need CAP_NET_ADMIN/root for `ip tuntap`)"
+            );
+            e
+        })?;
+        tracing::debug!(%tap_name, %host_ip, "node-fc cold boot: tap up");
+
+        let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
+        let _ = std::fs::remove_file(&api_sock);
+        let console_log = pidfile::console_log_path(data_dir, uuid);
+        let (stdout, stderr) = console_stdio(Some(&console_log));
+        let child = Command::new(&cfg.bin)
+            .arg("--api-sock")
+            .arg(&api_sock)
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
+
+        let me = Self {
+            child: Some(child),
+            tap_name,
+            api_sock: api_sock.clone(),
+            guest_base,
+            client: reqwest::Client::new(),
+            mode: RuntimeMode::NodeFc,
+            exited: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            probe: None,
+        };
+
+        // Configure + start the VM. Unlike `cold_boot`, we DO NOT call
+        // `wait_until_ready` — the in-VM supervisor binds its own mesh ULA and
+        // never answers on the tap IP, and the runner must return fast so its
+        // control socket binds within the orchestrator's 30s gate.
+        me.configure_and_boot_node(kernel, rootfs, cfg, &guest_ip, &host_ip, &guest_mac)
+            .await?;
+
+        // Record the new child PID so a future restart can clean it up.
+        if let Some(pid) = me.child.as_ref().and_then(|c| c.id()) {
+            pidfile::write(data_dir, uuid, pid);
+        }
+        Ok(me)
+    }
+
     /// Restore a previously-snapshotted VM from `cache_dir`.
     ///
     /// Flow: `setup_tap` (new tap/IP, derived by VM_SEQ) → spawn
@@ -367,6 +486,8 @@ impl FirecrackerRuntime {
             api_sock: api_sock.clone(),
             guest_base,
             client: reqwest::Client::new(),
+            mode: RuntimeMode::Generic,
+            exited: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             probe: None,
         };
@@ -431,6 +552,62 @@ impl FirecrackerRuntime {
         self.api_put("/actions", &instance_start_body())
             .await
             .context("PUT /actions InstanceStart")?;
+        Ok(())
+    }
+
+    /// Push the firecracker REST configuration for a node-firecracker VM, then
+    /// start it. A copy of [`Self::configure_and_boot`] that takes an EXPLICIT
+    /// `kernel` (instead of `rt.kernel`/`cfg.kernel`) and an explicit `rootfs`,
+    /// and ENDS at the `InstanceStart` PUT — there is NO `wait_until_ready`
+    /// call, because the in-VM supervisor binds its own mesh ULA and never
+    /// answers on the tap IP. Uses the supervisor's configured `vcpus`/default
+    /// memory; the node image is self-contained, so no manifest `Runtime` is
+    /// needed. The boot `ip=` cmdline (set by `boot_source_body`) is fine for
+    /// NixOS.
+    async fn configure_and_boot_node(
+        &self,
+        kernel: &Path,
+        rootfs: &Path,
+        cfg: &FcConfig,
+        guest_ip: &Ipv4Addr,
+        host_ip: &Ipv4Addr,
+        guest_mac: &str,
+    ) -> Result<()> {
+        // The API socket appears asynchronously after spawn; wait for it.
+        wait_for_socket(&self.api_sock).await?;
+
+        let kernel_str = kernel
+            .to_str()
+            .ok_or_else(|| anyhow!("node image kernel path is not valid UTF-8"))?;
+        let rootfs_str = rootfs
+            .to_str()
+            .ok_or_else(|| anyhow!("node image rootfs path is not valid UTF-8"))?;
+
+        self.api_put(
+            "/machine-config",
+            &machine_config_body(cfg.vcpus, NODE_FC_MEMORY_MB),
+        )
+        .await
+        .context("PUT /machine-config")?;
+        self.api_put(
+            "/boot-source",
+            &boot_source_body(kernel_str, &guest_ip.to_string(), &host_ip.to_string()),
+        )
+        .await
+        .context("PUT /boot-source")?;
+        self.api_put("/drives/rootfs", &rootfs_drive_body(rootfs_str))
+            .await
+            .context("PUT /drives/rootfs")?;
+        self.api_put(
+            "/network-interfaces/eth0",
+            &network_iface_body(&self.tap_name, guest_mac),
+        )
+        .await
+        .context("PUT /network-interfaces/eth0")?;
+        self.api_put("/actions", &instance_start_body())
+            .await
+            .context("PUT /actions InstanceStart")?;
+        // No `wait_until_ready`: return fast (see `launch_node_with_uuid`).
         Ok(())
     }
 
@@ -592,18 +769,65 @@ impl FirecrackerRuntime {
             api_sock: PathBuf::from("/tmp/firecracker-test.sock"),
             guest_base: guest_base.to_owned(),
             client: reqwest::Client::new(),
+            mode: RuntimeMode::Generic,
+            exited: Arc::new(AtomicBool::new(false)),
             probe: Some(probe),
+        }
+    }
+
+    /// Construct a `NodeFc`-mode runtime with no live child/tap, for unit tests
+    /// that exercise the exit-flag `health()` path and the 502 `handle()` path
+    /// without a real microVM.
+    #[cfg(test)]
+    pub(crate) fn test_node_fc() -> Self {
+        Self {
+            child: None,
+            tap_name: String::new(),
+            api_sock: PathBuf::new(),
+            guest_base: String::new(),
+            client: reqwest::Client::new(),
+            mode: RuntimeMode::NodeFc,
+            exited: Arc::new(AtomicBool::new(false)),
+            probe: None,
         }
     }
 }
 
 impl AppRuntime for FirecrackerRuntime {
     fn handle<'a>(&'a self, request: Request<Bytes>) -> BoxRespFut<'a> {
-        // Delegate to the VM-independent proxy core (tested via wiremock).
-        Box::pin(proxy_request(&self.client, &self.guest_base, request))
+        match self.mode {
+            // node-firecracker VMs are reached over the mesh by their own ULA,
+            // not proxied over the tap — so a direct request here is a 502.
+            RuntimeMode::NodeFc => Box::pin(async {
+                Ok(http::Response::builder()
+                    .status(http::StatusCode::BAD_GATEWAY)
+                    .body(Bytes::from_static(
+                        b"node-firecracker is reached over the mesh, not proxied",
+                    ))?)
+            }),
+            // Generic OCI-app VM: delegate to the VM-independent proxy core
+            // (tested via wiremock).
+            RuntimeMode::Generic => {
+                Box::pin(proxy_request(&self.client, &self.guest_base, request))
+            }
+        }
     }
 
     fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+        // node-firecracker: the in-VM supervisor binds its own mesh ULA (not the
+        // tap), so the tap-IP HTTP probe can't reach it. Liveness comes from the
+        // `exited` flag that `watch_for_exit`'s `waitpid(WNOHANG)` loop sets.
+        if self.mode == RuntimeMode::NodeFc {
+            let dead = self.exited.load(Ordering::SeqCst);
+            return Box::pin(async move {
+                if dead {
+                    RuntimeHealth::Unavailable("node-fc microVM exited".into())
+                } else {
+                    RuntimeHealth::Serving
+                }
+            });
+        }
+
         // Test seam: when an injectable probe is present (set only by
         // `with_probe_for_test`), use it instead of a real HTTP GET so health
         // can be exercised without a live microVM. The probe receives the
@@ -651,6 +875,7 @@ impl AppRuntime for FirecrackerRuntime {
         // `Child::wait` needs `&mut`, which `Drop` owns). When the VM exits
         // the app is gone → the runner exits → L2 respawns it.
         let pid = self.child.as_ref().and_then(|c| c.id());
+        let exited = self.exited.clone();
         Box::pin(async move {
             match pid {
                 None => std::future::pending().await,
@@ -663,6 +888,9 @@ impl AppRuntime for FirecrackerRuntime {
                         libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
                     };
                     if r != 0 {
+                        // Record liveness for `NodeFc` `health()` (which can't
+                        // HTTP-probe the in-VM supervisor over the tap).
+                        exited.store(true, Ordering::SeqCst);
                         return ExitReason::Died(format!("firecracker child pid {pid} exited"));
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
