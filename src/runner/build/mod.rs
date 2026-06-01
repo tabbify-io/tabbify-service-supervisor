@@ -159,10 +159,12 @@ pub struct ArtifactRef {
 /// SHA) and return an [`ArtifactRef`].
 ///
 /// All dependencies are injected so the function is fully unit-testable without
-/// a real git binary, Docker daemon, build toolchain, or `oras` binary. The
-/// `push_runner` + `docker_bin` drive the docker path; the `oras_runner` +
-/// `build_cmd_runner` + `oras_bin` drive the wasm path (each path ignores the
-/// other's runners).
+/// a real git binary, Docker daemon, build toolchain, or `oras`/`skopeo` binary.
+/// The `skopeo_runner` + `skopeo_bin` drive the docker path's registry PUSH (the
+/// image is built by `backend`, then `skopeo` copies it from the local docker
+/// daemon to the mesh registry — the daemon never needs a mesh route); the
+/// `oras_runner` + `build_cmd_runner` + `oras_bin` drive the wasm path (each path
+/// ignores the other's runners).
 ///
 /// # Errors
 /// Clone failure; (docker) missing `Dockerfile`, build error, or push failure;
@@ -173,8 +175,8 @@ pub async fn run_build(
     job: &BuildJob,
     backend: &dyn crate::build_backend::BuildBackend,
     git: &crate::git::GitRun,
-    push_runner: &crate::docker::CommandRunner,
-    docker_bin: &str,
+    skopeo_runner: &crate::docker::CommandRunner,
+    skopeo_bin: &str,
     oras_runner: &crate::docker::CommandRunner,
     build_cmd_runner: &BuildCmdRunner,
     oras_bin: &str,
@@ -200,7 +202,7 @@ pub async fn run_build(
 
     match job.build_kind {
         BuildKind::Docker => {
-            docker::run_docker_build(job, backend, push_runner, docker_bin, &src, reff).await
+            docker::run_docker_build(job, backend, skopeo_runner, skopeo_bin, &src, reff).await
         }
         BuildKind::Wasm => {
             wasm::run_wasm_build(job, build_cmd_runner, oras_runner, oras_bin, &src, reff).await
@@ -228,9 +230,15 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
     let oras_bin = std::env::var("SUPERVISOR_ORAS_BIN")
         .unwrap_or_else(|_| crate::config::DEFAULT_ORAS_BIN.to_owned());
 
+    // The docker build path pushes via supervisor-side `skopeo` (copies the
+    // built image from the local docker daemon to the mesh registry), so the
+    // docker daemon — which has no mesh route — never talks to the registry.
+    let skopeo_bin = std::env::var("SUPERVISOR_SKOPEO_BIN")
+        .unwrap_or_else(|_| crate::config::DEFAULT_SKOPEO_BIN.to_owned());
+
     let backend = crate::build_backend::HostDockerBackend::new(docker_bin.clone());
     let git = crate::git::real_git_run(git_bin);
-    let push_runner = crate::docker::production_command_runner(docker_bin.clone());
+    let skopeo_runner = crate::skopeo::production_skopeo_runner(skopeo_bin.clone());
     let oras_runner = crate::oras::production_oras_runner(oras_bin.clone());
     let build_cmd_runner = production_build_cmd_runner();
 
@@ -246,8 +254,8 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
         &job,
         &backend,
         &git,
-        &push_runner,
-        &docker_bin,
+        &skopeo_runner,
+        &skopeo_bin,
         &oras_runner,
         &build_cmd_runner,
         &oras_bin,

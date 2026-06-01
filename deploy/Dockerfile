@@ -16,13 +16,16 @@ FROM debian:bookworm-slim
 
 # docker CLI ONLY (client; talks to a mounted host socket — no daemon in-image).
 # oras CLI for pulling WASM OCI artifacts from the mesh registry (plain-http over WG).
+# skopeo for the docker build push: copies the built image from the docker daemon
+# straight to the mesh registry (`skopeo copy docker-daemon:<tag>:latest
+# docker://<ref>`), run supervisor-side so the daemon never needs a mesh route.
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG DOCKER_ARCH=aarch64
 # ORAS_ARCH uses the OCI-standard naming (amd64 / arm64).
 ARG ORAS_VERSION=1.2.0
 ARG ORAS_ARCH=arm64
 RUN apt-get update \
- && apt-get install -y --no-install-recommends iproute2 ca-certificates curl git \
+ && apt-get install -y --no-install-recommends iproute2 ca-certificates curl git skopeo \
  && curl -fsSL "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar xz -C /usr/local/bin --strip-components=1 docker/docker \
  && curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz" \

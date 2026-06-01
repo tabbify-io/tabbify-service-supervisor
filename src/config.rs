@@ -183,6 +183,12 @@ pub const DEFAULT_DOCKER_BIN: &str = "docker";
 /// artifacts from the mesh registry (`oras pull --plain-http <ref>`).
 pub const DEFAULT_ORAS_BIN: &str = "oras";
 
+/// Default `skopeo` binary (looked up on `$PATH`). Used by the docker build path
+/// to push the built image from the local docker daemon to the mesh registry
+/// (`skopeo copy docker-daemon:<tag>:latest docker://<ref>`), run supervisor-side
+/// so the docker daemon never needs a mesh route.
+pub const DEFAULT_SKOPEO_BIN: &str = "skopeo";
+
 /// Default port the app's HTTP server listens on inside the container.
 pub const DEFAULT_DOCKER_APP_PORT: u16 = 8080;
 
@@ -210,6 +216,15 @@ pub struct DockerConfig {
     /// `oras pull --plain-http` is used for every `[ula]:5000` ref.
     #[arg(long = "oras-bin", env = "SUPERVISOR_ORAS_BIN", default_value = DEFAULT_ORAS_BIN)]
     pub oras_bin: String,
+
+    /// Path to the `skopeo` binary used by the docker build path to push the
+    /// built image from the local docker daemon to the mesh registry
+    /// (`skopeo copy docker-daemon:<tag>:latest docker://<ref>`). Run
+    /// supervisor-side (on the mesh) so the docker daemon — which has no mesh
+    /// route — never talks to the registry; `--dest-tls-verify=false` is used
+    /// because the mesh registry is plain HTTP over the WireGuard overlay.
+    #[arg(long = "skopeo-bin", env = "SUPERVISOR_SKOPEO_BIN", default_value = DEFAULT_SKOPEO_BIN)]
+    pub skopeo_bin: String,
 
     /// Port the app's HTTP server listens on inside the container (the image's
     /// `EXPOSE`d / served port). The supervisor publishes an ephemeral loopback
@@ -239,6 +254,7 @@ impl Default for DockerConfig {
         Self {
             docker_bin: DEFAULT_DOCKER_BIN.to_owned(),
             oras_bin: DEFAULT_ORAS_BIN.to_owned(),
+            skopeo_bin: DEFAULT_SKOPEO_BIN.to_owned(),
             app_port: DEFAULT_DOCKER_APP_PORT,
             build_timeout_secs: DEFAULT_DOCKER_BUILD_TIMEOUT_SECS,
         }
@@ -344,6 +360,7 @@ mod tests {
         let cfg = Config::try_parse_from(["supervisord"]).unwrap();
         assert_eq!(cfg.docker.docker_bin, DEFAULT_DOCKER_BIN);
         assert_eq!(cfg.docker.oras_bin, DEFAULT_ORAS_BIN);
+        assert_eq!(cfg.docker.skopeo_bin, DEFAULT_SKOPEO_BIN);
         assert_eq!(cfg.docker.app_port, DEFAULT_DOCKER_APP_PORT);
         assert_eq!(
             cfg.docker.build_timeout_secs,
@@ -357,6 +374,7 @@ mod tests {
         let dflt = DockerConfig::default();
         assert_eq!(parsed.docker_bin, dflt.docker_bin);
         assert_eq!(parsed.oras_bin, dflt.oras_bin);
+        assert_eq!(parsed.skopeo_bin, dflt.skopeo_bin);
         assert_eq!(parsed.app_port, dflt.app_port);
         assert_eq!(parsed.build_timeout_secs, dflt.build_timeout_secs);
     }
@@ -369,6 +387,8 @@ mod tests {
             "/usr/local/bin/docker",
             "--oras-bin",
             "/usr/local/bin/oras",
+            "--skopeo-bin",
+            "/usr/local/bin/skopeo",
             "--docker-app-port",
             "3000",
             "--docker-build-timeout-secs",
@@ -377,6 +397,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.docker.docker_bin, "/usr/local/bin/docker");
         assert_eq!(cfg.docker.oras_bin, "/usr/local/bin/oras");
+        assert_eq!(cfg.docker.skopeo_bin, "/usr/local/bin/skopeo");
         assert_eq!(cfg.docker.app_port, 3000);
         assert_eq!(cfg.docker.build_timeout_secs, 600);
     }

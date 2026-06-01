@@ -850,8 +850,8 @@ async fn push_image_surfaces_push_stderr_in_err() {
 }
 
 /// The build runner's docker path must bail with the registry stderr (not just
-/// the image ref) when `push_image` fails — confirming the diagnostic survives
-/// all the way to the `run_docker_build` caller.
+/// the image ref) when the supervisor-side `skopeo` push fails — confirming the
+/// diagnostic survives all the way to the `run_docker_build` caller.
 #[tokio::test]
 async fn run_docker_build_bails_with_push_stderr() {
     use crate::build_backend::HostDockerBackend;
@@ -876,10 +876,10 @@ async fn run_docker_build_bails_with_push_stderr() {
     let build_runner: super::CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
     let backend = HostDockerBackend::with_runner("docker".to_owned(), build_runner);
 
-    // Push runner: tag succeeds, push fails with the auth stderr.
-    let push_runner: super::CommandRunner = Arc::new(|args: Vec<String>| {
+    // Skopeo push runner: the `skopeo copy` fails with the auth stderr.
+    let skopeo_runner: super::CommandRunner = Arc::new(|args: Vec<String>| {
         let fut: BoxFut<'static, Result<(), String>> =
-            if args.first().map(String::as_str) == Some("push") {
+            if args.first().map(String::as_str) == Some("copy") {
                 Box::pin(async { Err("unauthorized: authentication required".to_owned()) })
             } else {
                 Box::pin(async { Ok(()) })
@@ -908,8 +908,8 @@ async fn run_docker_build_bails_with_push_stderr() {
         &job,
         &backend,
         &git,
-        &push_runner,
-        "docker",
+        &skopeo_runner,
+        "skopeo",
         &oras_runner,
         &build_cmd_runner,
         "oras",

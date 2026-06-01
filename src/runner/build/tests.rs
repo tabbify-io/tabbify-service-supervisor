@@ -173,20 +173,23 @@
 
     /// Convenience wrapper around [`run_build`] for DOCKER tests: passes no-op
     /// runners for the wasm-path seams (which the docker path ignores).
+    ///
+    /// The docker path pushes via the supervisor-side `skopeo`, so `skopeo_runner`
+    /// is the runner that records the registry-push argv.
     async fn run_docker_test(
         job: &BuildJob,
         backend: &dyn BuildBackend,
         git: &GitRun,
-        push_runner: &CommandRunner,
-        docker_bin: &str,
+        skopeo_runner: &CommandRunner,
+        skopeo_bin: &str,
         workdir: &Path,
     ) -> anyhow::Result<ArtifactRef> {
         run_build(
             job,
             backend,
             git,
-            push_runner,
-            docker_bin,
+            skopeo_runner,
+            skopeo_bin,
             &noop_runner(),
             &noop_build_cmd_runner(),
             "oras",
@@ -224,7 +227,9 @@
 
     // ── run_build (injected) ──────────────────────────────────────────────────
 
-    /// Happy path: clone creates Dockerfile → build → push → correct ArtifactRef.
+    /// Happy path: clone creates Dockerfile → build → skopeo push → correct
+    /// ArtifactRef. The registry push is a `skopeo copy docker-daemon:<tag>:latest
+    /// docker://<reff>` issued by the supervisor-side skopeo runner.
     #[tokio::test]
     async fn run_build_clones_builds_pushes_and_returns_ref() {
         let dir = tempfile::tempdir().unwrap();
@@ -237,10 +242,10 @@
         };
 
         let pushed = Arc::new(Mutex::new(Vec::new()));
-        let push_runner = record_runner(pushed.clone());
+        let skopeo_runner = record_runner(pushed.clone());
 
         let job = test_job();
-        let art = run_docker_test(&job, &backend, &git, &push_runner, "docker", dir.path())
+        let art = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
             .await
             .unwrap();
 
@@ -258,16 +263,22 @@
         );
         assert_eq!(tag, "tbf-build-u");
 
-        // push runner must have been called with push argv containing the ref.
+        // skopeo runner must have been called with a `copy` argv that reads from
+        // the local docker daemon and writes the registry ref via docker://.
         let cmds = pushed.lock().unwrap();
         assert!(
-            cmds.iter().any(|c| c.contains(&"push".to_string())),
-            "push command must be issued; got {cmds:?}"
+            cmds.iter().any(|c| c.first() == Some(&"copy".to_string())),
+            "skopeo copy command must be issued; got {cmds:?}"
         );
         assert!(
             cmds.iter()
-                .any(|c| c.iter().any(|a| a.contains("[fd5a::1]:5000/acme/u:abc123"))),
-            "push argv must contain the registry ref; got {cmds:?}"
+                .any(|c| c.contains(&"docker-daemon:tbf-build-u:latest".to_string())),
+            "skopeo argv must read the built image from the local docker daemon; got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains(&"docker://[fd5a::1]:5000/acme/u:abc123".to_string())),
+            "skopeo argv must push to docker://<reff>; got {cmds:?}"
         );
     }
 
@@ -280,10 +291,10 @@
         let backend = FakeBackend {
             built: Arc::new(Mutex::new(None)),
         };
-        let push_runner = fail_runner();
+        let skopeo_runner = fail_runner();
 
         let job = test_job();
-        let err = run_docker_test(&job, &backend, &git, &push_runner, "docker", dir.path())
+        let err = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
             .await
             .unwrap_err()
             .to_string();
@@ -303,10 +314,10 @@
         let backend = FakeBackend {
             built: Arc::new(Mutex::new(None)),
         };
-        let push_runner = fail_runner();
+        let skopeo_runner = fail_runner();
 
         let job = test_job();
-        let err = run_docker_test(&job, &backend, &git, &push_runner, "docker", dir.path())
+        let err = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
             .await
             .unwrap_err()
             .to_string();
@@ -327,14 +338,14 @@
         let dir = tempfile::tempdir().unwrap();
         let git = git_with_dockerfile(Arc::new(Mutex::new(None)));
         let backend = FailBackend;
-        let push_runner = fail_runner();
+        let skopeo_runner = fail_runner();
 
         let err = run_docker_test(
             &test_job(),
             &backend,
             &git,
-            &push_runner,
-            "docker",
+            &skopeo_runner,
+            "skopeo",
             dir.path(),
         )
         .await
@@ -356,7 +367,7 @@
             built: Arc::new(Mutex::new(None)),
         };
         let pushed = Arc::new(Mutex::new(Vec::new()));
-        let push_runner = record_runner(pushed);
+        let skopeo_runner = record_runner(pushed);
 
         let job = BuildJob {
             repo_url: "https://github.com/example/repo".into(),
@@ -370,7 +381,7 @@
             build_cmd: None,
             artifact_path: None,
         };
-        let art = run_docker_test(&job, &backend, &git, &push_runner, "docker", dir.path())
+        let art = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
             .await
             .unwrap();
 
