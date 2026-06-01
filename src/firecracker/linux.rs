@@ -565,6 +565,7 @@ impl FirecrackerRuntime {
     /// ULA and never answers on the tap IP, so readiness is verified out-of-band
     /// over the mesh. The boot `ip=` cmdline (set by `boot_source_body`) is fine
     /// for NixOS.
+    #[allow(clippy::too_many_arguments)]
     async fn configure_and_boot_node(
         &self,
         kernel: &Path,
