@@ -43,6 +43,20 @@ async fn node_fc_handle_returns_502() {
     );
 }
 
+/// node-firecracker machine-config is sourced from the synthetic manifest's
+/// `runtime` (the single source of truth), NOT `FcConfig`'s defaults: the
+/// recursive node VM must boot with the manifest's 4 vCPU / 2048 MiB, not
+/// `cfg.vcpus == 1`.
+#[test]
+fn node_machine_config_honors_manifest_vcpus_and_memory() {
+    let fetched = crate::build::fetched_for_node_fc("019e7903-0000-7000-8000-000000000f01");
+    let cfg = FcConfig::default();
+    assert_eq!(cfg.vcpus, 1, "cfg default must be 1 so the test proves override");
+    let body = node_machine_config(&fetched.manifest.runtime, &cfg);
+    assert_eq!(body["vcpu_count"], 4);
+    assert_eq!(body["mem_size_mib"], 2048);
+}
+
 /// REAL microVM boot — Linux + `/dev/kvm` + a provisioned kernel + a
 /// rootfs only. `#[ignore]`d so CI / the macOS dev host never runs it;
 /// run it by hand on a KVM box (e.g. Leo's Lima Ubuntu):

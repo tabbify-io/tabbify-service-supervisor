@@ -52,6 +52,7 @@ impl FirecrackerRuntime {
     pub async fn launch_node_with_uuid(
         _kernel: &std::path::Path,
         _rootfs: &std::path::Path,
+        _rt: &Runtime,
         _cfg: &FcConfig,
         _uuid: &str,
         _data_dir: &std::path::Path,

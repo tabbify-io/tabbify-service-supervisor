@@ -36,11 +36,6 @@ const READY_POLL: Duration = Duration::from_millis(250);
 /// How long to wait for one firecracker API call over the unix socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Guest RAM (MiB) for a `node-firecracker` microVM. A recursive tabbify-node
-/// runs systemd + a tabbify-supervisor + dockerd + the mesh joiner, so it needs
-/// far more than a single OCI app; 2 GiB is a sane floor for the POC.
-const NODE_FC_MEMORY_MB: u32 = 2048;
-
 /// Env flag enabling live-boot debugging: when truthy, the firecracker child's
 /// stdout+stderr (including the guest serial console, `console=ttyS0`) are
 /// appended to `<data_dir>/fc/<uuid>.console.log` instead of discarded, so a
@@ -323,6 +318,7 @@ impl FirecrackerRuntime {
     pub async fn launch_node_with_uuid(
         kernel: &Path,
         rootfs: &Path,
+        rt: &Runtime,
         cfg: &FcConfig,
         uuid: &str,
         data_dir: &Path,
@@ -396,11 +392,11 @@ impl FirecrackerRuntime {
             probe: None,
         };
 
-        // Configure + start the VM. Unlike `cold_boot`, we DO NOT call
-        // `wait_until_ready` — the in-VM supervisor binds its own mesh ULA and
-        // never answers on the tap IP, and the runner must return fast so its
-        // control socket binds within the orchestrator's 30s gate.
-        me.configure_and_boot_node(kernel, rootfs, cfg, &guest_ip, &host_ip, &guest_mac)
+        // Configure + start the VM. This launch path has NO post-boot
+        // readiness wait at all — the in-VM supervisor binds its own mesh ULA
+        // and never answers on the tap IP, and the runner must return fast so
+        // its control socket binds within the orchestrator's 30s gate.
+        me.configure_and_boot_node(kernel, rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac)
             .await?;
 
         // Record the new child PID so a future restart can clean it up.
@@ -557,17 +553,23 @@ impl FirecrackerRuntime {
 
     /// Push the firecracker REST configuration for a node-firecracker VM, then
     /// start it. A copy of [`Self::configure_and_boot`] that takes an EXPLICIT
-    /// `kernel` (instead of `rt.kernel`/`cfg.kernel`) and an explicit `rootfs`,
-    /// and ENDS at the `InstanceStart` PUT — there is NO `wait_until_ready`
-    /// call, because the in-VM supervisor binds its own mesh ULA and never
-    /// answers on the tap IP. Uses the supervisor's configured `vcpus`/default
-    /// memory; the node image is self-contained, so no manifest `Runtime` is
-    /// needed. The boot `ip=` cmdline (set by `boot_source_body`) is fine for
-    /// NixOS.
+    /// `kernel` (instead of `rt.kernel`/`cfg.kernel`) and an explicit `rootfs`.
+    /// vCPU count + guest RAM come from the (synthetic) manifest `rt` — the
+    /// single source of truth — via [`node_machine_config`].
+    ///
+    /// Like [`Self::configure_and_boot`], this ends at the `InstanceStart` PUT.
+    /// The difference is in the LAUNCH PATH: `configure_and_boot`'s caller
+    /// (`cold_boot`) then polls `wait_until_ready`, whereas node-firecracker's
+    /// launch path (`launch_node_with_uuid`) returns right after `InstanceStart`
+    /// with no readiness wait at all — the in-VM supervisor binds its own mesh
+    /// ULA and never answers on the tap IP, so readiness is verified out-of-band
+    /// over the mesh. The boot `ip=` cmdline (set by `boot_source_body`) is fine
+    /// for NixOS.
     async fn configure_and_boot_node(
         &self,
         kernel: &Path,
         rootfs: &Path,
+        rt: &Runtime,
         cfg: &FcConfig,
         guest_ip: &Ipv4Addr,
         host_ip: &Ipv4Addr,
@@ -583,12 +585,9 @@ impl FirecrackerRuntime {
             .to_str()
             .ok_or_else(|| anyhow!("node image rootfs path is not valid UTF-8"))?;
 
-        self.api_put(
-            "/machine-config",
-            &machine_config_body(cfg.vcpus, NODE_FC_MEMORY_MB),
-        )
-        .await
-        .context("PUT /machine-config")?;
+        self.api_put("/machine-config", &node_machine_config(rt, cfg))
+            .await
+            .context("PUT /machine-config")?;
         self.api_put(
             "/boot-source",
             &boot_source_body(kernel_str, &guest_ip.to_string(), &host_ip.to_string()),
@@ -1002,6 +1001,14 @@ fn derive_guest_mac(seq: u32) -> String {
     let b = seq.to_le_bytes();
     // 02:xx → locally administered, unicast.
     format!("02:FC:{:02X}:{:02X}:{:02X}:{:02X}", b[0], b[1], b[2], b[3])
+}
+
+/// Build the `/machine-config` body for a node-firecracker VM from the manifest
+/// `rt` (the single source of truth): vCPUs default to `cfg.vcpus` only when the
+/// manifest omits them; guest RAM is always the manifest's `memory_mb` (a
+/// recursive tabbify-node needs real resources, e.g. 4 vCPU / 2048 MiB).
+fn node_machine_config(rt: &Runtime, cfg: &FcConfig) -> serde_json::Value {
+    machine_config_body(rt.vcpus.unwrap_or(cfg.vcpus), rt.memory_mb)
 }
 
 /// Wait (bounded) for firecracker to create its API socket after spawn.

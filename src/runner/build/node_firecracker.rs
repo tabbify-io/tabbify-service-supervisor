@@ -17,7 +17,7 @@ use crate::runtime::AppRuntime;
 /// fails to launch.
 pub async fn run_node_firecracker_build(
     uuid: &str,
-    _fetched: &FetchedApp,
+    fetched: &FetchedApp,
     fc: &FcConfig,
     data_dir: &Path,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
@@ -30,6 +30,17 @@ pub async fn run_node_firecracker_build(
             fc.node_image_dir.display()
         );
     }
-    let vm = FirecrackerRuntime::launch_node_with_uuid(&kernel, &rootfs, fc, uuid, data_dir).await?;
+    // The synthetic manifest's `runtime` is the single source of truth for the
+    // VM's vCPUs / RAM (a recursive tabbify-node needs real resources, not the
+    // single-vCPU `FcConfig` default).
+    let vm = FirecrackerRuntime::launch_node_with_uuid(
+        &kernel,
+        &rootfs,
+        &fetched.manifest.runtime,
+        fc,
+        uuid,
+        data_dir,
+    )
+    .await?;
     Ok(Arc::new(vm))
 }
