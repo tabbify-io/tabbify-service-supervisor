@@ -168,6 +168,12 @@ pub async fn build_runtime_with_oras(
             .await?;
             Ok(Arc::new(container))
         }
+        "node-firecracker" => {
+            crate::runner::build::node_firecracker::run_node_firecracker_build(
+                uuid, fetched, fc, data_dir,
+            )
+            .await
+        }
         other => anyhow::bail!("unknown runtime type: {other}"),
     }
 }
@@ -676,6 +682,38 @@ mod tests {
         assert!(matches!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn));
         assert_eq!(f.version, 0);
         assert!(f.wasm.is_empty());
+    }
+
+    /// The `node-firecracker` arm errors CLEARLY (mentioning the missing node
+    /// image) when the host-local node image dir has no `vmlinux` / `rootfs.ext4`
+    /// — the precheck fails before the Linux-only launch is ever reached, so this
+    /// is fully verifiable cross-platform.
+    #[tokio::test]
+    async fn node_firecracker_arm_errors_clearly_without_image() {
+        let fetched = fetched_for_node_fc("019e7903-0000-7000-8000-000000000f01");
+        let fc = FcConfig {
+            node_image_dir: "/nonexistent/node-images".into(),
+            ..FcConfig::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let runner: CommandRunner = Arc::new(|_| Box::pin(async { Ok(()) }));
+        // `Arc<dyn AppRuntime>` is not `Debug`, so `.unwrap_err()` cannot be used;
+        // match on the result to extract the error directly instead.
+        let result = build_runtime_with_oras(
+            Some("node-firecracker"),
+            "u1",
+            &fetched,
+            &fc,
+            &DockerConfig::default(),
+            tmp.path(),
+            &runner,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("expected an error for a missing node image"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("node image"), "got: {err}");
     }
 
     // ---- resolve_fetched: fallback decision when S3 fetch fails ---------------
