@@ -247,6 +247,48 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
     }
 }
 
+/// Synthesize a minimal `FetchedApp` for a node-firecracker deploy: no S3
+/// artifact, no registry ref (the node image is host-local). `build_runtime`
+/// dispatches on the `"node-firecracker"` type / override.
+#[must_use]
+pub fn fetched_for_node_fc(uuid: &str) -> FetchedApp {
+    use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
+
+    FetchedApp {
+        // There is no S3 `latest` for a node-firecracker deploy; the host-local
+        // node image is authoritative. 0 keeps the cache layout deterministic.
+        version: 0,
+        manifest: AppManifest {
+            app: AppMeta {
+                id: None,
+                name: uuid.to_owned(),
+                version: String::new(),
+                kind: "node".to_owned(),
+                description: String::new(),
+            },
+            lifecycle: Lifecycle {
+                // A node microVM should come up immediately, not lazily.
+                mode: LifecycleMode::AlwaysOn,
+                idle_timeout_sec: 300,
+            },
+            runtime: Runtime {
+                r#type: "node-firecracker".to_owned(),
+                entry: String::new(),
+                fuel_per_request: 0,
+                // A recursive tabbify-node microVM needs real resources.
+                memory_mb: 2048,
+                vcpus: Some(4),
+                kernel: None,
+                // The node image is host-local; nothing to pull from a registry.
+                registry_ref: None,
+            },
+            routes: Routes::default(),
+        },
+        wasm: bytes::Bytes::new(),
+        cached_path: std::path::PathBuf::new(),
+    }
+}
+
 /// Decide the [`FetchedApp`] the runner should build its INITIAL runtime from,
 /// given the result of the S3 fetch, the app `uuid`, an optional deployed
 /// `image_ref` (the orchestrator's `--image-ref`), and the runner's `data_dir`.
@@ -622,6 +664,18 @@ mod tests {
     fn fetched_from_ref_is_always_on() {
         let f = fetched_from_ref("abc-uuid", "reg:5000/x:main");
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
+    }
+
+    // ---- fetched_for_node_fc: synthesize a node-firecracker FetchedApp --------
+
+    #[test]
+    fn fetched_for_node_fc_is_node_runtime_no_registry_alwayson() {
+        let f = fetched_for_node_fc("019e7903-0000-7000-8000-000000000f01");
+        assert_eq!(f.manifest.runtime.r#type, "node-firecracker");
+        assert!(f.manifest.runtime.registry_ref.is_none());
+        assert!(matches!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn));
+        assert_eq!(f.version, 0);
+        assert!(f.wasm.is_empty());
     }
 
     // ---- resolve_fetched: fallback decision when S3 fetch fails ---------------

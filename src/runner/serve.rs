@@ -44,7 +44,7 @@ use uuid::Uuid;
 use crate::app_ula::derive_app_ula;
 use crate::build::build_runtime;
 use crate::config::{DockerConfig, FcConfig};
-use crate::fetcher::S3Fetcher;
+use crate::fetcher::{FetchedApp, S3Fetcher};
 use crate::host::{AppHost, AppServe};
 use crate::mesh::MeshMembership;
 use crate::runner::active::ActiveRuntime;
@@ -216,39 +216,11 @@ impl RunnerServe {
             .with_context(|| format!("invalid app uuid: {:?}", cfg.uuid))?;
         let app_ula = derive_app_ula(parsed_uuid);
 
+        // The lifecycle holds an `S3Fetcher` for later cache purges; construct it
+        // here so it stays available even though `resolve_app` does its own fetch.
         let fetcher = S3Fetcher::new(&cfg.s3_base_url, &cfg.data_dir);
-        let fetch_result = fetcher.fetch(&cfg.uuid).await;
 
-        // Resolve the FetchedApp the initial build runs from.
-        //
-        // - S3 fetch SUCCEEDS (tcli-push apps + wasm/firecracker): when an
-        //   `--image-ref` was passed (orchestrator respawn), apply it to the
-        //   manifest's docker `registry_ref` so the INITIAL build comes up on
-        //   the deployed version (a `docker pull <ref>` instead of a source
-        //   build). The override is also reflected in the `fetched` stored for
-        //   later `Deploy` calls. Ignored for wasm/firecracker. This is the
-        //   unchanged historical behavior.
-        // - S3 fetch FAILS but an `--image-ref` is present: this is a
-        //   BUILD-pipeline app (`POST /v1/deploy` with a repo_url) — its image
-        //   is in the mesh registry and it has NO S3 manifest. Synthesize a
-        //   minimal docker manifest from the ref and run the deployed image
-        //   directly instead of crash-looping on the absent S3 fetch.
-        // - S3 fetch FAILS with no image-ref: propagate the error (a genuine
-        //   missing app).
-        if fetch_result.is_err() && cfg.image_ref.is_some() {
-            tracing::info!(
-                uuid = %cfg.uuid,
-                image_ref = ?cfg.image_ref,
-                "no S3 manifest for app — running deployed image from registry ref directly"
-            );
-        }
-        let fetched = crate::build::resolve_fetched(
-            fetch_result,
-            &cfg.uuid,
-            cfg.image_ref.as_deref(),
-            &cfg.data_dir,
-        )
-        .with_context(|| format!("fetch app {}", cfg.uuid))?;
+        let fetched = resolve_app(&cfg).await?;
 
         let initial_runtime = build_runtime(
             cfg.runtime_override.as_deref(),
@@ -372,6 +344,56 @@ impl RunnerServe {
     }
 }
 
+/// Resolve the [`FetchedApp`] the runner builds its INITIAL runtime from.
+///
+/// - `runtime_override == "node-firecracker"`: a recursive NixOS tabbify-node
+///   microVM. There is NO S3 artifact and no image ref (the node image is
+///   host-local), so this is FETCH-EXEMPT — synthesize a minimal node-firecracker
+///   `FetchedApp` via [`crate::build::fetched_for_node_fc`] and skip S3 entirely.
+/// - Otherwise: the historical path. S3 fetch SUCCEEDS (tcli-push apps +
+///   wasm/firecracker): when an `--image-ref` was passed (orchestrator respawn),
+///   apply it to the manifest's docker `registry_ref` so the INITIAL build comes
+///   up on the deployed version (a `docker pull <ref>` instead of a source
+///   build); ignored for wasm/firecracker. S3 fetch FAILS but an `--image-ref`
+///   is present: this is a BUILD-pipeline app (`POST /v1/deploy` with a
+///   repo_url) — its image is in the mesh registry and it has NO S3 manifest;
+///   synthesize a minimal docker manifest from the ref and run the deployed
+///   image directly instead of crash-looping on the absent S3 fetch. S3 fetch
+///   FAILS with no image-ref: propagate the error (a genuine missing app).
+///
+/// Extracted from [`RunnerServe::start`] so the fetch/resolve decision is
+/// directly unit-testable without binding a listener or joining the mesh.
+///
+/// # Errors
+/// Propagates the [`crate::build::resolve_fetched`] error on the non-exempt path
+/// (S3 fetch failed and no `image_ref` was supplied, or a filesystem error
+/// materializing the build-context placeholder).
+pub async fn resolve_app(cfg: &ServeConfig) -> Result<FetchedApp> {
+    if cfg.runtime_override.as_deref() == Some("node-firecracker") {
+        return Ok(crate::build::fetched_for_node_fc(&cfg.uuid));
+    }
+
+    let fetch_result = S3Fetcher::new(&cfg.s3_base_url, &cfg.data_dir)
+        .fetch(&cfg.uuid)
+        .await;
+
+    if fetch_result.is_err() && cfg.image_ref.is_some() {
+        tracing::info!(
+            uuid = %cfg.uuid,
+            image_ref = ?cfg.image_ref,
+            "no S3 manifest for app — running deployed image from registry ref directly"
+        );
+    }
+
+    crate::build::resolve_fetched(
+        fetch_result,
+        &cfg.uuid,
+        cfg.image_ref.as_deref(),
+        &cfg.data_dir,
+    )
+    .with_context(|| format!("fetch app {}", cfg.uuid))
+}
+
 /// Per-uuid path for a runner's persistent WireGuard keypair, under `data_dir`.
 ///
 /// Scheme: `<data_dir>/runners/<uuid>.meshkey`. Each per-app runner MUST own a
@@ -462,6 +484,25 @@ mod tests {
             image_ref: None,
             runtime_override: None,
         }
+    }
+
+    /// A node-firecracker deploy is fetch-exempt: there is NO S3 artifact and no
+    /// image_ref, so `resolve_app` must NOT hit S3 (point `s3_base_url` at an
+    /// unreachable address to prove it) and must synthesize a node-firecracker
+    /// `FetchedApp` directly.
+    #[tokio::test]
+    async fn resolve_app_node_fc_skips_s3_fetch() {
+        let mut cfg = mesh_cfg();
+        // An unreachable S3 base: a fetch here would error, which would make
+        // resolve_fetched (the non-exempt path) bail. The node-fc short-circuit
+        // must avoid touching S3 entirely.
+        cfg.s3_base_url = "http://127.0.0.1:1/".to_owned();
+        cfg.image_ref = None;
+        cfg.runtime_override = Some("node-firecracker".to_owned());
+
+        let fetched = resolve_app(&cfg).await.expect("node-fc must resolve without S3");
+        assert_eq!(fetched.manifest.runtime.r#type, "node-firecracker");
+        assert!(fetched.manifest.runtime.registry_ref.is_none());
     }
 
     /// The runner's mesh join must claim its app-ULA + declare its role,
