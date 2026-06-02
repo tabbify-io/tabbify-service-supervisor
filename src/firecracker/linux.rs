@@ -191,6 +191,10 @@ impl FirecrackerRuntime {
         })?;
         tracing::debug!(%tap_name, %host_ip, "fc cold boot: tap up");
 
+        // Guest egress (best-effort): forward + SNAT the tap subnet so the
+        // in-VM supervisor can reach the public mesh coordinator/relay.
+        setup_guest_nat(&tap_name, &cfg.tap_subnet).await;
+
         // Spawn firecracker with its API socket. Clean any stale socket.
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
         let _ = std::fs::remove_file(&api_sock);
@@ -366,6 +370,10 @@ impl FirecrackerRuntime {
             e
         })?;
         tracing::debug!(%tap_name, %host_ip, "node-fc cold boot: tap up");
+
+        // Guest egress (best-effort): forward + SNAT the tap subnet so the
+        // in-VM supervisor can reach the public mesh coordinator/relay.
+        setup_guest_nat(&tap_name, &cfg.tap_subnet).await;
 
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
         let _ = std::fs::remove_file(&api_sock);
@@ -978,6 +986,102 @@ async fn run_ip(args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Give cold-booted guests internet egress so the in-VM tabbify-supervisor can
+/// reach the public mesh coordinator (and the relay / WG peers): enable IPv4
+/// forwarding and SNAT the guest tap subnet out the host's default-route
+/// uplink, plus explicit FORWARD ACCEPTs (a docker-managed FORWARD policy of
+/// DROP would otherwise black-hole guest traffic even with masquerade present).
+///
+/// BEST-EFFORT and idempotent: a failure here must not abort a boot — it only
+/// costs the guest its egress (the VM still runs and answers the :8080 probe),
+/// so we log loudly and continue. The host tap link itself (`setup_tap`) is
+/// what the readiness probe needs; this only matters for guest→internet.
+async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
+    // Enable forwarding (no-op if already 1; warn but continue on EACCES).
+    if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await {
+        tracing::warn!(error = %e, "fc nat: could not enable net.ipv4.ip_forward");
+    }
+    let Some(uplink) = default_route_dev().await else {
+        tracing::warn!("fc nat: no default-route uplink found; guest egress disabled");
+        return;
+    };
+    // Idempotent (`-C ... || -A/-I ...`). FORWARD rules are *inserted* at the
+    // head so they precede any docker-installed DROP/jump.
+    let rules: [(Vec<&str>, Vec<&str>); 3] = [
+        (
+            vec!["-t", "nat", "-C", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE"],
+            vec!["-t", "nat", "-A", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE"],
+        ),
+        (
+            vec!["-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
+            vec!["-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
+        ),
+        (
+            vec!["-C", "FORWARD", "-i", &uplink, "-o", tap_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+            vec!["-I", "FORWARD", "1", "-i", &uplink, "-o", tap_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ),
+    ];
+    for (check, add) in &rules {
+        if let Err(e) = ensure_iptables(check, add).await {
+            tracing::warn!(error = %e, "fc nat: iptables rule add failed; guest egress may be blocked");
+        }
+    }
+    tracing::info!(%tap_name, uplink = %uplink, subnet = %tap_subnet, "fc nat: guest egress enabled");
+}
+
+/// Ensure an iptables rule exists: run the `-C` (check) form; if absent, run
+/// the `-A`/`-I` (add) form. Errors only if the *add* itself fails — a missing
+/// rule (check returns non-zero) is the normal "needs adding" path.
+async fn ensure_iptables(check: &[&str], add: &[&str]) -> Result<()> {
+    let present = Command::new("iptables")
+        .args(check)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if present {
+        return Ok(());
+    }
+    let out = Command::new("iptables")
+        .args(add)
+        .output()
+        .await
+        .with_context(|| format!("spawn iptables {}", add.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "iptables {} failed: {}",
+            add.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The interface name of the host's default IPv4 route, e.g. `eth0` from
+/// `default via 10.0.0.1 dev eth0 proto dhcp ...`. `None` if there is no
+/// default route or `ip` is unavailable.
+async fn default_route_dev() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_default_dev(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the `dev <iface>` token out of `ip route show default` output. Pure +
+/// isolated for unit-testing.
+fn parse_default_dev(route_output: &str) -> Option<String> {
+    let toks: Vec<&str> = route_output.split_whitespace().collect();
+    toks.iter()
+        .position(|t| *t == "dev")
+        .and_then(|i| toks.get(i + 1))
+        .map(|d| (*d).to_owned())
 }
 
 /// Derive a (host_ip, guest_ip) /30 pair for VM index `seq` out of

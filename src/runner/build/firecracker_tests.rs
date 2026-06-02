@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use super::oci_fixtures::{make_tar, write_min_oci_layout};
 use super::{
-    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, render_init,
+    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, ext4_geometry,
+    measure_tree, render_init,
 };
 
 /// `oci-spec` links and parses an OCI image config's entrypoint/cmd/env/
@@ -1173,4 +1174,45 @@ async fn real_conversion_gzip_layers_and_mkfs_ext4_produces_valid_rootfs() {
         !ls_etc.contains(".wh."),
         "no .wh. whiteout marker may survive into the rootfs; debugfs ls -l /etc:\n{ls_etc}"
     );
+}
+
+/// `ext4_geometry`: a small app whose content is far under the RAM hint keeps
+/// the hint as the floor, and gets the minimum inode table.
+#[test]
+fn ext4_geometry_small_app_floored_by_hint() {
+    let (mib, inodes) = ext4_geometry(5 * 1024 * 1024, 200, 2048);
+    assert_eq!(mib, 2048, "tiny content must not shrink below the caller hint");
+    assert_eq!(inodes, 262_144, "inode floor protects small-file images");
+}
+
+/// A large dind-class rootfs (content well above the RAM hint, tens of
+/// thousands of files) must GROW the image past the hint AND expand the inode
+/// table — this is the exact case that made `mkfs.ext4 -d` fail intermittently.
+#[test]
+fn ext4_geometry_large_rootfs_grows_size_and_inodes() {
+    // 2000 MiB content, 200k files, 2048 MiB hint.
+    let (mib, inodes) = ext4_geometry(2000 * 1024 * 1024, 200_000, 2048);
+    assert_eq!(mib, 2000 * 3 / 2 + 512, "size = 1.5x content + 512 MiB slack");
+    assert!(mib > 2048, "must exceed the RAM hint for a large rootfs");
+    assert_eq!(inodes, 400_000, "inodes = 2x the file count when above the floor");
+}
+
+/// Saturating arithmetic must not panic on absurd inputs.
+#[test]
+fn ext4_geometry_saturates() {
+    let (mib, inodes) = ext4_geometry(u64::MAX, u64::MAX, 1);
+    assert!(mib >= 512 && inodes >= 262_144);
+}
+
+/// `measure_tree` sums file bytes and counts every entry (dirs + files).
+#[tokio::test]
+async fn measure_tree_sums_bytes_and_counts_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.txt"), b"hello").unwrap(); // 5 bytes
+    std::fs::write(root.join("sub/b.bin"), vec![0u8; 100]).unwrap(); // 100 bytes
+    let (bytes, count) = measure_tree(root).await.unwrap();
+    assert_eq!(bytes, 105, "byte sum of both files");
+    assert_eq!(count, 3, "two files + one subdir");
 }

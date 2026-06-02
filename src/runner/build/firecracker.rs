@@ -182,6 +182,53 @@ pub async fn build_rootfs_ext4(
     build_rootfs_ext4_inner(layout, config, out_dir, size_mib, None, runner).await
 }
 
+/// Sum the on-disk byte size and entry count of a staging tree. Used to size
+/// the ext4 image and its inode table from real content rather than a guess.
+/// Symlinks are counted but not followed (their own size, not the target).
+/// The blocking walk runs on a dedicated thread.
+async fn measure_tree(root: &Path) -> Result<(u64, u64)> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut bytes = 0u64;
+        let mut count = 0u64;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                count += 1;
+                // `DirEntry::metadata` does NOT follow symlinks — exactly what
+                // we want (count the link, not its target).
+                let Ok(md) = entry.metadata() else {
+                    continue;
+                };
+                if md.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    bytes += md.len();
+                }
+            }
+        }
+        (bytes, count)
+    })
+    .await
+    .context("measure staging tree (join)")
+}
+
+/// Compute `(ext4_size_mib, inode_count)` from staged content. Pure + isolated
+/// so it is unit-testable. Size = 1.5× content + 512 MiB slack (ext4 journal,
+/// metadata, write headroom), never below the caller's hint. Inodes = 2× the
+/// file count, floored at 262144 (double the e2fsprogs default density) — a
+/// dind tree's small-file count, inflated further by cross-layer hardlink
+/// splitting in `merge_layer`, overruns the default inode table otherwise.
+fn ext4_geometry(content_bytes: u64, file_count: u64, size_hint_mib: u32) -> (u32, u64) {
+    let content_mib = u32::try_from(content_bytes / (1024 * 1024)).unwrap_or(u32::MAX);
+    let effective_mib = size_hint_mib.max(content_mib.saturating_mul(3) / 2 + 512);
+    let inodes = file_count.saturating_mul(2).max(262_144);
+    (effective_mib, inodes)
+}
+
 /// Shared OCI→ext4 primitive — the SINGLE source of truth for the
 /// unpack → (optional init inject) → `mkfs.ext4 -d` sequence.
 ///
@@ -218,13 +265,28 @@ async fn build_rootfs_ext4_inner(
         inject_init(&staging, script).await?;
     }
 
-    // 3. Pre-size the backing image to `size_mib` MiB (sparse `set_len`, no
-    //    loop device, no root), then `mkfs.ext4 -F -d <staging> <out>` formats
-    //    the existing file in place. The fs-size positional is intentionally
-    //    OMITTED so the OUTPUT path stays the final argv element: `mkfs.ext4`
-    //    treats the first positional as the device and the *optional* trailing
-    //    one as the fs size; a regular file pre-sized here makes the size
-    //    positional redundant. Content-populated, rootless, loopless.
+    // 3. Size the ext4 from the ACTUAL staged content, not the caller's hint
+    //    (which is the guest RAM size — unrelated to disk need). A large dind
+    //    rootfs with tens of thousands of small files exhausts both the byte
+    //    budget AND the default inode table, which is why `mkfs.ext4 -d` failed
+    //    intermittently. We measure the staged tree and provision explicitly.
+    let (content_bytes, file_count) = measure_tree(&staging).await?;
+    let (effective_mib, inodes) = ext4_geometry(content_bytes, file_count, size_mib);
+    tracing::info!(
+        content_bytes,
+        file_count,
+        effective_mib,
+        inodes,
+        size_hint_mib = size_mib,
+        "fc build: sizing ext4 from staged content"
+    );
+
+    //    Pre-size the backing image to `effective_mib` MiB (sparse `set_len`,
+    //    no loop device, no root), then `mkfs.ext4 -F -m 0 -N <inodes> -d
+    //    <staging> <out>` formats the existing file in place. The fs-size
+    //    positional is OMITTED so the OUTPUT path stays the final argv element.
+    //    `-m 0` reclaims the 5% root-reserved blocks a single-purpose rootfs
+    //    does not need; `-N` pins the inode count to the real file count.
     let rootfs = out_dir.join(ROOTFS_NAME);
     {
         let file = tokio::fs::OpenOptions::new()
@@ -234,20 +296,29 @@ async fn build_rootfs_ext4_inner(
             .open(&rootfs)
             .await
             .with_context(|| format!("create rootfs image {}", rootfs.display()))?;
-        file.set_len(u64::from(size_mib) * 1024 * 1024)
+        file.set_len(u64::from(effective_mib) * 1024 * 1024)
             .await
-            .with_context(|| format!("size rootfs image {} to {size_mib}MiB", rootfs.display()))?;
+            .with_context(|| {
+                format!("size rootfs image {} to {effective_mib}MiB", rootfs.display())
+            })?;
     }
     let (made, _) = (runner)(vec![
         "mkfs.ext4".to_owned(),
         "-F".to_owned(), // overwrite the pre-sized image without prompting
+        "-m".to_owned(),
+        "0".to_owned(), // no reserved-for-root blocks
+        "-N".to_owned(),
+        inodes.to_string(), // explicit inode table sized to the content
         "-d".to_owned(),
         staging.to_string_lossy().into_owned(),
         rootfs.to_string_lossy().into_owned(),
     ])
     .await;
     if !made {
-        bail!("mkfs.ext4 -d failed for OCI layout {}", layout.display());
+        bail!(
+            "mkfs.ext4 -d failed for OCI layout {} (sized {effective_mib}MiB, {inodes} inodes for {file_count} files / {content_bytes} bytes; see preceding 'command failed' log for the e2fsprogs diagnostic)",
+            layout.display()
+        );
     }
     if !rootfs.is_file() {
         bail!(
@@ -798,12 +869,28 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
                 .args(rest)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .output()
                 .await
             {
-                Ok(out) => (out.status.success(), out.stdout),
-                Err(_) => (false, Vec::new()),
+                Ok(out) => {
+                    if !out.status.success() {
+                        // Surface the tool's own diagnostic (e.g. mkfs.ext4
+                        // "Could not allocate N inodes" vs "too small") instead
+                        // of discarding it — the caller only sees a bool.
+                        tracing::warn!(
+                            cmd = %argv.join(" "),
+                            code = out.status.code().unwrap_or(-1),
+                            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                            "fc build: command failed"
+                        );
+                    }
+                    (out.status.success(), out.stdout)
+                }
+                Err(e) => {
+                    tracing::warn!(cmd = %argv.join(" "), error = %e, "fc build: command spawn failed");
+                    (false, Vec::new())
+                }
             }
         });
         fut

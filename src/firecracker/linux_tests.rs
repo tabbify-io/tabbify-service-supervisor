@@ -100,3 +100,23 @@ async fn real_vm_boots_and_serves() {
     assert!(resp.status().is_success());
     drop(vm); // child killed + tap deleted
 }
+
+#[test]
+fn parse_default_dev_extracts_iface() {
+    assert_eq!(
+        parse_default_dev("default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.5 metric 100"),
+        Some("eth0".to_owned())
+    );
+    assert_eq!(
+        parse_default_dev("default via 192.168.1.1 dev wlan0\n"),
+        Some("wlan0".to_owned())
+    );
+}
+
+#[test]
+fn parse_default_dev_none_when_no_route_or_dev() {
+    assert_eq!(parse_default_dev(""), None);
+    assert_eq!(parse_default_dev("blackhole 10.0.0.0/8"), None);
+    // "dev" with no following token must not panic.
+    assert_eq!(parse_default_dev("default via 10.0.0.1 dev"), None);
+}
