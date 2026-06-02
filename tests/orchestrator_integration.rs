@@ -766,6 +766,7 @@ async fn readopt_adopts_living_runner_and_respawns_dead_one() {
         spawned_at: 0,
         restart: Default::default(),
         image_ref: None,
+        requested_runtime: None,
     };
     dead_handle
         .save(runner_dir.path())
@@ -915,6 +916,7 @@ async fn monitor_tick_does_not_respawn_within_grace_window() {
         spawned_at: now_secs, // within grace window
         restart: Default::default(),
         image_ref: None,
+        requested_runtime: None,
     };
     grace_record
         .save(runner_dir.path())
@@ -1028,6 +1030,7 @@ async fn monitor_tick_kills_hung_runner_before_respawn() {
         spawned_at: old_secs,
         restart: Default::default(),
         image_ref: None,
+        requested_runtime: None,
     };
     hung_record
         .save(runner_dir.path())
@@ -1056,6 +1059,7 @@ async fn monitor_tick_kills_hung_runner_before_respawn() {
         spawned_at: old_secs,
         restart: Default::default(),
         image_ref: None,
+        requested_runtime: None,
     };
     hung_record2
         .save(runner_dir.path())

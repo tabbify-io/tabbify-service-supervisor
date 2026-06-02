@@ -103,9 +103,13 @@ impl SharedRunnerConfig {
             no_mesh: self.no_mesh,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
-            // A respawn rebuilds from the manifest default; the runtime override
-            // travels in the request body only and is not persisted (D10).
-            runtime_override: None,
+            // Respawn with the SAME runtime the deploy requested. The override
+            // IS persisted on the record (`requested_runtime`) because for a
+            // ref-deploy it is the only source of truth: the synthetic
+            // `fetched_from_ref` manifest hard-codes docker, so dropping the
+            // override here would crashloop a firecracker app on a docker-less
+            // host. `None` ⇒ manifest default (unchanged behavior).
+            runtime_override: record.requested_runtime.clone(),
         }
     }
 }
@@ -250,6 +254,7 @@ mod tests {
             spawned_at: 0,
             restart: Default::default(),
             image_ref: None,
+            requested_runtime: None,
         }
     }
 
@@ -281,6 +286,31 @@ mod tests {
         rec.parent = None;
         let spec = cfg.spawn_spec_for(&rec);
         assert!(spec.parent.is_none());
+    }
+
+    /// A respawn must preserve the runtime the deploy requested: a record with
+    /// `requested_runtime = Some("firecracker")` reconstructs a spec whose
+    /// `runtime_override` is `Some("firecracker")` — otherwise a ref-deploy
+    /// crash-respawn would fall back to the manifest's hard-coded docker runtime
+    /// and crashloop on a docker-less host.
+    #[test]
+    fn spawn_spec_for_preserves_requested_runtime() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.requested_runtime = Some("firecracker".to_owned());
+        let spec = cfg.spawn_spec_for(&rec);
+        assert_eq!(spec.runtime_override, Some("firecracker".to_owned()));
+    }
+
+    /// With no requested runtime on the record, the respawn spec carries no
+    /// override (manifest default applies, unchanged behavior).
+    #[test]
+    fn spawn_spec_for_no_requested_runtime_is_none() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.requested_runtime = None;
+        let spec = cfg.spawn_spec_for(&rec);
+        assert!(spec.runtime_override.is_none());
     }
 
     /// Accessors expose the orchestrator's config + record dir.

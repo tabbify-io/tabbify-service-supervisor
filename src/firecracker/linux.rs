@@ -306,7 +306,7 @@ impl FirecrackerRuntime {
     /// snapshot.
     ///
     /// Returns as soon as `InstanceStart` succeeds (seconds) so the runner's
-    /// control socket binds within the orchestrator's 30s gate; the deep NixOS
+    /// control socket binds within the orchestrator's start-healthy gate; the deep NixOS
     /// boot + mesh-join are verified out-of-band. The in-VM supervisor binds its
     /// own mesh ULA (NOT the tap), so this path does NOT HTTP-probe the guest
     /// over the tap (`wait_until_ready` is skipped). Liveness is tracked in
@@ -395,7 +395,7 @@ impl FirecrackerRuntime {
         // Configure + start the VM. This launch path has NO post-boot
         // readiness wait at all — the in-VM supervisor binds its own mesh ULA
         // and never answers on the tap IP, and the runner must return fast so
-        // its control socket binds within the orchestrator's 30s gate.
+        // its control socket binds within the orchestrator's start-healthy gate.
         me.configure_and_boot_node(kernel, rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac)
             .await?;
 

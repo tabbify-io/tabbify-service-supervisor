@@ -240,6 +240,9 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // Carry the deployed ref through so a future respawn-from-record keeps
         // the same version. `None` on a fresh spawn = today's behavior.
         image_ref: spec.image_ref.clone(),
+        // Persist the requested runtime override so a respawn-from-record
+        // rebuilds the SAME runtime (the only source of truth for a ref-deploy).
+        requested_runtime: spec.runtime_override.clone(),
     };
 
     handle

@@ -61,6 +61,22 @@ pub struct RunnerHandle {
     /// exists, persists/loads, and flows into the spawn args.
     #[serde(default)]
     pub image_ref: Option<String>,
+    /// Runtime override (D4 wire string, e.g. `"firecracker"`) the deploy/start
+    /// requested, persisted so a supervisor-driven respawn rebuilds the SAME
+    /// runtime.
+    ///
+    /// For a ref-deploy the requested runtime is the only source of truth: the
+    /// synthetic `fetched_from_ref` manifest hard-codes `runtime = docker`, so a
+    /// respawn that dropped this override would fall back to docker and crashloop
+    /// on a docker-less host. The orchestrator forwards it to the runner as
+    /// `--runtime-override <wire>` (see [`spawn_spec_for`]).
+    ///
+    /// `#[serde(default)]` keeps old on-disk records (written before this field
+    /// existed) loading — they get `None`, i.e. the manifest default.
+    ///
+    /// [`spawn_spec_for`]: crate::orchestrator::SharedRunnerConfig::spawn_spec_for
+    #[serde(default)]
+    pub requested_runtime: Option<String>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -164,6 +180,7 @@ mod tests {
             spawned_at: 1_700_000_000,
             restart: Default::default(),
             image_ref: None,
+            requested_runtime: None,
         }
     }
 
@@ -177,6 +194,7 @@ mod tests {
             spawned_at: 0,
             restart: Default::default(),
             image_ref: None,
+            requested_runtime: None,
         }
     }
 
@@ -294,6 +312,50 @@ mod tests {
         assert!(
             h.image_ref.is_none(),
             "missing image_ref key must deserialize as None"
+        );
+    }
+
+    // ── requested_runtime field ───────────────────────────────────────────────
+
+    /// A handle with a non-default `requested_runtime` must round-trip through
+    /// `save` → `load` with the runtime intact (so a respawn rebuilds the same
+    /// runtime the deploy requested).
+    #[test]
+    fn requested_runtime_round_trips_via_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.requested_runtime = Some("firecracker".to_owned());
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded.requested_runtime.as_deref(),
+            Some("firecracker"),
+            "requested_runtime must survive save/load"
+        );
+        assert_eq!(loaded, h);
+    }
+
+    /// JSON written before the `requested_runtime` field was added (no
+    /// `"requested_runtime"` key) must deserialize with
+    /// `requested_runtime = None` so old records still load.
+    #[test]
+    fn requested_runtime_defaults_to_none_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000,
+            "image_ref": null
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert!(
+            h.requested_runtime.is_none(),
+            "missing requested_runtime key must deserialize as None"
         );
     }
 

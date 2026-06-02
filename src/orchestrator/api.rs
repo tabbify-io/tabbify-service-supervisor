@@ -37,8 +37,15 @@ use crate::orchestrator::{MONITOR_INTERVAL, Orchestrator};
 
 /// How long [`Orchestrator::start_app`] waits for a freshly-spawned runner to
 /// answer its control socket before giving up. A cold start fetches the
-/// artifact from S3 and (for docker) builds an image, so this is generous.
-const START_HEALTHY_TIMEOUT: Duration = Duration::from_secs(30);
+/// artifact from S3 and builds a runtime, so this is generous.
+///
+/// A firecracker cold build is the worst case and drives this value: it pulls a
+/// multi-hundred-MB image by digest, converts the OCI layers to an ext4 rootfs,
+/// boots the microVM, and waits for in-guest readiness — comfortably exceeding
+/// the previous 30s gate, which killed slow-but-healthy firecracker runners
+/// before they came up. 180s covers that worst case while still failing a
+/// genuinely-doomed start in bounded time.
+const START_HEALTHY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Externally-visible lifecycle state of an app, mirrored onto the control-API
 /// JSON `state` field. In the orchestrator model an app is `running` iff its
@@ -630,6 +637,7 @@ mod tests {
             spawned_at: 0,
             restart,
             image_ref: None,
+            requested_runtime: None,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -702,6 +710,7 @@ mod tests {
             spawned_at: 0,
             restart: crashed_restart,
             image_ref: None,
+            requested_runtime: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -841,6 +850,7 @@ mod tests {
             spawned_at: 0,
             restart: Default::default(),
             image_ref: None,
+            requested_runtime: None,
         };
         rec.save(dir.path()).unwrap();
 
