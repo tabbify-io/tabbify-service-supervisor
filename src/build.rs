@@ -1,68 +1,51 @@
 //! Shared runtime construction — the `build_runtime` free function used by the
 //! per-app runner serve core ([`crate::runner::serve`]).
 //!
-//! Keeping the `firecracker` / `docker` runtime-selection match in one place
-//! keeps it DRY and unit-testable independent of the serve wiring.
+//! There is exactly ONE executable runtime: generic Firecracker. Keeping the
+//! single construction path in one free function keeps it DRY and unit-testable
+//! independent of the serve wiring.
 
 use std::sync::Arc;
 
-use crate::config::{DockerConfig, FcConfig};
+use crate::config::FcConfig;
 use crate::fetcher::FetchedApp;
 use crate::runtime::AppRuntime;
 
-/// Build the [`AppRuntime`] for a fetched app from the EFFECTIVE runtime, which
-/// is `runtime_override` (the request-body override, contract D10) when present,
-/// otherwise `manifest.runtime.type`:
-/// - `firecracker` → KVM-gated [`FirecrackerRuntime`](crate::firecracker::FirecrackerRuntime)
-///   microVM (errors clearly on non-Linux / no `/dev/kvm`)
-/// - anything else → hard error (no silent fallback). The in-process WASM and
-///   the `docker run` EXECUTION runtimes were both removed (the platform serves
-///   a single FC-from-image runtime: an OCI image is converted to ext4 and
-///   booted as a microVM). The frozen `docker` / `wasm-http` wire strings now
-///   fall into this hard-error arm until the runtime enum is collapsed
-///   cross-repo. Docker survives only as the BUILD backend (`docker build` +
-///   skopeo push), not as a way to RUN apps.
+/// Build the [`AppRuntime`] for a fetched app — always a KVM-gated
+/// [`FirecrackerRuntime`](crate::firecracker::FirecrackerRuntime) microVM
+/// (errors clearly on non-Linux / no `/dev/kvm`).
 ///
-/// `runtime_override` is the D4 wire string (`docker` | `firecracker` |
-/// `wasm-http`); `None` ⇒ the manifest default is used (D10).
+/// The platform serves a SINGLE FC-from-image runtime: the deployed OCI image
+/// is converted to a rootfs.ext4 and booted as a microVM. The
+/// `manifest.runtime.type` field is no longer consulted to select a runtime —
+/// the in-process WASM and the `docker run` EXECUTION runtimes were both
+/// removed, and the runtime-string match (with its `docker`/`wasm-http` →
+/// hard-error arm) has been collapsed to this unconditional firecracker path.
+/// A deploy whose manifest still says `docker` / `wasm-http` therefore now
+/// builds as Firecracker instead of bailing — the intended end-state, ahead of
+/// the cross-repo step that drops those wire strings (and the lenient-deser
+/// step). Docker survives only as the BUILD backend (`docker build` + skopeo
+/// push), not as a way to RUN apps.
+///
 /// `uuid` makes the docker image tag + container name deterministic, and
 /// drives the firecracker pidfile path for stale-VM reconciliation.
 /// `data_dir` is the local cache root used to write / read the fc pidfile.
 ///
 /// # Errors
-/// A firecracker launch failure (no KVM / non-Linux / boot failure), or an
-/// unknown runtime type (`docker` / `wasm-http` are no longer executable
-/// runtimes and hit the hard-error arm).
+/// A firecracker launch failure (no KVM / non-Linux / boot failure).
 pub async fn build_runtime(
-    runtime_override: Option<&str>,
     uuid: &str,
     fetched: &FetchedApp,
     fc: &FcConfig,
-    // Retained for the call-site signature; the docker RUN runtime was removed,
-    // so the builder no longer reads it. Docker now only BUILDS images
-    // (build_backend + skopeo), it does not run apps. Dropped fully when the
-    // runtime enum is collapsed cross-repo.
-    _docker: &DockerConfig,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
-    let rt = &fetched.manifest.runtime;
-    // Override wins over the manifest default (D10). The manifest's runtime
-    // type is the fallback when no override travels in the request body.
-    let effective = runtime_override.unwrap_or(rt.r#type.as_str());
-    match effective {
-        "firecracker" => {
-            // Generic Firecracker (D11): convert the deployed OCI image into a
-            // rootfs.ext4 (cached by digest) + a PID-1 init, then boot it via
-            // the existing FirecrackerRuntime contract. The conversion shells
-            // out to docker/tar/mkfs.ext4 via the production runner.
-            let runner = crate::runner::build::firecracker::production_fc_build_runner();
-            crate::runner::build::firecracker::run_firecracker_build(
-                uuid, fetched, fc, data_dir, &runner,
-            )
-            .await
-        }
-        other => anyhow::bail!("unknown runtime type: {other}"),
-    }
+    // Generic Firecracker (D11): convert the deployed OCI image into a
+    // rootfs.ext4 (cached by digest) + a PID-1 init, then boot it via the
+    // existing FirecrackerRuntime contract. The conversion shells out to
+    // docker/tar/mkfs.ext4 via the production runner.
+    let runner = crate::runner::build::firecracker::production_fc_build_runner();
+    crate::runner::build::firecracker::run_firecracker_build(uuid, fetched, fc, data_dir, &runner)
+        .await
 }
 
 /// Return a clone of `fetched` with its docker `registry_ref` overridden to
@@ -80,17 +63,16 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
     next
 }
 
-/// Synthesize a minimal docker [`FetchedApp`] from a deployed OCI image `reff`,
-/// for an app that was deployed via the BUILD pipeline (`POST /v1/deploy` with a
+/// Synthesize a minimal [`FetchedApp`] from a deployed OCI image `reff`, for an
+/// app that was deployed via the BUILD pipeline (`POST /v1/deploy` with a
 /// `repo_url`): its image lives in the mesh OCI registry but there is NO app
 /// artifact/manifest in S3 (only `tcli push` uploads an S3 manifest). The runner
-/// therefore runs the deployed image directly via `docker pull <reff>` instead of
+/// therefore runs the deployed image directly by pulling `reff` instead of
 /// erroring on the (absent) S3 fetch.
 ///
-/// The synthesized runtime type is `docker` with `registry_ref = Some(reff)`.
-/// NOTE: the docker RUN runtime has been removed, so until the runtime enum is
-/// collapsed cross-repo a `docker`-typed app reaches [`build_runtime`]'s
-/// hard-error arm; this synthesizer is retained as part of that interim seam.
+/// The synthesized runtime type is `firecracker` with `registry_ref =
+/// Some(reff)`: a by-ref deploy is the FC pull source — the image is converted
+/// to a rootfs.ext4 and booted as a microVM (the platform's single runtime).
 /// `cached_path` is set relative (`apps/<uuid>/deployed/context.tar.gz`);
 /// [`resolve_fetched`] rebases it under the real data dir AND materializes a
 /// placeholder file there.
@@ -116,15 +98,14 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
                 idle_timeout_sec: 300,
             },
             runtime: Runtime {
-                r#type: "docker".to_owned(),
+                r#type: "firecracker".to_owned(),
                 entry: "context.tar.gz".to_owned(),
                 fuel_per_request: 0,
-                // For docker this is an advisory cgroup cap; for a by-ref deploy
-                // promoted to runtime=firecracker it is the microVM's RAM. 64 MiB
-                // starves a microVM — ACPI table init fails under memory pressure,
-                // virtio-mmio devices aren't discovered, and the guest panics with
-                // "Cannot open root device vda" (intermittently). 2 GiB boots an FC
-                // guest reliably AND runs dind; it is only a cap for docker.
+                // The microVM's RAM. 64 MiB starves a microVM — ACPI table init
+                // fails under memory pressure, virtio-mmio devices aren't
+                // discovered, and the guest panics with "Cannot open root device
+                // vda" (intermittently). 2 GiB boots an FC guest reliably AND
+                // runs dind.
                 memory_mb: 2048,
                 vcpus: Some(2),
                 kernel: None,
@@ -148,13 +129,13 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
 ///   is `Some`, apply it via [`fetched_with_ref`] (the override the runner has
 ///   always done for tcli-push docker / wasm / firecracker apps); when `None`,
 ///   return the fetched app unchanged.
-/// - S3 fetch **fails** with `image_ref` `Some` → synthesize a docker
+/// - S3 fetch **fails** with `image_ref` `Some` → synthesize a firecracker
 ///   [`FetchedApp`] from the ref via [`fetched_from_ref`] (the BUILD-pipeline
 ///   app: image in the registry, no S3 manifest). The synthesized `cached_path`
 ///   is rebased under `data_dir` and a placeholder build-context file is created
-///   there so the docker launch precheck (which requires the context file to
-///   exist) passes — the file is never read because a successful registry pull
-///   makes the W2 cache check skip `docker build`.
+///   there so the launch precheck (which requires the context file to exist)
+///   passes — the file is never read because a successful registry pull makes
+///   the W2 cache check skip the source build.
 /// - S3 fetch **fails** with `image_ref` `None` → propagate the error (a genuine
 ///   missing app, unchanged behavior).
 ///
@@ -184,7 +165,7 @@ pub fn resolve_fetched(
                 // BUILD-pipeline app: image in the mesh registry, no S3 manifest.
                 let mut fetched = fetched_from_ref(uuid, reff);
                 // Rebase the relative cached_path under the real data dir and
-                // materialize a placeholder build context so the docker precheck
+                // materialize a placeholder build context so the launch precheck
                 // (context.is_file()) passes — never read (pull skips the build).
                 let abs = data_dir.join(&fetched.cached_path);
                 if let Some(parent) = abs.parent() {
@@ -276,28 +257,28 @@ mod tests {
 
     // ---- fetched_from_ref: synthesize a docker FetchedApp from an image ref ----
 
-    /// `fetched_from_ref` synthesizes a docker `FetchedApp` carrying the given
-    /// `registry_ref` — the manifest the runner uses when an app was deployed
-    /// via the BUILD pipeline (image in the mesh registry, NO S3 manifest).
+    /// `fetched_from_ref` synthesizes a firecracker `FetchedApp` carrying the
+    /// given `registry_ref` — the manifest the runner uses when an app was
+    /// deployed via the BUILD pipeline (image in the mesh registry, NO S3
+    /// manifest). A by-ref deploy is the FC pull source.
     #[test]
-    fn fetched_from_ref_builds_docker_manifest_with_ref() {
+    fn fetched_from_ref_builds_firecracker_manifest_with_ref() {
         let reff = "[fd5a:1f00:0:3::1]:5000/tabbify/abc:main";
         let f = fetched_from_ref("abc-uuid", reff);
         assert_eq!(
-            f.manifest.runtime.r#type, "docker",
-            "synthesized runtime must be docker"
+            f.manifest.runtime.r#type, "firecracker",
+            "synthesized runtime must be firecracker"
         );
         assert_eq!(
             f.manifest.runtime.registry_ref.as_deref(),
             Some(reff),
             "registry_ref must carry the deployed image ref"
         );
-        // The docker runtime's container port comes from DockerConfig::app_port
-        // (NOT the manifest), so the entry need only be the conventional docker
-        // build-context filename — and there must be a sane memory cap.
+        // The entry is the conventional build-context filename, and the memory
+        // cap is the microVM's RAM (must be a sane non-zero value).
         assert_eq!(f.manifest.runtime.entry, "context.tar.gz");
         assert!(f.manifest.runtime.memory_mb > 0, "memory cap must be sane");
-        // No wasm bytes for a docker app.
+        // No wasm bytes.
         assert!(f.wasm.is_empty());
     }
 
@@ -342,9 +323,9 @@ mod tests {
     }
 
     /// On a FAILED S3 fetch WITH an image_ref, `resolve_fetched` synthesizes a
-    /// docker FetchedApp from the ref (no error) — this is the BUILD-pipeline
-    /// app whose image lives in the registry and has no S3 manifest. The
-    /// synthesized cached_path must be a REAL file on disk so the docker
+    /// firecracker FetchedApp from the ref (no error) — this is the
+    /// BUILD-pipeline app whose image lives in the registry and has no S3
+    /// manifest. The synthesized cached_path must be a REAL file on disk so the
     /// runtime's precheck (which requires the build-context file to exist)
     /// passes even though the image is pulled by ref, not built.
     #[test]
@@ -358,7 +339,7 @@ mod tests {
             tmp.path(),
         )
         .expect("S3 fetch failure + image_ref present must NOT error");
-        assert_eq!(resolved.manifest.runtime.r#type, "docker");
+        assert_eq!(resolved.manifest.runtime.r#type, "firecracker");
         assert_eq!(resolved.manifest.runtime.registry_ref.as_deref(), Some(reff));
         assert!(
             resolved.cached_path.is_file(),

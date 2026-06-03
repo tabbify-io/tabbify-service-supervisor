@@ -173,10 +173,6 @@ pub struct ServeConfig {
     /// INITIAL [`build_runtime`], so a supervisor-driven respawn comes up on the
     /// deployed version. `None` = build from the S3 manifest as usual.
     pub image_ref: Option<String>,
-    /// Runtime override (D4 wire string). When `Some`, passed to
-    /// [`build_runtime`] so the INITIAL runtime is the requested one rather than
-    /// the manifest default (D10). `None` = manifest default.
-    pub runtime_override: Option<String>,
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
@@ -222,16 +218,9 @@ impl RunnerServe {
 
         let fetched = resolve_app(&cfg).await?;
 
-        let initial_runtime = build_runtime(
-            cfg.runtime_override.as_deref(),
-            &cfg.uuid,
-            &fetched,
-            &cfg.fc,
-            &cfg.docker,
-            &cfg.data_dir,
-        )
-        .await
-        .with_context(|| format!("build runtime for {}", cfg.uuid))?;
+        let initial_runtime = build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.data_dir)
+            .await
+            .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 
         // Wrap the initial runtime in a swappable cell so P2.3 can atomically
         // replace it for zero-downtime deploys without touching the listener or
@@ -474,7 +463,6 @@ mod tests {
             fc: FcConfig::default(),
             docker: DockerConfig::default(),
             image_ref: None,
-            runtime_override: None,
         }
     }
 

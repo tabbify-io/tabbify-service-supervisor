@@ -117,7 +117,7 @@ impl Orchestrator {
     /// shared config's notion of the supervisor's own ULA (currently `None` for
     /// no-mesh runs; see
     /// [`SharedRunnerConfig::parent`](crate::orchestrator::SharedRunnerConfig)).
-    fn spawn_spec_for_uuid(&self, uuid: &str, runtime_override: Option<&str>) -> SpawnSpec {
+    fn spawn_spec_for_uuid(&self, uuid: &str) -> SpawnSpec {
         let shared = self.shared();
         SpawnSpec {
             runner_bin: shared.runner_bin.clone(),
@@ -129,7 +129,6 @@ impl Orchestrator {
             no_mesh: shared.no_mesh,
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
-            runtime_override: runtime_override.map(str::to_owned),
         }
     }
 
@@ -158,6 +157,11 @@ impl Orchestrator {
     /// (idempotent); otherwise spawn a DETACHED runner and wait until its
     /// control socket is healthy.
     ///
+    /// `runtime_override` is accepted for HTTP back-compat and echoed back in the
+    /// response summary's `requested_runtime`, but it no longer selects a runtime:
+    /// every app builds as Firecracker, so the override is NOT threaded into the
+    /// spawned runner.
+    ///
     /// # Errors
     /// - `uuid` is not a valid UUID;
     /// - the runner process fails to spawn (binary missing / record write);
@@ -182,8 +186,9 @@ impl Orchestrator {
             });
         }
 
-        // No live runner. Spawn one DETACHED (it persists its own record).
-        let spec = self.spawn_spec_for_uuid(uuid, runtime_override);
+        // No live runner. Spawn one DETACHED (it persists its own record). The
+        // runtime is fixed to Firecracker, so the override is not threaded in.
+        let spec = self.spawn_spec_for_uuid(uuid);
         let (handle, _child) = spawn_runner(&spec, self.runner_dir())
             .await
             .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -349,6 +354,11 @@ impl Orchestrator {
     /// pinned to `reff`. The deployed ref is persisted so a future supervisor
     /// restart respawns the runner on the same version.
     ///
+    /// `runtime_override` is accepted for HTTP back-compat and echoed back in the
+    /// response summary's `requested_runtime`, but it no longer selects a runtime:
+    /// a by-ref deploy is always the Firecracker pull source, so the override is
+    /// NOT threaded into the control `Deploy` message or the spawned runner.
+    ///
     /// # Errors
     /// - `uuid` is not a valid UUID;
     /// - the control-socket deploy fails (runner returned `Reply::Err`);
@@ -363,7 +373,7 @@ impl Orchestrator {
 
         if self.client_for(uuid).health().await.is_ok() {
             // Live runner: send the Deploy message.
-            match self.client_for(uuid).deploy(reff, runtime_override).await {
+            match self.client_for(uuid).deploy(reff).await {
                 Ok(Reply::Ok) => {}
                 Ok(Reply::Err { message }) => {
                     return Err(anyhow::anyhow!("runner deploy failed: {message}"));
@@ -393,8 +403,9 @@ impl Orchestrator {
                 requested_runtime: runtime_override.map(str::to_owned),
             })
         } else {
-            // No live runner: spawn one pinned to reff.
-            let mut spec = self.spawn_spec_for_uuid(uuid, runtime_override);
+            // No live runner: spawn one pinned to reff. The runtime is fixed to
+            // Firecracker, so the override is not threaded into the spec.
+            let mut spec = self.spawn_spec_for_uuid(uuid);
             spec.image_ref = Some(reff.to_owned());
             let (handle, _child) = spawn_runner(&spec, self.runner_dir())
                 .await
@@ -575,7 +586,7 @@ mod tests {
     #[test]
     fn spawn_spec_carries_derived_sock_and_shared_fields() {
         let o = orch(PathBuf::from("/run/tabbify/runners"));
-        let spec = o.spawn_spec_for_uuid(APP_UUID, None);
+        let spec = o.spawn_spec_for_uuid(APP_UUID);
         assert_eq!(spec.uuid, APP_UUID);
         assert_eq!(spec.control_sock, o.control_sock_for(APP_UUID));
         assert_eq!(spec.s3_base_url, "http://s3.invalid");

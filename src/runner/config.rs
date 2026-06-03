@@ -67,12 +67,6 @@ pub struct RunnerConfig {
     #[arg(long, env = "RUNNER_IMAGE_REF")]
     pub image_ref: Option<String>,
 
-    /// Runtime override (D4 wire string: `docker` | `firecracker` | `wasm-http`).
-    /// When set the runner builds THIS runtime instead of the manifest default
-    /// (D10). `None` = build from the manifest's `runtime.type`.
-    #[arg(long, env = "RUNNER_RUNTIME_OVERRIDE")]
-    pub runtime_override: Option<String>,
-
     /// Path to a JSON build-spec file. When set the runner operates in
     /// one-shot builder mode: it reads the [`BuildJob`], runs the build
     /// pipeline, prints the [`ArtifactRef`] JSON to stdout, and exits.
