@@ -1,9 +1,11 @@
 //! The runtime seam shared by every app runtime.
 //!
 //! [`AppRuntime`] is the object-safe trait the per-app listener ([`crate::host`])
-//! dispatches to; the Docker ([`crate::docker::DockerRuntime`]) and Firecracker
-//! ([`crate::firecracker::FirecrackerRuntime`]) runtimes implement it, so the
+//! dispatches to; the Firecracker microVM runtime
+//! ([`crate::firecracker::FirecrackerRuntime`]) implements it, so the
 //! hosting/serving code is identical regardless of how an app actually runs.
+//! (The in-process WASM and `docker run` runtimes were both removed: an OCI
+//! image is now converted to ext4 and booted as a Firecracker microVM.)
 //!
 //! This module holds ONLY the seam (the trait + its small value types + the
 //! boxed-future aliases). Concrete runtimes live in their own modules.
@@ -49,9 +51,9 @@ pub enum ExitReason {
 }
 
 /// The runtime seam the per-app listener ([`crate::host`]) dispatches to. The
-/// Firecracker microVM runtime ([`crate::firecracker::FirecrackerRuntime`]) and
-/// the Docker container runtime ([`crate::docker::DockerRuntime`]) implement it,
-/// so the hosting/serving code is identical regardless of how an app runs.
+/// Firecracker microVM runtime ([`crate::firecracker::FirecrackerRuntime`])
+/// implements it, so the hosting/serving code is identical regardless of how an
+/// app runs.
 ///
 /// Object-safe (`Arc<dyn AppRuntime>`): the registry picks the concrete runtime
 /// from the deploy-time runtime selection and hands the listener a trait object.

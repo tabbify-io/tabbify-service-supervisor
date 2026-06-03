@@ -98,7 +98,7 @@ static VM_SEQ: AtomicU32 = AtomicU32::new(0);
 /// Probe type: given a `host:port` string returns `true` iff the guest app is
 /// reachable. Production `health()` does a real HTTP GET to `guest_base`; this
 /// injectable seam lets unit tests fake the result so no real microVM is
-/// needed. Mirrors `DockerRuntime`'s `TcpProbe`.
+/// needed.
 #[cfg(test)]
 type TcpProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -586,7 +586,7 @@ impl FirecrackerRuntime {
     /// There is no live child or tap here — `child` is `None` and `tap_name`
     /// is a sentinel — so `health()` can be exercised without a real microVM.
     /// This constructor is `#[cfg(test)]`-only so it never surfaces in
-    /// production code (mirrors `DockerRuntime::with_probe_for_test`).
+    /// production code.
     #[cfg(test)]
     pub fn with_probe_for_test(guest_base: &str, probe: TcpProbe) -> Self {
         Self {
@@ -610,8 +610,7 @@ impl AppRuntime for FirecrackerRuntime {
         // Test seam: when an injectable probe is present (set only by
         // `with_probe_for_test`), use it instead of a real HTTP GET so health
         // can be exercised without a live microVM. The probe receives the
-        // `host:port` (with the `http://` scheme stripped), mirroring
-        // `DockerRuntime::health`.
+        // `host:port` (with the `http://` scheme stripped).
         #[cfg(test)]
         if let Some(probe) = self.probe.clone() {
             let hp = self
