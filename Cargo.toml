@@ -43,10 +43,7 @@ utoipa-swagger-ui = { version = "8", features = ["axum"] }
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
 
-# WASM runtime (wasmtime 26, wasi:http/proxy world). See §8 of the contract.
-wasmtime = { version = "26", features = ["component-model", "async", "pooling-allocator"] }
-wasmtime-wasi = "26"
-wasmtime-wasi-http = "26"
+# HTTP request/response types shared by the runtime seam + the proxy paths.
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -123,8 +120,8 @@ tar = "0.4"
 # Test-only: compress synthetic OCI layer tarballs (gzip / zstd) so the
 # real-conversion integration test can stage layers carrying the compressed OCI
 # media types and exercise the real host `tar -z`/`--zstd` unpack path. Both are
-# already in the dependency graph (flate2 via utoipa-swagger-ui, zstd via
-# wasmtime-cache), so this adds no new build cost. flate2's default backend is
+# already in the dependency graph (flate2 via utoipa-swagger-ui, zstd via the
+# FC rootfs build), so this adds no new build cost. flate2's default backend is
 # pure-Rust (miniz_oxide), keeping the fixtures musl-clean.
 flate2 = "1"
 zstd = "0.13"

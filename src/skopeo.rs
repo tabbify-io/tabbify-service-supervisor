@@ -62,8 +62,8 @@ pub async fn skopeo_push(
 /// `Err`, and a spawn failure returns the OS error in `Err`.
 ///
 /// Re-uses the same `Arc<dyn Fn(…) -> BoxFut<…>>` shape as
-/// [`crate::docker::production_command_runner`] / [`crate::oras::production_oras_runner`]
-/// so the skopeo, oras, and docker seams are structurally identical.
+/// [`crate::docker::production_command_runner`] so the skopeo and docker seams
+/// are structurally identical.
 #[must_use]
 pub fn production_skopeo_runner(skopeo_bin: String) -> CommandRunner {
     use std::sync::Arc;

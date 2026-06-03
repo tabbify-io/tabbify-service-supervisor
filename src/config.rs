@@ -192,22 +192,21 @@ pub const DEFAULT_DOCKER_BUILD_TIMEOUT_SECS: u64 = 300;
 
 /// Docker container runtime configuration. Only consulted when the supervisor is
 /// asked to host an app whose `runtime.type == "docker"` on a host with a
-/// reachable Docker daemon; ignored everywhere else (so a WASM-only supervisor
-/// never needs any of these). Unlike firecracker, Docker is cross-platform — it
-/// shells out to the `docker` CLI, which runs on macOS + Linux alike.
+/// reachable Docker daemon; ignored everywhere else. Unlike firecracker, Docker
+/// is cross-platform — it shells out to the `docker` CLI, which runs on macOS +
+/// Linux alike.
 ///
-/// Also holds the `oras_bin` path used by the `wasm-http` runtime to pull WASM
-/// OCI artifacts from the mesh registry — co-located here because both are
-/// external CLI tools that the supervisor shells out to.
+/// Also holds the `oras_bin` path (an external CLI the supervisor shells out
+/// to, co-located here with the other external-tool paths).
 #[derive(Debug, Clone, Parser)]
 pub struct DockerConfig {
     /// Path to the `docker` binary.
     #[arg(long = "docker-bin", env = "SUPERVISOR_DOCKER_BIN", default_value = DEFAULT_DOCKER_BIN)]
     pub docker_bin: String,
 
-    /// Path to the `oras` binary used to pull WASM OCI artifacts from the
-    /// mesh registry. The registry is plain HTTP over the WireGuard overlay so
-    /// `oras pull --plain-http` is used for every `[ula]:5000` ref.
+    /// Path to the `oras` binary. The registry is plain HTTP over the WireGuard
+    /// overlay so the `oras` source flag is `--from-plain-http` for every
+    /// `[ula]:5000` ref.
     #[arg(long = "oras-bin", env = "SUPERVISOR_ORAS_BIN", default_value = DEFAULT_ORAS_BIN)]
     pub oras_bin: String,
 

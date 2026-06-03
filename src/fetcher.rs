@@ -178,10 +178,11 @@ impl S3Fetcher {
 
         let entry = manifest.runtime.entry.clone();
         let entry_path = dir.join(&entry);
-        // Only `wasm-http` needs the artifact bytes resident in memory (the
-        // wasmtime engine compiles them). `firecracker` (a rootfs image) and
+        // The in-process WASM runtime (the only one that needed artifact bytes
+        // resident in memory) was removed. `firecracker` (a rootfs image) and
         // `docker` (a build-context tarball) consume the on-disk path instead,
-        // so we never read a large artifact into RAM for those.
+        // so we never read a large artifact into RAM. A legacy `wasm-http`
+        // manifest still loads its bytes (harmless: `build_runtime` bails on it).
         let loads_into_memory = manifest.runtime.r#type == "wasm-http";
 
         // Ensure the entry file is present on disk (fetch + persist on miss). We

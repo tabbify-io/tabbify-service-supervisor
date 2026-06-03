@@ -14,7 +14,7 @@ pub struct AppManifest {
     pub app: AppMeta,
     /// Lifecycle policy (always-on vs on-request).
     pub lifecycle: Lifecycle,
-    /// Runtime parameters (wasm entry, fuel, memory).
+    /// Runtime parameters (entry artifact, memory, vcpus).
     pub runtime: Runtime,
     /// Routing hints (Phase-1: dynamic prefixes).
     #[serde(default)]
@@ -78,11 +78,11 @@ pub struct Runtime {
     /// `context.tar.gz`, the app dir + `Dockerfile`) for `docker`.
     #[serde(default = "default_entry")]
     pub entry: String,
-    /// Per-request fuel budget (wasm-http only).
+    /// Inert wire field (formerly the wasm per-request fuel budget). Retained so
+    /// existing manifests still parse; no runtime consumes it.
     #[serde(default = "default_fuel")]
     pub fuel_per_request: u64,
-    /// Memory cap (MB). Advisory for wasm-http; the guest RAM size for
-    /// firecracker.
+    /// Memory cap (MB). Advisory for docker; the guest RAM size for firecracker.
     #[serde(default = "default_mem")]
     pub memory_mb: u32,
     /// vCPU count override (firecracker only). `None` → the supervisor's

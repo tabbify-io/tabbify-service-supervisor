@@ -259,7 +259,6 @@ impl FirecrackerRuntime {
         }
 
         // Per-app snapshot cache: <data_dir>/apps/<uuid>/cache/
-        // (mirrors the wasm .cwasm cache directory layout)
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
         // Per-app console log: <data_dir>/fc/<uuid>.console.log. Only written
         // when SUPERVISOR_FC_DEBUG is truthy (see `console_stdio`).

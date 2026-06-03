@@ -17,7 +17,7 @@
 //!    `oras copy --from-plain-http <ref> --to-oci-layout <dir>` argv form
 //!    (`--from-plain-http` is the SOURCE flag for the plain-HTTP mesh registry,
 //!    NOT `--plain-http`). This is the form the fc-dl-1 step-0a probe PROVED:
-//!    `oras pull -o <dir>` (the `crate::oras::oras_pull_args` argv) does NOT
+//!    `oras pull -o <dir>` (the now-removed `oras pull` form) does NOT
 //!    produce a layout for a normal container image — `oras` skips layers
 //!    lacking an `org.opencontainers.image.title` annotation (all docker-built
 //!    layers) and leaves the dir EMPTY. The `--to-oci-layout` form yields the
@@ -48,7 +48,7 @@
 //!
 //! ## fc-dl-1 probe outcome (RECORDED — `oras` 1.3.2, real registry)
 //! Step 0a probed `oras` against a real registry (docker.io busybox). RESULT:
-//! `oras pull -o <dir>` (the form behind [`crate::oras::oras_pull_args`]) does
+//! `oras pull -o <dir>` (the now-removed `oras pull` form) does
 //! NOT produce a layout for a normal container image — `oras` skips layers that
 //! lack an `org.opencontainers.image.title` annotation (all docker-built image
 //! layers) and leaves the output dir EMPTY, printing:
@@ -352,7 +352,7 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
 /// conversion entirely. A new digest gets a fresh dir, never clobbering the old
 /// rootfs (immutable-by-content).
 ///
-/// Layout mirrors the wasm `.cwasm` / fc snapshot caches:
+/// Layout mirrors the fc snapshot cache:
 /// `<data_dir>/apps/<uuid>/fc/<digest-sanitized>/rootfs.ext4`.
 /// The `:` in the digest is replaced with `-` so it's a single path segment.
 #[must_use]
@@ -995,7 +995,7 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
 ///
 /// CRITICAL — why `oras copy --to-oci-layout`, NOT `oras pull -o`: the fc-dl-1
 /// probe (recorded in this file's header) PROVED that `oras pull -o <dir>` (the
-/// `crate::oras::oras_pull_args` argv) does NOT produce a layout for a normal
+/// now-removed `oras pull` form) does NOT produce a layout for a normal
 /// docker-built container image — `oras` skips every layer lacking an
 /// `org.opencontainers.image.title` annotation and leaves `<dir>` EMPTY
 /// (`"Skipped pulling layers without file name ... Use 'oras copy ...
