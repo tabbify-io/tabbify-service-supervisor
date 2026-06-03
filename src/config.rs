@@ -154,11 +154,6 @@ pub struct FcConfig {
         default_value_t = 8080
     )]
     pub app_port: u16,
-
-    /// Directory holding the prebuilt NixOS node image (`vmlinux` + `rootfs.ext4`)
-    /// for the `node-firecracker` runtime. Host-local for now; S3 fetch comes later.
-    #[arg(long = "node-image-dir", env = "SUPERVISOR_NODE_IMAGE_DIR", default_value = "/opt/tabbify/node-images/default")]
-    pub node_image_dir: std::path::PathBuf,
 }
 
 impl Default for FcConfig {
@@ -171,7 +166,6 @@ impl Default for FcConfig {
             vcpus: 1,
             tap_subnet: DEFAULT_FC_TAP_SUBNET.to_owned(),
             app_port: 8080,
-            node_image_dir: "/opt/tabbify/node-images/default".into(),
         }
     }
 }
@@ -189,31 +183,24 @@ pub const DEFAULT_ORAS_BIN: &str = "oras";
 /// so the docker daemon never needs a mesh route.
 pub const DEFAULT_SKOPEO_BIN: &str = "skopeo";
 
-/// Default port the app's HTTP server listens on inside the container.
-pub const DEFAULT_DOCKER_APP_PORT: u16 = 8080;
-
-/// Default `docker build` timeout (seconds). A cold build that pulls a base
-/// image + installs deps can take a while; 300s is a generous ceiling.
-pub const DEFAULT_DOCKER_BUILD_TIMEOUT_SECS: u64 = 300;
-
-/// Docker container runtime configuration. Only consulted when the supervisor is
-/// asked to host an app whose `runtime.type == "docker"` on a host with a
-/// reachable Docker daemon; ignored everywhere else (so a WASM-only supervisor
-/// never needs any of these). Unlike firecracker, Docker is cross-platform — it
-/// shells out to the `docker` CLI, which runs on macOS + Linux alike.
+/// Docker BUILD-tool configuration: the external-CLI paths the supervisor shells
+/// out to when BUILDING + PUSHING OCI images (`docker build` then `skopeo copy`
+/// to the mesh registry). Docker no longer RUNS apps (an OCI image is converted
+/// to ext4 and booted as a Firecracker microVM), so this holds only build-side
+/// binary paths. Unlike firecracker, the docker build path is cross-platform —
+/// it shells out to the `docker` CLI, which runs on macOS + Linux alike.
 ///
-/// Also holds the `oras_bin` path used by the `wasm-http` runtime to pull WASM
-/// OCI artifacts from the mesh registry — co-located here because both are
-/// external CLI tools that the supervisor shells out to.
+/// Also holds the `oras_bin` path, co-located here with the other external-tool
+/// paths.
 #[derive(Debug, Clone, Parser)]
 pub struct DockerConfig {
     /// Path to the `docker` binary.
     #[arg(long = "docker-bin", env = "SUPERVISOR_DOCKER_BIN", default_value = DEFAULT_DOCKER_BIN)]
     pub docker_bin: String,
 
-    /// Path to the `oras` binary used to pull WASM OCI artifacts from the
-    /// mesh registry. The registry is plain HTTP over the WireGuard overlay so
-    /// `oras pull --plain-http` is used for every `[ula]:5000` ref.
+    /// Path to the `oras` binary. The registry is plain HTTP over the WireGuard
+    /// overlay so the `oras` source flag is `--from-plain-http` for every
+    /// `[ula]:5000` ref.
     #[arg(long = "oras-bin", env = "SUPERVISOR_ORAS_BIN", default_value = DEFAULT_ORAS_BIN)]
     pub oras_bin: String,
 
@@ -225,26 +212,6 @@ pub struct DockerConfig {
     /// because the mesh registry is plain HTTP over the WireGuard overlay.
     #[arg(long = "skopeo-bin", env = "SUPERVISOR_SKOPEO_BIN", default_value = DEFAULT_SKOPEO_BIN)]
     pub skopeo_bin: String,
-
-    /// Port the app's HTTP server listens on inside the container (the image's
-    /// `EXPOSE`d / served port). The supervisor publishes an ephemeral loopback
-    /// host port onto this container port. The clap `id` is distinct from
-    /// [`FcConfig`]'s `app_port` so the two flattened structs don't collide.
-    #[arg(
-        id = "docker_app_port",
-        long = "docker-app-port",
-        env = "SUPERVISOR_DOCKER_APP_PORT",
-        default_value_t = DEFAULT_DOCKER_APP_PORT
-    )]
-    pub app_port: u16,
-
-    /// Maximum time to wait for `docker build` to finish (seconds).
-    #[arg(
-        long = "docker-build-timeout-secs",
-        env = "SUPERVISOR_DOCKER_BUILD_TIMEOUT_SECS",
-        default_value_t = DEFAULT_DOCKER_BUILD_TIMEOUT_SECS
-    )]
-    pub build_timeout_secs: u64,
 }
 
 impl Default for DockerConfig {
@@ -255,8 +222,6 @@ impl Default for DockerConfig {
             docker_bin: DEFAULT_DOCKER_BIN.to_owned(),
             oras_bin: DEFAULT_ORAS_BIN.to_owned(),
             skopeo_bin: DEFAULT_SKOPEO_BIN.to_owned(),
-            app_port: DEFAULT_DOCKER_APP_PORT,
-            build_timeout_secs: DEFAULT_DOCKER_BUILD_TIMEOUT_SECS,
         }
     }
 }
@@ -325,14 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_node_image_dir_default() {
-        assert_eq!(
-            FcConfig::default().node_image_dir,
-            PathBuf::from("/opt/tabbify/node-images/default")
-        );
-    }
-
-    #[test]
     fn firecracker_overrides_parse() {
         let cfg = Config::try_parse_from([
             "supervisord",
@@ -361,11 +318,6 @@ mod tests {
         assert_eq!(cfg.docker.docker_bin, DEFAULT_DOCKER_BIN);
         assert_eq!(cfg.docker.oras_bin, DEFAULT_ORAS_BIN);
         assert_eq!(cfg.docker.skopeo_bin, DEFAULT_SKOPEO_BIN);
-        assert_eq!(cfg.docker.app_port, DEFAULT_DOCKER_APP_PORT);
-        assert_eq!(
-            cfg.docker.build_timeout_secs,
-            DEFAULT_DOCKER_BUILD_TIMEOUT_SECS
-        );
     }
 
     #[test]
@@ -375,8 +327,6 @@ mod tests {
         assert_eq!(parsed.docker_bin, dflt.docker_bin);
         assert_eq!(parsed.oras_bin, dflt.oras_bin);
         assert_eq!(parsed.skopeo_bin, dflt.skopeo_bin);
-        assert_eq!(parsed.app_port, dflt.app_port);
-        assert_eq!(parsed.build_timeout_secs, dflt.build_timeout_secs);
     }
 
     #[test]
@@ -389,17 +339,11 @@ mod tests {
             "/usr/local/bin/oras",
             "--skopeo-bin",
             "/usr/local/bin/skopeo",
-            "--docker-app-port",
-            "3000",
-            "--docker-build-timeout-secs",
-            "600",
         ])
         .unwrap();
         assert_eq!(cfg.docker.docker_bin, "/usr/local/bin/docker");
         assert_eq!(cfg.docker.oras_bin, "/usr/local/bin/oras");
         assert_eq!(cfg.docker.skopeo_bin, "/usr/local/bin/skopeo");
-        assert_eq!(cfg.docker.app_port, 3000);
-        assert_eq!(cfg.docker.build_timeout_secs, 600);
     }
 
     #[test]

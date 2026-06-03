@@ -71,7 +71,7 @@ pub struct RunnerLifecycle {
     /// rebuilds the runtime from it via [`build_runtime`].
     pub(crate) fetched: FetchedApp,
     /// Firecracker runtime config — passed to [`build_runtime`] when `Deploy`
-    /// rebuilds the runtime (ignored for docker/wasm apps).
+    /// rebuilds the runtime (the platform's single runtime).
     pub(crate) fc: FcConfig,
     /// Local data dir for the artifact / AOT cache — passed to
     /// [`build_runtime`] when `Deploy` rebuilds the runtime.
@@ -159,19 +159,15 @@ impl RunnerLifecycle {
     ///   never came up) or [`perform_swap`] aborted because the new runtime was
     ///   unhealthy — in both cases the OLD runtime stays in service (no
     ///   downtime).
-    async fn deploy(&self, reff: &str, runtime_override: Option<&str>) -> Reply {
+    async fn deploy(&self, reff: &str) -> Reply {
         // Build the new runtime from the app's manifest with the deploy ref
-        // applied. For docker this triggers `docker pull <reff>` instead of a
-        // source build; for wasm/firecracker the ref is ignored and the runtime
-        // is rebuilt from the existing (cached) artifact. A runtime override
-        // (D10) takes precedence over the manifest default when present.
+        // applied: the runtime is always Firecracker, which pulls `reff` from the
+        // mesh registry, converts the OCI image to a rootfs.ext4, and boots it.
         let next_fetched = fetched_with_ref(&self.fetched, reff);
         let new_runtime = match build_runtime(
-            runtime_override,
             &self.uuid,
             &next_fetched,
             &self.fc,
-            &self.docker,
             &self.data_dir,
         )
         .await
@@ -292,7 +288,7 @@ async fn dispatch(cmd: Cmd, lifecycle: &RunnerLifecycle) -> Reply {
             lifecycle.purge().await;
             Reply::Ok
         }
-        Cmd::Deploy { reff, runtime } => lifecycle.deploy(&reff, runtime.as_deref()).await,
+        Cmd::Deploy { reff } => lifecycle.deploy(&reff).await,
         Cmd::Shutdown => {
             lifecycle.stop().await;
             // Signal the main task to exit cleanly, if a shutdown notifier is
@@ -350,11 +346,11 @@ mod tests {
         }
     }
 
-    /// A `wasm-http` `FetchedApp` carrying the committed hello.wasm fixture, so
-    /// `build_runtime` (called by `deploy`) compiles a real, healthy runtime
-    /// without needing docker or a live registry.
-    fn wasm_fetched() -> FetchedApp {
-        let wasm = include_bytes!("../../tests/fixtures/hello.wasm");
+    /// A firecracker `FetchedApp` used only to populate
+    /// `RunnerLifecycle::fetched`. The health-dispatch tests never build a
+    /// runtime from it; the deploy build-failure test drives the FC build off it
+    /// against an unreachable registry ref to force a deterministic failure.
+    fn fc_fetched() -> FetchedApp {
         FetchedApp {
             version: 1,
             manifest: AppManifest {
@@ -370,18 +366,18 @@ mod tests {
                     idle_timeout_sec: 300,
                 },
                 runtime: Runtime {
-                    r#type: "wasm-http".to_owned(),
-                    entry: "app.wasm".to_owned(),
-                    fuel_per_request: crate::runtime::DEFAULT_FUEL_PER_REQUEST,
-                    memory_mb: 64,
-                    vcpus: None,
+                    r#type: "firecracker".to_owned(),
+                    entry: "context.tar.gz".to_owned(),
+                    fuel_per_request: 0,
+                    memory_mb: 2048,
+                    vcpus: Some(2),
                     kernel: None,
                     registry_ref: None,
                 },
                 routes: Routes::default(),
             },
-            wasm: BytesAlias::from_static(wasm),
-            cached_path: std::path::PathBuf::from("/tmp/tabbify-deploy-test/app.wasm"),
+            wasm: BytesAlias::new(),
+            cached_path: std::path::PathBuf::from("/tmp/tabbify-deploy-test/context.tar.gz"),
         }
     }
 
@@ -396,7 +392,7 @@ mod tests {
             docker: DockerConfig::default(),
             runtime: runtime.clone(),
             active: Arc::new(ActiveRuntime::new(runtime)),
-            fetched: wasm_fetched(),
+            fetched: fc_fetched(),
             fc: FcConfig::default(),
             data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
             shutdown_tx: Arc::new(Mutex::new(None)),
@@ -444,63 +440,25 @@ mod tests {
 
     // ---- Deploy dispatch tests ----------------------------------------------
 
-    /// A `Deploy` whose new runtime builds + becomes healthy must reply `Ok` and
-    /// the shared `ActiveRuntime` cell must now hold a DIFFERENT runtime (the
-    /// swap flipped). The new runtime is a real wasm runtime compiled from the
-    /// committed fixture (default health = Serving), so `perform_swap` passes its
-    /// health-gate and flips. The swap mechanics themselves are covered by
-    /// `perform_swap`'s own P2.3a tests; here we verify the command is dispatched
-    /// to the swap path and the active cell is updated.
+    // NOTE: the happy-path deploy/swap test was removed with the in-process WASM
+    // runtime — it was the only runtime that could build a healthy app hermetically
+    // (no docker daemon / no KVM). The build-failure path below still pins the
+    // no-downtime invariant (a failed build must NOT swap the active runtime).
+
+    /// When building the new runtime fails (the FC build pulls an UNREACHABLE
+    /// registry ref — a non-routable mesh ULA — so the pull errors out), `Deploy`
+    /// must reply `Err` and the active runtime must be UNCHANGED — the old
+    /// runtime stays in service (no downtime).
     #[tokio::test]
-    async fn deploy_healthy_new_runtime_swaps_active_and_replies_ok() {
+    async fn deploy_build_failure_keeps_old_runtime_and_replies_err() {
         let lc = fake_lifecycle(RuntimeHealth::Serving);
         let before = lc.active.load();
 
         let reply = dispatch(
             Cmd::Deploy {
-                reff: "ignored-for-wasm".to_owned(),
-                runtime: None,
-            },
-            &lc,
-        )
-        .await;
-
-        assert!(
-            matches!(reply, Reply::Ok),
-            "healthy deploy must reply Ok, got {reply:?}"
-        );
-        // The active runtime was swapped: the post-deploy load is a different
-        // allocation than the pre-deploy one (the FakeRuntime we started with).
-        assert!(
-            !Arc::ptr_eq(&before, &lc.active.load()),
-            "Deploy must swap the active runtime to the freshly-built one"
-        );
-        // And the new active runtime serves 200 (it is the real wasm fixture).
-        let req = Request::builder()
-            .method("GET")
-            .uri("http://example.com/")
-            .body(Bytes::new())
-            .unwrap();
-        let resp = lc.active.load().handle(req).await.expect("handle");
-        assert_eq!(resp.status(), 200);
-    }
-
-    /// When building the new runtime fails (an unknown runtime type triggers a
-    /// hard error in `build_runtime`), `Deploy` must reply `Err` and the active
-    /// runtime must be UNCHANGED — the old runtime stays in service (no
-    /// downtime).
-    #[tokio::test]
-    async fn deploy_build_failure_keeps_old_runtime_and_replies_err() {
-        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
-        // Force the build to fail: an unrecognised runtime type is a hard error
-        // in `build_runtime` (no silent fallback).
-        lc.fetched.manifest.runtime.r#type = "no-such-runtime".to_owned();
-        let before = lc.active.load();
-
-        let reply = dispatch(
-            Cmd::Deploy {
+                // Unroutable mesh ULA: the FC build's `oras copy` pull fails,
+                // which is the deterministic build failure this test pins.
                 reff: "[fd5a::1]:5000/acme/app:sha".to_owned(),
-                runtime: None,
             },
             &lc,
         )

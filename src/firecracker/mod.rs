@@ -52,21 +52,6 @@ pub use linux::FirecrackerRuntime;
 #[cfg(not(target_os = "linux"))]
 pub use stub::FirecrackerRuntime;
 
-/// How a `FirecrackerRuntime` behaves. `Generic` = OCI-app VM (HTTP-proxied over
-/// the tap /30). `NodeFc` = recursive tabbify-node VM: the in-VM supervisor binds
-/// its own mesh ULA (not the tap), so the outer supervisor only manages lifecycle
-/// — it does not proxy/probe over HTTP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeMode {
-    /// OCI-app VM: HTTP requests are proxied to the guest over the tap /30 and
-    /// `health()` probes the guest's HTTP server.
-    Generic,
-    /// Recursive tabbify-node VM: the in-VM supervisor binds its own mesh ULA,
-    /// so the outer supervisor only manages lifecycle (no HTTP proxy/probe over
-    /// the tap); `health()` reads the `exited` flag, `handle()` returns 502.
-    NodeFc,
-}
-
 /// Path to the KVM device node; presence + R/W openability gates firecracker.
 const DEV_KVM: &str = "/dev/kvm";
 

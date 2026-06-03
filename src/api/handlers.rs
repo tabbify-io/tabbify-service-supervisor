@@ -347,15 +347,13 @@ pub struct BuildBody {
     #[serde(default)]
     pub(super) push_token: Option<String>,
     /// Which build pipeline to run. Absent ⇒ [`crate::runner::build::BuildKind::Docker`]
-    /// (the original behaviour); `"wasm"` selects the wasm-component path.
+    /// (the only kind today).
     #[serde(default)]
     pub(super) build_kind: crate::runner::build::BuildKind,
-    /// (Wasm only) shell command that produces the `.wasm`, run with the cloned
-    /// source dir as cwd. Ignored by the docker path.
+    /// Inert wire field (formerly the wasm `build_cmd`); no build path consumes it.
     #[serde(default)]
     pub(super) build_cmd: Option<String>,
-    /// (Wasm only) path to the produced `.wasm`, relative to the repo root.
-    /// Ignored by the docker path.
+    /// Inert wire field (formerly the wasm `artifact_path`); no build path consumes it.
     #[serde(default)]
     pub(super) artifact_path: Option<String>,
 }
@@ -406,9 +404,8 @@ pub async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildB
         registry_ula: body.registry_ula,
         clone_token: body.clone_token,
         push_token: body.push_token,
-        // Threaded from the request: a caller may select the wasm build path
-        // (`build_kind: "wasm"` + `build_cmd` + `artifact_path`); all three
-        // default to the docker pipeline when omitted (unchanged behaviour).
+        // build_kind defaults to docker (the only pipeline); build_cmd /
+        // artifact_path are inert wire fields preserved for spec compatibility.
         build_kind: body.build_kind,
         build_cmd: body.build_cmd,
         artifact_path: body.artifact_path,
@@ -544,8 +541,10 @@ mod tests {
 
     #[test]
     fn start_body_parses_explicit_runtime() {
+        // Single-runtime model: a legacy `"docker"` runtime still parses and
+        // coerces to the only runtime (Firecracker).
         let b: StartBody = serde_json::from_str(r#"{"runtime":"docker"}"#).unwrap();
-        assert_eq!(b.runtime, Some(Runtime::Docker));
+        assert_eq!(b.runtime, Some(Runtime::Firecracker));
     }
 
     #[test]
@@ -556,9 +555,11 @@ mod tests {
 
     #[test]
     fn deploy_body_parses_runtime_override() {
+        // Single-runtime model: a legacy `"docker"` runtime override still parses
+        // and coerces to the only runtime (Firecracker).
         let b: DeployBody =
             serde_json::from_str(r#"{"ref":"reg/acme/app:sha","runtime":"docker"}"#).unwrap();
-        assert_eq!(b.runtime, Some(Runtime::Docker));
+        assert_eq!(b.runtime, Some(Runtime::Firecracker));
     }
 
     #[test]

@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Sanitize a UUID/id string to `[a-z0-9-]` — same rules as `container_name`.
+/// Sanitize a UUID/id string to `[a-z0-9-]` (lower-case, non-alnum → `-`).
 fn sanitize(id: &str) -> String {
     id.chars()
         .map(|c| {

@@ -61,20 +61,19 @@ pub struct RunnerHandle {
     /// exists, persists/loads, and flows into the spawn args.
     #[serde(default)]
     pub image_ref: Option<String>,
-    /// Runtime override (D4 wire string, e.g. `"firecracker"`) the deploy/start
-    /// requested, persisted so a supervisor-driven respawn rebuilds the SAME
-    /// runtime.
+    /// INERT, back-compat-only. Once the D4 wire string (e.g. `"firecracker"` /
+    /// `"docker"`) the deploy/start requested, persisted so a respawn could
+    /// rebuild the same runtime.
     ///
-    /// For a ref-deploy the requested runtime is the only source of truth: the
-    /// synthetic `fetched_from_ref` manifest hard-codes `runtime = docker`, so a
-    /// respawn that dropped this override would fall back to docker and crashloop
-    /// on a docker-less host. The orchestrator forwards it to the runner as
-    /// `--runtime-override <wire>` (see [`spawn_spec_for`]).
+    /// The platform now serves a SINGLE runtime (generic Firecracker), so the
+    /// runtime is no longer selectable: this field is no longer written (new
+    /// records get `None`) and is NEVER read for dispatch. It is retained ONLY so
+    /// that old on-disk records that still carry a `requested_runtime` (including
+    /// a now-unknown value like `"docker"`) keep deserializing without error.
     ///
-    /// `#[serde(default)]` keeps old on-disk records (written before this field
-    /// existed) loading — they get `None`, i.e. the manifest default.
-    ///
-    /// [`spawn_spec_for`]: crate::orchestrator::SharedRunnerConfig::spawn_spec_for
+    /// `#[serde(default)]` keeps even older records (written before this field
+    /// existed) loading — they also get `None`. NOTE: do NOT add
+    /// `deny_unknown_fields` to this struct, or old records would fail to load.
     #[serde(default)]
     pub requested_runtime: Option<String>,
 }
@@ -356,6 +355,32 @@ mod tests {
         assert!(
             h.requested_runtime.is_none(),
             "missing requested_runtime key must deserialize as None"
+        );
+    }
+
+    /// An OLD on-disk record that still carries a now-unknown
+    /// `requested_runtime` (e.g. `"docker"`, written before the runtime was
+    /// fixed to Firecracker) MUST still deserialize without error — the field is
+    /// inert/back-compat only and is never read for dispatch. (No
+    /// `deny_unknown_fields`; the value is preserved on read, just ignored.)
+    #[test]
+    fn requested_runtime_loads_legacy_docker_value() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000,
+            "image_ref": null,
+            "requested_runtime": "docker"
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json)
+            .expect("an old record with requested_runtime=docker must still load");
+        assert_eq!(
+            h.requested_runtime.as_deref(),
+            Some("docker"),
+            "the legacy value is read but inert (never used for dispatch)"
         );
     }
 

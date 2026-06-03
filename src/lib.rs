@@ -2,19 +2,19 @@
 
 //! `tabbify-service-supervisor` — app-layer supervisor for the Tabbify mesh.
 //!
-//! Joins the WireGuard mesh as a `supervisor`-tagged peer, fetches WASM apps
-//! from S3 by UUID, runs them per a TOML lifecycle, and serves them over the
-//! mesh on `[my_ula]:8730` (contract §5).
+//! Joins the WireGuard mesh as a `supervisor`-tagged peer, fetches apps from S3
+//! by UUID, runs them per a TOML lifecycle, and serves them over the mesh on
+//! `[my_ula]:8730` (contract §5).
 //!
 //! # Layers
 //! - [`config`] — configuration (env + clap).
 //! - [`manifest`] — vendored `manifest.toml` schema (contract §3).
 //! - [`app_ula`] — vendored deterministic app-ULA (contract §4).
-//! - [`runtime`] — the [`runtime::AppRuntime`] seam + the minimal wasmtime
-//!   `wasi:http/proxy` runtime (contract §8).
-//! - [`firecracker`] — the second [`runtime::AppRuntime`]: a KVM-gated
-//!   Firecracker microVM runtime (real on Linux, stub elsewhere).
-//! - [`docker`] — the third [`runtime::AppRuntime`]: a cross-platform Docker
+//! - [`app_runtime`] — the [`app_runtime::AppRuntime`] seam (re-exported from
+//!   [`runtime`]) plus the deploy-time runtime-selection enum.
+//! - [`firecracker`] — an [`app_runtime::AppRuntime`]: a KVM-gated Firecracker
+//!   microVM runtime (real on Linux, stub elsewhere).
+//! - [`docker`] — an [`app_runtime::AppRuntime`]: a cross-platform Docker
 //!   container runtime that builds the app image from source on the supervisor.
 //! - [`build_backend`] — swappable OCI-image build backends:
 //!   [`build_backend::BuildBackend`] trait + [`build_backend::HostDockerBackend`]
@@ -36,6 +36,7 @@
 //!   emitted once after bind + mesh-join; best-effort no-op off systemd.
 
 pub mod api;
+pub mod app_runtime;
 pub mod app_ula;
 pub mod build;
 pub mod build_backend;

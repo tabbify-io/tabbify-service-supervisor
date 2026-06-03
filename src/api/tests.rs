@@ -296,33 +296,6 @@ fn build_body_defaults_to_docker_build_kind() {
     assert!(body.artifact_path.is_none());
 }
 
-/// A body WITH `build_kind: "wasm"` (+ `build_cmd` / `artifact_path`) parses
-/// to `BuildKind::Wasm` and carries the wasm build coordinates through.
-#[test]
-fn build_body_parses_wasm_build_kind() {
-    use crate::runner::build::BuildKind;
-    let json = r#"{
-        "repo_url":"https://github.com/acme/app",
-        "ref":"abc123",
-        "tenant":"acme",
-        "app_uuid":"u",
-        "registry_ula":"[fd5a::1]:5000",
-        "build_kind":"wasm",
-        "build_cmd":"cargo build --release --target wasm32-wasip2",
-        "artifact_path":"target/wasm32-wasip2/release/app.wasm"
-    }"#;
-    let body: BuildBody = serde_json::from_str(json).unwrap();
-    assert_eq!(body.build_kind, BuildKind::Wasm);
-    assert_eq!(
-        body.build_cmd.as_deref(),
-        Some("cargo build --release --target wasm32-wasip2")
-    );
-    assert_eq!(
-        body.artifact_path.as_deref(),
-        Some("target/wasm32-wasip2/release/app.wasm")
-    );
-}
-
 // ── POST /v1/build — route exists and delegates to the orchestrator ────────
 
 /// `POST /v1/build` with a valid body reaches the handler and returns 500

@@ -103,13 +103,9 @@ impl SharedRunnerConfig {
             no_mesh: self.no_mesh,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
-            // Respawn with the SAME runtime the deploy requested. The override
-            // IS persisted on the record (`requested_runtime`) because for a
-            // ref-deploy it is the only source of truth: the synthetic
-            // `fetched_from_ref` manifest hard-codes docker, so dropping the
-            // override here would crashloop a firecracker app on a docker-less
-            // host. `None` ⇒ manifest default (unchanged behavior).
-            runtime_override: record.requested_runtime.clone(),
+            // The runtime is no longer selectable — every app builds as
+            // Firecracker, and a by-ref deploy synthesizes a firecracker manifest
+            // — so the record's (now inert) `requested_runtime` is NOT read here.
         }
     }
 }
@@ -288,29 +284,21 @@ mod tests {
         assert!(spec.parent.is_none());
     }
 
-    /// A respawn must preserve the runtime the deploy requested: a record with
-    /// `requested_runtime = Some("firecracker")` reconstructs a spec whose
-    /// `runtime_override` is `Some("firecracker")` — otherwise a ref-deploy
-    /// crash-respawn would fall back to the manifest's hard-coded docker runtime
-    /// and crashloop on a docker-less host.
+    /// A record's (now inert) `requested_runtime` does NOT affect the respawn
+    /// spec: the runtime is fixed to Firecracker, so a record carrying a stale
+    /// `requested_runtime` still reconstructs a faithful spec (the field is only
+    /// kept so old on-disk records deserialize). `SpawnSpec` no longer has a
+    /// `runtime_override` field, so there is nothing for it to set.
     #[test]
-    fn spawn_spec_for_preserves_requested_runtime() {
+    fn spawn_spec_for_ignores_requested_runtime() {
         let cfg = shared();
         let mut rec = record();
-        rec.requested_runtime = Some("firecracker".to_owned());
+        rec.requested_runtime = Some("docker".to_owned());
         let spec = cfg.spawn_spec_for(&rec);
-        assert_eq!(spec.runtime_override, Some("firecracker".to_owned()));
-    }
-
-    /// With no requested runtime on the record, the respawn spec carries no
-    /// override (manifest default applies, unchanged behavior).
-    #[test]
-    fn spawn_spec_for_no_requested_runtime_is_none() {
-        let cfg = shared();
-        let mut rec = record();
-        rec.requested_runtime = None;
-        let spec = cfg.spawn_spec_for(&rec);
-        assert!(spec.runtime_override.is_none());
+        // The spec faithfully reconstructs from the record's other fields; the
+        // stale runtime hint is simply not consulted.
+        assert_eq!(spec.uuid, rec.uuid);
+        assert_eq!(spec.image_ref, rec.image_ref);
     }
 
     /// Accessors expose the orchestrator's config + record dir.

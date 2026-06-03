@@ -1,5 +1,14 @@
 # Tabbify App-Layer — Phase 1 Integration Contract
 
+> ⚠️ **SINGLE-RUNTIME MODEL (2026-06-03, Phase 4 / fly.io model):** Tabbify now
+> runs ONE runtime — an OCI image booted as a Firecracker microVM. The wire
+> `Runtime` enum (§3 / D4) collapsed to a single `Firecracker` variant with
+> LENIENT deserialize (any legacy `"docker"`/`"wasm-http"`/`"node-firecracker"`
+> string coerces to `Firecracker`). The **runtime-override clause (D10) is
+> REMOVED** — the `{"runtime":"…"}` body is still accepted for back-compat but is
+> inert and ignored. Applied IDENTICALLY in `tabbify-cli` + `tabbify-service-node`
+> + `tabbify-service-supervisor`.
+
 > ⚠️ **SUPERVISOR MODEL SUPERSEDED (2026-05-26):** `tabbify-service-supervisor`
 > is now an **orchestrator-of-runners**. It no longer hosts apps in-process. Each
 > app runs in a separate detached `tabbify-runner` process (a mesh peer in its own
@@ -97,6 +106,13 @@ tabbify-apps/
 
 Derived from substrate `tabbify-app-manifest`, **simplified to Phase-1 lifecycle vocabulary**. Define this Rust module identically in `tabbify-cli` and `tabbify-service-supervisor` (suggest `src/manifest.rs`). Do **NOT** use `deny_unknown_fields` (forward-compat). Use `serde` + `toml`.
 
+> **Single-runtime / fly.io model (Phase 4).** `[runtime].type` is now INERT.
+> Tabbify runs ONE runtime — an OCI image booted as a Firecracker microVM — so a
+> legacy `type = "wasm-http"` / `"docker"` is tolerated by serde and IGNORED (the
+> wire `Runtime` enum, separate from this `[runtime]` table, deserializes any
+> string to `Firecracker`; see D4). `entry` / `fuel_per_request` are likewise
+> WASM-era leftovers kept for back-compat.
+
 ```rust
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -183,6 +199,25 @@ memory_mb        = 64
 dynamic_prefixes = ["/"]
 ```
 
+### D4 — runtime wire enum (FROZEN, vendor IDENTICALLY in cli + node + supervisor)
+
+The deploy-time runtime selector is a vendored `Runtime` enum (`src/runtime.rs`),
+distinct from the `[runtime]` table above. **Single-runtime / fly.io model
+(Phase 4):** it has ONE variant, `Firecracker`, and serializes to the FROZEN
+wire string `"firecracker"`. Deserialize is **LENIENT** — any legacy string
+(`"docker"`, `"wasm-http"`, `"node-firecracker"`, …) COERCES to `Firecracker`
+rather than erroring, so older wire payloads, `tabbify.toml`s, and on-disk
+records keep deserializing. `Runtime::default()` is `Firecracker`. Each repo
+carries the golden round-trip test pinning serialize→`"firecracker"` + the
+lenient coerce. Do **NOT** add `deny_unknown_fields` to bodies carrying it.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Runtime { #[default] Firecracker }
+impl Runtime { pub fn as_wire(self) -> &'static str { "firecracker" } }
+// Serialize → "firecracker"; Deserialize → accept ANY string, coerce to Firecracker.
+```
+
 ---
 
 ## 4. App ULA derivation (vendor IDENTICALLY in supervisor + node; golden-tested)
@@ -253,12 +288,13 @@ Then `let my_ula = joiner.my_ula();` and bind listeners on `[my_ula]:PORT`.
   ```
   `present=false` (404 body or `{"present":false}`) when this supervisor cannot serve it.
 - `POST /v1/apps/<uuid>/start` → fetch (if needed) + instantiate + pin → `{"state":"running","app_ula":"..."}`. **Pinning**: an API start sets a sticky flag so the idle reaper will NOT stop it (this is the "API overrides on_request" rule).
-- **Runtime override (D10)**: `POST /v1/apps/<uuid>/start` and `.../deploy` accept
-  an optional JSON body `{"runtime": "docker" | "firecracker" | "wasm-http"}`.
-  When present the supervisor builds THAT runtime instead of the manifest
-  default; the chosen value is echoed back as `requested_runtime`. A bodyless
-  start preserves the historical manifest-default behaviour. The override is
-  NEVER persisted to the manifest — it travels in the request body only.
+- **Runtime override (D10) — REMOVED (single-runtime / fly.io model, Phase 4).**
+  There is no longer a runtime to override: Tabbify runs ONE runtime (an OCI
+  image booted as a Firecracker microVM). `POST /v1/apps/<uuid>/start` and
+  `.../deploy` STILL ACCEPT an optional `{"runtime": "…"}` body for wire
+  back-compat, but the value is now INERT — any string deserializes (lenient
+  coerce, see D4) and is ignored; the supervisor always builds the single
+  runtime. Old clients sending `{"runtime":"docker"}` keep working unchanged.
 - `POST /v1/apps/<uuid>/stop` → stop + unpin → `{"state":"stopped"}`.
 - **App traffic**: `ANY /apps/<uuid>/{*rest}` → if not running, lazy-spawn per lifecycle (on_request) → strip `/apps/<uuid>` prefix → hand the rewritten `http::Request<Bytes>` to the WASM instance → return its `http::Response<Bytes>`. This is the path the node proxies to.
 

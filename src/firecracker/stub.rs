@@ -42,23 +42,6 @@ impl FirecrackerRuntime {
     ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }
-
-    /// Cold-boot a prebuilt NixOS node image as a recursive tabbify-node microVM.
-    /// Always `Err` on non-Linux hosts — the stub mirrors the Linux API surface.
-    ///
-    /// # Errors
-    /// Always — node-firecracker is Linux + `/dev/kvm` only.
-    #[allow(clippy::unused_async)]
-    pub async fn launch_node_with_uuid(
-        _kernel: &std::path::Path,
-        _rootfs: &std::path::Path,
-        _rt: &Runtime,
-        _cfg: &FcConfig,
-        _uuid: &str,
-        _data_dir: &std::path::Path,
-    ) -> Result<Self> {
-        bail!("node-firecracker requires Linux + /dev/kvm")
-    }
 }
 
 impl AppRuntime for FirecrackerRuntime {

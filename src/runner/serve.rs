@@ -173,10 +173,6 @@ pub struct ServeConfig {
     /// INITIAL [`build_runtime`], so a supervisor-driven respawn comes up on the
     /// deployed version. `None` = build from the S3 manifest as usual.
     pub image_ref: Option<String>,
-    /// Runtime override (D4 wire string). When `Some`, passed to
-    /// [`build_runtime`] so the INITIAL runtime is the requested one rather than
-    /// the manifest default (D10). `None` = manifest default.
-    pub runtime_override: Option<String>,
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
@@ -222,16 +218,9 @@ impl RunnerServe {
 
         let fetched = resolve_app(&cfg).await?;
 
-        let initial_runtime = build_runtime(
-            cfg.runtime_override.as_deref(),
-            &cfg.uuid,
-            &fetched,
-            &cfg.fc,
-            &cfg.docker,
-            &cfg.data_dir,
-        )
-        .await
-        .with_context(|| format!("build runtime for {}", cfg.uuid))?;
+        let initial_runtime = build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.data_dir)
+            .await
+            .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 
         // Wrap the initial runtime in a swappable cell so P2.3 can atomically
         // replace it for zero-downtime deploys without touching the listener or
@@ -346,11 +335,7 @@ impl RunnerServe {
 
 /// Resolve the [`FetchedApp`] the runner builds its INITIAL runtime from.
 ///
-/// - `runtime_override == "node-firecracker"`: a recursive NixOS tabbify-node
-///   microVM. There is NO S3 artifact and no image ref (the node image is
-///   host-local), so this is FETCH-EXEMPT — synthesize a minimal node-firecracker
-///   `FetchedApp` via [`crate::build::fetched_for_node_fc`] and skip S3 entirely.
-/// - Otherwise: the historical path. S3 fetch SUCCEEDS (tcli-push apps +
+/// - The historical path. S3 fetch SUCCEEDS (tcli-push apps +
 ///   wasm/firecracker): when an `--image-ref` was passed (orchestrator respawn),
 ///   apply it to the manifest's docker `registry_ref` so the INITIAL build comes
 ///   up on the deployed version (a `docker pull <ref>` instead of a source
@@ -369,10 +354,6 @@ impl RunnerServe {
 /// (S3 fetch failed and no `image_ref` was supplied, or a filesystem error
 /// materializing the build-context placeholder).
 pub async fn resolve_app(cfg: &ServeConfig) -> Result<FetchedApp> {
-    if cfg.runtime_override.as_deref() == Some("node-firecracker") {
-        return Ok(crate::build::fetched_for_node_fc(&cfg.uuid));
-    }
-
     let fetch_result = S3Fetcher::new(&cfg.s3_base_url, &cfg.data_dir)
         .fetch(&cfg.uuid)
         .await;
@@ -482,27 +463,7 @@ mod tests {
             fc: FcConfig::default(),
             docker: DockerConfig::default(),
             image_ref: None,
-            runtime_override: None,
         }
-    }
-
-    /// A node-firecracker deploy is fetch-exempt: there is NO S3 artifact and no
-    /// image_ref, so `resolve_app` must NOT hit S3 (point `s3_base_url` at an
-    /// unreachable address to prove it) and must synthesize a node-firecracker
-    /// `FetchedApp` directly.
-    #[tokio::test]
-    async fn resolve_app_node_fc_skips_s3_fetch() {
-        let mut cfg = mesh_cfg();
-        // An unreachable S3 base: a fetch here would error, which would make
-        // resolve_fetched (the non-exempt path) bail. The node-fc short-circuit
-        // must avoid touching S3 entirely.
-        cfg.s3_base_url = "http://127.0.0.1:1/".to_owned();
-        cfg.image_ref = None;
-        cfg.runtime_override = Some("node-firecracker".to_owned());
-
-        let fetched = resolve_app(&cfg).await.expect("node-fc must resolve without S3");
-        assert_eq!(fetched.manifest.runtime.r#type, "node-firecracker");
-        assert!(fetched.manifest.runtime.registry_ref.is_none());
     }
 
     /// The runner's mesh join must claim its app-ULA + declare its role,

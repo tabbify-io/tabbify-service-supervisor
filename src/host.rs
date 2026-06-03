@@ -331,10 +331,9 @@ mod tests {
 
     use super::*;
     use crate::app_ula::derive_app_ula;
-    use crate::runtime::WasmRuntime;
+    use crate::runtime::{BoxRespFut, RuntimeHealth};
 
     const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
-    const HELLO_WASM: &[u8] = include_bytes!("../tests/fixtures/hello.wasm");
 
     /// A fake [`MeshHost`] that records the app-ULAs it was asked to host /
     /// unhost, so we can assert the routing calls with no real TUN.
@@ -358,8 +357,28 @@ mod tests {
         }
     }
 
+    /// A minimal [`AppRuntime`] stub: answers every request `200 "Hello,
+    /// Tabbify!"`. Stands in for a real runtime so the listener/hosting machinery
+    /// is exercised with no daemon, VM, or compiled artifact.
+    struct StubRuntime;
+
+    impl AppRuntime for StubRuntime {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async {
+                Ok(http::Response::builder()
+                    .status(200)
+                    .body(Bytes::from_static(b"Hello, Tabbify!"))
+                    .expect("build stub response"))
+            })
+        }
+
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            Box::pin(async { RuntimeHealth::Serving })
+        }
+    }
+
     fn fixture_runtime() -> Arc<dyn AppRuntime> {
-        Arc::new(WasmRuntime::load(HELLO_WASM).expect("load fixture"))
+        Arc::new(StubRuntime)
     }
 
     fn noop_serve() -> AppServe {

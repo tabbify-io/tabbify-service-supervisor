@@ -71,10 +71,6 @@ pub struct SpawnSpec {
     /// [`RunnerHandle::image_ref`](crate::orchestrator::handle::RunnerHandle) on
     /// a respawn; `None` on a fresh spawn.
     pub image_ref: Option<String>,
-    /// Runtime override (D4 wire string) forwarded to the runner as
-    /// `--runtime-override <wire>`, so a cold spawn builds the requested runtime
-    /// instead of the manifest default (D10). `None` = manifest default.
-    pub runtime_override: Option<String>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -123,12 +119,6 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
     if let Some(image_ref) = &spec.image_ref {
         args.push("--image-ref".into());
         args.push(image_ref.as_str().into());
-    }
-    // Forward the runtime override so a cold spawn builds the requested runtime
-    // instead of the manifest default (D10).
-    if let Some(rt) = &spec.runtime_override {
-        args.push("--runtime-override".into());
-        args.push(rt.as_str().into());
     }
     args
 }
@@ -240,9 +230,11 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // Carry the deployed ref through so a future respawn-from-record keeps
         // the same version. `None` on a fresh spawn = today's behavior.
         image_ref: spec.image_ref.clone(),
-        // Persist the requested runtime override so a respawn-from-record
-        // rebuilds the SAME runtime (the only source of truth for a ref-deploy).
-        requested_runtime: spec.runtime_override.clone(),
+        // The runtime is no longer selectable — every app builds as Firecracker —
+        // so nothing is threaded here. The field is retained on RunnerHandle only
+        // so old on-disk records (which may carry a `requested_runtime`) still
+        // deserialize; it is inert and never read for dispatch.
+        requested_runtime: None,
     };
 
     handle
@@ -295,7 +287,6 @@ mod tests {
             parent: Some("fd5a:1f00:1::1".to_owned()),
             no_mesh: true,
             image_ref: None,
-            runtime_override: None,
         }
     }
 
@@ -386,40 +377,19 @@ mod tests {
         );
     }
 
-    /// runtime_override = Some emits `--runtime-override <wire>`.
+    /// The runtime is no longer selectable per app — every app builds as
+    /// Firecracker — so the runner argv never carries a `--runtime-override`
+    /// flag (the flag and the threading were removed).
     #[test]
-    fn build_args_includes_runtime_override_when_present() {
-        let mut s = spec();
-        s.runtime_override = Some("docker".to_owned());
-        let args = build_args(&s);
-        let joined: Vec<String> = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let idx = joined
-            .iter()
-            .position(|a| a == "--runtime-override")
-            .unwrap_or_else(|| panic!("missing --runtime-override in {joined:?}"));
-        assert_eq!(
-            joined.get(idx + 1).map(String::as_str),
-            Some("docker"),
-            "--runtime-override must be followed by the wire string"
-        );
-    }
-
-    /// runtime_override = None emits no `--runtime-override`.
-    #[test]
-    fn build_args_omits_runtime_override_when_none() {
-        let mut s = spec();
-        s.runtime_override = None;
-        let args = build_args(&s);
+    fn build_args_never_emits_runtime_override() {
+        let args = build_args(&spec());
         let joined: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(
             !joined.iter().any(|a| a == "--runtime-override"),
-            "no --runtime-override when None; got: {joined:?}"
+            "runtime is fixed to firecracker; no --runtime-override must be emitted; got: {joined:?}"
         );
     }
 

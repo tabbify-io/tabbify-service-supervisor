@@ -11,30 +11,25 @@
 //!
 //! ## Module layout
 //! - [`docker`] — the docker sub-pipeline (`Dockerfile` → build → docker push).
-//! - [`wasm`]   — the wasm sub-pipeline (`build_cmd` → verify `.wasm` → oras push).
 //! - [`firecracker`] — the generic Firecracker RUNTIME-build (OCI image →
 //!   bootable `rootfs.ext4` + PID-1 init); `pub` so the KVM-gated integration
 //!   test can drive [`firecracker::run_firecracker_build`] end-to-end.
 //! - Everything else (the [`BuildJob`] type, the dispatcher, the production
 //!   wiring, and the tests) lives in this file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::BoxFut;
-
 mod docker;
 pub mod firecracker;
-pub mod node_firecracker;
-mod wasm;
 
 /// Which build pipeline a [`BuildJob`] drives.
 ///
 /// Absent in the JSON spec ⇒ [`BuildKind::Docker`] (the original behaviour), so
-/// every pre-existing docker job + test is unchanged. [`BuildKind::Wasm`] selects
-/// the additive wasm-component build path (`build_cmd` → `oras push`).
+/// every pre-existing docker job + test is unchanged. The in-process WASM
+/// runtime was removed, so the only build pipeline is the docker one.
 #[derive(
     Debug,
     Clone,
@@ -51,54 +46,14 @@ pub enum BuildKind {
     /// Clone → require `Dockerfile` → `docker build` → `docker push`.
     #[default]
     Docker,
-    /// Clone → run `build_cmd` → verify `artifact_path` → `oras push` the `.wasm`.
-    Wasm,
-}
-
-/// The build-command executor seam for the wasm path.
-///
-/// Receives the shell command string and the working directory (the cloned
-/// source dir) and returns `true` iff the command exited successfully. The seam
-/// lets tests simulate a build (e.g. write the expected `.wasm`) without running
-/// a real toolchain; production uses [`production_build_cmd_runner`].
-pub type BuildCmdRunner =
-    std::sync::Arc<dyn Fn(String, PathBuf) -> BoxFut<'static, bool> + Send + Sync>;
-
-/// Build the production [`BuildCmdRunner`]: runs `sh -c <cmd>` with the working
-/// directory set to `cwd` and returns `true` iff the process exits 0.
-///
-/// The command runs untrusted-ish source on the host — the same trust model as
-/// the docker build path (trusted source / RnD). The `cmd` originates from the
-/// [`BuildJob`] (set by the deployer), never blindly from the cloned repo.
-/// fc-sandbox hardening for untrusted source is a separate follow-up.
-#[must_use]
-pub fn production_build_cmd_runner() -> BuildCmdRunner {
-    use std::sync::Arc;
-    use tokio::process::Command;
-
-    Arc::new(move |cmd: String, cwd: PathBuf| {
-        let fut: BoxFut<'static, bool> = Box::pin(async move {
-            match Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&cwd)
-                .stdin(std::process::Stdio::null())
-                .status()
-                .await
-            {
-                Ok(s) => s.success(),
-                Err(_) => false,
-            }
-        });
-        fut
-    })
 }
 
 /// A one-shot build job: clone `repo_url`@`git_ref`, build an artifact, push it
 /// to the mesh registry at `registry_ula` as `<tenant>/<app_uuid>:<sha>`.
 ///
-/// `build_kind` selects the pipeline (docker — the default — or wasm). The
-/// `build_cmd` / `artifact_path` fields are only consulted for the wasm path.
+/// `build_kind` selects the pipeline (docker — the only kind today). The
+/// `build_cmd` / `artifact_path` fields are retained as inert wire surface
+/// (the WASM build path that consumed them was removed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct BuildJob {
     /// HTTPS URL of the Git repository to clone.
@@ -124,12 +79,12 @@ pub struct BuildJob {
     /// Which build pipeline to run. Absent ⇒ [`BuildKind::Docker`].
     #[serde(default)]
     pub build_kind: BuildKind,
-    /// (Wasm only) shell command that produces the `.wasm`, run with the cloned
-    /// source dir as cwd, e.g. `"cargo build --release --target wasm32-wasip2"`.
+    /// Inert wire field (formerly the wasm `build_cmd`). Retained so existing
+    /// build specs still parse; no build path consumes it.
     #[serde(default)]
     pub build_cmd: Option<String>,
-    /// (Wasm only) path to the produced `.wasm`, relative to the repo root,
-    /// e.g. `"target/wasm32-wasip2/release/app.wasm"`.
+    /// Inert wire field (formerly the wasm `artifact_path`). Retained so existing
+    /// build specs still parse; no build path consumes it.
     #[serde(default)]
     pub artifact_path: Option<String>,
 }
@@ -148,41 +103,30 @@ pub struct ArtifactRef {
 /// Run a build job end-to-end with injected dependencies.
 ///
 /// Dispatches on [`BuildJob::build_kind`]:
-/// - [`BuildKind::Docker`] (default): clone → require `Dockerfile` →
+/// - [`BuildKind::Docker`] (the only kind): clone → require `Dockerfile` →
 ///   `backend.build` → `docker tag`+`push` to the mesh registry.
-/// - [`BuildKind::Wasm`]: clone → run `build_cmd` (cwd = cloned src) → verify
-///   `artifact_path` exists → `oras push` the `.wasm` to the mesh registry.
 ///
-/// Both paths compute the same ref scheme
-/// `job.registry_ula/<tenant>/<app_uuid>:<git_ref>` (the `git_ref` is used
-/// verbatim as the tag component; the control-plane must supply an immutable
-/// SHA) and return an [`ArtifactRef`].
+/// Computes the ref scheme `job.registry_ula/<tenant>/<app_uuid>:<git_ref>` (the
+/// `git_ref` is used verbatim as the tag component; the control-plane must
+/// supply an immutable SHA) and returns an [`ArtifactRef`].
 ///
 /// All dependencies are injected so the function is fully unit-testable without
-/// a real git binary, Docker daemon, build toolchain, or `oras`/`skopeo` binary.
-/// The `skopeo_runner` + `skopeo_bin` drive the docker path's registry PUSH (the
-/// image is built by `backend`, then `skopeo` copies it from the local docker
-/// daemon to the mesh registry — the daemon never needs a mesh route); the
-/// `oras_runner` + `build_cmd_runner` + `oras_bin` drive the wasm path (each path
-/// ignores the other's runners).
+/// a real git binary, Docker daemon, or `skopeo` binary. The `skopeo_runner` +
+/// `skopeo_bin` drive the registry PUSH (the image is built by `backend`, then
+/// `skopeo` copies it from the local docker daemon to the mesh registry — the
+/// daemon never needs a mesh route).
 ///
 /// # Errors
-/// Clone failure; (docker) missing `Dockerfile`, build error, or push failure;
-/// (wasm) missing `build_cmd`/`artifact_path`, build-command failure, a missing
-/// produced artifact, or `oras push` failure.
-#[allow(clippy::too_many_arguments)]
+/// Clone failure; missing `Dockerfile`, build error, or push failure.
 pub async fn run_build(
     job: &BuildJob,
     backend: &dyn crate::build_backend::BuildBackend,
     git: &crate::git::GitRun,
     skopeo_runner: &crate::docker::CommandRunner,
     skopeo_bin: &str,
-    oras_runner: &crate::docker::CommandRunner,
-    build_cmd_runner: &BuildCmdRunner,
-    oras_bin: &str,
     workdir: &Path,
 ) -> anyhow::Result<ArtifactRef> {
-    // 1. Clone into <workdir>/src (shared by both build kinds).
+    // 1. Clone into <workdir>/src.
     let src = workdir.join("src");
     crate::git::clone(
         &job.repo_url,
@@ -194,7 +138,7 @@ pub async fn run_build(
     .await
     .context("clone")?;
 
-    // Image/artifact ref: <registry_ula>/<tenant>/<app_uuid>:<git_ref> (shared).
+    // Image ref: <registry_ula>/<tenant>/<app_uuid>:<git_ref>.
     let reff = format!(
         "{}/{}/{}:{}",
         job.registry_ula, job.tenant, job.app_uuid, job.git_ref
@@ -203,9 +147,6 @@ pub async fn run_build(
     match job.build_kind {
         BuildKind::Docker => {
             docker::run_docker_build(job, backend, skopeo_runner, skopeo_bin, &src, reff).await
-        }
-        BuildKind::Wasm => {
-            wasm::run_wasm_build(job, build_cmd_runner, oras_runner, oras_bin, &src, reff).await
         }
     }
 }
@@ -227,9 +168,6 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
         .unwrap_or_else(|_| crate::config::DEFAULT_DOCKER_BIN.to_owned());
     let git_bin = std::env::var("RUNNER_GIT_BIN").unwrap_or_else(|_| "git".to_owned());
 
-    let oras_bin = std::env::var("SUPERVISOR_ORAS_BIN")
-        .unwrap_or_else(|_| crate::config::DEFAULT_ORAS_BIN.to_owned());
-
     // The docker build path pushes via supervisor-side `skopeo` (copies the
     // built image from the local docker daemon to the mesh registry), so the
     // docker daemon — which has no mesh route — never talks to the registry.
@@ -239,8 +177,6 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
     let backend = crate::build_backend::HostDockerBackend::new(docker_bin.clone());
     let git = crate::git::real_git_run(git_bin);
     let skopeo_runner = crate::skopeo::production_skopeo_runner(skopeo_bin.clone());
-    let oras_runner = crate::oras::production_oras_runner(oras_bin.clone());
-    let build_cmd_runner = production_build_cmd_runner();
 
     // Work directory: a fresh sub-dir under a tempdir for this build.
     // Using tempdir keeps build artefacts off any persistent volume without
@@ -256,9 +192,6 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
         &git,
         &skopeo_runner,
         &skopeo_bin,
-        &oras_runner,
-        &build_cmd_runner,
-        &oras_bin,
         workdir.path(),
     )
     .await
