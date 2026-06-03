@@ -237,9 +237,14 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
                 r#type: "docker".to_owned(),
                 entry: "context.tar.gz".to_owned(),
                 fuel_per_request: 0,
-                // Advisory for docker; a sane non-zero cap.
-                memory_mb: 64,
-                vcpus: None,
+                // For docker this is an advisory cgroup cap; for a by-ref deploy
+                // promoted to runtime=firecracker it is the microVM's RAM. 64 MiB
+                // starves a microVM — ACPI table init fails under memory pressure,
+                // virtio-mmio devices aren't discovered, and the guest panics with
+                // "Cannot open root device vda" (intermittently). 2 GiB boots an FC
+                // guest reliably AND runs dind; it is only a cap for docker.
+                memory_mb: 2048,
+                vcpus: Some(2),
                 kernel: None,
                 registry_ref: Some(reff.to_owned()),
             },
