@@ -350,11 +350,10 @@ mod tests {
         }
     }
 
-    /// A `wasm-http` `FetchedApp` carrying the committed hello.wasm fixture, so
-    /// `build_runtime` (called by `deploy`) compiles a real, healthy runtime
-    /// without needing docker or a live registry.
-    fn wasm_fetched() -> FetchedApp {
-        let wasm = include_bytes!("../../tests/fixtures/hello.wasm");
+    /// A docker `FetchedApp` used only to populate `RunnerLifecycle::fetched`.
+    /// The health-dispatch tests never build a runtime from it; the deploy
+    /// build-failure test overrides its runtime type to force a hard error.
+    fn docker_fetched() -> FetchedApp {
         FetchedApp {
             version: 1,
             manifest: AppManifest {
@@ -370,9 +369,9 @@ mod tests {
                     idle_timeout_sec: 300,
                 },
                 runtime: Runtime {
-                    r#type: "wasm-http".to_owned(),
-                    entry: "app.wasm".to_owned(),
-                    fuel_per_request: crate::runtime::DEFAULT_FUEL_PER_REQUEST,
+                    r#type: "docker".to_owned(),
+                    entry: "context.tar.gz".to_owned(),
+                    fuel_per_request: 0,
                     memory_mb: 64,
                     vcpus: None,
                     kernel: None,
@@ -380,8 +379,8 @@ mod tests {
                 },
                 routes: Routes::default(),
             },
-            wasm: BytesAlias::from_static(wasm),
-            cached_path: std::path::PathBuf::from("/tmp/tabbify-deploy-test/app.wasm"),
+            wasm: BytesAlias::new(),
+            cached_path: std::path::PathBuf::from("/tmp/tabbify-deploy-test/context.tar.gz"),
         }
     }
 
@@ -396,7 +395,7 @@ mod tests {
             docker: DockerConfig::default(),
             runtime: runtime.clone(),
             active: Arc::new(ActiveRuntime::new(runtime)),
-            fetched: wasm_fetched(),
+            fetched: docker_fetched(),
             fc: FcConfig::default(),
             data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
             shutdown_tx: Arc::new(Mutex::new(None)),
@@ -444,46 +443,10 @@ mod tests {
 
     // ---- Deploy dispatch tests ----------------------------------------------
 
-    /// A `Deploy` whose new runtime builds + becomes healthy must reply `Ok` and
-    /// the shared `ActiveRuntime` cell must now hold a DIFFERENT runtime (the
-    /// swap flipped). The new runtime is a real wasm runtime compiled from the
-    /// committed fixture (default health = Serving), so `perform_swap` passes its
-    /// health-gate and flips. The swap mechanics themselves are covered by
-    /// `perform_swap`'s own P2.3a tests; here we verify the command is dispatched
-    /// to the swap path and the active cell is updated.
-    #[tokio::test]
-    async fn deploy_healthy_new_runtime_swaps_active_and_replies_ok() {
-        let lc = fake_lifecycle(RuntimeHealth::Serving);
-        let before = lc.active.load();
-
-        let reply = dispatch(
-            Cmd::Deploy {
-                reff: "ignored-for-wasm".to_owned(),
-                runtime: None,
-            },
-            &lc,
-        )
-        .await;
-
-        assert!(
-            matches!(reply, Reply::Ok),
-            "healthy deploy must reply Ok, got {reply:?}"
-        );
-        // The active runtime was swapped: the post-deploy load is a different
-        // allocation than the pre-deploy one (the FakeRuntime we started with).
-        assert!(
-            !Arc::ptr_eq(&before, &lc.active.load()),
-            "Deploy must swap the active runtime to the freshly-built one"
-        );
-        // And the new active runtime serves 200 (it is the real wasm fixture).
-        let req = Request::builder()
-            .method("GET")
-            .uri("http://example.com/")
-            .body(Bytes::new())
-            .unwrap();
-        let resp = lc.active.load().handle(req).await.expect("handle");
-        assert_eq!(resp.status(), 200);
-    }
+    // NOTE: the happy-path deploy/swap test was removed with the in-process WASM
+    // runtime — it was the only runtime that could build a healthy app hermetically
+    // (no docker daemon / no KVM). The build-failure path below still pins the
+    // no-downtime invariant (a failed build must NOT swap the active runtime).
 
     /// When building the new runtime fails (an unknown runtime type triggers a
     /// hard error in `build_runtime`), `Deploy` must reply `Err` and the active

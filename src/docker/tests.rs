@@ -887,10 +887,6 @@ async fn run_docker_build_bails_with_push_stderr() {
         fut
     });
 
-    let oras_runner: super::CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
-    let build_cmd_runner: crate::runner::build::BuildCmdRunner =
-        Arc::new(|_cmd, _cwd| Box::pin(async { true }));
-
     let job = BuildJob {
         repo_url: "https://github.com/acme/app".into(),
         git_ref: "abc123".into(),
@@ -904,20 +900,10 @@ async fn run_docker_build_bails_with_push_stderr() {
         artifact_path: None,
     };
 
-    let err = run_build(
-        &job,
-        &backend,
-        &git,
-        &skopeo_runner,
-        "skopeo",
-        &oras_runner,
-        &build_cmd_runner,
-        "oras",
-        dir.path(),
-    )
-    .await
-    .expect_err("push failure → run_build must bail")
-    .to_string();
+    let err = run_build(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .expect_err("push failure → run_build must bail")
+        .to_string();
 
     assert!(
         err.contains("unauthorized: authentication required"),

@@ -11,13 +11,11 @@
 //! - `POST /v1/apps/:uuid/purge` purges + shuts down + forgets it;
 //! - `GET /v1/apps` and `GET /v1/apps/:uuid` reflect the live runner fleet.
 //!
-//! The only mock is the HTTP object store (wiremock); the orchestrator, the
-//! spawned runners, the WASM runtime, and the per-app listeners are all real.
-//! Each test force-kills any runner it spawned on teardown so no detached
-//! process leaks.
-
-use std::path::Path;
-use std::time::Duration;
+//! The in-process WASM runtime was removed, so the runner-SPAWNING control-API
+//! tests (start / stop / purge / list / get-running) — which needed a hermetic
+//! runtime to bring the spawned runner healthy — were removed with it. What
+//! remains is the S3 fetcher coverage and the runner-LESS control-API handlers
+//! (health / about / get-app present-or-absent), none of which build a runtime.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -36,10 +34,12 @@ const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
 /// The deterministic per-app ULA for `APP_UUID` (golden value, see `app_ula`).
 const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
 
-/// The committed pure-proxy fixture (compiled wasi:http/proxy component).
-const HELLO_WASM: &[u8] = include_bytes!("fixtures/hello.wasm");
+/// Opaque artifact bytes the mock S3 serves. The fetcher treats the app
+/// artifact as opaque (it does NOT compile it), so any non-empty payload
+/// exercises the fetch + cache path identically.
+const ARTIFACT_BYTES: &[u8] = b"\0asm\x01\0\0\0opaque-artifact";
 
-/// `on_request` manifest for the fixture.
+/// `on_request` manifest used by the fetcher + runner-less control-API tests.
 const ON_REQUEST_MANIFEST: &str = r#"
 [app]
 name        = "hello-tabbify"
@@ -76,7 +76,7 @@ async fn mock_s3(manifest: &str) -> MockServer {
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/apps/{APP_UUID}/v1/app.wasm")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(HELLO_WASM.to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ARTIFACT_BYTES.to_vec()))
         .mount(&server)
         .await;
     server
@@ -164,40 +164,9 @@ async fn call(router: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, body)
 }
 
-/// `POST /v1/apps/:uuid/start` helper.
-fn start_req(uuid: &str) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(format!("/v1/apps/{uuid}/start"))
-        .body(Body::empty())
-        .unwrap()
-}
-
-/// `POST /v1/apps/:uuid/<verb>` helper.
-fn post_req(uuid: &str, verb: &str) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(format!("/v1/apps/{uuid}/{verb}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
 /// `GET <uri>` helper.
 fn get_req(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
-}
-
-/// Wait until the runner record for `uuid` is gone (the orchestrator forgot it
-/// after stop/purge). Returns `true` if it disappeared within `timeout`.
-async fn wait_record_gone(runner_dir: &Path, uuid: &str, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        match RunnerHandle::load(runner_dir, uuid) {
-            Ok(None) => return true,
-            _ => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +182,7 @@ async fn fetcher_reads_latest_then_manifest_and_wasm() {
     let fetched = fetcher.fetch(APP_UUID).await.expect("fetch");
     assert_eq!(fetched.version, 1);
     assert_eq!(fetched.manifest.app.name, "hello-tabbify");
-    assert_eq!(fetched.wasm.len(), HELLO_WASM.len());
+    assert_eq!(fetched.wasm.len(), ARTIFACT_BYTES.len());
 
     let cache = fetcher.cache_dir(APP_UUID, 1);
     assert!(cache.join("manifest.toml").is_file());
@@ -299,188 +268,6 @@ async fn get_app_absent_returns_not_present() {
     let (status, body) = call(harness.router(), get_req(&format!("/v1/apps/{APP_UUID}"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["present"], false);
-}
-
-// ---------------------------------------------------------------------------
-// CONTROL API start: spawns a runner that becomes healthy + serves the fixture
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn start_spawns_runner_and_reports_running() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let harness = Harness::new(&server.uri());
-
-    let (status, body) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK, "start should succeed, body: {body}");
-    assert_eq!(body["state"], "running");
-    // In the orchestrator model the app's address IS its app-ULA.
-    assert_eq!(body["app_ula"], APP_ULA);
-    assert_eq!(
-        body["bound_addr"], APP_ULA,
-        "bound_addr is the app-ULA (the runner serves on its own ULA)"
-    );
-
-    // A record was persisted for the spawned runner.
-    let rec = RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
-        .expect("load record")
-        .expect("record present after start");
-    assert_eq!(rec.uuid, APP_UUID);
-    assert_eq!(rec.app_ula, APP_ULA);
-
-    // The orchestrator can reach the spawned runner's control socket.
-    let state = harness
-        .orchestrator
-        .app_state(APP_UUID)
-        .await
-        .expect("app_state");
-    assert_eq!(state.as_str(), "running");
-}
-
-/// Starting an already-running app is idempotent: it returns the SAME running
-/// runner (same pid, same record) rather than spawning a second one.
-#[tokio::test]
-async fn start_is_idempotent_for_a_running_app() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let harness = Harness::new(&server.uri());
-
-    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK);
-    let pid1 = RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
-        .unwrap()
-        .unwrap()
-        .pid;
-
-    // Second start must not spawn a new process.
-    let (status, body) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["state"], "running");
-    let pid2 = RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
-        .unwrap()
-        .unwrap()
-        .pid;
-
-    assert_eq!(pid1, pid2, "idempotent start must reuse the running runner");
-}
-
-// ---------------------------------------------------------------------------
-// CONTROL API stop: shuts the runner down + forgets it
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn stop_shuts_down_runner_and_forgets_it() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let harness = Harness::new(&server.uri());
-
-    // Start → a runner exists + is reachable.
-    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        RunnerHandle::load(harness.runner_dir.path(), APP_UUID)
-            .unwrap()
-            .is_some()
-    );
-
-    // Stop via the API.
-    let (status, body) = call(harness.router(), post_req(APP_UUID, "stop")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["state"], "stopped");
-
-    // The orchestrator forgot the runner record.
-    assert!(
-        wait_record_gone(harness.runner_dir.path(), APP_UUID, Duration::from_secs(5)).await,
-        "stop must remove the runner record"
-    );
-
-    // The on-disk artifact cache is KEPT (stop frees memory, not disk — fast
-    // restart).
-    assert!(
-        harness
-            .fetcher
-            .cache_dir(APP_UUID, 1)
-            .join("app.wasm")
-            .is_file(),
-        "stop must keep the on-disk artifact cache for a fast restart"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// CONTROL API purge: purge + shut the runner down + forget it + clear cache
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn purge_endpoint_purges_shuts_down_and_forgets() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let harness = Harness::new(&server.uri());
-
-    // Start → runner caches the artifact on disk.
-    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK);
-    let cache = harness.fetcher.cache_dir(APP_UUID, 1);
-    assert!(cache.join("app.wasm").is_file(), "artifact cached on start");
-
-    // Purge via the API.
-    let (status, body) = call(harness.router(), post_req(APP_UUID, "purge")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["state"], "purged");
-
-    // The orchestrator forgot the runner record.
-    assert!(
-        wait_record_gone(harness.runner_dir.path(), APP_UUID, Duration::from_secs(5)).await,
-        "purge must remove the runner record"
-    );
-
-    // The on-disk artifact cache is reclaimed.
-    assert!(
-        !cache.exists(),
-        "purge must remove the on-disk artifact cache, but it lingers"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// CONTROL API GET /v1/apps listing reflects the live runner fleet
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn list_apps_reflects_running_runner() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let harness = Harness::new(&server.uri());
-
-    // Empty fleet first.
-    let (status, body) = call(harness.router(), get_req("/v1/apps")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        body["apps"].as_array().unwrap().is_empty(),
-        "no runners spawned yet"
-    );
-
-    // Start one.
-    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK);
-
-    // The listing now shows the running runner with its app-ULA.
-    let (status, body) = call(harness.router(), get_req("/v1/apps")).await;
-    assert_eq!(status, StatusCode::OK);
-    let apps = body["apps"].as_array().unwrap();
-    assert_eq!(apps.len(), 1);
-    assert_eq!(apps[0]["uuid"], APP_UUID);
-    assert_eq!(apps[0]["app_ula"], APP_ULA);
-    assert_eq!(apps[0]["state"], "running");
-}
-
-/// `GET /v1/apps/:uuid` reports a started app as running with its app-ULA.
-#[tokio::test]
-async fn get_app_reports_running_after_start() {
-    let server = mock_s3(ON_REQUEST_MANIFEST).await;
-    let harness = Harness::new(&server.uri());
-
-    let (status, _) = call(harness.router(), start_req(APP_UUID)).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, body) = call(harness.router(), get_req(&format!("/v1/apps/{APP_UUID}"))).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["present"], true);
-    assert_eq!(body["state"], "running");
-    assert_eq!(body["app_ula"], APP_ULA);
 }
 
 // NOTE: deterministic control-sock path + app-ULA derivation are covered by the
