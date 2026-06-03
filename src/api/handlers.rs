@@ -541,8 +541,10 @@ mod tests {
 
     #[test]
     fn start_body_parses_explicit_runtime() {
+        // Single-runtime model: a legacy `"docker"` runtime still parses and
+        // coerces to the only runtime (Firecracker).
         let b: StartBody = serde_json::from_str(r#"{"runtime":"docker"}"#).unwrap();
-        assert_eq!(b.runtime, Some(Runtime::Docker));
+        assert_eq!(b.runtime, Some(Runtime::Firecracker));
     }
 
     #[test]
@@ -553,9 +555,11 @@ mod tests {
 
     #[test]
     fn deploy_body_parses_runtime_override() {
+        // Single-runtime model: a legacy `"docker"` runtime override still parses
+        // and coerces to the only runtime (Firecracker).
         let b: DeployBody =
             serde_json::from_str(r#"{"ref":"reg/acme/app:sha","runtime":"docker"}"#).unwrap();
-        assert_eq!(b.runtime, Some(Runtime::Docker));
+        assert_eq!(b.runtime, Some(Runtime::Firecracker));
     }
 
     #[test]

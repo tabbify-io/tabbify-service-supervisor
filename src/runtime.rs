@@ -9,52 +9,46 @@
 // Re-export the runtime seam so `crate::runtime::*` paths keep resolving.
 pub use crate::app_runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-// Deploy-time runtime selection enum — the FROZEN wire type from the contract.
-//
-// Distinct from `manifest::Runtime` (the `[runtime]` TABLE). This enum is the
-// `runtime` field in `[runtime].type`, each `[[deploy]].runtime`, and the
-// node→supervisor request body. Wire strings are FROZEN (contract D4):
-// `"docker"` / `"firecracker"` / `"wasm-http"`. Vendor IDENTICALLY in
-// cli / node / supervisor; every repo carries the golden round-trip test below.
-
-/// How a runner EXECUTES the artifact, chosen at deploy time per target.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    Serialize,
-    Deserialize,
-    utoipa::ToSchema,
-    schemars::JsonSchema,
-)]
-#[serde(rename_all = "kebab-case")]
+/// The app runtime. Tabbify runs ONE runtime: an OCI image booted as a
+/// Firecracker microVM. The enum is retained with a single variant for
+/// wire/back-compat — older clients, `tabbify.toml`s, and on-disk records may
+/// still carry "docker"/"wasm-http"/"node-firecracker"; deserialize COERCES any
+/// string to Firecracker rather than erroring. (contract D4: wire = "firecracker")
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, utoipa::ToSchema, schemars::JsonSchema)]
 pub enum Runtime {
-    /// `docker run` the OCI image.
-    Docker,
-    /// Boot the OCI image as a Firecracker microVM.
-    Firecracker,
-    /// Legacy in-process wasm selection. The in-process WASM runtime has been
-    /// removed (the platform serves a single FC-from-image runtime); this
-    /// variant is retained ONLY to keep the wire string frozen until the enum
-    /// is collapsed cross-repo in a later lockstep step.
+    /// Boot the OCI image as a Firecracker microVM. The only runtime Tabbify ships.
     #[default]
-    WasmHttp,
+    Firecracker,
 }
 
 impl Runtime {
     /// The exact wire string (FROZEN, contract D4). Mirrors serde output.
     #[must_use]
     pub fn as_wire(self) -> &'static str {
-        match self {
-            Runtime::Docker => "docker",
-            Runtime::Firecracker => "firecracker",
-            Runtime::WasmHttp => "wasm-http",
-        }
+        "firecracker"
+    }
+}
+
+impl Serialize for Runtime {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for Runtime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Lenient: tolerate ANY legacy string ("docker"/"wasm-http"/
+        // "node-firecracker"/…) and coerce to the single runtime.
+        let _ = String::deserialize(deserializer)?;
+        Ok(Runtime::Firecracker)
     }
 }
 
@@ -63,31 +57,28 @@ impl Runtime {
 mod tests {
     use super::*;
 
-    /// GOLDEN round-trip: the wire string for each variant is FROZEN (contract D4).
-    /// If this test changes, the contract changed — coordinate all three repos.
+    /// GOLDEN round-trip: the wire string is FROZEN (contract D4) and deserialize
+    /// LENIENTLY coerces any legacy string to Firecracker. If this test changes,
+    /// the contract changed — coordinate all three repos.
     #[test]
     fn runtime_wire_strings_are_frozen() {
-        for (variant, wire) in [
-            (Runtime::Docker, "docker"),
-            (Runtime::Firecracker, "firecracker"),
-            (Runtime::WasmHttp, "wasm-http"),
-        ] {
-            // serialize → exact string
-            let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, format!("\"{wire}\""), "serialize mismatch for {variant:?}");
-            // deserialize ← exact string
-            let back: Runtime = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
-            assert_eq!(back, variant, "deserialize mismatch for {wire}");
+        // serialize → "firecracker"
+        assert_eq!(Runtime::Firecracker.as_wire(), "firecracker");
+        let json = serde_json::to_string(&Runtime::Firecracker).unwrap();
+        assert_eq!(json, "\"firecracker\"");
+        // round-trip
+        let back: Runtime = serde_json::from_str("\"firecracker\"").unwrap();
+        assert_eq!(back, Runtime::Firecracker);
+
+        // LENIENT-COERCE: legacy wire strings all deserialize to Firecracker.
+        for legacy in ["docker", "wasm-http", "node-firecracker"] {
+            let back: Runtime = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            assert_eq!(back, Runtime::Firecracker, "legacy string {legacy} must coerce");
         }
     }
 
     #[test]
-    fn runtime_default_is_wasm_http() {
-        assert_eq!(Runtime::default(), Runtime::WasmHttp);
-    }
-
-    #[test]
-    fn runtime_rejects_unknown_string() {
-        assert!(serde_json::from_str::<Runtime>("\"podman\"").is_err());
+    fn runtime_defaults_to_firecracker() {
+        assert_eq!(Runtime::default(), Runtime::Firecracker);
     }
 }
