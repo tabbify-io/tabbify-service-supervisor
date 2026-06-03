@@ -64,6 +64,12 @@ pub struct SpawnSpec {
     /// Skip mesh join; bind plain loopback. Used for local runs / tests without
     /// root + TUN.
     pub no_mesh: bool,
+    /// Explicit DERP-style mesh relay endpoint (`TABBIFY_MESH_RELAY_URL`),
+    /// forwarded to the runner as `--mesh-relay-url <url>` when `Some` so the
+    /// runner routes its OWN mesh-join relay over the same `wss://` endpoint as
+    /// the supervisor (the corporate-firewall escape hatch). `None` (the
+    /// default) lets the runner derive the relay from the coordinator URL.
+    pub relay_url: Option<String>,
     /// OCI image ref of the last successful deploy, forwarded to the runner as
     /// `--image-ref <ref>` so a respawn comes up on the deployed version (the
     /// runner applies it to the manifest's `registry_ref`). `None` (the default)
@@ -114,6 +120,16 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
     if let Some(parent) = &spec.parent {
         args.push("--parent".into());
         args.push(parent.as_str().into());
+    }
+    // Forward the explicit relay endpoint so the runner routes its OWN mesh-join
+    // relay over the same `wss://` url as the supervisor (corporate firewall).
+    // Omitted when `None` so the runner derives the relay from the coordinator
+    // URL as before. The runner ALSO reads `TABBIFY_MESH_RELAY_URL` via clap
+    // `env=`, so an inherited env is a safety net — but the explicit arg is
+    // authoritative.
+    if let Some(relay_url) = &spec.relay_url {
+        args.push("--mesh-relay-url".into());
+        args.push(relay_url.as_str().into());
     }
     // Forward the deployed image ref so a respawn comes up on that version.
     if let Some(image_ref) = &spec.image_ref {
@@ -286,6 +302,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/tabbify/data"),
             parent: Some("fd5a:1f00:1::1".to_owned()),
             no_mesh: true,
+            relay_url: None,
             image_ref: None,
         }
     }
@@ -374,6 +391,46 @@ mod tests {
         assert!(
             !joined.iter().any(|a| a == "--image-ref"),
             "no --image-ref when None; got: {joined:?}"
+        );
+    }
+
+    /// When `relay_url` is set, the runner argv carries `--mesh-relay-url <url>`
+    /// so the runner routes its OWN mesh-join relay over the same `wss://`
+    /// endpoint as the supervisor (the corporate-firewall escape hatch).
+    #[test]
+    fn build_args_includes_relay_url_when_present() {
+        let mut s = spec();
+        s.relay_url = Some("wss://relay.tabbify.io/v1/mesh/relay".to_owned());
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let idx = joined
+            .iter()
+            .position(|a| a == "--mesh-relay-url")
+            .unwrap_or_else(|| panic!("missing --mesh-relay-url in {joined:?}"));
+        assert_eq!(
+            joined.get(idx + 1).map(String::as_str),
+            Some("wss://relay.tabbify.io/v1/mesh/relay"),
+            "--mesh-relay-url must be followed by the relay endpoint"
+        );
+    }
+
+    /// When `relay_url` is `None`, no `--mesh-relay-url` arg is emitted (the
+    /// runner derives the relay from the coordinator URL — today's default).
+    #[test]
+    fn build_args_omits_relay_url_when_none() {
+        let mut s = spec();
+        s.relay_url = None;
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a == "--mesh-relay-url"),
+            "no --mesh-relay-url when None; got: {joined:?}"
         );
     }
 

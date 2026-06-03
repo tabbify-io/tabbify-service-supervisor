@@ -51,6 +51,15 @@ pub struct RunnerConfig {
     #[arg(long, env = "TABBIFY_MESH_COORDINATOR", default_value = DEFAULT_COORDINATOR_URL)]
     pub coordinator_url: String,
 
+    /// Explicit mesh relay endpoint (DERP-style). When set, the runner connects
+    /// its relay over THIS url (e.g. `wss://relay.tabbify.io/v1/mesh/relay`)
+    /// instead of deriving `ws://` from the coordinator URL — required to reach
+    /// the relay through corporate proxies/firewalls. The supervisor passes this
+    /// via `--mesh-relay-url`; the `env=` fallback also picks up an inherited
+    /// `TABBIFY_MESH_RELAY_URL`. None ⇒ derive from coordinator_url.
+    #[arg(long = "mesh-relay-url", env = "TABBIFY_MESH_RELAY_URL")]
+    pub relay_url: Option<String>,
+
     /// S3 base URL for anonymous artifact fetch (overridable for tests).
     #[arg(long, env = "RUNNER_S3_BASE_URL", default_value = DEFAULT_S3_BASE_URL)]
     pub s3_base_url: String,

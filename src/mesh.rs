@@ -53,6 +53,12 @@ impl MeshMembership {
     /// join fields onto the [`JoinConfig`]; the supervisor passes
     /// [`JoinMetadata::default`] (all `None`) for now.
     ///
+    /// `relay_url` is the explicit DERP-style relay endpoint (from
+    /// `TABBIFY_MESH_RELAY_URL`): when `Some`, the joiner connects its relay over
+    /// that url verbatim (e.g. `wss://relay.tabbify.io/v1/mesh/relay`) instead of
+    /// deriving `ws://` from the coordinator URL — required to reach the relay
+    /// through corporate proxies/firewalls. `None` keeps the existing behavior.
+    ///
     /// # Errors
     /// Propagates the broad `Joiner::join` failure surface (HTTP, TUN setup,
     /// UDP bind, sudo). On a host without root / TUN this fails — callers that
@@ -62,8 +68,15 @@ impl MeshMembership {
         display_name: &str,
         extra_tags: &[String],
         metadata: JoinMetadata,
+        relay_url: Option<String>,
     ) -> anyhow::Result<Self> {
-        let config = build_supervisor_join_config(coordinator_url, display_name, extra_tags, metadata);
+        let config = build_supervisor_join_config(
+            coordinator_url,
+            display_name,
+            extra_tags,
+            metadata,
+            relay_url,
+        );
         Self::from_config(config, "join mesh as supervisor").await
     }
 
@@ -159,6 +172,7 @@ fn build_supervisor_join_config(
     display_name: &str,
     extra_tags: &[String],
     metadata: JoinMetadata,
+    relay_url: Option<String>,
 ) -> JoinConfig {
     let mut tags = vec!["supervisor".to_owned()];
     tags.extend_from_slice(extra_tags);
@@ -177,6 +191,12 @@ fn build_supervisor_join_config(
         // version drift is visible. `None` stays back-compatible (the joiner
         // never invents a value).
         software_version: metadata.software_version,
+        // Explicit DERP-style relay endpoint (`TABBIFY_MESH_RELAY_URL`). `Some`
+        // makes the joiner connect its relay over this url verbatim instead of
+        // deriving `ws://` from the coordinator URL — the corporate-firewall
+        // escape hatch (route the relay over `wss://`/443). `None` keeps the
+        // default derivation, unchanged for AWS-side peers.
+        relay_url,
         ..Default::default()
     }
 }
@@ -258,7 +278,7 @@ mod tests {
             software_version: Some("1.4.0".to_owned()),
             ..Default::default()
         };
-        let config = build_supervisor_join_config("http://coord:8888", "node-1", &[], md);
+        let config = build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None);
         assert_eq!(config.software_version.as_deref(), Some("1.4.0"));
         // The supervisor tag is always present; metadata fields ride through.
         assert!(config.tags.contains(&"supervisor".to_owned()));
@@ -273,8 +293,46 @@ mod tests {
             "node-1",
             &["firecracker".to_owned()],
             JoinMetadata::default(),
+            None,
         );
         assert!(config.software_version.is_none());
         assert!(config.tags.contains(&"firecracker".to_owned()));
+    }
+
+    /// An explicit `relay_url` (from `TABBIFY_MESH_RELAY_URL`) rides onto the
+    /// supervisor's `JoinConfig.relay_url` verbatim, so the joiner connects its
+    /// relay over that url (the corporate-firewall escape hatch) instead of
+    /// deriving `ws://` from the coordinator URL.
+    #[test]
+    fn build_config_wires_relay_url_onto_join_config() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            Some("wss://relay.tabbify.io/v1/mesh/relay".to_owned()),
+        );
+        assert_eq!(
+            config.relay_url.as_deref(),
+            Some("wss://relay.tabbify.io/v1/mesh/relay"),
+            "explicit relay_url must ride onto JoinConfig verbatim"
+        );
+    }
+
+    /// Absent `relay_url` (the default) leaves `JoinConfig.relay_url` `None`, so
+    /// the joiner derives the relay endpoint from the coordinator URL as before.
+    #[test]
+    fn build_config_omits_absent_relay_url() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+        );
+        assert!(
+            config.relay_url.is_none(),
+            "None relay_url must keep the default coordinator-derived relay"
+        );
     }
 }

@@ -82,6 +82,12 @@ pub struct SharedRunnerConfig {
     /// Skip mesh join; bind plain loopback. Used for local runs / tests without
     /// root + TUN.
     pub no_mesh: bool,
+    /// Explicit DERP-style mesh relay endpoint (`TABBIFY_MESH_RELAY_URL`),
+    /// forwarded to every spawned runner as `--mesh-relay-url <url>` so the
+    /// runner's OWN mesh join routes its relay over the same `wss://` endpoint
+    /// as the supervisor (the corporate-firewall escape hatch). `None` (the
+    /// default) lets each runner derive the relay from the coordinator URL.
+    pub relay_url: Option<String>,
 }
 
 impl SharedRunnerConfig {
@@ -101,6 +107,9 @@ impl SharedRunnerConfig {
             data_dir: self.data_dir.clone(),
             parent: record.parent.clone(),
             no_mesh: self.no_mesh,
+            // Forward the supervisor's relay endpoint so a respawned runner
+            // routes its relay over the same `wss://` url (corporate firewall).
+            relay_url: self.relay_url.clone(),
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
             // The runtime is no longer selectable — every app builds as
@@ -237,6 +246,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/tabbify/data"),
             parent: None,
             no_mesh: true,
+            relay_url: None,
         }
     }
 

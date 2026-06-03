@@ -22,6 +22,7 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         data_dir: cfg.data_dir.clone(),
         no_mesh: cfg.no_mesh,
         coordinator_url: cfg.coordinator_url.clone(),
+        relay_url: cfg.relay_url.clone(),
         // Use the served app's UUID as the mesh display name so the runner is
         // identifiable in the coordinator roster.
         display_name: format!("tabbify-runner:{}", cfg.uuid),

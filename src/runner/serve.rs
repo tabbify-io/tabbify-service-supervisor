@@ -156,6 +156,12 @@ pub struct ServeConfig {
     pub no_mesh: bool,
     /// Mesh coordinator control-plane URL (used only when `no_mesh = false`).
     pub coordinator_url: String,
+    /// Explicit DERP-style mesh relay endpoint (`TABBIFY_MESH_RELAY_URL`). When
+    /// `Some`, the runner's mesh join routes its relay over this url verbatim
+    /// (e.g. `wss://relay.tabbify.io/v1/mesh/relay`) instead of deriving `ws://`
+    /// from the coordinator URL — the corporate-firewall escape hatch. `None`
+    /// (the default) keeps the coordinator-derived relay.
+    pub relay_url: Option<String>,
     /// Human-readable display name advertised to the coordinator (mesh mode).
     pub display_name: String,
     /// ULA of the parent supervisor that spawned this runner, declared on the
@@ -436,6 +442,11 @@ pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
         kind: Some("runner".to_owned()),
         parent: cfg.parent.clone(),
         app_uuid: Some(cfg.uuid.clone()),
+        // Explicit DERP-style relay endpoint (`TABBIFY_MESH_RELAY_URL`),
+        // forwarded by the supervisor as `--mesh-relay-url`. `Some` routes the
+        // runner's relay over this url verbatim (corporate-firewall escape
+        // hatch); `None` keeps the coordinator-derived relay, unchanged.
+        relay_url: cfg.relay_url.clone(),
         ..Default::default()
     }
 }
@@ -457,6 +468,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/tabbify-runner-test"),
             no_mesh: false,
             coordinator_url: "http://10.0.0.1:8888".to_owned(),
+            relay_url: None,
             display_name: "runner-test".to_owned(),
             parent: Some("fd5a:1f00:0:3::1".to_owned()),
             port: 8730,
@@ -510,6 +522,28 @@ mod tests {
             "keypair_path must contain the app uuid, got {kp_path:?}"
         );
         assert!(join.identity_path.is_none());
+        // No explicit relay endpoint by default → derive from coordinator URL.
+        assert!(
+            join.relay_url.is_none(),
+            "default ServeConfig must leave relay_url None"
+        );
+    }
+
+    /// An explicit `relay_url` on the runner's [`ServeConfig`] (forwarded by the
+    /// supervisor as `--mesh-relay-url`) rides onto the runner's
+    /// [`mesh_joiner::JoinConfig`] verbatim, so the runner routes its relay over
+    /// that `wss://` endpoint (the corporate-firewall escape hatch) instead of
+    /// deriving `ws://` from the coordinator URL.
+    #[test]
+    fn runner_join_config_wires_relay_url() {
+        let mut cfg = mesh_cfg();
+        cfg.relay_url = Some("wss://relay.tabbify.io/v1/mesh/relay".to_owned());
+        let join = build_runner_join_config(&cfg);
+        assert_eq!(
+            join.relay_url.as_deref(),
+            Some("wss://relay.tabbify.io/v1/mesh/relay"),
+            "explicit relay_url must ride onto the runner's JoinConfig"
+        );
     }
 
     /// Distinct uuids must yield distinct keypair paths — otherwise two runners

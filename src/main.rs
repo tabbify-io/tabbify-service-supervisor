@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
                 software_version: Some(tabbify_supervisor::version::binary_version().to_owned()),
                 ..Default::default()
             },
+            config.relay_url.clone(),
         )
         .await
         .context("join mesh")?;
@@ -145,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
         data_dir: config.data_dir.clone(),
         parent,
         no_mesh: config.no_mesh,
+        // Forward the supervisor's explicit relay endpoint to every runner.
+        relay_url: config.relay_url.clone(),
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
 
@@ -341,6 +344,7 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
                 ),
                 ..Default::default()
             },
+            config.relay_url.clone(),
         )
         .await
         {
@@ -365,6 +369,9 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
         data_dir: config.data_dir.clone(),
         parent: None,
         no_mesh: true,
+        // The candidate forwards the relay endpoint too, so its probe runner
+        // exercises the same relay path as production.
+        relay_url: config.relay_url.clone(),
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
@@ -501,6 +508,7 @@ mod tests {
             data_dir: tmp.clone(),
             parent: None,
             no_mesh: true,
+            relay_url: None,
         };
         let orchestrator = Orchestrator::new(shared, tmp.join("runners"));
         let fetcher = S3Fetcher::new("http://127.0.0.1:1/none", &tmp);

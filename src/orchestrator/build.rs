@@ -278,6 +278,7 @@ mod tests {
                 data_dir,
                 parent: None,
                 no_mesh: true,
+                relay_url: None,
             },
             runner_dir,
         )

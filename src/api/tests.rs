@@ -26,6 +26,7 @@ fn make_state(runner_dir: PathBuf) -> SupervisorState {
             data_dir: PathBuf::from("/var/lib/tabbify/data"),
             parent: None,
             no_mesh: true,
+            relay_url: None,
         },
         runner_dir.clone(),
     );

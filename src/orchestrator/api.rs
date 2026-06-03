@@ -127,6 +127,9 @@ impl Orchestrator {
             data_dir: shared.data_dir.clone(),
             parent: shared.parent.clone(),
             no_mesh: shared.no_mesh,
+            // Forward the supervisor's relay endpoint so the runner routes its
+            // relay over the same `wss://` url (corporate firewall).
+            relay_url: shared.relay_url.clone(),
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
         }
@@ -556,6 +559,7 @@ mod tests {
                 data_dir: PathBuf::from("/var/lib/tabbify/data"),
                 parent: None,
                 no_mesh: true,
+                relay_url: None,
             },
             runner_dir,
         )

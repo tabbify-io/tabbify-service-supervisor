@@ -43,6 +43,14 @@ pub struct Config {
     #[arg(long, env = "TABBIFY_MESH_COORDINATOR", default_value = DEFAULT_COORDINATOR_URL)]
     pub coordinator_url: String,
 
+    /// Explicit mesh relay endpoint (DERP-style). When set, the joiner connects
+    /// its relay over THIS url (e.g. `wss://relay.tabbify.io/v1/mesh/relay`)
+    /// instead of deriving `ws://` from the coordinator URL — required to reach
+    /// the relay through corporate proxies/firewalls that mangle plaintext ws.
+    /// None ⇒ derive from coordinator_url (the default for AWS-side peers).
+    #[arg(long = "mesh-relay-url", env = "TABBIFY_MESH_RELAY_URL")]
+    pub relay_url: Option<String>,
+
     /// Skip mesh join entirely and bind a plain loopback/`--bind` addr. Used
     /// for local runs/tests without root + TUN. Defaults off (join the mesh).
     #[arg(long, env = "SUPERVISOR_NO_MESH", default_value_t = false)]
@@ -401,6 +409,30 @@ mod tests {
     fn self_update_requires_to_version() {
         // `self-update` with no `--to` is a usage error, not a silent no-op.
         assert!(Config::try_parse_from(["supervisord", "self-update"]).is_err());
+    }
+
+    #[test]
+    fn relay_url_defaults_to_none() {
+        // Absent `--mesh-relay-url` / `TABBIFY_MESH_RELAY_URL` ⇒ None ⇒ the
+        // joiner derives the relay from the coordinator URL (existing behavior).
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert!(cfg.relay_url.is_none());
+    }
+
+    #[test]
+    fn relay_url_flag_parses() {
+        // The explicit flag (how the supervisor forwards it to runners, and how
+        // an operator pins it) parses into `Some(..)` verbatim.
+        let cfg = Config::try_parse_from([
+            "supervisord",
+            "--mesh-relay-url",
+            "wss://relay.tabbify.io/v1/mesh/relay",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.relay_url.as_deref(),
+            Some("wss://relay.tabbify.io/v1/mesh/relay")
+        );
     }
 
     #[test]
