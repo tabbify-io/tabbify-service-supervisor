@@ -177,6 +177,38 @@ fn render_init_exec_form_mounts_env_workdir_and_execs() {
     );
 }
 
+/// FIX 4 regression (proven LIVE): minimal OCI images (e.g. `busybox`) ship NO
+/// /proc /sys /dev mountpoints — a container runtime normally provides them — so
+/// `render_init` must `mkdir -p` them BEFORE mounting, and the pseudo-fs mounts
+/// must be BEST-EFFORT (`|| true`) so a missing/already-mounted fs can NEVER kill
+/// PID 1 and panic the guest ("Attempted to kill init"). A busybox httpd image
+/// only served once /proc /sys existed in the rootfs.
+#[test]
+fn render_init_creates_pseudo_fs_mountpoints_and_mounts_best_effort() {
+    let exec = OciExec {
+        entrypoint: vec!["busybox".to_owned(), "httpd".to_owned()],
+        cmd: vec![],
+        env: vec![],
+        workdir: "/".to_owned(),
+    };
+    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    assert!(
+        init.contains("mkdir -p /proc /sys /dev"),
+        "must create pseudo-fs mountpoints (minimal images lack them); got:\n{init}"
+    );
+    let mkdir_at = init.find("mkdir -p /proc /sys /dev").expect("mkdir present");
+    let proc_at = init.find("mount -t proc").expect("proc mount present");
+    assert!(mkdir_at < proc_at, "mkdir must precede the mounts; got:\n{init}");
+    assert!(
+        init.contains("mount -t proc proc /proc 2>/dev/null || true"),
+        "proc mount must be best-effort; got:\n{init}"
+    );
+    assert!(
+        init.contains("mount -t sysfs sysfs /sys 2>/dev/null || true"),
+        "sysfs mount must be best-effort; got:\n{init}"
+    );
+}
+
 /// FIX 1 regression: argv elements containing whitespace, glob chars (`*` `?`),
 /// `$`, or quotes must be single-quoted in the rendered init so that the
 /// `/bin/sh` running `/init` re-tokenizes them back to the EXACT argv instead of

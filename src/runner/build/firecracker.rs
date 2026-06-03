@@ -508,16 +508,21 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
         })
         .collect();
 
-    // POSIX sh init. `set -e` so a failed mount aborts loudly to the console.
+    // POSIX sh init. Minimal OCI images (e.g. busybox) ship NO /proc /sys /dev
+    // mountpoints — a container runtime normally provides them — so `mkdir -p`
+    // them first, then mount BEST-EFFORT: a missing pseudo-fs (or already-mounted)
+    // must NEVER kill PID 1 and panic the kernel (FIX 4: ANY image must boot, not
+    // just fat ones that happen to carry the mountpoints).
     // OCI/Docker auto-create a missing WorkingDir; with `set -e` a bare `cd` into
     // an unmaterialized workdir would kill PID 1, so `mkdir -p` it first (FIX 3).
     let workdir = sh_single_quote(&exec.workdir);
     Ok(format!(
         "#!/bin/sh\n\
          set -e\n\
-         mount -t proc proc /proc\n\
-         mount -t sysfs sysfs /sys\n\
-         mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev\n\
+         mkdir -p /proc /sys /dev\n\
+         mount -t proc proc /proc 2>/dev/null || true\n\
+         mount -t sysfs sysfs /sys 2>/dev/null || true\n\
+         mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null || true\n\
          # eth0 is configured by the kernel ip= boot-arg; verify it came up.\n\
          if [ ! -e /sys/class/net/eth0 ]; then\n\
          \techo 'tabbify-init: eth0 missing (kernel ip= boot-arg did not configure it)' >&2\n\
