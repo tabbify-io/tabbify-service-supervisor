@@ -27,7 +27,6 @@ use crate::runtime::BoxFut;
 
 mod docker;
 pub mod firecracker;
-pub mod node_firecracker;
 mod wasm;
 
 /// Which build pipeline a [`BuildJob`] drives.

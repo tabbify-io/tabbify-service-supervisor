@@ -99,9 +99,6 @@ pub enum Runtime {
     Docker,
     /// Boot the OCI image as a Firecracker microVM.
     Firecracker,
-    /// Boot a NixOS Firecracker microVM that itself runs a tabbify-supervisor
-    /// (PID-1 via systemd) + dockerd + mesh-joiner — a recursive client node.
-    NodeFirecracker,
     /// In-process wasmtime; the always-available runtime (never capability-gated).
     #[default]
     WasmHttp,
@@ -114,7 +111,6 @@ impl Runtime {
         match self {
             Runtime::Docker => "docker",
             Runtime::Firecracker => "firecracker",
-            Runtime::NodeFirecracker => "node-firecracker",
             Runtime::WasmHttp => "wasm-http",
         }
     }
@@ -549,7 +545,6 @@ mod tests {
         for (variant, wire) in [
             (Runtime::Docker, "docker"),
             (Runtime::Firecracker, "firecracker"),
-            (Runtime::NodeFirecracker, "node-firecracker"),
             (Runtime::WasmHttp, "wasm-http"),
         ] {
             // serialize → exact string

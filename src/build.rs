@@ -168,12 +168,6 @@ pub async fn build_runtime_with_oras(
             .await?;
             Ok(Arc::new(container))
         }
-        "node-firecracker" => {
-            crate::runner::build::node_firecracker::run_node_firecracker_build(
-                uuid, fetched, fc, data_dir,
-            )
-            .await
-        }
         other => anyhow::bail!("unknown runtime type: {other}"),
     }
 }
@@ -255,48 +249,6 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
             .join(uuid)
             .join("deployed")
             .join("context.tar.gz"),
-    }
-}
-
-/// Synthesize a minimal `FetchedApp` for a node-firecracker deploy: no S3
-/// artifact, no registry ref (the node image is host-local). `build_runtime`
-/// dispatches on the `"node-firecracker"` type / override.
-#[must_use]
-pub fn fetched_for_node_fc(uuid: &str) -> FetchedApp {
-    use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
-
-    FetchedApp {
-        // There is no S3 `latest` for a node-firecracker deploy; the host-local
-        // node image is authoritative. 0 keeps the cache layout deterministic.
-        version: 0,
-        manifest: AppManifest {
-            app: AppMeta {
-                id: None,
-                name: uuid.to_owned(),
-                version: String::new(),
-                kind: "node".to_owned(),
-                description: String::new(),
-            },
-            lifecycle: Lifecycle {
-                // A node microVM should come up immediately, not lazily.
-                mode: LifecycleMode::AlwaysOn,
-                idle_timeout_sec: 300,
-            },
-            runtime: Runtime {
-                r#type: "node-firecracker".to_owned(),
-                entry: String::new(),
-                fuel_per_request: 0,
-                // A recursive tabbify-node microVM needs real resources.
-                memory_mb: 2048,
-                vcpus: Some(4),
-                kernel: None,
-                // The node image is host-local; nothing to pull from a registry.
-                registry_ref: None,
-            },
-            routes: Routes::default(),
-        },
-        wasm: bytes::Bytes::new(),
-        cached_path: std::path::PathBuf::new(),
     }
 }
 
@@ -675,50 +627,6 @@ mod tests {
     fn fetched_from_ref_is_always_on() {
         let f = fetched_from_ref("abc-uuid", "reg:5000/x:main");
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
-    }
-
-    // ---- fetched_for_node_fc: synthesize a node-firecracker FetchedApp --------
-
-    #[test]
-    fn fetched_for_node_fc_is_node_runtime_no_registry_alwayson() {
-        let f = fetched_for_node_fc("019e7903-0000-7000-8000-000000000f01");
-        assert_eq!(f.manifest.runtime.r#type, "node-firecracker");
-        assert!(f.manifest.runtime.registry_ref.is_none());
-        assert!(matches!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn));
-        assert_eq!(f.version, 0);
-        assert!(f.wasm.is_empty());
-    }
-
-    /// The `node-firecracker` arm errors CLEARLY (mentioning the missing node
-    /// image) when the host-local node image dir has no `vmlinux` / `rootfs.ext4`
-    /// — the precheck fails before the Linux-only launch is ever reached, so this
-    /// is fully verifiable cross-platform.
-    #[tokio::test]
-    async fn node_firecracker_arm_errors_clearly_without_image() {
-        let fetched = fetched_for_node_fc("019e7903-0000-7000-8000-000000000f01");
-        let fc = FcConfig {
-            node_image_dir: "/nonexistent/node-images".into(),
-            ..FcConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let runner: CommandRunner = Arc::new(|_| Box::pin(async { Ok(()) }));
-        // `Arc<dyn AppRuntime>` is not `Debug`, so `.unwrap_err()` cannot be used;
-        // match on the result to extract the error directly instead.
-        let result = build_runtime_with_oras(
-            Some("node-firecracker"),
-            "u1",
-            &fetched,
-            &fc,
-            &DockerConfig::default(),
-            tmp.path(),
-            &runner,
-        )
-        .await;
-        let err = match result {
-            Ok(_) => panic!("expected an error for a missing node image"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("node image"), "got: {err}");
     }
 
     // ---- resolve_fetched: fallback decision when S3 fetch fails ---------------
