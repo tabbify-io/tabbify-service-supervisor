@@ -179,7 +179,12 @@ jobs:
         # Compute sha256 of the just-uploaded binaries + write the sibling
         # `latest` manifest. Run once (x86_64) so a single source of truth lists
         # both binaries' checksums.
-        if: matrix.arch == 'x86_64'
+        # TAG-PUSH ONLY: a push to `main` derives SEMVER from Cargo.toml, so if a
+        # tag was cut without bumping Cargo.toml the main run would CLOBBER `latest`
+        # back to the stale Cargo.toml version (this is exactly what pinned `latest`
+        # at v1.4.10 while v1.4.11/v1.4.12 tags shipped). Only a real `v*` tag — the
+        # deliberate release act — publishes `latest`.
+        if: matrix.arch == 'x86_64' && github.ref_type == 'tag'
         run: |
           set -euo pipefail
           V="v${{ steps.ver.outputs.semver }}"
