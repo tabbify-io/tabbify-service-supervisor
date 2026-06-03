@@ -258,7 +258,7 @@ async fn build_rootfs_ext4_inner(
 
     // 1+2. DOCKER-LESS: untar the OCI layout's layers into the staging dir,
     //      whiteout-aware (replaces `docker create` + `docker export` + flat untar).
-    unpack_oci_layers(layout, config, &staging, runner).await?;
+    unpack_oci_layers(layout, config, &staging).await?;
 
     // 2c. fc-5 only: inject the rendered PID-1 init AFTER unpack, BEFORE mkfs.
     if let Some(script) = init {
@@ -623,8 +623,45 @@ fn blob_path(layout: &Path, digest: &oci_spec::image::Digest) -> PathBuf {
 /// with (`…rootfs.diff.tar.gzip` / `.zstd`, which `oci-spec` types as
 /// [`MediaType::Other`]) resolve correctly.
 ///
+/// Extract one OCI layer blob into `dest` IN-PROCESS via the `tar` crate.
+///
+/// We do NOT shell the host `tar`: the runner's PATH resolves busybox tar on
+/// NixOS / Alpine, and busybox tar strips the leading `/` from ABSOLUTE symlink
+/// targets (so `/bin/sh -> /bin/busybox` lands as the broken `bin/busybox` ->
+/// `/bin/bin/busybox`), which then breaks the guest `/init` (`#!/bin/sh`) with
+/// "No working init found". The `tar` crate writes symlink targets verbatim and
+/// is portable (no dependency on which `tar` binary is on PATH). Decompression
+/// is chosen from the layer media type (gzip / zstd / plain), not autodetected.
+///
+/// Synchronous (std fs/IO) — call from a blocking task.
+fn extract_layer_blob(
+    blob: &Path,
+    media_type: &oci_spec::image::MediaType,
+    dest: &Path,
+) -> Result<()> {
+    let f = std::fs::File::open(blob)
+        .with_context(|| format!("open layer blob {}", blob.display()))?;
+    let mt = media_type.to_string();
+    let reader: Box<dyn std::io::Read> = if mt.ends_with("+gzip") || mt.ends_with(".tar.gzip") {
+        Box::new(flate2::read::GzDecoder::new(f))
+    } else if mt.ends_with("+zstd") || mt.ends_with(".tar.zstd") {
+        Box::new(zstd::stream::read::Decoder::new(f).context("open zstd layer decoder")?)
+    } else {
+        Box::new(f)
+    };
+    let mut ar = tar::Archive::new(reader);
+    ar.set_preserve_permissions(true);
+    ar.set_preserve_mtime(false);
+    ar.set_overwrite(true);
+    // Unpack verbatim — in particular do NOT rewrite/sanitise symlink targets.
+    ar.unpack(dest)
+        .with_context(|| format!("tar-unpack layer into {}", dest.display()))?;
+    Ok(())
+}
+
 /// Returns `Some("-z")` for gzip, `Some("--zstd")` for zstd, and `None` for plain
 /// uncompressed tar (or an unknown type — let `tar` read the raw archive).
+#[allow(dead_code)] // superseded by extract_layer_blob; kept for its unit tests
 fn tar_decompress_flag(media_type: &oci_spec::image::MediaType) -> Option<&'static str> {
     let mt = media_type.to_string();
     if mt.ends_with("+gzip") || mt.ends_with(".tar.gzip") {
@@ -643,6 +680,7 @@ fn tar_decompress_flag(media_type: &oci_spec::image::MediaType) -> Option<&'stat
 /// placed BEFORE `-f` so `tar` decompresses the blob it then reads. Kept as a
 /// pure argv builder so the flag-selection ↔ argv assembly is unit-testable
 /// without spawning `tar`.
+#[allow(dead_code)] // superseded by extract_layer_blob; kept for its unit tests
 fn unpack_tar_argv(flag: &str, blob: &Path, out: &Path) -> Vec<String> {
     let mut argv = vec!["tar".to_owned(), "-x".to_owned()];
     if !flag.is_empty() {
@@ -672,7 +710,6 @@ async fn unpack_oci_layers(
     layout: &Path,
     config: &oci_spec::image::ImageConfiguration,
     staging: &Path,
-    runner: &FcBuildRunner,
 ) -> Result<()> {
     let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
         .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
@@ -725,15 +762,19 @@ async fn unpack_oci_layers(
             .await
             .with_context(|| format!("create layer dir {}", layer_dir.display()))?;
         let blob = blob_path(layout, layer.digest());
-        // Decompress per the layer descriptor's media type rather than trusting
-        // `tar` autodetect: real layers are gzip (`+gzip`) or zstd (`+zstd`), and
-        // busybox/older host tar cannot autodetect zstd. An explicit `-z` / `--zstd`
-        // is correct everywhere; plain tar gets no flag (FIX 4).
-        let flag = tar_decompress_flag(layer.media_type()).unwrap_or("");
-        let (ok, _) = (runner)(unpack_tar_argv(flag, &blob, &layer_dir)).await;
-        if !ok {
-            bail!("untar of OCI layer {} failed", blob.display());
-        }
+        // Extract IN-PROCESS (tar crate), NOT via the host `tar`: the runner's
+        // PATH resolves busybox tar on NixOS/Alpine, which strips the leading `/`
+        // from ABSOLUTE symlink targets (/bin/sh -> /bin/busybox lands as the
+        // broken `bin/busybox`), corrupting the guest rootfs so /init can't exec.
+        // The tar crate writes symlink targets verbatim; decompression is chosen
+        // by the layer media type (gzip / zstd / plain).
+        let mt = layer.media_type().clone();
+        let blob_c = blob.clone();
+        let layer_dir_c = layer_dir.clone();
+        tokio::task::spawn_blocking(move || extract_layer_blob(&blob_c, &mt, &layer_dir_c))
+            .await
+            .context("join layer-extract task")?
+            .with_context(|| format!("extract OCI layer {}", blob.display()))?;
         // Apply this layer's whiteouts against the accumulated `staging` tree
         // (clearing lower-layer entries), then overlay the layer's own files
         // on top — so a same-layer re-add always survives the opaque clear.

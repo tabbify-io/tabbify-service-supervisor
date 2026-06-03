@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use super::oci_fixtures::{make_tar, write_min_oci_layout};
 use super::{
     Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, ext4_geometry,
-    measure_tree, render_init,
+    extract_layer_blob, measure_tree, render_init,
 };
 
 /// `oci-spec` links and parses an OCI image config's entrypoint/cmd/env/
@@ -797,8 +797,7 @@ async fn unpack_oci_layers_applies_whiteouts_in_order() {
     let staging = tmp.path().join("stage");
 
     // Real `tar` via the runner (shells the host tar binary).
-    let runner = super::production_fc_build_runner();
-    super::unpack_oci_layers(&layout, &config, &staging, &runner)
+    super::unpack_oci_layers(&layout, &config, &staging)
         .await
         .expect("unpack must succeed");
 
@@ -833,8 +832,7 @@ async fn unpack_oci_layers_opaque_keeps_same_layer_readd() {
     let config = super::read_oci_config_from_layout(&layout).unwrap();
     let staging = tmp.path().join("stage");
 
-    let runner = super::production_fc_build_runner();
-    super::unpack_oci_layers(&layout, &config, &staging, &runner)
+    super::unpack_oci_layers(&layout, &config, &staging)
         .await
         .expect("unpack must succeed");
 
@@ -870,8 +868,7 @@ async fn unpack_oci_layers_replaces_lower_file_with_upper_dir() {
     let config = super::read_oci_config_from_layout(&layout).unwrap();
     let staging = tmp.path().join("stage");
 
-    let runner = super::production_fc_build_runner();
-    super::unpack_oci_layers(&layout, &config, &staging, &runner)
+    super::unpack_oci_layers(&layout, &config, &staging)
         .await
         .expect("file-to-dir replacement across layers must succeed");
 
@@ -968,8 +965,7 @@ async fn unpack_oci_layers_errors_on_diffid_count_mismatch() {
     });
     let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:a", &l0)]);
     let config = super::read_oci_config_from_layout(&layout).unwrap();
-    let runner = super::production_fc_build_runner();
-    let err = super::unpack_oci_layers(&layout, &config, &tmp.path().join("s"), &runner)
+    let err = super::unpack_oci_layers(&layout, &config, &tmp.path().join("s"))
         .await
         .unwrap_err();
     assert!(err.to_string().to_lowercase().contains("layer"),
@@ -1215,4 +1211,44 @@ async fn measure_tree_sums_bytes_and_counts_entries() {
     let (bytes, count) = measure_tree(root).await.unwrap();
     assert_eq!(bytes, 105, "byte sum of both files");
     assert_eq!(count, 3, "two files + one subdir");
+}
+
+/// THE symlink-mangling regression: an ABSOLUTE symlink target (`/bin/busybox`)
+/// must be preserved verbatim by the in-process extractor. busybox tar (which
+/// the NixOS/Alpine runner resolves on PATH) strips the leading `/` -> the
+/// broken `bin/busybox` -> `/bin/bin/busybox`, which breaks the guest /init.
+#[tokio::test]
+async fn extract_layer_preserves_absolute_symlink_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tgz = tmp.path().join("layer.tar.gz");
+    {
+        let f = std::fs::File::create(&tgz).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut b = tar::Builder::new(enc);
+        // bin/busybox regular file
+        let data = b"ELF";
+        let mut h = tar::Header::new_gnu();
+        h.set_path("bin/busybox").unwrap();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        b.append(&h, &data[..]).unwrap();
+        // bin/sh -> /bin/busybox (ABSOLUTE target)
+        let mut hs = tar::Header::new_gnu();
+        hs.set_size(0);
+        hs.set_mode(0o777);
+        hs.set_entry_type(tar::EntryType::Symlink);
+        b.append_link(&mut hs, "bin/sh", "/bin/busybox").unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+    }
+    let dest = tmp.path().join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    extract_layer_blob(&tgz, &oci_spec::image::MediaType::ImageLayerGzip, &dest).unwrap();
+    let target = std::fs::read_link(dest.join("bin/sh")).unwrap();
+    assert_eq!(
+        target.to_str().unwrap(),
+        "/bin/busybox",
+        "absolute symlink target must stay verbatim (busybox tar would mangle it to bin/busybox)"
+    );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tabbify-service-supervisor"
-version = "1.4.9"
+version = "1.4.10"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -50,6 +50,15 @@ wasmtime-wasi-http = "26"
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+
+# OCI layer extraction IN-PROCESS. The host `tar` the runner resolves on NixOS /
+# Alpine is busybox tar, which STRIPS the leading `/` from absolute symlink
+# targets (/bin/sh -> /bin/busybox becomes the broken bin/busybox), corrupting
+# the guest rootfs. These crates preserve symlink targets verbatim and are
+# portable (no dependency on which tar binary is on PATH). Already in the graph.
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
 
 # S3 fetch (anonymous HTTPS GET). rustls so musl static builds don't pull openssl.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
