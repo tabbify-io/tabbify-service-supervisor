@@ -52,8 +52,12 @@ pub struct Config {
     #[arg(long, env = "SUPERVISOR_NAME", default_value = "tabbify-supervisor")]
     pub display_name: String,
 
-    /// Local data dir for cached app artifacts (`<data_dir>/apps/<uuid>/v<N>/`).
-    #[arg(long, env = "SUPERVISOR_DATA_DIR", default_value = "./data")]
+    /// Local data dir for cached app artifacts (`<data_dir>/apps/<uuid>/v<N>/`)
+    /// AND the sticky mesh identity (`<data_dir>/mesh-identity.json`). Defaults to
+    /// a STABLE absolute path so a host that forgets `SUPERVISOR_DATA_DIR`
+    /// (ThinkPad/NixOS/node-in-FC) still persists its identity across restarts
+    /// instead of churning its pubkey. Containers/systemd already set this env.
+    #[arg(long, env = "SUPERVISOR_DATA_DIR", default_value = "/var/lib/tabbify")]
     pub data_dir: PathBuf,
 
     /// S3 base URL for anonymous artifact fetch (overridable for tests).
@@ -265,7 +269,7 @@ mod tests {
         assert!(!cfg.no_mesh);
         assert!(cfg.bind.is_none());
         assert!(cfg.apps.is_empty());
-        assert_eq!(cfg.data_dir, PathBuf::from("./data"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/tabbify"));
     }
 
     #[test]
