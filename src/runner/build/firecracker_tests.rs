@@ -353,6 +353,12 @@ use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Ru
 use bytes::Bytes;
 
 fn fc_fetched(digest: &str) -> FetchedApp {
+    fc_fetched_ref(&format!("[fd5a::1]:5000/acme/vm@{digest}"))
+}
+
+/// Like [`fc_fetched`] but takes the FULL `registry_ref` verbatim, so a test can
+/// stage a TAG ref (`…/vm:latest`, no `@<digest>`) as well as a digest ref.
+fn fc_fetched_ref(registry_ref: &str) -> FetchedApp {
     FetchedApp {
         version: 3,
         manifest: AppManifest {
@@ -374,7 +380,7 @@ fn fc_fetched(digest: &str) -> FetchedApp {
                 memory_mb: 128,
                 vcpus: Some(2),
                 kernel: None,
-                registry_ref: Some(format!("[fd5a::1]:5000/acme/vm@{digest}")),
+                registry_ref: Some(registry_ref.to_owned()),
             },
             routes: Routes::default(),
         },
@@ -1250,5 +1256,147 @@ async fn extract_layer_preserves_absolute_symlink_targets() {
         target.to_str().unwrap(),
         "/bin/busybox",
         "absolute symlink target must stay verbatim (busybox tar would mangle it to bin/busybox)"
+    );
+}
+
+/// `read_manifest_digest_from_layout` derives the IMMUTABLE image digest from a
+/// pulled OCI layout: it reads `index.json` and returns `manifests[0].digest`
+/// (the `sha256:…` of the image manifest blob), matching the same descriptor
+/// `read_oci_config_from_layout` resolves. This is the cache key for a TAG ref
+/// (no `@<digest>`), where the digest is unknown until the layout is pulled.
+#[test]
+fn read_manifest_digest_from_layout_returns_index_manifest_digest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os": "linux",
+        "config": {"Entrypoint": ["/bin/server"]},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
+    });
+    let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:l0", &l0)]);
+
+    // The expected digest is exactly the descriptor the index points at — the
+    // SAME one the config-read path resolves the manifest blob from.
+    let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json")).unwrap();
+    let expected = index.manifests().first().unwrap().digest().to_string();
+
+    let digest = super::read_manifest_digest_from_layout(&layout).expect("derive digest");
+    assert_eq!(
+        digest, expected,
+        "must return index.json manifests[0].digest verbatim (sha256:…)"
+    );
+    assert!(
+        digest.starts_with("sha256:"),
+        "derived digest must be a full algo-prefixed digest; got {digest:?}"
+    );
+}
+
+/// A layout with an empty `index.json` (no manifest descriptor) errors clearly
+/// rather than fabricating a bogus cache key.
+#[test]
+fn read_manifest_digest_from_layout_errors_on_empty_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("index.json"),
+        br#"{"schemaVersion":2,"manifests":[]}"#,
+    )
+    .unwrap();
+    let err = super::read_manifest_digest_from_layout(tmp.path()).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("manifest"),
+        "must name the missing manifest; got: {err}"
+    );
+}
+
+/// THE #1 e2e blocker: a TAG `registry_ref` (NO `@<digest>`) must NOT bail.
+/// `run_firecracker_build` must pull the layout first, DERIVE the immutable
+/// digest from the layout's `index.json`, and then convert with THAT digest as
+/// the cache key — the produced rootfs must land at the digest-keyed path
+/// (fc-3 invariant), not at any tag-derived path.
+///
+/// The fake `oras copy` is a no-op success; we pre-stage a real layout where the
+/// tag-path pull lands it, use the real host `tar` for the unpack, and fake only
+/// `mkfs.ext4` to touch the digest-keyed output. The final VM boot has no
+/// Firecracker/KVM here so it errors, but conversion (incl. the digest-keyed
+/// `mkfs.ext4` argv) runs BEFORE the boot and is asserted on the recorded argv.
+#[tokio::test]
+async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uuid = "uuid-tagref";
+    // A TAG ref — no `@sha256:…`. The old code bailed here.
+    let fetched = fc_fetched_ref("[fd5a::1]:5000/acme/vm:latest");
+    let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
+
+    // Stage the layout where the tag-path pull writes it: a digest-INDEPENDENT
+    // work dir (`<data_dir>/apps/<uuid>/fc/.pull/oci`), since the digest is not
+    // yet known for a tag ref.
+    let l0 = make_tar(&[("bin/server", b"elf")]);
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os": "linux",
+        "config": {"Entrypoint": ["/app/server"], "Env": ["PATH=/usr/bin"], "WorkingDir": "/app"},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
+    });
+    let pull_layout_dir = tmp
+        .path()
+        .join("apps")
+        .join(uuid)
+        .join("fc")
+        .join(".pull")
+        .join("oci");
+    std::fs::create_dir_all(&pull_layout_dir).unwrap();
+    write_min_oci_layout(&pull_layout_dir, &cfg, &[("sha256:l0", &l0)]);
+
+    // The immutable digest the build MUST derive + key the cache by.
+    let expected_digest = super::read_manifest_digest_from_layout(&pull_layout_dir).unwrap();
+    let target = super::cached_rootfs_path(tmp.path(), uuid, &expected_digest);
+
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    let target2 = target.clone();
+    let real = super::production_fc_build_runner();
+    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+        calls2.lock().unwrap().push(argv.clone());
+        let target3 = target2.clone();
+        let real = real.clone();
+        Box::pin(async move {
+            match argv.first().map(String::as_str) {
+                Some("mkfs.ext4") => {
+                    std::fs::create_dir_all(target3.parent().unwrap()).ok();
+                    if let Some(out) = argv.iter().find(|a| a.ends_with("rootfs.ext4")) {
+                        std::fs::write(out, b"\0").unwrap();
+                    }
+                    (true, Vec::new())
+                }
+                Some("oras") => (true, Vec::new()), // pull no-op; layout pre-staged
+                _ => (real)(argv).await,            // real host tar for the unpack
+            }
+        })
+    });
+
+    // Tag ref must NOT bail; the boot at the end errors (no KVM) — irrelevant to
+    // the digest-derivation assertion below.
+    let _ = super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    // It pulled the layout (oras) for the tag ref instead of bailing.
+    assert!(
+        recorded
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("oras")),
+        "tag ref must trigger an oras layout pull; got {recorded:?}"
+    );
+    // The conversion ran and wrote the rootfs to the DIGEST-keyed path.
+    let mkfs = recorded
+        .iter()
+        .find(|c| c.first().map(String::as_str) == Some("mkfs.ext4"))
+        .expect("tag ref must reach conversion (mkfs.ext4), not bail");
+    let sanitized = expected_digest.replace(':', "-");
+    assert!(
+        mkfs.iter().any(|a| a.contains(&sanitized)),
+        "rootfs must be keyed by the DERIVED immutable digest {sanitized:?} (fc-3); got {mkfs:?}"
+    );
+    assert!(
+        target.is_file(),
+        "the digest-keyed rootfs must be produced at {target:?}"
     );
 }

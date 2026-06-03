@@ -372,6 +372,18 @@ pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str) -> bool {
     cached_rootfs_path(data_dir, uuid, digest).is_file()
 }
 
+/// The digest-keyed work dir for a digest `registry_ref` — the parent of
+/// [`cached_rootfs_path`], i.e. where the OCI layout is pulled and the converted
+/// `rootfs.ext4` lands. Only valid once the digest is known (digest refs); a TAG
+/// ref pulls into a digest-INDEPENDENT `.pull` dir first (see
+/// [`run_firecracker_build`]).
+fn digest_work_dir(data_dir: &Path, uuid: &str, digest: &str) -> Result<PathBuf> {
+    Ok(cached_rootfs_path(data_dir, uuid, digest)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
+        .to_path_buf())
+}
+
 /// The exec-form entrypoint distilled from an OCI image config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OciExec {
@@ -586,14 +598,7 @@ pub async fn resolve_rootfs(
 /// # Errors
 /// Missing/garbled `index.json`, no image manifest, or an unreadable blob.
 fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageConfiguration> {
-    let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
-        .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
-    let man_desc = index
-        .manifests()
-        .iter()
-        .find(|d| matches!(d.media_type(), oci_spec::image::MediaType::ImageManifest))
-        .or_else(|| index.manifests().first())
-        .ok_or_else(|| anyhow::anyhow!("OCI index.json has no image manifest descriptor"))?;
+    let man_desc = read_manifest_descriptor_from_layout(layout)?;
     let manifest = oci_spec::image::ImageManifest::from_file(blob_path(layout, man_desc.digest()))
         .context("read OCI image manifest blob")?;
     let cfg = oci_spec::image::ImageConfiguration::from_file(blob_path(
@@ -602,6 +607,45 @@ fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageCo
     ))
     .context("read OCI image config blob")?;
     Ok(cfg)
+}
+
+/// Resolve `<layout>/index.json` → the first image-manifest descriptor. Shared
+/// by [`read_oci_config_from_layout`] (which then reads the manifest+config
+/// blobs) and [`read_manifest_digest_from_layout`] (which only needs the
+/// descriptor's digest) so the index-parsing rule lives in ONE place (DRY).
+///
+/// # Errors
+/// Missing/garbled `index.json` or an index with no manifest descriptor.
+fn read_manifest_descriptor_from_layout(
+    layout: &Path,
+) -> Result<oci_spec::image::Descriptor> {
+    let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
+        .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
+    index
+        .manifests()
+        .iter()
+        .find(|d| matches!(d.media_type(), oci_spec::image::MediaType::ImageManifest))
+        .or_else(|| index.manifests().first())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("OCI index.json has no image manifest descriptor"))
+}
+
+/// Derive the IMMUTABLE image digest (`sha256:…`) from a pulled OCI layout:
+/// `index.json → manifests[0].digest`. This is the content-addressed digest of
+/// the image manifest blob, i.e. the same digest a registry resolves a TAG to.
+///
+/// Used by [`run_firecracker_build`] for a TAG `registry_ref` (no `@<digest>`):
+/// the digest is unknown until the layout is pulled, so we pull first and read
+/// the digest from the layout — then key the rootfs cache by it (fc-3). The
+/// descriptor resolved here is the SAME one [`read_oci_config_from_layout`]
+/// walks for the config blob, so the cache key and the converted config agree.
+///
+/// # Errors
+/// Missing/garbled `index.json` or an index with no manifest descriptor.
+fn read_manifest_digest_from_layout(layout: &Path) -> Result<String> {
+    Ok(read_manifest_descriptor_from_layout(layout)?
+        .digest()
+        .to_string())
 }
 
 /// `blobs/<alg>/<hex>` path for a content-addressed [`oci_spec::image::Digest`].
@@ -995,7 +1039,6 @@ pub async fn run_firecracker_build(
     data_dir: &Path,
     runner: &FcBuildRunner,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
-    // The deployed image ref carries the immutable digest after the `@`.
     let reff = fetched
         .manifest
         .runtime
@@ -1004,25 +1047,45 @@ pub async fn run_firecracker_build(
         .ok_or_else(|| {
             anyhow::anyhow!("firecracker runtime requires a registry_ref (image to convert)")
         })?;
-    let digest = reff.rsplit_once('@').map(|(_, d)| d).ok_or_else(|| {
-        anyhow::anyhow!(
-            "registry_ref {reff:?} has no @<digest>; need an immutable digest for the rootfs cache"
-        )
-    })?;
 
-    let rootfs = if rootfs_is_cached(data_dir, uuid, digest) {
-        cached_rootfs_path(data_dir, uuid, digest)
+    // Two ref shapes, both keyed by the IMMUTABLE digest (fc-3):
+    //
+    //   1. `…@sha256:…` (digest ref) — the digest is known up front, so we take
+    //      the FAST path: a cache hit skips the pull entirely; a miss pulls into
+    //      the digest-keyed work dir (where the rootfs already lives).
+    //
+    //   2. `…:tag` (tag ref) — the immutable digest is UNKNOWN until pulled. The
+    //      automated build pipeline deploys tag refs, so bailing here was the #1
+    //      e2e blocker. Pull into a digest-INDEPENDENT work dir, DERIVE the digest
+    //      from the layout's `index.json` (`manifests[0].digest`), then convert
+    //      keyed by THAT digest — preserving the digest-keyed cache guarantee.
+    //
+    // DOCKER-LESS throughout: pull = `oras copy --to-oci-layout`, config read FROM
+    // the layout. No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
+    let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
+        if rootfs_is_cached(data_dir, uuid, digest) {
+            cached_rootfs_path(data_dir, uuid, digest)
+        } else {
+            // The layout lands under the digest-keyed work dir (= the rootfs dir).
+            let work = digest_work_dir(data_dir, uuid, digest)?;
+            let layout = pull_oci_layout(reff, &work, runner).await?;
+            let config = read_oci_config_from_layout(&layout)?;
+            resolve_rootfs(uuid, fetched, &layout, &config, digest, data_dir, runner).await?
+        }
     } else {
-        // DOCKER-LESS: pull the image as an OCI layout, read its config from the
-        // layout, then convert. The layout lands under the digest-keyed work dir.
-        // No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
-        let work = cached_rootfs_path(data_dir, uuid, digest)
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
-            .to_path_buf();
+        // Tag ref: pull into a digest-INDEPENDENT `.pull` work dir (the digest is
+        // not yet known). `oras copy` resolves the tag, so the pull works without
+        // the digest; we then read the digest from the resulting layout and the
+        // digest-keyed `resolve_rootfs` writes the rootfs to its own digest dir.
+        let work = data_dir.join("apps").join(uuid).join("fc").join(".pull");
         let layout = pull_oci_layout(reff, &work, runner).await?;
-        let config = read_oci_config_from_layout(&layout)?;
-        resolve_rootfs(uuid, fetched, &layout, &config, digest, data_dir, runner).await?
+        let digest = read_manifest_digest_from_layout(&layout)?;
+        if rootfs_is_cached(data_dir, uuid, &digest) {
+            cached_rootfs_path(data_dir, uuid, &digest)
+        } else {
+            let config = read_oci_config_from_layout(&layout)?;
+            resolve_rootfs(uuid, fetched, &layout, &config, &digest, data_dir, runner).await?
+        }
     };
 
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
