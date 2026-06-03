@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use crate::config::{DockerConfig, FcConfig};
-use crate::docker::DockerRuntime;
 use crate::fetcher::FetchedApp;
 use crate::runtime::AppRuntime;
 
@@ -16,12 +15,13 @@ use crate::runtime::AppRuntime;
 /// otherwise `manifest.runtime.type`:
 /// - `firecracker` → KVM-gated [`FirecrackerRuntime`](crate::firecracker::FirecrackerRuntime)
 ///   microVM (errors clearly on non-Linux / no `/dev/kvm`)
-/// - `docker`      → [`DockerRuntime`] container built from the cached context
-///   tarball (errors if no Docker daemon)
-/// - anything else → hard error (no silent fallback). The in-process WASM
-///   runtime was removed (the platform serves a single FC-from-image runtime),
-///   so the frozen `wasm-http` wire string now falls into this hard-error arm
-///   until the runtime enum is collapsed cross-repo.
+/// - anything else → hard error (no silent fallback). The in-process WASM and
+///   the `docker run` EXECUTION runtimes were both removed (the platform serves
+///   a single FC-from-image runtime: an OCI image is converted to ext4 and
+///   booted as a microVM). The frozen `docker` / `wasm-http` wire strings now
+///   fall into this hard-error arm until the runtime enum is collapsed
+///   cross-repo. Docker survives only as the BUILD backend (`docker build` +
+///   skopeo push), not as a way to RUN apps.
 ///
 /// `runtime_override` is the D4 wire string (`docker` | `firecracker` |
 /// `wasm-http`); `None` ⇒ the manifest default is used (D10).
@@ -30,14 +30,19 @@ use crate::runtime::AppRuntime;
 /// `data_dir` is the local cache root used to write / read the fc pidfile.
 ///
 /// # Errors
-/// A firecracker launch failure (no KVM / non-Linux / boot failure), a docker
-/// launch failure (no daemon / build / run failure), or an unknown runtime type.
+/// A firecracker launch failure (no KVM / non-Linux / boot failure), or an
+/// unknown runtime type (`docker` / `wasm-http` are no longer executable
+/// runtimes and hit the hard-error arm).
 pub async fn build_runtime(
     runtime_override: Option<&str>,
     uuid: &str,
     fetched: &FetchedApp,
     fc: &FcConfig,
-    docker: &DockerConfig,
+    // Retained for the call-site signature; the docker RUN runtime was removed,
+    // so the builder no longer reads it. Docker now only BUILDS images
+    // (build_backend + skopeo), it does not run apps. Dropped fully when the
+    // runtime enum is collapsed cross-repo.
+    _docker: &DockerConfig,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     let rt = &fetched.manifest.runtime;
@@ -55,19 +60,6 @@ pub async fn build_runtime(
                 uuid, fetched, fc, data_dir, &runner,
             )
             .await
-        }
-        "docker" => {
-            // Registry-pull is docker-only; wasm uses oras (above).
-            let container = DockerRuntime::launch_with_id(
-                &fetched.cached_path,
-                rt,
-                docker,
-                uuid,
-                fetched.version,
-                rt.registry_ref.as_deref(),
-            )
-            .await?;
-            Ok(Arc::new(container))
         }
         other => anyhow::bail!("unknown runtime type: {other}"),
     }
@@ -95,16 +87,13 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
 /// therefore runs the deployed image directly via `docker pull <reff>` instead of
 /// erroring on the (absent) S3 fetch.
 ///
-/// The runtime is `docker` with `registry_ref = Some(reff)`, so `build_runtime`
-/// pulls + tags the image from the registry rather than building from source. The
-/// container port the runner proxies to is taken from [`DockerConfig::app_port`]
-/// (NOT the manifest — see [`crate::docker::runtime::rt_app_port`]), so no port
-/// needs to be carried here. `cached_path` is set relative (`apps/<uuid>/deployed/
-/// context.tar.gz`); [`resolve_fetched`] rebases it under the real data dir AND
-/// materializes a placeholder file there, because the docker launch precheck
-/// requires the build-context file to *exist* on disk even when the image is
-/// pulled by ref (the placeholder is never read — a successful pull makes the W2
-/// inspect skip `docker build`).
+/// The synthesized runtime type is `docker` with `registry_ref = Some(reff)`.
+/// NOTE: the docker RUN runtime has been removed, so until the runtime enum is
+/// collapsed cross-repo a `docker`-typed app reaches [`build_runtime`]'s
+/// hard-error arm; this synthesizer is retained as part of that interim seam.
+/// `cached_path` is set relative (`apps/<uuid>/deployed/context.tar.gz`);
+/// [`resolve_fetched`] rebases it under the real data dir AND materializes a
+/// placeholder file there.
 #[must_use]
 pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
     use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
