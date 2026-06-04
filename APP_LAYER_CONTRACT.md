@@ -523,8 +523,11 @@ Node-side selection semantics:
 - **Builder for `/v1/build`** — explicit hint wins (REST/MCP `builder` field,
   or `tabbify.toml [build].builder` = display name or ULA, no fallback);
   otherwise: `builder`-tagged peers (roster order) → `docker`-tagged peers →
-  legacy first-in-roster (untagged dev fleets). The pipeline retries the next
-  candidate on build failure (bounded: 3 attempts).
+  legacy first-in-roster (untagged dev fleets). The pipeline fails over to
+  the next candidate ONLY when a builder is UNREACHABLE at the transport
+  level (bounded: 3 attempts) — an HTTP error means the build ran and
+  failed (deterministic, e.g. a broken Dockerfile) and is surfaced as-is,
+  never re-run on another host.
 - **Default deploy fan-out** (no explicit `targets`) — only
   `firecracker`-tagged supervisors. A roster where capability tags exist but
   nobody can RUN is a loud error, not a silent half-failed fan-out. A fully
