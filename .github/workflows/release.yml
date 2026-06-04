@@ -56,6 +56,15 @@ on:
     tags:
       - "v*"
 
+# Serialize release runs: two concurrent SSM redeploys raced docker
+# compose mid-recreate on the serving box (2026-06-04: containers left
+# Created-but-not-started, public API 504 until manual compose up).
+# One release at a time; a newer queued run supersedes an older queued
+# one (latest wins), the RUNNING one is never cancelled mid-deploy.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -192,28 +201,6 @@ jobs:
           aws s3 cp scripts/install.sh \
             "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/install" \
             --content-type text/x-shellscript
-
-      - name: Publish supervisor/latest manifest (x86_64 leader)
-        # Compute sha256 of the just-uploaded binaries + write the sibling
-        # `latest` manifest. Run once (x86_64) so a single source of truth lists
-        # both binaries' checksums.
-        # TAG-PUSH ONLY: a push to `main` derives SEMVER from Cargo.toml, so if a
-        # tag was cut without bumping Cargo.toml the main run would CLOBBER `latest`
-        # back to the stale Cargo.toml version (this is exactly what pinned `latest`
-        # at v1.4.10 while v1.4.11/v1.4.12 tags shipped). Only a real `v*` tag — the
-        # deliberate release act — publishes `latest`.
-        if: matrix.arch == 'x86_64' && github.ref_type == 'tag'
-        run: |
-          set -euo pipefail
-          V="v${{ steps.ver.outputs.semver }}"
-          SUP_SHA="$(sha256sum target/${{ matrix.target }}/release/supervisord | awk '{print $1}')"
-          RUN_SHA="$(sha256sum target/${{ matrix.target }}/release/tabbify-runner | awk '{print $1}')"
-          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cat > /tmp/latest.json <<EOF
-          {"latest":"${V}","versions":["${V}"],"sha256":{"supervisord":"${SUP_SHA}","tabbify-runner":"${RUN_SHA}"},"ts":"${TS}"}
-          EOF
-          jq -e . /tmp/latest.json > /dev/null   # fail the build on malformed JSON
-          aws s3 cp /tmp/latest.json "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/latest" --content-type application/json
 
       - name: Upload supervisord to S3 (legacy un-prefixed key)
         # Only x86_64 sets legacy_key. Keeps the pre-existing
@@ -365,6 +352,53 @@ jobs:
   # After both per-arch images are pushed, stitch them into one multi-arch
   # `:latest` manifest so `docker run ghcr.io/tabbify-io/tabbify-supervisor`
   # pulls the right arch automatically.
+  # `latest` is published ONLY after BOTH arch legs uploaded their versioned
+  # binaries (needs: the whole matrix) — otherwise an aarch64 host installing
+  # in the release window resolves `latest` and 404s on its binary. The job
+  # re-downloads the uploaded binaries to hash them, and publishes BOTH the
+  # plain keys (x86_64 — the historical shape every deployed engine reads)
+  # and `<bin>_aarch64` keys (read by arch-aware engines + the installer).
+  # TAG-PUSH ONLY: a main push must never move `latest` (see the v1.4.10
+  # clobber incident).
+  publish-latest:
+    needs: build-and-release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Publish supervisor/latest manifest (all arches present)
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME}"
+          BUCKET="${{ vars.RELEASE_S3_BUCKET }}"
+          mkdir -p /tmp/rel
+          for arch in x86_64 aarch64; do
+            for bin in supervisord tabbify-runner; do
+              aws s3 cp "s3://${BUCKET}/supervisor/${V}/${arch}/${bin}" "/tmp/rel/${bin}.${arch}"
+            done
+          done
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -nc \
+            --arg v "$V" --arg ts "$TS" \
+            --arg sup_x   "$(sha256sum /tmp/rel/supervisord.x86_64     | cut -d' ' -f1)" \
+            --arg run_x   "$(sha256sum /tmp/rel/tabbify-runner.x86_64  | cut -d' ' -f1)" \
+            --arg sup_a   "$(sha256sum /tmp/rel/supervisord.aarch64    | cut -d' ' -f1)" \
+            --arg run_a   "$(sha256sum /tmp/rel/tabbify-runner.aarch64 | cut -d' ' -f1)" \
+            '{latest:$v, versions:[$v],
+              sha256:{supervisord:$sup_x, "tabbify-runner":$run_x,
+                      supervisord_aarch64:$sup_a, "tabbify-runner_aarch64":$run_a},
+              ts:$ts}' > /tmp/latest.json
+          aws s3 cp /tmp/latest.json "s3://${BUCKET}/supervisor/latest" --content-type application/json
+          echo "published:"; cat /tmp/latest.json
+
   publish-image-manifest:
     needs: build-and-release
     runs-on: ubuntu-latest

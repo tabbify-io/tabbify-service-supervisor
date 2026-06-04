@@ -269,7 +269,10 @@ mod tests {
         let sup = dir.join("supervisord");
         std::fs::write(&sup, b"sup").unwrap();
         std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(!release_is_complete(&dir), "non-executable binary must be rejected");
+        assert!(
+            !release_is_complete(&dir),
+            "non-executable binary must be rejected"
+        );
 
         // Both present and executable: complete.
         std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -368,10 +371,7 @@ mod tests {
                 format!("v2-{bin}").into_bytes(),
                 "{bin} symlink must point at the new version dir",
             );
-            assert_eq!(
-                std::fs::read_link(install.join(bin)).unwrap(),
-                v2.join(bin),
-            );
+            assert_eq!(std::fs::read_link(install.join(bin)).unwrap(), v2.join(bin),);
         }
 
         // VERSION ledger: new current, old current promoted to previous.
@@ -434,7 +434,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_version_file(install).unwrap().pending_confirm.as_deref(),
+            read_version_file(install)
+                .unwrap()
+                .pending_confirm
+                .as_deref(),
             Some("v2.0.0"),
         );
 

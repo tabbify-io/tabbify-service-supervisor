@@ -138,8 +138,7 @@ impl SelfUpdateConfig {
     ) -> Self {
         let install_dir =
             install_dir.map_or_else(|| PathBuf::from(DEFAULT_INSTALL_DIR), PathBuf::from);
-        let releases_dir =
-            releases_dir.map_or_else(|| install_dir.join("releases"), PathBuf::from);
+        let releases_dir = releases_dir.map_or_else(|| install_dir.join("releases"), PathBuf::from);
         Self {
             release_base_url: release_base_url
                 .unwrap_or_else(|| DEFAULT_RELEASE_BASE_URL.to_owned()),
@@ -214,7 +213,10 @@ mod tests {
         let cfg = SelfUpdateConfig::from_locations(None, None, None);
         assert_eq!(cfg.release_base_url, DEFAULT_RELEASE_BASE_URL);
         assert_eq!(cfg.install_dir, PathBuf::from(DEFAULT_INSTALL_DIR));
-        assert_eq!(cfg.releases_dir, PathBuf::from(DEFAULT_INSTALL_DIR).join("releases"));
+        assert_eq!(
+            cfg.releases_dir,
+            PathBuf::from(DEFAULT_INSTALL_DIR).join("releases")
+        );
         assert_eq!(
             cfg.candidate_identity_path,
             PathBuf::from(DEFAULT_INSTALL_DIR).join("candidate-identity.json"),

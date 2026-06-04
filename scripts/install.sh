@@ -75,10 +75,17 @@ fetch_bin() {
   log "downloading $name $VER"
   curl -fSL -o "$REL/$name.tmp" "$BASE/supervisor/$VER/$ARCH/$name" \
     || die "download failed: $BASE/supervisor/$VER/$ARCH/$name"
-  if [ "$ARCH" = x86_64 ]; then
-    want=$(printf '%s' "$MANIFEST" | grep -o "\"$name\":\"[a-f0-9]*\"" | cut -d'"' -f4)
+  # Per-arch manifest key (`<bin>_aarch64`); the plain key holds the x86_64
+  # hash. Older manifests carry no aarch64 hash — skip with a warning rather
+  # than failing the install (HTTPS + bucket trust still applies).
+  KEY="$name"
+  [ "$ARCH" = aarch64 ] && KEY="${name}_aarch64"
+  want=$(printf '%s' "$MANIFEST" | grep -o "\"$KEY\":[[:space:]]*\"[a-f0-9]*\"" | grep -o '[a-f0-9]\{64\}') || true
+  if [ -n "$want" ]; then
     got=$(sha256sum "$REL/$name.tmp" | cut -d' ' -f1)
     [ "$want" = "$got" ] || die "$name sha256 mismatch (manifest $want, downloaded $got)"
+  else
+    warn "manifest carries no $ARCH sha256 for $name (older release) — skipping verification"
   fi
   chmod +x "$REL/$name.tmp"
   mv "$REL/$name.tmp" "$REL/$name"

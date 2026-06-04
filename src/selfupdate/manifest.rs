@@ -35,7 +35,9 @@ mod tests {
         "versions": ["v1.4.0", "v1.3.0"],
         "sha256": {
             "supervisord": "aabbccdd",
-            "tabbify-runner": "11223344"
+            "tabbify-runner": "11223344",
+            "supervisord_aarch64": "eeff0011",
+            "tabbify-runner_aarch64": "22334455"
         },
         "ts": "2026-05-30T00:00:00Z"
     }"#;
@@ -47,6 +49,10 @@ mod tests {
         assert_eq!(m.versions.len(), 2);
         assert_eq!(m.sha256_for("supervisord"), Some("aabbccdd"));
         assert_eq!(m.sha256_for("tabbify-runner"), Some("11223344"));
+        // Per-arch keys (published by the dependent-job manifest) are plain
+        // map entries — the fetcher tries `<bin>_<arch>` before `<bin>`.
+        assert_eq!(m.sha256_for("supervisord_aarch64"), Some("eeff0011"));
+        assert_eq!(m.sha256_for("supervisord_x86_64"), None);
         assert_eq!(m.sha256_for("nope"), None);
     }
 }

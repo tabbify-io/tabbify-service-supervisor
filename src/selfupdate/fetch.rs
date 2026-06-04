@@ -69,15 +69,21 @@ impl VersionFetcher {
     pub async fn fetch_version(&self, version: &str) -> Result<PathBuf> {
         let manifest = self.fetch_manifest().await?;
         let dir = self.version_dir(version);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create release dir {dir:?}"))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("create release dir {dir:?}"))?;
 
         for bin in BINARIES {
             let url = format!("{}/supervisor/{version}/{}/{bin}", self.base_url, self.arch);
             let bytes = self.get_bytes(&url).await?;
 
+            // Per-arch hash first (`<bin>_<arch>`, published since the
+            // dependent-job manifest), then the plain key — which holds the
+            // x86_64 leader's hash, the correct value for x86_64 hosts and
+            // the historical manifest shape. Without the arch-suffixed
+            // lookup an aarch64 host compared its download against the
+            // x86_64 hash and could never self-update.
             let expected = manifest
-                .sha256_for(bin)
+                .sha256_for(&format!("{bin}_{}", self.arch))
+                .or_else(|| manifest.sha256_for(bin))
                 .with_context(|| format!("manifest has no sha256 for {bin}"))?;
             let actual = hex_sha256(&bytes);
             if actual != expected {

@@ -140,7 +140,10 @@ pub async fn revert_to_previous(
     .context("write VERSION after rollback")?;
 
     if !restart(vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]).await {
-        tracing::warn!(unit = SUPERVISOR_UNIT, "rollback restart trigger reported failure");
+        tracing::warn!(
+            unit = SUPERVISOR_UNIT,
+            "rollback restart trigger reported failure"
+        );
     }
     Ok(previous)
 }
@@ -321,7 +324,9 @@ mod tests {
         .unwrap();
 
         let (restart, calls) = recording_restart();
-        let rolled_back = revert_to_previous(install, &releases, &restart).await.unwrap();
+        let rolled_back = revert_to_previous(install, &releases, &restart)
+            .await
+            .unwrap();
         assert_eq!(rolled_back, "v1.0.0");
 
         // Symlinks now resolve to the previous-good binaries.
@@ -400,7 +405,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(kept, None, "healthy window must keep the new version");
-        assert!(calls.lock().unwrap().is_empty(), "no rollback restart expected");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no rollback restart expected"
+        );
     }
 
     /// run_watchdog rolls back to previous-good the moment an unhealthy poll is
@@ -452,7 +460,11 @@ mod tests {
 
         assert_eq!(rolled_back, Some("v1.0.0".to_owned()));
         assert_eq!(read_version_file(install).unwrap().current, "v1.0.0");
-        assert_eq!(calls.lock().unwrap().len(), 1, "rollback triggers one restart");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "rollback triggers one restart"
+        );
     }
 
     /// I3: a failing observation reverts PROMPTLY — on the very first poll tick
@@ -517,7 +529,11 @@ mod tests {
             1,
             "revert must fire on the FIRST failing observation, not wait for the window",
         );
-        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one rollback restart");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "exactly one rollback restart"
+        );
     }
 
     /// A crash-loop seen on the first tick (mid-window) reverts immediately via
@@ -664,7 +680,10 @@ mod tests {
         let vf = read_version_file(install).unwrap();
         assert_eq!(vf.current, "v2.0.0");
         assert_eq!(vf.previous, vec!["v1.0.0".to_owned()]);
-        assert!(calls.lock().unwrap().is_empty(), "no restart on failed rollback");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no restart on failed rollback"
+        );
     }
 
     /// When the newest previous entry is incomplete but an older one is fully
@@ -692,7 +711,9 @@ mod tests {
         .unwrap();
 
         let (restart, calls) = recording_restart();
-        let rolled_back = revert_to_previous(install, &releases, &restart).await.unwrap();
+        let rolled_back = revert_to_previous(install, &releases, &restart)
+            .await
+            .unwrap();
         assert_eq!(rolled_back, "v1.0.0", "must skip incomplete v1.5.0");
 
         // Symlinks resolve to the live v1.0.0 binaries (and are not dangling).
@@ -708,6 +729,10 @@ mod tests {
         let vf = read_version_file(install).unwrap();
         assert_eq!(vf.current, "v1.0.0");
         assert!(vf.previous.is_empty());
-        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one restart on success");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "exactly one restart on success"
+        );
     }
 }

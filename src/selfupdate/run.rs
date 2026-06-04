@@ -172,7 +172,10 @@ pub async fn self_update_to(
     if !restart(vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]).await {
         // A failed restart trigger is NOT fatal: the post-restart watchdog (or
         // systemd's own restart policy) will observe liveness. Log and proceed.
-        tracing::warn!(unit = SUPERVISOR_UNIT, "self-update restart trigger reported failure");
+        tracing::warn!(
+            unit = SUPERVISOR_UNIT,
+            "self-update restart trigger reported failure"
+        );
     }
 
     Ok(SelfUpdateOutcome::Swapped(version.to_owned()))
@@ -240,11 +243,7 @@ mod tests {
     /// Stand up a mock release server serving `supervisor/latest` + the two
     /// versioned binaries for `version`, and return a `SelfUpdateConfig` wired to
     /// it with `install_dir`/`releases_dir` under `tmp`.
-    async fn mock_release(
-        tmp: &Path,
-        version: &str,
-        arch: &str,
-    ) -> (MockServer, SelfUpdateConfig) {
+    async fn mock_release(tmp: &Path, version: &str, arch: &str) -> (MockServer, SelfUpdateConfig) {
         let server = MockServer::start().await;
         let sup = format!("FAKE-supervisord-{version}").into_bytes();
         let run = format!("FAKE-runner-{version}").into_bytes();
@@ -401,13 +400,15 @@ mod tests {
         let probe: CandidateProbe = Box::new(|_b, _i, _t| {
             Box::pin(async { panic!("probe must not run for a no-op update") })
         });
-        let restart: RestartRunner = Arc::new(|_args| {
-            Box::pin(async { panic!("restart must not run for a no-op update") })
-        });
+        let restart: RestartRunner =
+            Arc::new(|_args| Box::pin(async { panic!("restart must not run for a no-op update") }));
 
         let outcome = self_update_to("v9.9.9", &cfg, &probe, &restart)
             .await
             .unwrap();
-        assert_eq!(outcome, SelfUpdateOutcome::AlreadyCurrent("v9.9.9".to_owned()));
+        assert_eq!(
+            outcome,
+            SelfUpdateOutcome::AlreadyCurrent("v9.9.9".to_owned())
+        );
     }
 }
