@@ -168,12 +168,30 @@ jobs:
           echo "semver=${SEMVER}" >> "$GITHUB_OUTPUT"
 
       - name: Upload versioned binaries to S3
+        # TAG-PUSH ONLY: a main push derives SEMVER from Cargo.toml, so an
+        # unbumped main commit would silently OVERWRITE the already-released
+        # supervisor/v<SEMVER>/<arch>/ binaries with different bytes while
+        # `latest` keeps the original sha256 — every fresh install then dies
+        # on "sha256 mismatch". Versioned keys are immutable per tag.
+        if: github.ref_type == 'tag'
         run: |
           set -euo pipefail
           V="v${{ steps.ver.outputs.semver }}"
           BASE="s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/${V}/${{ matrix.arch }}"
           aws s3 cp "target/${{ matrix.target }}/release/supervisord"    "${BASE}/supervisord"
           aws s3 cp "target/${{ matrix.target }}/release/tabbify-runner" "${BASE}/tabbify-runner"
+
+      - name: Upload the one-command installer
+        # The installer resolves `latest` at run time, so it is version-
+        # independent — refreshed on every push (not gated on tags). One
+        # command on a clean systemd host:
+        #   curl -fsSL <bucket>/supervisor/install | sudo sh
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          aws s3 cp scripts/install.sh \
+            "s3://${{ vars.RELEASE_S3_BUCKET }}/supervisor/install" \
+            --content-type text/x-shellscript
 
       - name: Publish supervisor/latest manifest (x86_64 leader)
         # Compute sha256 of the just-uploaded binaries + write the sibling
