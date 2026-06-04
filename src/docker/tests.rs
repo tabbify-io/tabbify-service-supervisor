@@ -211,11 +211,19 @@ async fn run_docker_build_bails_with_push_stderr() {
     let dir = tempfile::tempdir().unwrap();
 
     // Clone creates the src dir + a Dockerfile so the docker path proceeds.
+    // Only the `git init -q <dest>` step carries the dest as its last arg —
+    // the later steps end with the repo URL / git ref / `FETCH_HEAD`, and a
+    // fake that mistook those for dests used to litter the crate root with
+    // `FETCH_HEAD/`, `abc123/`, `https:/…` dirs on every test run.
     let git: GitRun = Arc::new(move |args: Vec<String>, _env| {
-        let dest = args.last().cloned().unwrap_or_default();
+        let dest = (args.first().map(String::as_str) == Some("init"))
+            .then(|| args.last().cloned())
+            .flatten();
         Box::pin(async move {
-            std::fs::create_dir_all(&dest).ok();
-            std::fs::write(format!("{dest}/Dockerfile"), "FROM scratch\n").unwrap();
+            if let Some(dest) = dest {
+                std::fs::create_dir_all(&dest).ok();
+                std::fs::write(format!("{dest}/Dockerfile"), "FROM scratch\n").unwrap();
+            }
             Ok(())
         })
     });
