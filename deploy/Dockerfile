@@ -21,9 +21,12 @@ FROM debian:trixie-slim
 
 # docker CLI ONLY (client; talks to a mounted host socket — no daemon in-image).
 # oras CLI for pulling WASM OCI artifacts from the mesh registry (plain-http over WG).
-# skopeo for the docker build push: copies the built image from the docker daemon
-# straight to the mesh registry (`skopeo copy docker-daemon:<tag>:latest
-# docker://<ref>`), run supervisor-side so the daemon never needs a mesh route.
+# skopeo + oras for the docker build push (TWO steps, supervisor-side so the
+# daemon never needs a mesh route): skopeo copies the built image out of the
+# docker daemon into an OCI layout (local transports — skopeo cannot parse the
+# registry's bracketed-IPv6 ref on ANY version), then oras pushes the layout
+# to the mesh registry (oras parses such refs; same binary the run side pulls
+# with).
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG DOCKER_ARCH=aarch64
 # ORAS_ARCH uses the OCI-standard naming (amd64 / arm64).

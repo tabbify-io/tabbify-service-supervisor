@@ -232,10 +232,11 @@ async fn run_docker_build_bails_with_push_stderr() {
     let build_runner: super::CommandRunner = Arc::new(|_args| Box::pin(async { Ok(()) }));
     let backend = HostDockerBackend::with_runner("docker".to_owned(), build_runner);
 
-    // Skopeo push runner: the `skopeo copy` fails with the auth stderr.
+    // Tool runner (argv[0] = binary): the oras registry leg fails with the
+    // auth stderr; the skopeo daemon→layout leg succeeds.
     let skopeo_runner: super::CommandRunner = Arc::new(|args: Vec<String>| {
         let fut: BoxFut<'static, Result<(), String>> =
-            if args.first().map(String::as_str) == Some("copy") {
+            if args.first().map(String::as_str) == Some("oras") {
                 Box::pin(async { Err("unauthorized: authentication required".to_owned()) })
             } else {
                 Box::pin(async { Ok(()) })
@@ -256,7 +257,7 @@ async fn run_docker_build_bails_with_push_stderr() {
         artifact_path: None,
     };
 
-    let err = run_build(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+    let err = run_build(&job, &backend, &git, &skopeo_runner, "skopeo", "oras", dir.path())
         .await
         .expect_err("push failure → run_build must bail")
         .to_string();

@@ -23,8 +23,9 @@ use crate::docker::CommandRunner;
 pub(super) async fn run_docker_build(
     job: &BuildJob,
     backend: &dyn BuildBackend,
-    skopeo_runner: &CommandRunner,
+    tool_runner: &CommandRunner,
     skopeo_bin: &str,
+    oras_bin: &str,
     src: &Path,
     reff: String,
 ) -> anyhow::Result<ArtifactRef> {
@@ -44,13 +45,30 @@ pub(super) async fn run_docker_build(
         .await
         .context("build image")?;
 
-    // Push to the mesh registry via the supervisor-side skopeo (the docker
-    // daemon has no mesh route; skopeo runs in the supervisor's mesh-routed
-    // netns and copies the built image straight from the daemon to the registry).
-    // On failure bail with the captured registry stderr (e.g. `unauthorized:
-    // authentication required`) so the diagnostic survives instead of being
-    // collapsed to just the image ref.
-    if let Err(e) = crate::skopeo::skopeo_push(skopeo_bin, &local_tag, &reff, skopeo_runner).await {
+    // Push to the mesh registry in TWO supervisor-side steps: skopeo copies
+    // the built image out of the docker daemon into an OCI layout (local
+    // transports only — skopeo cannot parse the registry's bracketed-IPv6
+    // ref), then oras pushes the layout to the registry (oras parses such
+    // refs; the run-side pulls with the same form). The docker daemon never
+    // needs a mesh route. On failure bail with the captured stderr (e.g.
+    // `unauthorized`) so the diagnostic survives instead of being collapsed
+    // to just the image ref.
+    let layout_dir = src
+        .parent()
+        .unwrap_or(src)
+        .join("oci-out")
+        .to_string_lossy()
+        .into_owned();
+    if let Err(e) = crate::skopeo::push_to_registry(
+        skopeo_bin,
+        oras_bin,
+        &local_tag,
+        &reff,
+        &layout_dir,
+        tool_runner,
+    )
+    .await
+    {
         anyhow::bail!("push to registry failed: {reff}: {e}");
     }
 

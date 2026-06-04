@@ -112,8 +112,9 @@ pub async fn run_build(
     job: &BuildJob,
     backend: &dyn crate::build_backend::BuildBackend,
     git: &crate::git::GitRun,
-    skopeo_runner: &crate::docker::CommandRunner,
+    tool_runner: &crate::docker::CommandRunner,
     skopeo_bin: &str,
+    oras_bin: &str,
     workdir: &Path,
 ) -> anyhow::Result<ArtifactRef> {
     // 1. Clone into <workdir>/src.
@@ -136,7 +137,8 @@ pub async fn run_build(
 
     match job.build_kind {
         BuildKind::Docker => {
-            docker::run_docker_build(job, backend, skopeo_runner, skopeo_bin, &src, reff).await
+            docker::run_docker_build(job, backend, tool_runner, skopeo_bin, oras_bin, &src, reff)
+                .await
         }
     }
 }
@@ -163,10 +165,14 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
     // docker daemon — which has no mesh route — never talks to the registry.
     let skopeo_bin = std::env::var("SUPERVISOR_SKOPEO_BIN")
         .unwrap_or_else(|_| crate::config::DEFAULT_SKOPEO_BIN.to_owned());
+    // oras does the registry leg of the push (bracketed-IPv6-capable refs);
+    // same env override pattern as the run-side pull.
+    let oras_bin = std::env::var("SUPERVISOR_ORAS_BIN")
+        .unwrap_or_else(|_| crate::config::DEFAULT_ORAS_BIN.to_owned());
 
     let backend = crate::build_backend::HostDockerBackend::new(docker_bin.clone());
     let git = crate::git::real_git_run(git_bin);
-    let skopeo_runner = crate::skopeo::production_skopeo_runner(skopeo_bin.clone());
+    let tool_runner = crate::skopeo::production_tool_runner();
 
     // Work directory: a fresh sub-dir under a tempdir for this build.
     // Using tempdir keeps build artefacts off any persistent volume without
@@ -180,8 +186,9 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
         &job,
         &backend,
         &git,
-        &skopeo_runner,
+        &tool_runner,
         &skopeo_bin,
+        &oras_bin,
         workdir.path(),
     )
     .await

@@ -128,11 +128,11 @@ async fn run_docker_test(
     job: &BuildJob,
     backend: &dyn BuildBackend,
     git: &GitRun,
-    skopeo_runner: &CommandRunner,
+    tool_runner: &CommandRunner,
     skopeo_bin: &str,
     workdir: &Path,
 ) -> anyhow::Result<ArtifactRef> {
-    run_build(job, backend, git, skopeo_runner, skopeo_bin, workdir).await
+    run_build(job, backend, git, tool_runner, skopeo_bin, "oras", workdir).await
 }
 
 // ── serde round-trips ─────────────────────────────────────────────────────
@@ -200,22 +200,24 @@ async fn run_build_clones_builds_pushes_and_returns_ref() {
     );
     assert_eq!(tag, "tbf-build-u");
 
-    // skopeo runner must have been called with a `copy` argv that reads from
-    // the local docker daemon and writes the registry ref via docker://.
+    // The two-step push must be issued through the tool runner (argv[0] =
+    // binary): skopeo reads the built image out of the docker daemon into an
+    // OCI layout, then oras pushes the layout to the registry reff (skopeo
+    // cannot parse the bracketed-IPv6 registry ref).
     let cmds = pushed.lock().unwrap();
     assert!(
-        cmds.iter().any(|c| c.first() == Some(&"copy".to_string())),
-        "skopeo copy command must be issued; got {cmds:?}"
+        cmds.iter().any(|c| {
+            c.first() == Some(&"skopeo".to_string())
+                && c.contains(&"docker-daemon:tbf-build-u:latest".to_string())
+        }),
+        "skopeo daemon->layout step must be issued; got {cmds:?}"
     );
     assert!(
-        cmds.iter()
-            .any(|c| c.contains(&"docker-daemon:tbf-build-u:latest".to_string())),
-        "skopeo argv must read the built image from the local docker daemon; got {cmds:?}"
-    );
-    assert!(
-        cmds.iter()
-            .any(|c| c.contains(&"docker://[fd5a::1]:5000/acme/u:abc123".to_string())),
-        "skopeo argv must push to docker://<reff>; got {cmds:?}"
+        cmds.iter().any(|c| {
+            c.first() == Some(&"oras".to_string())
+                && c.contains(&"[fd5a::1]:5000/acme/u:abc123".to_string())
+        }),
+        "oras layout->registry step must push the reff; got {cmds:?}"
     );
 }
 
