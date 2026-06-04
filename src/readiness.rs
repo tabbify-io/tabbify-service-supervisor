@@ -143,7 +143,10 @@ mod tests {
         // A real send failure (e.g. under systemd with a broken socket) must be
         // swallowed: the function returns Failed, never panics, never propagates.
         let spy = SpyNotifier::new(|| {
-            Err(io::Error::new(io::ErrorKind::NotConnected, "no NOTIFY_SOCKET"))
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no NOTIFY_SOCKET",
+            ))
         });
         let outcome = emit_ready(&spy);
         assert_eq!(outcome, ReadyOutcome::Failed);

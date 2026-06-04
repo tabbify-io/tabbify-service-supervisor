@@ -26,8 +26,7 @@ pub(crate) fn write_min_oci_layout(
     config_json: &serde_json::Value,
     layers: &[(&str, &[u8])],
 ) -> std::path::PathBuf {
-    let typed: Vec<(&str, &[u8], &str)> =
-        layers.iter().map(|(d, b)| (*d, *b, MEDIA_TAR)).collect();
+    let typed: Vec<(&str, &[u8], &str)> = layers.iter().map(|(d, b)| (*d, *b, MEDIA_TAR)).collect();
     write_min_oci_layout_typed(dir, config_json, &typed)
 }
 

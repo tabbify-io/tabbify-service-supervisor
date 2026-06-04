@@ -613,10 +613,7 @@ impl AppRuntime for FirecrackerRuntime {
         // `host:port` (with the `http://` scheme stripped).
         #[cfg(test)]
         if let Some(probe) = self.probe.clone() {
-            let hp = self
-                .guest_base
-                .trim_start_matches("http://")
-                .to_owned();
+            let hp = self.guest_base.trim_start_matches("http://").to_owned();
             return Box::pin(async move {
                 if (probe)(&hp) {
                     RuntimeHealth::Serving
@@ -777,16 +774,69 @@ async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
     // head so they precede any docker-installed DROP/jump.
     let rules: [(Vec<&str>, Vec<&str>); 3] = [
         (
-            vec!["-t", "nat", "-C", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE"],
-            vec!["-t", "nat", "-A", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE"],
+            vec![
+                "-t",
+                "nat",
+                "-C",
+                "POSTROUTING",
+                "-s",
+                tap_subnet,
+                "-o",
+                &uplink,
+                "-j",
+                "MASQUERADE",
+            ],
+            vec![
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                tap_subnet,
+                "-o",
+                &uplink,
+                "-j",
+                "MASQUERADE",
+            ],
         ),
         (
-            vec!["-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
-            vec!["-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
+            vec![
+                "-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
+            ],
+            vec![
+                "-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
+            ],
         ),
         (
-            vec!["-C", "FORWARD", "-i", &uplink, "-o", tap_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-            vec!["-I", "FORWARD", "1", "-i", &uplink, "-o", tap_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+            vec![
+                "-C",
+                "FORWARD",
+                "-i",
+                &uplink,
+                "-o",
+                tap_name,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+            vec![
+                "-I",
+                "FORWARD",
+                "1",
+                "-i",
+                &uplink,
+                "-o",
+                tap_name,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
         ),
     ];
     for (check, add) in &rules {

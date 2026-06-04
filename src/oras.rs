@@ -68,8 +68,14 @@ mod tests {
             args.contains(&"--to-oci-layout".to_owned()),
             "must copy into an OCI layout; got {args:?}"
         );
-        assert!(args.contains(&reff.to_owned()), "must carry the ref; got {args:?}");
-        assert!(args.contains(&dir.to_owned()), "must carry the layout dir; got {args:?}");
+        assert!(
+            args.contains(&reff.to_owned()),
+            "must carry the ref; got {args:?}"
+        );
+        assert!(
+            args.contains(&dir.to_owned()),
+            "must carry the layout dir; got {args:?}"
+        );
         assert!(
             !args.contains(&"-o".to_owned()) && !args.contains(&"pull".to_owned()),
             "must NOT be the empty-layout `oras pull -o` form; got {args:?}"

@@ -140,7 +140,10 @@ mod tests {
             requested_runtime: Some("docker".to_owned()),
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"requested_runtime\":\"docker\""), "got: {json}");
+        assert!(
+            json.contains("\"requested_runtime\":\"docker\""),
+            "got: {json}"
+        );
     }
 
     #[test]

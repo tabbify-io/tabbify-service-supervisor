@@ -73,7 +73,11 @@ mod tests {
         // LENIENT-COERCE: legacy wire strings all deserialize to Firecracker.
         for legacy in ["docker", "wasm-http", "node-firecracker"] {
             let back: Runtime = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
-            assert_eq!(back, Runtime::Firecracker, "legacy string {legacy} must coerce");
+            assert_eq!(
+                back,
+                Runtime::Firecracker,
+                "legacy string {legacy} must coerce"
+            );
         }
     }
 

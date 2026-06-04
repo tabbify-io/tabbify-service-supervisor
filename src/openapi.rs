@@ -54,7 +54,7 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         BuildJob,
         BuildKind,
         ArtifactRef,
-    )),
+    ))
 )]
 pub struct ApiDoc;
 

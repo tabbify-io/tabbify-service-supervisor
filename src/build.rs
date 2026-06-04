@@ -300,10 +300,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = docker_fetched(None);
         let reff = "[fd5a::1]:5000/acme/app:sha";
-        let resolved =
-            resolve_fetched(Ok(base.clone()), "u", Some(reff), tmp.path()).unwrap();
+        let resolved = resolve_fetched(Ok(base.clone()), "u", Some(reff), tmp.path()).unwrap();
         // Override applied; every other field preserved (== fetched_with_ref).
-        assert_eq!(resolved.manifest.runtime.registry_ref.as_deref(), Some(reff));
+        assert_eq!(
+            resolved.manifest.runtime.registry_ref.as_deref(),
+            Some(reff)
+        );
         assert_eq!(resolved.version, base.version);
         assert_eq!(resolved.cached_path, base.cached_path);
     }
@@ -340,7 +342,10 @@ mod tests {
         )
         .expect("S3 fetch failure + image_ref present must NOT error");
         assert_eq!(resolved.manifest.runtime.r#type, "firecracker");
-        assert_eq!(resolved.manifest.runtime.registry_ref.as_deref(), Some(reff));
+        assert_eq!(
+            resolved.manifest.runtime.registry_ref.as_deref(),
+            Some(reff)
+        );
         assert!(
             resolved.cached_path.is_file(),
             "cached_path must be a real file so docker precheck passes; got {}",

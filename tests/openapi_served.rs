@@ -79,8 +79,7 @@ async fn openapi_json_served() {
     let (status, body) = fetch(&app, "/openapi.json").await;
     assert_eq!(status, StatusCode::OK, "/openapi.json must be 200");
 
-    let spec: Value =
-        serde_json::from_slice(&body).expect("openapi.json must be valid JSON");
+    let spec: Value = serde_json::from_slice(&body).expect("openapi.json must be valid JSON");
 
     // --- info block carries the service title -------------------------------
     assert_eq!(
@@ -90,9 +89,7 @@ async fn openapi_json_served() {
     );
 
     // --- every documented path is listed ------------------------------------
-    let paths = spec["paths"]
-        .as_object()
-        .expect("paths must be an object");
+    let paths = spec["paths"].as_object().expect("paths must be an object");
     for expected in [
         "/health",
         "/v1/apps",

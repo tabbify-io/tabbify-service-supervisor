@@ -26,8 +26,7 @@ fn oci_spec_parses_image_config_json() {
         },
         "rootfs": { "type": "layers", "diff_ids": [] }
     }"#;
-    let cfg: oci_spec::image::ImageConfiguration =
-        serde_json::from_str(json).unwrap();
+    let cfg: oci_spec::image::ImageConfiguration = serde_json::from_str(json).unwrap();
     let inner = cfg.config().as_ref().unwrap();
     assert_eq!(
         inner.entrypoint().as_ref().unwrap(),
@@ -196,9 +195,14 @@ fn render_init_creates_pseudo_fs_mountpoints_and_mounts_best_effort() {
         init.contains("mkdir -p /proc /sys /dev"),
         "must create pseudo-fs mountpoints (minimal images lack them); got:\n{init}"
     );
-    let mkdir_at = init.find("mkdir -p /proc /sys /dev").expect("mkdir present");
+    let mkdir_at = init
+        .find("mkdir -p /proc /sys /dev")
+        .expect("mkdir present");
     let proc_at = init.find("mount -t proc").expect("proc mount present");
-    assert!(mkdir_at < proc_at, "mkdir must precede the mounts; got:\n{init}");
+    assert!(
+        mkdir_at < proc_at,
+        "mkdir must precede the mounts; got:\n{init}"
+    );
     assert!(
         init.contains("mount -t proc proc /proc 2>/dev/null || true"),
         "proc mount must be best-effort; got:\n{init}"
@@ -223,7 +227,10 @@ fn render_init_single_quotes_argv_and_env_values() {
             "hello world".to_owned(),
             "*.txt".to_owned(),
         ],
-        env: vec!["GREETING=hello world".to_owned(), "PATTERN=$HOME/*".to_owned()],
+        env: vec![
+            "GREETING=hello world".to_owned(),
+            "PATTERN=$HOME/*".to_owned(),
+        ],
         workdir: "/app".to_owned(),
     };
     let init = render_init(&Entrypoint::Exec(exec)).unwrap();
@@ -321,8 +328,7 @@ fn entrypoint_from_oci_classifies_exec_vs_shell_form() {
                   "Env":["A=1"],"WorkingDir":"/srv"},
         "rootfs":{"type":"layers","diff_ids":[]}
     }"#;
-    let cfg: oci_spec::image::ImageConfiguration =
-        serde_json::from_str(json).unwrap();
+    let cfg: oci_spec::image::ImageConfiguration = serde_json::from_str(json).unwrap();
     match Entrypoint::from_oci(&cfg) {
         Entrypoint::Exec(e) => {
             assert_eq!(e.entrypoint, vec!["/bin/app".to_owned()]);
@@ -334,8 +340,7 @@ fn entrypoint_from_oci_classifies_exec_vs_shell_form() {
 
     let empty = r#"{"architecture":"amd64","os":"linux",
         "config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#;
-    let cfg2: oci_spec::image::ImageConfiguration =
-        serde_json::from_str(empty).unwrap();
+    let cfg2: oci_spec::image::ImageConfiguration = serde_json::from_str(empty).unwrap();
     assert!(matches!(Entrypoint::from_oci(&cfg2), Entrypoint::ShellForm));
 }
 
@@ -522,7 +527,13 @@ async fn resolve_rootfs_rejects_arch_mismatch_before_conversion() {
     });
 
     let err = super::resolve_rootfs(
-        "uuid-arch", &fetched, &layout, &config, digest, tmp.path(), &runner,
+        "uuid-arch",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
     )
     .await
     .expect_err("arch mismatch must fail fast");
@@ -598,7 +609,13 @@ async fn resolve_rootfs_allows_matching_host_arch() {
     });
 
     let rootfs = super::resolve_rootfs(
-        "uuid-archok", &fetched, &layout, &config, digest, tmp.path(), &runner,
+        "uuid-archok",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
     )
     .await
     .expect("matching host arch must convert");
@@ -754,21 +771,39 @@ async fn pull_oci_layout_uses_oras_copy_to_oci_layout() {
 
     let recorded = calls.lock().unwrap().clone();
     let pull = recorded.first().expect("must issue one oras copy");
-    assert_eq!(pull.first().map(String::as_str), Some("oras"),
-        "argv[0] must be the oras binary (FcBuildRunner spawns argv[0]); got {pull:?}");
-    assert!(pull.contains(&"copy".to_owned()),
-        "must be an `oras copy` (probe-proven layout form), not `oras pull`; got {pull:?}");
-    assert!(pull.contains(&"--to-oci-layout".to_owned()),
-        "must copy into an OCI layout; got {pull:?}");
-    assert!(pull.contains(&"--from-plain-http".to_owned()),
-        "mesh registry source is plain http; must use --from-plain-http; got {pull:?}");
-    assert!(!pull.contains(&"--plain-http".to_owned()),
-        "--plain-http is not the copy SOURCE flag; got {pull:?}");
-    assert!(!pull.contains(&"pull".to_owned()) && !pull.contains(&"-o".to_owned()),
-        "must NOT be the empty-layout `oras pull -o` form; got {pull:?}");
-    assert!(pull.contains(&reff.to_owned()), "must carry the ref; got {pull:?}");
-    assert!(pull.iter().any(|a| a.ends_with("oci")),
-        "must target the layout dir <out>/oci; got {pull:?}");
+    assert_eq!(
+        pull.first().map(String::as_str),
+        Some("oras"),
+        "argv[0] must be the oras binary (FcBuildRunner spawns argv[0]); got {pull:?}"
+    );
+    assert!(
+        pull.contains(&"copy".to_owned()),
+        "must be an `oras copy` (probe-proven layout form), not `oras pull`; got {pull:?}"
+    );
+    assert!(
+        pull.contains(&"--to-oci-layout".to_owned()),
+        "must copy into an OCI layout; got {pull:?}"
+    );
+    assert!(
+        pull.contains(&"--from-plain-http".to_owned()),
+        "mesh registry source is plain http; must use --from-plain-http; got {pull:?}"
+    );
+    assert!(
+        !pull.contains(&"--plain-http".to_owned()),
+        "--plain-http is not the copy SOURCE flag; got {pull:?}"
+    );
+    assert!(
+        !pull.contains(&"pull".to_owned()) && !pull.contains(&"-o".to_owned()),
+        "must NOT be the empty-layout `oras pull -o` form; got {pull:?}"
+    );
+    assert!(
+        pull.contains(&reff.to_owned()),
+        "must carry the ref; got {pull:?}"
+    );
+    assert!(
+        pull.iter().any(|a| a.ends_with("oci")),
+        "must target the layout dir <out>/oci; got {pull:?}"
+    );
 }
 
 /// A failing oras copy surfaces a clear error naming the pull step.
@@ -779,8 +814,10 @@ async fn pull_oci_layout_errors_when_oras_fails() {
     let err = super::pull_oci_layout("reg/img@sha256:x", tmp.path(), &runner)
         .await
         .expect_err("must error when oras pull fails");
-    assert!(err.to_string().to_lowercase().contains("oras"),
-        "error must name the oras pull step; got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("oras"),
+        "error must name the oras pull step; got: {err}"
+    );
 }
 
 /// `read_oci_config_from_layout` resolves index → manifest → config blob and
@@ -797,7 +834,10 @@ fn read_oci_config_from_layout_parses_entrypoint() {
     let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:aaaa", b"layer0")]);
     let parsed = super::read_oci_config_from_layout(&layout).expect("read config");
     let inner = parsed.config().as_ref().unwrap();
-    assert_eq!(inner.entrypoint().as_ref().unwrap(), &vec!["/app/server".to_owned()]);
+    assert_eq!(
+        inner.entrypoint().as_ref().unwrap(),
+        &vec!["/app/server".to_owned()]
+    );
     assert_eq!(inner.working_dir().as_ref().unwrap(), "/app");
     assert_eq!(parsed.rootfs().diff_ids(), &vec!["sha256:aaaa".to_owned()]);
 }
@@ -806,11 +846,16 @@ fn read_oci_config_from_layout_parses_entrypoint() {
 #[test]
 fn read_oci_config_from_layout_errors_on_empty_index() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("index.json"),
-        br#"{"schemaVersion":2,"manifests":[]}"#).unwrap();
+    std::fs::write(
+        tmp.path().join("index.json"),
+        br#"{"schemaVersion":2,"manifests":[]}"#,
+    )
+    .unwrap();
     let err = super::read_oci_config_from_layout(tmp.path()).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("manifest"),
-        "must name the missing manifest; got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("manifest"),
+        "must name the missing manifest; got: {err}"
+    );
 }
 
 /// `unpack_oci_layers` untars layers in order and applies OCI whiteouts:
@@ -821,16 +866,23 @@ fn read_oci_config_from_layout_errors_on_empty_index() {
 async fn unpack_oci_layers_applies_whiteouts_in_order() {
     let tmp = tempfile::tempdir().unwrap();
     // Layer 0: a/keep.txt, a/drop.txt, b/old.txt
-    let l0 = make_tar(&[("a/keep.txt", b"k"), ("a/drop.txt", b"d"), ("b/old.txt", b"o")]);
+    let l0 = make_tar(&[
+        ("a/keep.txt", b"k"),
+        ("a/drop.txt", b"d"),
+        ("b/old.txt", b"o"),
+    ]);
     // Layer 1: whiteout a/drop.txt + opaque b/ + b/new.txt
-    let l1 = make_tar(&[("a/.wh.drop.txt", b""), ("b/.wh..wh..opq", b""), ("b/new.txt", b"n")]);
+    let l1 = make_tar(&[
+        ("a/.wh.drop.txt", b""),
+        ("b/.wh..wh..opq", b""),
+        ("b/new.txt", b"n"),
+    ]);
     let cfg = serde_json::json!({
         "architecture":"amd64","os":"linux",
         "config":{"Entrypoint":["/x"]},
         "rootfs":{"type":"layers","diff_ids":["sha256:l0","sha256:l1"]}
     });
-    let layout = write_min_oci_layout(tmp.path(), &cfg,
-        &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
+    let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
     let config = super::read_oci_config_from_layout(&layout).unwrap();
     let staging = tmp.path().join("stage");
 
@@ -840,11 +892,26 @@ async fn unpack_oci_layers_applies_whiteouts_in_order() {
         .expect("unpack must succeed");
 
     assert!(staging.join("a/keep.txt").is_file(), "kept file survives");
-    assert!(!staging.join("a/drop.txt").exists(), ".wh.drop.txt must delete it");
-    assert!(!staging.join("b/old.txt").exists(), "opaque dir clears earlier b/ contents");
-    assert!(staging.join("b/new.txt").is_file(), "new file in opaque layer survives");
-    assert!(!staging.join("a/.wh.drop.txt").exists(), "wh marker must not survive");
-    assert!(!staging.join("b/.wh..wh..opq").exists(), "opq marker must not survive");
+    assert!(
+        !staging.join("a/drop.txt").exists(),
+        ".wh.drop.txt must delete it"
+    );
+    assert!(
+        !staging.join("b/old.txt").exists(),
+        "opaque dir clears earlier b/ contents"
+    );
+    assert!(
+        staging.join("b/new.txt").is_file(),
+        "new file in opaque layer survives"
+    );
+    assert!(
+        !staging.join("a/.wh.drop.txt").exists(),
+        "wh marker must not survive"
+    );
+    assert!(
+        !staging.join("b/.wh..wh..opq").exists(),
+        "opq marker must not survive"
+    );
 }
 
 /// Regression: an opaque marker hides entries from LOWER layers but MUST keep
@@ -865,8 +932,7 @@ async fn unpack_oci_layers_opaque_keeps_same_layer_readd() {
         "config":{"Entrypoint":["/x"]},
         "rootfs":{"type":"layers","diff_ids":["sha256:l0","sha256:l1"]}
     });
-    let layout = write_min_oci_layout(tmp.path(), &cfg,
-        &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
+    let layout = write_min_oci_layout(tmp.path(), &cfg, &[("sha256:l0", &l0), ("sha256:l1", &l1)]);
     let config = super::read_oci_config_from_layout(&layout).unwrap();
     let staging = tmp.path().join("stage");
 
@@ -874,10 +940,14 @@ async fn unpack_oci_layers_opaque_keeps_same_layer_readd() {
         .await
         .expect("unpack must succeed");
 
-    assert!(!staging.join("b/old.txt").exists(),
-        "opaque dir clears the lower layer's b/old.txt");
-    assert!(staging.join("b/keep.txt").is_file(),
-        "same-layer re-add of b/keep.txt must survive the opaque clear");
+    assert!(
+        !staging.join("b/old.txt").exists(),
+        "opaque dir clears the lower layer's b/old.txt"
+    );
+    assert!(
+        staging.join("b/keep.txt").is_file(),
+        "same-layer re-add of b/keep.txt must survive the opaque clear"
+    );
     assert_eq!(
         std::fs::read(staging.join("b/keep.txt")).unwrap(),
         b"new",
@@ -970,7 +1040,10 @@ fn unpack_tar_argv_includes_decompress_flag() {
 
     let gz = super::unpack_tar_argv("-z", blob, out);
     assert_eq!(gz.first().map(String::as_str), Some("tar"));
-    assert!(gz.contains(&"-z".to_owned()), "gzip layer must pass -z; got {gz:?}");
+    assert!(
+        gz.contains(&"-z".to_owned()),
+        "gzip layer must pass -z; got {gz:?}"
+    );
     // The decompress flag must precede -f so tar reads the blob compressed.
     let z_at = gz.iter().position(|a| a == "-z").unwrap();
     let f_at = gz.iter().position(|a| a == "-f").unwrap();
@@ -1006,8 +1079,10 @@ async fn unpack_oci_layers_errors_on_diffid_count_mismatch() {
     let err = super::unpack_oci_layers(&layout, &config, &tmp.path().join("s"))
         .await
         .unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("layer"),
-        "must name the layer/diff_id mismatch; got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("layer"),
+        "must name the layer/diff_id mismatch; got: {err}"
+    );
 }
 
 use super::oci_fixtures::{
@@ -1031,7 +1106,11 @@ fn compressed_layer_fixtures_stage_real_oci_layout() {
     //     inflates back to a tar whose header names the entry. zstd starts with
     //     its 0x28 0xb5 0x2f 0xfd magic.
     let gz = make_tar_gzip(&[("bin/server", b"elf-bytes")]);
-    assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip layer must carry the gzip magic");
+    assert_eq!(
+        &gz[..2],
+        &[0x1f, 0x8b],
+        "gzip layer must carry the gzip magic"
+    );
     let zst = make_tar_zstd(&[("bin/server", b"elf-bytes")]);
     assert_eq!(
         &zst[..4],
@@ -1062,11 +1141,8 @@ fn compressed_layer_fixtures_stage_real_oci_layout() {
         "config": {"Entrypoint": ["/bin/server"]},
         "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
     });
-    let layout = write_min_oci_layout_typed(
-        tmp.path(),
-        &cfg,
-        &[("sha256:l0", &gz, MEDIA_TAR_GZIP)],
-    );
+    let layout =
+        write_min_oci_layout_typed(tmp.path(), &cfg, &[("sha256:l0", &gz, MEDIA_TAR_GZIP)]);
     let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json")).unwrap();
     let man_desc = index.manifests().first().unwrap();
     let blob = layout
@@ -1215,7 +1291,10 @@ async fn real_conversion_gzip_layers_and_mkfs_ext4_produces_valid_rootfs() {
 #[test]
 fn ext4_geometry_small_app_floored_by_hint() {
     let (mib, inodes) = ext4_geometry(5 * 1024 * 1024, 200, 2048);
-    assert_eq!(mib, 2048, "tiny content must not shrink below the caller hint");
+    assert_eq!(
+        mib, 2048,
+        "tiny content must not shrink below the caller hint"
+    );
     assert_eq!(inodes, 262_144, "inode floor protects small-file images");
 }
 
@@ -1226,9 +1305,16 @@ fn ext4_geometry_small_app_floored_by_hint() {
 fn ext4_geometry_large_rootfs_grows_size_and_inodes() {
     // 2000 MiB content, 200k files, 2048 MiB hint.
     let (mib, inodes) = ext4_geometry(2000 * 1024 * 1024, 200_000, 2048);
-    assert_eq!(mib, 2000 * 3 / 2 + 512, "size = 1.5x content + 512 MiB slack");
+    assert_eq!(
+        mib,
+        2000 * 3 / 2 + 512,
+        "size = 1.5x content + 512 MiB slack"
+    );
     assert!(mib > 2048, "must exceed the RAM hint for a large rootfs");
-    assert_eq!(inodes, 400_000, "inodes = 2x the file count when above the floor");
+    assert_eq!(
+        inodes, 400_000,
+        "inodes = 2x the file count when above the floor"
+    );
 }
 
 /// Saturating arithmetic must not panic on absurd inputs.

@@ -249,7 +249,9 @@ pub struct DeployBody {
     ///
     /// Renamed from `reff` because `ref` is a Rust keyword.
     #[serde(rename = "ref")]
-    #[schema(example = "[fd5a:1f00:0:3::1]:5000/tabbify/0191e7c2-0000-7000-8000-000000000001:sha256abc")]
+    #[schema(
+        example = "[fd5a:1f00:0:3::1]:5000/tabbify/0191e7c2-0000-7000-8000-000000000001:sha256abc"
+    )]
     pub(super) reff: String,
     /// Runtime override (D4 wire string); `None` ⇒ manifest default (D10).
     /// Travels in the body only, never persisted to the manifest.

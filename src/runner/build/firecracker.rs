@@ -96,8 +96,7 @@ use crate::runtime::BoxFut;
 /// command's STDOUT, so all current callers ignore the second tuple element; the
 /// stdout slot is retained for the seam's shape. Unit tests inject a fake runner
 /// that side-effects the rootfs file for `mkfs.ext4` and no-ops `oras copy`.
-pub type FcBuildRunner =
-    Arc<dyn Fn(Vec<String>) -> BoxFut<'static, (bool, Vec<u8>)> + Send + Sync>;
+pub type FcBuildRunner = Arc<dyn Fn(Vec<String>) -> BoxFut<'static, (bool, Vec<u8>)> + Send + Sync>;
 
 /// Name of the produced rootfs image inside the output dir.
 const ROOTFS_NAME: &str = "rootfs.ext4";
@@ -299,7 +298,10 @@ async fn build_rootfs_ext4_inner(
         file.set_len(u64::from(effective_mib) * 1024 * 1024)
             .await
             .with_context(|| {
-                format!("size rootfs image {} to {effective_mib}MiB", rootfs.display())
+                format!(
+                    "size rootfs image {} to {effective_mib}MiB",
+                    rootfs.display()
+                )
             })?;
     }
     let (made, _) = (runner)(vec![
@@ -621,9 +623,7 @@ fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageCo
 ///
 /// # Errors
 /// Missing/garbled `index.json` or an index with no manifest descriptor.
-fn read_manifest_descriptor_from_layout(
-    layout: &Path,
-) -> Result<oci_spec::image::Descriptor> {
+fn read_manifest_descriptor_from_layout(layout: &Path) -> Result<oci_spec::image::Descriptor> {
     let index = oci_spec::image::ImageIndex::from_file(layout.join("index.json"))
         .with_context(|| format!("read OCI index.json under {}", layout.display()))?;
     index
@@ -688,8 +688,8 @@ fn extract_layer_blob(
     media_type: &oci_spec::image::MediaType,
     dest: &Path,
 ) -> Result<()> {
-    let f = std::fs::File::open(blob)
-        .with_context(|| format!("open layer blob {}", blob.display()))?;
+    let f =
+        std::fs::File::open(blob).with_context(|| format!("open layer blob {}", blob.display()))?;
     let mt = media_type.to_string();
     let reader: Box<dyn std::io::Read> = if mt.ends_with("+gzip") || mt.ends_with(".tar.gzip") {
         Box::new(flate2::read::GzDecoder::new(f))

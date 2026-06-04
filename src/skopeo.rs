@@ -172,7 +172,10 @@ mod tests {
         let local_tag = "tbf-build-u";
         let reff = "[fd5a::1]:5000/myapp:latest";
         let res = skopeo_push("skopeo", local_tag, reff, &runner).await;
-        assert!(res.is_ok(), "runner succeeded → skopeo_push must be Ok; got {res:?}");
+        assert!(
+            res.is_ok(),
+            "runner succeeded → skopeo_push must be Ok; got {res:?}"
+        );
 
         let calls = captured.lock().unwrap();
         assert_eq!(calls.len(), 1, "runner must be called exactly once");

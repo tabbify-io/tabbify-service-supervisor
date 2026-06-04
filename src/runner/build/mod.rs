@@ -30,17 +30,7 @@ pub mod firecracker;
 /// Absent in the JSON spec ⇒ [`BuildKind::Docker`] (the original behaviour), so
 /// every pre-existing docker job + test is unchanged. The in-process WASM
 /// runtime was removed, so the only build pipeline is the docker one.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    Default,
-    utoipa::ToSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildKind {
     /// Clone → require `Dockerfile` → `docker build` → `docker push`.
@@ -196,7 +186,6 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
     )
     .await
 }
-
 
 #[cfg(test)]
 mod tests;

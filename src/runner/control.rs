@@ -164,13 +164,8 @@ impl RunnerLifecycle {
         // applied: the runtime is always Firecracker, which pulls `reff` from the
         // mesh registry, converts the OCI image to a rootfs.ext4, and boots it.
         let next_fetched = fetched_with_ref(&self.fetched, reff);
-        let new_runtime = match build_runtime(
-            &self.uuid,
-            &next_fetched,
-            &self.fc,
-            &self.data_dir,
-        )
-        .await
+        let new_runtime = match build_runtime(&self.uuid, &next_fetched, &self.fc, &self.data_dir)
+            .await
         {
             Ok(rt) => rt,
             Err(e) => {

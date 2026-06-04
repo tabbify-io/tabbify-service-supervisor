@@ -382,7 +382,10 @@ mod tests {
             "main".to_owned(),
         ];
         let msg = format_git_error(&args, Some(128), "fatal: Repository not found\n");
-        assert!(msg.contains("128"), "error must include the exit code: {msg}");
+        assert!(
+            msg.contains("128"),
+            "error must include the exit code: {msg}"
+        );
         assert!(
             msg.contains("Repository not found"),
             "error must include the git stderr text: {msg}"
@@ -394,7 +397,10 @@ mod tests {
     fn format_git_error_handles_missing_code() {
         let args = vec!["init".to_owned(), "-q".to_owned(), "/tmp/dest".to_owned()];
         let msg = format_git_error(&args, None, "some failure\n");
-        assert!(msg.contains("git init"), "must still name the subcommand: {msg}");
+        assert!(
+            msg.contains("git init"),
+            "must still name the subcommand: {msg}"
+        );
         assert!(
             msg.contains("some failure"),
             "must still include stderr: {msg}"
