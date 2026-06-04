@@ -1,6 +1,6 @@
 //! Thin entrypoint for `tabbify-runner`: parse config, init logging, start the
-//! per-app serve core (loopback path for now; mesh join deferred to Task 1.3),
-//! bind the control socket, and run until shutdown.
+//! per-app serve core (loopback path under `--no-mesh`, otherwise it joins the
+//! mesh claiming its app-ULA), bind the control socket, and run until shutdown.
 //!
 //! All logic lives in the `tabbify_supervisor` library; this file only wires
 //! the pieces together — matching the `supervisord` `main.rs` pattern.
@@ -56,8 +56,8 @@ async fn main() -> anyhow::Result<()> {
     let serve_cfg = serve_config_from(&cfg);
 
     // Start the per-app serve core. In `--no-mesh` mode this binds a loopback
-    // listener; when `no_mesh = false` the mesh path is deferred (Task 1.3) and
-    // will bail with an explicit error so the binary fails loudly.
+    // listener; when `no_mesh = false` the runner joins the mesh claiming its
+    // app-ULA and binds that ULA directly.
     let runner = RunnerServe::start(serve_cfg)
         .await
         .context("start runner serve")?;

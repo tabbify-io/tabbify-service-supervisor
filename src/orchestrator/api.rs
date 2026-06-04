@@ -374,6 +374,14 @@ impl Orchestrator {
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
+        // Mark this uuid as deploy-in-flight for the WHOLE deploy. The RAII guard
+        // clears it on every exit path (early `?`, error, success). While it is
+        // held the monitor's reconcile defers killing + respawning this runner —
+        // the runner can be briefly busy/unresponsive on its control socket while
+        // it builds the new VM + performs the swap, and a reap mid-deploy would
+        // abort the swap and orphan the half-built VM.
+        let _deploy_guard = self.begin_deploy(uuid);
+
         if self.client_for(uuid).health().await.is_ok() {
             // Live runner: send the Deploy message.
             match self.client_for(uuid).deploy(reff).await {

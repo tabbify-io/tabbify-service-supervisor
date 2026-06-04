@@ -30,7 +30,9 @@ pub mod monitor;
 pub mod restart;
 pub mod spawn;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use api::{AppState, AppSummary};
@@ -133,6 +135,34 @@ pub struct Orchestrator {
     shared: SharedRunnerConfig,
     /// Directory holding one `<uuid>.json` [`RunnerHandle`] record per runner.
     runner_dir: PathBuf,
+    /// UUIDs with a deploy currently in flight. While a uuid is in this set the
+    /// monitor's [`reconcile_record`](Self::reconcile_record) MUST NOT kill +
+    /// respawn its runner: during a zero-downtime swap the runner can be briefly
+    /// busy/unresponsive on its control socket, and reaping it mid-deploy would
+    /// abort the swap (and orphan the half-built new VM). `deploy_app` inserts
+    /// the uuid before dispatching `Deploy` and removes it on every exit path via
+    /// an RAII [`DeployGuard`]. Shared across clones (the orchestrator is cloned
+    /// to the monitor task + the API layer), so a `std::sync::Mutex` is enough —
+    /// it is only ever locked for the duration of a `contains`/`insert`/`remove`,
+    /// never across an await.
+    deploying: Arc<Mutex<HashSet<String>>>,
+}
+
+/// RAII guard that removes a uuid from the orchestrator's in-flight-deploy set
+/// when dropped. Guarantees the uuid is cleared on EVERY exit path of
+/// [`Orchestrator::deploy_app`] (early `?` returns, panics, the happy path) so a
+/// failed deploy can never leave a runner permanently shielded from the monitor.
+pub(crate) struct DeployGuard {
+    deploying: Arc<Mutex<HashSet<String>>>,
+    uuid: String,
+}
+
+impl Drop for DeployGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.deploying.lock() {
+            set.remove(&self.uuid);
+        }
+    }
 }
 
 impl Orchestrator {
@@ -140,7 +170,33 @@ impl Orchestrator {
     /// records under `runner_dir`.
     #[must_use]
     pub fn new(shared: SharedRunnerConfig, runner_dir: PathBuf) -> Self {
-        Self { shared, runner_dir }
+        Self {
+            shared,
+            runner_dir,
+            deploying: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Mark `uuid` as deploy-in-flight and return an RAII [`DeployGuard`] that
+    /// clears it on drop. While the guard is alive the monitor defers reaping
+    /// this runner (see [`reconcile_record`](Self::reconcile_record)).
+    pub(crate) fn begin_deploy(&self, uuid: &str) -> DeployGuard {
+        if let Ok(mut set) = self.deploying.lock() {
+            set.insert(uuid.to_owned());
+        }
+        DeployGuard {
+            deploying: Arc::clone(&self.deploying),
+            uuid: uuid.to_owned(),
+        }
+    }
+
+    /// Is a deploy currently in flight for `uuid`? The monitor consults this
+    /// before killing + respawning an unresponsive runner.
+    pub(crate) fn is_deploying(&self, uuid: &str) -> bool {
+        self.deploying
+            .lock()
+            .map(|set| set.contains(uuid))
+            .unwrap_or(false)
     }
 
     /// The shared runner config.
@@ -318,5 +374,53 @@ mod tests {
         let orch = Orchestrator::new(shared(), dir.clone());
         assert_eq!(orch.runner_dir(), dir);
         assert_eq!(orch.shared().runner_bin, shared().runner_bin);
+    }
+
+    // ── deploy-in-flight guard ───────────────────────────────────────────────
+
+    /// `begin_deploy` marks a uuid in-flight; the returned guard clears it on
+    /// drop. `is_deploying` reflects the set membership across that lifecycle.
+    #[test]
+    fn deploy_guard_marks_and_clears_uuid() {
+        let orch = Orchestrator::new(shared(), PathBuf::from("/run/tabbify/runners"));
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+
+        assert!(!orch.is_deploying(uuid), "not deploying before begin_deploy");
+        {
+            let _guard = orch.begin_deploy(uuid);
+            assert!(orch.is_deploying(uuid), "in-flight while the guard is held");
+        }
+        assert!(
+            !orch.is_deploying(uuid),
+            "guard drop must clear the in-flight mark"
+        );
+    }
+
+    /// The in-flight set is shared across clones (the orchestrator is cloned to
+    /// the monitor task), so a deploy begun on one clone is visible on another.
+    #[test]
+    fn deploy_guard_visible_across_clones() {
+        let orch = Orchestrator::new(shared(), PathBuf::from("/run/tabbify/runners"));
+        let monitor_view = orch.clone();
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+
+        let _guard = orch.begin_deploy(uuid);
+        assert!(
+            monitor_view.is_deploying(uuid),
+            "a deploy begun on one clone must be visible to the monitor clone"
+        );
+    }
+
+    /// Distinct uuids are tracked independently — a deploy on one does not
+    /// shield another.
+    #[test]
+    fn deploy_guard_is_per_uuid() {
+        let orch = Orchestrator::new(shared(), PathBuf::from("/run/tabbify/runners"));
+        let a = "0191e7c2-1111-7222-8333-444455556666";
+        let b = "019e7903-aaaa-7bbb-8ccc-ddddeeeeffff";
+
+        let _guard = orch.begin_deploy(a);
+        assert!(orch.is_deploying(a));
+        assert!(!orch.is_deploying(b), "guard must be scoped to its own uuid");
     }
 }

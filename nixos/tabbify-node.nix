@@ -233,6 +233,13 @@ in {
       SUPERVISOR_DATA_DIR    = "${dataDir}/data";
       SUPERVISOR_S3_BASE_URL = "http://127.0.0.1:9000";   # local app-staging server (svc #6)
       SUPERVISOR_FC_KERNEL   = "${dataDir}/vmlinux";
+      # FC build-mode + builder role baked into the unit so a rebooted node
+      # comes back as an FC-builder (ephemeral OCI->ext4 FC build sandbox)
+      # without any post-boot manual `systemctl set-environment`. The tools the
+      # build path execs (firecracker, oras, git, mkfs.ext4/debugfs from
+      # e2fsprogs) are on the service `path` above.
+      SUPERVISOR_FC_BUILD    = "true";
+      SUPERVISOR_BUILDER     = "true";
       RUST_LOG               = "info";
     };
     serviceConfig = {

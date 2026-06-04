@@ -271,6 +271,19 @@ impl Orchestrator {
                     // once stable_secs have elapsed since last exit).
                     self.persist_healthy_if_changed(record, now_secs);
                     RecordOutcome::Adopted
+                } else if self.is_deploying(&record.uuid) {
+                    // A deploy is in flight for this uuid: the runner is alive but
+                    // briefly busy/unresponsive on its control socket while it
+                    // builds the new VM + swaps. Killing it now would abort the
+                    // deploy and orphan the half-built VM. Defer the reap — the
+                    // deploy guard clears once the deploy finishes, and the next
+                    // tick re-evaluates with the runner responsive again.
+                    tracing::info!(
+                        uuid = %record.uuid,
+                        pid = record.pid,
+                        "deploy in progress; deferring reap (runner busy mid-deploy)"
+                    );
+                    RecordOutcome::Adopted
                 } else {
                     // Gate kill-then-respawn behind the backoff policy too.
                     if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
@@ -374,11 +387,16 @@ impl Orchestrator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::orchestrator::handle::RunnerHandle;
     use crate::orchestrator::restart::RestartState;
+    use crate::orchestrator::{Orchestrator, SharedRunnerConfig};
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -590,5 +608,106 @@ mod tests {
             BackoffAction::RespawnNow,
             "at the exact retry boundary, RespawnNow must fire"
         );
+    }
+
+    // ── deploy-in-flight defers the reap ─────────────────────────────────────
+
+    fn shared_for_test() -> SharedRunnerConfig {
+        SharedRunnerConfig {
+            // A binary that does not exist → any respawn attempt fails, so an
+            // outcome that is NOT `Adopted` would surface as `RespawnFailed`.
+            runner_bin: PathBuf::from("/nonexistent/tabbify-runner"),
+            s3_base_url: "http://s3.invalid".to_owned(),
+            data_dir: PathBuf::from("/var/lib/tabbify/data"),
+            parent: None,
+            no_mesh: true,
+            relay_url: None,
+        }
+    }
+
+    /// Spawn a real, long-lived child process (`sleep`) and return its pid. The
+    /// pid is alive (so `runner_is_alive` reports true) and — crucially — it is
+    /// safe for the reap path to SIGKILL it (it is NOT the test process). The
+    /// child is harvested at the end of each test via the returned handle.
+    fn spawn_sleep_child() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep child")
+    }
+
+    fn unhealthy_record(uuid: &str, pid: u32, dir: &std::path::Path) -> RunnerHandle {
+        RunnerHandle {
+            uuid: uuid.to_owned(),
+            pid,
+            // Non-existent socket → health probe fails (unhealthy).
+            control_sock: dir.join("no-such.sock"),
+            app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
+            parent: None,
+            // spawned_at = 0 → treated as well past the grace window.
+            spawned_at: 0,
+            restart: RestartState::default(),
+            image_ref: None,
+            requested_runtime: None,
+        }
+    }
+
+    /// A runner whose pid is ALIVE (a real `sleep` child) but whose control
+    /// socket is unhealthy, past the grace window, is normally killed +
+    /// respawned. With a deploy in flight for its uuid, the monitor must instead
+    /// DEFER the reap and report `Adopted` — the runner is left running so the
+    /// in-flight deploy can finish (its pid is NOT killed).
+    #[tokio::test]
+    async fn reconcile_defers_reap_while_deploying() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+
+        let mut child = spawn_sleep_child();
+        let record = unhealthy_record(uuid, child.id(), dir.path());
+
+        // Hold the deploy guard for the uuid across the reconcile.
+        let _guard = orch.begin_deploy(uuid);
+        let outcome = orch.reconcile_record(&record).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::Adopted,
+            "a runner with a deploy in flight must be adopted (reap deferred), not reaped"
+        );
+        // The child must still be alive — the defer must NOT have killed it.
+        assert!(
+            runner_is_alive(child.id()),
+            "deferred reap must leave the runner pid alive"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Without a deploy in flight, the SAME alive-pid/unhealthy-socket record is
+    /// reaped: the kill-before-respawn path SIGKILLs the pid and the respawn is
+    /// attempted (failing on the missing binary → `RespawnFailed`). This proves
+    /// the defer above is caused by the guard, not by some other adopt path.
+    #[tokio::test]
+    async fn reconcile_reaps_when_not_deploying() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+
+        let mut child = spawn_sleep_child();
+        let child_pid = child.id();
+        let record = unhealthy_record(uuid, child_pid, dir.path());
+
+        // No deploy guard → the runner is reaped: SIGKILL then respawn (which
+        // fails on the nonexistent binary → RespawnFailed).
+        let outcome = orch.reconcile_record(&record).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::RespawnFailed,
+            "without a deploy in flight, an unhealthy runner is reaped (respawn attempted)"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

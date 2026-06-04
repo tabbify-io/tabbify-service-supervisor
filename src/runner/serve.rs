@@ -16,7 +16,7 @@
 //! listener, allowing `Stop`, `Purge`, and `Health` commands to operate on the
 //! same `HostedApp`.
 //!
-//! # Mesh path (Task 1.3)
+//! # Mesh path
 //! When `no_mesh = false` the runner joins the mesh as a `runner`-kind peer
 //! ([`build_runner_join_config`] builds the [`mesh_joiner::JoinConfig`]),
 //! claiming `requested_ula = derive_app_ula(uuid)` and declaring its
@@ -286,6 +286,12 @@ impl RunnerServe {
 
         let addr = hosted.addr;
 
+        // The ref the INITIAL runtime was built from: the resolved manifest's
+        // `runtime.registry_ref` (a deployed version applied via `--image-ref`,
+        // or `None` for a plain source/S3 build). Seeds the same-ref re-deploy
+        // guard so a deploy of the already-running ref is a no-op.
+        let initial_ref = fetched.manifest.runtime.registry_ref.clone();
+
         let lifecycle = RunnerLifecycle {
             uuid: cfg.uuid.clone(),
             version: fetched.version,
@@ -305,6 +311,8 @@ impl RunnerServe {
             // server falls back to the legacy direct-exit path until the
             // binary calls lifecycle.set_shutdown_tx(tx).
             shutdown_tx: Arc::new(Mutex::new(None)),
+            // Seed the same-ref guard with the initial build's ref.
+            current_ref: Arc::new(Mutex::new(initial_ref)),
         };
 
         Ok(Self {
