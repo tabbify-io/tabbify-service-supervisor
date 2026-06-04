@@ -1030,6 +1030,38 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
     Ok(layout)
 }
 
+/// Ensure the buildkit TOOLCHAIN rootfs for SANDBOXED builds (phase 2 of
+/// the build/run split): pull `reff` (a tag ref — the toolchain is published
+/// under a stable tag), derive the immutable digest from the pulled layout,
+/// and convert ONCE into `<data_dir>/build-toolchain/<digest>/rootfs.ext4`.
+/// A digest cache hit skips the conversion; a re-published tag (new digest)
+/// converts fresh alongside the old one.
+///
+/// # Errors
+/// Pull/convert failures, or a cross-architecture toolchain image.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) async fn ensure_toolchain_rootfs(
+    reff: &str,
+    data_dir: &Path,
+    runner: &FcBuildRunner,
+) -> Result<PathBuf> {
+    let root = data_dir.join("build-toolchain");
+    let pull = root.join(".pull");
+    let layout = pull_oci_layout(reff, &pull, runner).await?;
+    let digest = read_manifest_digest_from_layout(&layout)?;
+    let dir = root.join(digest.replace(':', "-"));
+    let cached = dir.join("rootfs.ext4");
+    if cached.is_file() {
+        tracing::info!(reff, digest, "toolchain rootfs cache hit");
+        return Ok(cached);
+    }
+    let config = read_oci_config_from_layout(&layout)?;
+    guard_arch_matches_host(&config)?;
+    let entry = Entrypoint::from_oci(&config);
+    let init = render_init(&entry)?;
+    build_rootfs_ext4_inner(&layout, &config, &dir, 1024, Some(&init), runner).await
+}
+
 /// Entry point for the `"firecracker"` arm of [`crate::build::build_runtime`]:
 /// resolve (cache or convert) the rootfs, then boot it via the existing
 /// `FirecrackerRuntime` contract (guest `172.31.0.2:8080`, kernel

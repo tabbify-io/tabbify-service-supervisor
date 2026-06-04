@@ -23,6 +23,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 mod docker;
+pub(crate) mod fc_sandbox;
 pub mod firecracker;
 
 /// Which build pipeline a [`BuildJob`] drives.
@@ -137,6 +138,31 @@ pub async fn run_build(
 
     match job.build_kind {
         BuildKind::Docker => {
+            // Phase-2 sandbox: build inside an ephemeral Firecracker VM
+            // (explicit opt-in + KVM). The host clones (above), the VM
+            // builds, the host pushes — no docker daemon anywhere.
+            if fc_sandbox::enabled() {
+                let fc_runner = firecracker::production_fc_build_runner();
+                let layout = fc_sandbox::run_sandboxed_build(
+                    &job.app_uuid,
+                    &src,
+                    &job.registry_ula,
+                    workdir,
+                    &fc_runner,
+                )
+                .await
+                .context("sandboxed (firecracker) build")?;
+                if let Err(e) = (tool_runner)(crate::skopeo::oras_push_args(
+                    oras_bin,
+                    &layout.to_string_lossy(),
+                    &reff,
+                ))
+                .await
+                {
+                    anyhow::bail!("push to registry failed: {reff}: {e}");
+                }
+                return Ok(ArtifactRef { reff, digest: None });
+            }
             docker::run_docker_build(job, backend, tool_runner, skopeo_bin, oras_bin, &src, reff)
                 .await
         }

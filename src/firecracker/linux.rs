@@ -63,7 +63,7 @@ fn fc_debug_enabled() -> bool {
 /// mode (its parent dir created best-effort) and both streams are pointed at
 /// it so the serial console is captured. If the file can't be opened we log a
 /// warning and fall back to `/dev/null` (never fail the boot over logging).
-fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
+pub(crate) fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
     let null = || (Stdio::null(), Stdio::null());
     if !fc_debug_enabled() {
         return null();
@@ -93,7 +93,7 @@ fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
 
 /// Monotonic per-process counter → a unique tap name + /30 offset per VM, so
 /// concurrently-hosted firecracker apps don't collide on tap devices/links.
-static VM_SEQ: AtomicU32 = AtomicU32::new(0);
+pub(crate) static VM_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Probe type: given a `host:port` string returns `true` iff the guest app is
 /// reachable. Production `health()` does a real HTTP GET to `guest_base`; this
@@ -442,16 +442,7 @@ impl FirecrackerRuntime {
     /// bodies and replies `204 No Content` (or 200) on success, an error
     /// JSON otherwise.
     async fn api_put(&self, path: &str, body: &serde_json::Value) -> Result<()> {
-        let payload = serde_json::to_vec(body)?;
-        let status =
-            tokio::time::timeout(API_TIMEOUT, unix_http_put(&self.api_sock, path, &payload))
-                .await
-                .map_err(|_| anyhow!("firecracker API timed out on PUT {path}"))??;
-        tracing::debug!(verb = "PUT", path, status, "fc API call");
-        if !(200..300).contains(&status) {
-            bail!("firecracker API PUT {path} returned HTTP {status}");
-        }
-        Ok(())
+        api_put_sock(&self.api_sock, path, body).await
     }
 
     /// One firecracker REST `PATCH` over the API unix socket.
@@ -721,7 +712,7 @@ impl Drop for FirecrackerRuntime {
 }
 
 /// Create the host tap device and assign it the /30 host IP.
-async fn setup_tap(tap_name: &str, host_ip: Ipv4Addr) -> Result<()> {
+pub(crate) async fn setup_tap(tap_name: &str, host_ip: Ipv4Addr) -> Result<()> {
     run_ip(&["tuntap", "add", tap_name, "mode", "tap"])
         .await
         .with_context(|| format!("ip tuntap add {tap_name}"))?;
@@ -735,7 +726,7 @@ async fn setup_tap(tap_name: &str, host_ip: Ipv4Addr) -> Result<()> {
 }
 
 /// Run an `ip ...` command, erroring on a non-zero exit.
-async fn run_ip(args: &[&str]) -> Result<()> {
+pub(crate) async fn run_ip(args: &[&str]) -> Result<()> {
     let out = Command::new("ip")
         .args(args)
         .output()
@@ -761,7 +752,7 @@ async fn run_ip(args: &[&str]) -> Result<()> {
 /// costs the guest its egress (the VM still runs and answers the :8080 probe),
 /// so we log loudly and continue. The host tap link itself (`setup_tap`) is
 /// what the readiness probe needs; this only matters for guest→internet.
-async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
+pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
     // Enable forwarding (no-op if already 1; warn but continue on EACCES).
     if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await {
         tracing::warn!(error = %e, "fc nat: could not enable net.ipv4.ip_forward");
@@ -903,7 +894,7 @@ fn parse_default_dev(route_output: &str) -> Option<String> {
 /// Derive a (host_ip, guest_ip) /30 pair for VM index `seq` out of
 /// `subnet`. We carve sequential /30s: VM `n` gets hosts
 /// `base + 4n + 1` (host) and `base + 4n + 2` (guest).
-fn derive_link_ips(subnet: &str, seq: u32) -> Result<(Ipv4Addr, Ipv4Addr)> {
+pub(crate) fn derive_link_ips(subnet: &str, seq: u32) -> Result<(Ipv4Addr, Ipv4Addr)> {
     let base = subnet
         .split('/')
         .next()
@@ -918,7 +909,7 @@ fn derive_link_ips(subnet: &str, seq: u32) -> Result<(Ipv4Addr, Ipv4Addr)> {
 }
 
 /// Deterministic locally-administered guest MAC from the VM index.
-fn derive_guest_mac(seq: u32) -> String {
+pub(crate) fn derive_guest_mac(seq: u32) -> String {
     let b = seq.to_le_bytes();
     // 02:xx → locally administered, unicast.
     format!("02:FC:{:02X}:{:02X}:{:02X}:{:02X}", b[0], b[1], b[2], b[3])
@@ -932,6 +923,25 @@ async fn wait_for_socket(sock: &Path) -> Result<()> {
             bail!("firecracker API socket {} never appeared", sock.display());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// One firecracker REST `PUT` against an explicit API socket — usable by
+/// callers that don't hold a [`FirecrackerRuntime`] (the build-VM boots its
+/// own short-lived machine). The instance method delegates here.
+pub(crate) async fn api_put_sock(
+    api_sock: &Path,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<()> {
+    let payload = serde_json::to_vec(body)?;
+    let status = tokio::time::timeout(API_TIMEOUT, unix_http_put(api_sock, path, &payload))
+        .await
+        .map_err(|_| anyhow!("firecracker API timed out on PUT {path}"))??;
+    tracing::debug!(verb = "PUT", path, status, "fc API call");
+    if !(200..300).contains(&status) {
+        bail!("firecracker API PUT {path} returned HTTP {status}");
     }
     Ok(())
 }

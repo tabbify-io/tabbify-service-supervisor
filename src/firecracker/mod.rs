@@ -37,6 +37,8 @@
 use crate::config::FcConfig;
 
 #[cfg(target_os = "linux")]
+pub(crate) mod build_vm;
+#[cfg(target_os = "linux")]
 mod linux;
 pub(crate) mod pidfile;
 mod protocol;

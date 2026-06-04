@@ -66,6 +66,19 @@ pub fn rootfs_drive_body(path_on_host: &str) -> Value {
     })
 }
 
+/// Build a `PUT /drives/<id>` body for an AUXILIARY (non-root) block
+/// device — the build-VM's scratch (input/output) and persistent cache
+/// disks. The guest sees them in attach order after the rootfs
+/// (`/dev/vdb`, `/dev/vdc`, …).
+pub fn aux_drive_body(drive_id: &str, path_on_host: &str, read_only: bool) -> Value {
+    json!({
+        "drive_id": drive_id,
+        "path_on_host": path_on_host,
+        "is_root_device": false,
+        "is_read_only": read_only,
+    })
+}
+
 /// Build the `PUT /network-interfaces/eth0` body: bind the guest `eth0` to
 /// the host tap device with a deterministic guest MAC.
 pub fn network_iface_body(host_dev_name: &str, guest_mac: &str) -> Value {
