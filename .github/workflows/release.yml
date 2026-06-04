@@ -245,7 +245,6 @@ jobs:
           context: ./deploy
           file: ./deploy/Dockerfile
           platforms: ${{ matrix.platform }}
-          build-args: DOCKER_ARCH=${{ matrix.arch }}
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/tabbify-supervisor:${{ matrix.arch }}
 
@@ -263,7 +262,6 @@ jobs:
           context: ./deploy
           file: ./deploy/Dockerfile
           platforms: linux/amd64
-          build-args: DOCKER_ARCH=${{ matrix.arch }}
           push: true
           tags: |
             ${{ steps.ecr.outputs.registry }}/tabbify-supervisor:latest

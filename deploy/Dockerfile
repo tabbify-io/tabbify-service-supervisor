@@ -28,15 +28,24 @@ FROM debian:trixie-slim
 # to the mesh registry (oras parses such refs; same binary the run side pulls
 # with).
 ARG DOCKER_CLI_VERSION=27.3.1
-ARG DOCKER_ARCH=aarch64
-# ORAS_ARCH uses the OCI-standard naming (amd64 / arm64).
 ARG ORAS_VERSION=1.2.0
-ARG ORAS_ARCH=arm64
-RUN apt-get update \
+# TARGETARCH is auto-populated by buildx per platform leg (amd64 / arm64).
+# BOTH tool arches derive from it IN here — passing arch build-args from CI
+# proved fragile: only DOCKER_ARCH was wired, so every image shipped the
+# Dockerfile-default ARM oras and the amd64 builder died with
+# "Exec format error" the first time the push path actually ran oras.
+ARG TARGETARCH
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) DOCKER_ARCH=x86_64 ;; \
+      arm64) DOCKER_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    apt-get update \
  && apt-get install -y --no-install-recommends iproute2 ca-certificates curl git skopeo \
  && curl -fsSL "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz" \
       | tar xz -C /usr/local/bin --strip-components=1 docker/docker \
- && curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz" \
+ && curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${TARGETARCH}.tar.gz" \
       | tar xz -C /usr/local/bin oras \
  && chmod +x /usr/local/bin/oras \
  && apt-get purge -y curl && apt-get autoremove -y \
