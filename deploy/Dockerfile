@@ -12,7 +12,12 @@
 #   docker run -d --device /dev/net/tun --cap-add NET_ADMIN \
 #     [--device /dev/kvm] [-v /var/run/docker.sock:/var/run/docker.sock] \
 #     -v tbf-state:/var/lib/tabbify tabbify-supervisor
-FROM debian:bookworm-slim
+# trixie REQUIRED (not bookworm): the mesh registry lives at a bracketed
+# IPv6 address ([fd5a:…]:5000/…) and bookworm's skopeo 1.9 cannot parse
+# bracketed-IPv6 image references (support landed in skopeo >= 1.14 via
+# distribution/reference v0.5) — the build push fails with "invalid
+# reference format" on the older parser.
+FROM debian:trixie-slim
 
 # docker CLI ONLY (client; talks to a mounted host socket — no daemon in-image).
 # oras CLI for pulling WASM OCI artifacts from the mesh registry (plain-http over WG).
