@@ -13,6 +13,15 @@ use uuid::Uuid;
 /// Prod coordinator control-plane URL (baked default, contract §5).
 pub const DEFAULT_COORDINATOR_URL: &str = "http://3.124.69.92:8888";
 
+/// Prod DERP-style relay endpoint over TLS/443. Baked default applied
+/// ONLY when the coordinator is the default (production) one — see
+/// [`Config::effective_relay_url`]. TLS matters: corporate firewalls
+/// mangle/kill plaintext `ws://:8888`, and the relay is the
+/// connectivity floor, so a zero-config node must land on `wss://` out
+/// of the box (previously this lived in a `/run` systemd drop-in on the
+/// ThinkPad — lost on every reboot).
+pub const DEFAULT_RELAY_URL: &str = "wss://relay.tabbify.io/v1/mesh/relay";
+
 /// Anonymous public-read base for app artifacts (contract §2).
 pub const DEFAULT_S3_BASE_URL: &str = "https://tabbify-apps.s3.eu-central-1.amazonaws.com";
 
@@ -254,6 +263,23 @@ impl Config {
     pub fn mesh_identity_path(&self) -> PathBuf {
         self.data_dir.join("mesh-identity.json")
     }
+
+    /// The relay URL to hand to the mesh joiner (and forward to runners).
+    ///
+    /// Resolution order:
+    /// 1. explicit `--mesh-relay-url` / `TABBIFY_MESH_RELAY_URL` — verbatim;
+    /// 2. default (production) coordinator → [`DEFAULT_RELAY_URL`]
+    ///    (`wss://` on 443: zero-config nodes must traverse corporate
+    ///    firewalls that kill plaintext ws);
+    /// 3. custom coordinator → `None` (the joiner derives
+    ///    `ws(s)://{coordinator-host}/v1/mesh/relay`, the right answer for
+    ///    local/dev meshes where no TLS relay exists).
+    #[must_use]
+    pub fn effective_relay_url(&self) -> Option<String> {
+        self.relay_url.clone().or_else(|| {
+            (self.coordinator_url == DEFAULT_COORDINATOR_URL).then(|| DEFAULT_RELAY_URL.to_owned())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -413,10 +439,48 @@ mod tests {
 
     #[test]
     fn relay_url_defaults_to_none() {
-        // Absent `--mesh-relay-url` / `TABBIFY_MESH_RELAY_URL` ⇒ None ⇒ the
-        // joiner derives the relay from the coordinator URL (existing behavior).
+        // Absent `--mesh-relay-url` / `TABBIFY_MESH_RELAY_URL` ⇒ the RAW field
+        // is None; the EFFECTIVE relay for the default (prod) coordinator is
+        // the baked wss:// endpoint — see `effective_relay_url_*` below.
         let cfg = Config::try_parse_from(["supervisord"]).unwrap();
         assert!(cfg.relay_url.is_none());
+    }
+
+    #[test]
+    fn effective_relay_url_bakes_wss_for_default_coordinator() {
+        // Zero-config prod node: default coordinator ⇒ TLS relay on 443, so
+        // a fresh install traverses corporate firewalls with NO env/drop-in
+        // (the old `/run` systemd drop-in died on every reboot).
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert_eq!(
+            cfg.effective_relay_url().as_deref(),
+            Some(DEFAULT_RELAY_URL)
+        );
+    }
+
+    #[test]
+    fn effective_relay_url_derives_for_custom_coordinator() {
+        // A custom (local/dev) coordinator has no TLS relay; None lets the
+        // joiner keep deriving ws(s)://{coordinator-host}/v1/mesh/relay.
+        let cfg =
+            Config::try_parse_from(["supervisord", "--coordinator-url", "http://127.0.0.1:8888"])
+                .unwrap();
+        assert!(cfg.effective_relay_url().is_none());
+    }
+
+    #[test]
+    fn effective_relay_url_explicit_overrides_everything() {
+        // An operator-pinned relay wins over both defaults.
+        let cfg = Config::try_parse_from([
+            "supervisord",
+            "--mesh-relay-url",
+            "wss://relay.example.com/v1/mesh/relay",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.effective_relay_url().as_deref(),
+            Some("wss://relay.example.com/v1/mesh/relay")
+        );
     }
 
     #[test]

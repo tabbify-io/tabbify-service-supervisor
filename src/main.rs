@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
                 software_version: Some(tabbify_supervisor::version::binary_version().to_owned()),
                 ..Default::default()
             },
-            config.relay_url.clone(),
+            config.effective_relay_url(),
         )
         .await
         .context("join mesh")?;
@@ -147,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
         parent,
         no_mesh: config.no_mesh,
         // Forward the supervisor's explicit relay endpoint to every runner.
-        relay_url: config.relay_url.clone(),
+        relay_url: config.effective_relay_url(),
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
 
@@ -339,12 +339,10 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
             &capability_tags,
             tabbify_supervisor::mesh::JoinMetadata {
                 identity_path: config.candidate_identity_path.clone(),
-                software_version: Some(
-                    tabbify_supervisor::version::binary_version().to_owned(),
-                ),
+                software_version: Some(tabbify_supervisor::version::binary_version().to_owned()),
                 ..Default::default()
             },
-            config.relay_url.clone(),
+            config.effective_relay_url(),
         )
         .await
         {
@@ -371,12 +369,17 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
         no_mesh: true,
         // The candidate forwards the relay endpoint too, so its probe runner
         // exercises the same relay path as production.
-        relay_url: config.relay_url.clone(),
+        relay_url: config.effective_relay_url(),
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
-    let state = SupervisorState::new(orchestrator, fetcher, "candidate".to_owned(), bind_addr.ip().to_string())
-        .with_version(tabbify_supervisor::version::binary_version().to_owned());
+    let state = SupervisorState::new(
+        orchestrator,
+        fetcher,
+        "candidate".to_owned(),
+        bind_addr.ip().to_string(),
+    )
+    .with_version(tabbify_supervisor::version::binary_version().to_owned());
     let app = router(state);
 
     let (health_200, pong) = match TcpListener::bind(bind_addr).await {
@@ -534,6 +537,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(health_200, "/health must answer 200");
-        assert!(pong, "/v1/about must answer 200 as the distinct part-3 signal");
+        assert!(
+            pong,
+            "/v1/about must answer 200 as the distinct part-3 signal"
+        );
     }
 }

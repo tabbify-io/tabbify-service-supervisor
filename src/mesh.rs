@@ -197,6 +197,12 @@ fn build_supervisor_join_config(
         // escape hatch (route the relay over `wss://`/443). `None` keeps the
         // default derivation, unchanged for AWS-side peers.
         relay_url,
+        // The supervisor is the HOST daemon: it owns the main-table routes
+        // (no source-scoping — its per-app runners scope themselves), and
+        // it keeps the host firewall from dropping inbound overlay dials
+        // to its control listener (:8730), tailscaled-style. Best-effort:
+        // a container without ip6tables only logs a warning.
+        manage_firewall: true,
         ..Default::default()
     }
 }
@@ -316,6 +322,30 @@ mod tests {
             config.relay_url.as_deref(),
             Some("wss://relay.tabbify.io/v1/mesh/relay"),
             "explicit relay_url must ride onto JoinConfig verbatim"
+        );
+    }
+
+    /// The supervisor is the host daemon: it manages the firewall trust for
+    /// its own TUN (tailscaled-style, so inbound :8730 dials survive distro
+    /// default firewalls) but does NOT source-scope its routes — it is the
+    /// rightful owner of the main-table `/128`s; its per-app runners scope
+    /// themselves instead.
+    #[test]
+    fn build_config_sets_host_integration_for_host_daemon() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+        );
+        assert!(
+            config.manage_firewall,
+            "supervisor must manage the firewall"
+        );
+        assert!(
+            !config.source_scoped_routes,
+            "supervisor must keep main-table routes (runners scope themselves)"
         );
     }
 

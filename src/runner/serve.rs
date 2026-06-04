@@ -447,6 +447,16 @@ pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
         // runner's relay over this url verbatim (corporate-firewall escape
         // hatch); `None` keeps the coordinator-derived relay, unchanged.
         relay_url: cfg.relay_url.clone(),
+        // A runner ALWAYS shares its netns with the supervisor (and other
+        // runners), so its peer `/128`s must live in its own source-scoped
+        // table — otherwise the supervisor's main-table routes win and the
+        // runner's return traffic egresses via the WRONG TUN (dropped by
+        // the remote peer's §5.5 source allowed-set). Intrinsic, not
+        // configurable: there is no single-netns runner deployment.
+        source_scoped_routes: true,
+        // Keep the host firewall from dropping inbound overlay dials to
+        // the app listener (tailscaled-style, best-effort).
+        manage_firewall: true,
         ..Default::default()
     }
 }
@@ -543,6 +553,26 @@ mod tests {
             join.relay_url.as_deref(),
             Some("wss://relay.tabbify.io/v1/mesh/relay"),
             "explicit relay_url must ride onto the runner's JoinConfig"
+        );
+    }
+
+    /// A runner ALWAYS shares its netns with the supervisor, so its joiner
+    /// must (a) source-scope its peer routes — otherwise the supervisor's
+    /// main-table `/128`s win and the runner's return traffic egresses via
+    /// the WRONG TUN (dropped by the remote §5.5 source check — the exact
+    /// 2026-06-04 outage) — and (b) self-manage the host-firewall trust for
+    /// its TUN so inbound app dials aren't dropped by `nixos-fw`-style
+    /// default firewalls.
+    #[test]
+    fn runner_join_config_enables_host_integration() {
+        let join = build_runner_join_config(&mesh_cfg());
+        assert!(
+            join.source_scoped_routes,
+            "runner must source-scope its peer routes (shared netns)"
+        );
+        assert!(
+            join.manage_firewall,
+            "runner must self-manage host-firewall TUN trust"
         );
     }
 
