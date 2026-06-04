@@ -19,6 +19,58 @@ fn guest_mac_is_locally_administered_and_deterministic() {
     assert_eq!(derive_guest_mac(1), "02:FC:01:00:00:00");
 }
 
+#[test]
+fn fc_identity_is_stable_per_uuid() {
+    // Same uuid → same tap name + link index every call (so cold boot, a
+    // respawn, and a snapshot restore for one app all share host plumbing).
+    let a = fc_identity_for_uuid("cc4bfba2-17a9-512d-b6f4-43f69114be65");
+    let b = fc_identity_for_uuid("cc4bfba2-17a9-512d-b6f4-43f69114be65");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn fc_identity_distinct_uuids_distinct_taps() {
+    // The bug this fixes: two different apps must NOT land on the same tap
+    // device / api-socket (the old VM_SEQ put every app on fc-tap0).
+    let (tap_a, _) = fc_identity_for_uuid("cc4bfba2-17a9-512d-b6f4-43f69114be65");
+    let (tap_b, _) = fc_identity_for_uuid("78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3");
+    assert_ne!(tap_a, tap_b);
+}
+
+#[test]
+fn fc_identity_tap_name_fits_ifnamsiz_and_is_prefixed() {
+    // Linux interface names are capped at 15 chars (IFNAMSIZ - 1). `fc-` + 12
+    // hex = exactly 15.
+    for uuid in [
+        "cc4bfba2-17a9-512d-b6f4-43f69114be65",
+        "78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3",
+        "fc-launch-default",
+        "0191e7c2-1111-7222-8333-444455556666",
+    ] {
+        let (tap, _) = fc_identity_for_uuid(uuid);
+        assert!(tap.starts_with("fc-"), "tap {tap} must start with fc-");
+        assert!(tap.len() <= 15, "tap {tap} exceeds IFNAMSIZ (len {})", tap.len());
+    }
+}
+
+#[test]
+fn fc_identity_link_idx_never_hits_build_slot() {
+    // link_idx must stay below the build VM's reserved /30 (BUILD_SEQ = 16382),
+    // so a serving VM and the build VM never share a /30.
+    for uuid in [
+        "cc4bfba2-17a9-512d-b6f4-43f69114be65",
+        "78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3",
+        "0191e7c2-2222-7222-8333-444455556666",
+    ] {
+        let (_, idx) = fc_identity_for_uuid(uuid);
+        assert!(idx < SERVING_LINK_SLOTS, "idx {idx} must be < {SERVING_LINK_SLOTS}");
+        assert!(
+            idx < crate::firecracker::build_vm::BUILD_SEQ,
+            "idx {idx} collides build slot"
+        );
+    }
+}
+
 /// REAL microVM boot — Linux + `/dev/kvm` + a provisioned kernel + a
 /// rootfs only. `#[ignore]`d so CI / the macOS dev host never runs it;
 /// run it by hand on a KVM box (e.g. Leo's Lima Ubuntu):

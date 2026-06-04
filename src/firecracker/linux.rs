@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(test)]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -91,9 +90,47 @@ pub(crate) fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
     }
 }
 
-/// Monotonic per-process counter → a unique tap name + /30 offset per VM, so
-/// concurrently-hosted firecracker apps don't collide on tap devices/links.
-pub(crate) static VM_SEQ: AtomicU32 = AtomicU32::new(0);
+/// `/30` link slots reserved for SERVING VMs in the tap `/16`. The build VM
+/// occupies the very top slot ([`super::build_vm::BUILD_SEQ`] = `0xFFFF/4 - 1`
+/// = 16382), so serving VMs hash into `[0, SERVING_LINK_SLOTS)` and never land
+/// on the build VM's `/30`.
+const SERVING_LINK_SLOTS: u32 = 16_382;
+
+/// Deterministic, **per-uuid** firecracker host identity — replaces the old
+/// process-global `VM_SEQ` counter.
+///
+/// The previous `VM_SEQ` was a `static AtomicU32::new(0)` LIVING IN THE RUNNER
+/// PROCESS. Since every app runs in its OWN `tabbify-runner` process, the
+/// counter started at 0 in each → **every app booted its microVM on `fc-tap0`
+/// / `/tmp/firecracker-fc-tap0.sock`**, so two concurrent apps (and a runner's
+/// own respawns vs. orphaned firecrackers) collided on the same tap device +
+/// api-socket. A new boot's `ip link del fc-tap0` then ripped the tap out from
+/// under a live microVM → unhealthy → monitor crash-loop. (`app_ula` was
+/// already per-uuid, so only the host-side plumbing collided.)
+///
+/// Deriving the identity from the uuid (same `blake3` source as
+/// [`crate::app_ula`]) makes it STABLE per app and collision-free in practice:
+/// - `tap_name`: `fc-<48-bit blake3 hex>` — 15 chars, the IFNAMSIZ limit; also
+///   names the `/tmp/firecracker-<tap>.sock` api socket. 48 bits ⇒ two distinct
+///   uuids effectively never share a tap device or socket.
+/// - `link_idx`: `hash % SERVING_LINK_SLOTS` — the `/30` + MAC index fed to
+///   [`derive_link_ips`] / [`derive_guest_mac`]. Only 14 bits (the `/16` holds
+///   16384 `/30`s), so a same-`link_idx` (different-`tap_name`) clash is rare
+///   and surfaces as a hard `ip addr add` duplicate-address error rather than
+///   silent corruption.
+fn fc_identity_for_uuid(uuid: &str) -> (String, u32) {
+    let digest = blake3::hash(uuid.as_bytes());
+    let b = digest.as_bytes();
+    let hash48: u64 = (u64::from(b[0]) << 40)
+        | (u64::from(b[1]) << 32)
+        | (u64::from(b[2]) << 24)
+        | (u64::from(b[3]) << 16)
+        | (u64::from(b[4]) << 8)
+        | u64::from(b[5]);
+    let tap_name = format!("fc-{hash48:012x}");
+    let link_idx = u32::try_from(hash48 % u64::from(SERVING_LINK_SLOTS)).unwrap_or(0);
+    (tap_name, link_idx)
+}
 
 /// Probe type: given a `host:port` string returns `true` iff the guest app is
 /// reachable. Production `health()` does a real HTTP GET to `guest_base`; this
@@ -133,7 +170,10 @@ impl FirecrackerRuntime {
     /// REST configuration call failing, or the guest app not answering
     /// within [`READY_TIMEOUT`].
     pub async fn launch(rootfs: &Path, rt: &Runtime, cfg: &FcConfig) -> Result<Self> {
-        Self::cold_boot(rootfs, rt, cfg, None, None).await
+        // No per-app uuid context here (the bare entry, used by tests + simple
+        // single-VM callers): a fixed identity is fine. The per-uuid production
+        // path is `launch_with_uuid`.
+        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default").await
     }
 
     /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
@@ -147,6 +187,7 @@ impl FirecrackerRuntime {
         cfg: &FcConfig,
         cache_dir: Option<&Path>,
         console_log: Option<&Path>,
+        uuid: &str,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -155,14 +196,16 @@ impl FirecrackerRuntime {
             bail!("firecracker rootfs not found at {}", rootfs.display());
         }
 
-        let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
-        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
+        // Per-uuid host identity (tap/api-sock/link/MAC) — STABLE per app and
+        // collision-free across concurrent apps + respawns (see
+        // `fc_identity_for_uuid`).
+        let (tap_name, link_idx) = fc_identity_for_uuid(uuid);
+        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
-        let tap_name = format!("fc-tap{seq}");
-        let guest_mac = derive_guest_mac(seq);
+        let guest_mac = derive_guest_mac(link_idx);
         let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
         tracing::debug!(
-            seq,
+            link_idx,
             %host_ip,
             %guest_ip,
             %tap_name,
@@ -268,7 +311,7 @@ impl FirecrackerRuntime {
             // Warm path: try to restore from a previously-taken snapshot.
             // Fall back to cold boot on any failure (corrupt files, kernel
             // mismatch, etc.) so the app always comes up eventually.
-            match Self::launch_from_snapshot(&cache_dir, cfg, Some(&console_log)).await {
+            match Self::launch_from_snapshot(&cache_dir, cfg, Some(&console_log), uuid).await {
                 Ok(warm_vm) => {
                     tracing::info!(uuid, "warm start from snapshot");
                     warm_vm
@@ -279,12 +322,13 @@ impl FirecrackerRuntime {
                         error = %e,
                         "snapshot load failed; falling back to cold boot"
                     );
-                    Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log)).await?
+                    Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), uuid)
+                        .await?
                 }
             }
         } else {
             // Cold path: first boot — take a snapshot on the way out.
-            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log)).await?
+            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), uuid).await?
         };
 
         // Record the new child PID so a future restart can clean it up.
@@ -296,14 +340,18 @@ impl FirecrackerRuntime {
 
     /// Restore a previously-snapshotted VM from `cache_dir`.
     ///
-    /// Flow: `setup_tap` (new tap/IP, derived by VM_SEQ) → spawn
-    /// `firecracker --api-sock` → `PUT /snapshot/load` (resume_vm=true) →
-    /// `wait_until_ready` (should be ~ms not seconds).
+    /// Flow: `setup_tap` (per-uuid tap/IP) → spawn `firecracker --api-sock` →
+    /// `PUT /snapshot/load` (resume_vm=true) → `wait_until_ready` (should be ~ms
+    /// not seconds).
     ///
     /// The machine-config / boot-source / drives / network-interfaces sequence
     /// from `configure_and_boot` is intentionally SKIPPED here — the snapshot
     /// embeds all that state. The only networking re-wiring needed is the host
-    /// tap; the guest MAC and IP are baked into the snapshot.
+    /// tap; the guest MAC and IP are baked into the snapshot — and because the
+    /// tap/IP are now derived from the SAME `uuid` as the cold boot that took
+    /// the snapshot, the re-wired host link matches the baked guest exactly
+    /// (the old `VM_SEQ` counter could hand the restore a DIFFERENT /30 than the
+    /// snapshot was taken with).
     ///
     /// # Errors
     /// Tap setup failure, firecracker spawn failure, snapshot load API failure,
@@ -312,6 +360,7 @@ impl FirecrackerRuntime {
         cache_dir: &Path,
         cfg: &FcConfig,
         console_log: Option<&Path>,
+        uuid: &str,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -327,14 +376,13 @@ impl FirecrackerRuntime {
             .to_str()
             .ok_or_else(|| anyhow!("snapshot mem path is not valid UTF-8"))?;
 
-        // Allocate a fresh tap + /30 for this restored VM.
-        let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
-        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, seq)
+        // Per-uuid tap + /30 — MATCHES the cold boot that took the snapshot.
+        let (tap_name, link_idx) = fc_identity_for_uuid(uuid);
+        let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
-        let tap_name = format!("fc-tap{seq}");
         let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
         tracing::debug!(
-            seq,
+            link_idx,
             %host_ip,
             %guest_ip,
             %tap_name,
