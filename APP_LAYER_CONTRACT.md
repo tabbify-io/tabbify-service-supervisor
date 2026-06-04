@@ -506,3 +506,36 @@ curl -fsSL "${BASE}/supervisord"    -o supervisord    && chmod +x supervisord
 curl -fsSL "${BASE}/tabbify-runner" -o tabbify-runner && chmod +x tabbify-runner
 sudo ./supervisord --runner-bin ./tabbify-runner
 ```
+
+## Builder role (build/run split, 2026-06-04)
+
+The supervisor is a UNIVERSAL node; its fleet role is expressed via mesh
+capability tags (frozen strings, additive-only):
+
+| Tag | Meaning | Source |
+|---|---|---|
+| `firecracker` | can RUN apps (`/dev/kvm` R/W) | auto-detected |
+| `docker` | docker daemon reachable (can build images) | auto-detected |
+| `builder` | operator-DESIGNATED build host | explicit: `SUPERVISOR_BUILDER=1` / `--builder` |
+
+Node-side selection semantics:
+
+- **Builder for `/v1/build`** — explicit hint wins (REST/MCP `builder` field,
+  or `tabbify.toml [build].builder` = display name or ULA, no fallback);
+  otherwise: `builder`-tagged peers (roster order) → `docker`-tagged peers →
+  legacy first-in-roster (untagged dev fleets). The pipeline retries the next
+  candidate on build failure (bounded: 3 attempts).
+- **Default deploy fan-out** (no explicit `targets`) — only
+  `firecracker`-tagged supervisors. A roster where capability tags exist but
+  nobody can RUN is a loud error, not a silent half-failed fan-out. A fully
+  untagged fleet keeps the historical fan-out-to-all.
+- `/v1/build` itself is NOT gated by the tag (transition compat + explicit
+  hints must work on any docker-capable host).
+
+`tabbify.toml` addition:
+
+```toml
+[build]
+kind = "docker"
+builder = "buildbox"   # optional: pin the build host (name or ULA)
+```

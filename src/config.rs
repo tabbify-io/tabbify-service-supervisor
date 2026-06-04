@@ -65,6 +65,14 @@ pub struct Config {
     #[arg(long, env = "SUPERVISOR_NO_MESH", default_value_t = false)]
     pub no_mesh: bool,
 
+    /// Designate this supervisor a BUILD host: advertise the `builder` mesh
+    /// tag so the node routes `/v1/build` jobs here. An explicit operator
+    /// decision (fleet composition), never auto-detected — a build host
+    /// additionally needs a reachable docker daemon + `skopeo` + `git`.
+    /// Defaults off (run-only node).
+    #[arg(long, env = "SUPERVISOR_BUILDER", default_value_t = false)]
+    pub builder: bool,
+
     /// Display name advertised to the coordinator.
     #[arg(long, env = "SUPERVISOR_NAME", default_value = "tabbify-supervisor")]
     pub display_name: String,

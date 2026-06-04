@@ -72,7 +72,8 @@ async fn main() -> anyhow::Result<()> {
     // host it; WASM is always available. A host advertises only what it can run.
     let kvm = kvm_available();
     let docker = docker_available();
-    let capability_tags = tabbify_supervisor::capability_tags::capability_tags(kvm, docker);
+    let capability_tags =
+        tabbify_supervisor::capability_tags::capability_tags(kvm, docker, config.builder);
     if kvm {
         tracing::info!("KVM available (/dev/kvm) — advertising `firecracker` capability");
     } else {
@@ -82,6 +83,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Docker daemon reachable — advertising `docker` capability");
     } else {
         tracing::info!("no Docker daemon — docker apps unsupported on this host");
+    }
+    if config.builder {
+        tracing::info!("designated BUILDER (SUPERVISOR_BUILDER) — advertising `builder` capability");
+        if !docker {
+            // Warn, not fatal: the daemon may come up later, and the node's
+            // builder selection happens against the roster tag — a build
+            // landing here without docker fails loudly in the build status.
+            tracing::warn!(
+                "designated builder but no reachable docker daemon — builds will fail until docker is up"
+            );
+        }
     }
     if capability_tags.is_empty() {
         tracing::info!("WASM-only supervisor (no firecracker / docker capability)");
@@ -326,9 +338,12 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
     // 1. Join the mesh with the TRANSIENT identity (separate file, OS-ephemeral
     //    WG port via the joiner default). On a host without root/TUN this fails
     //    and the gate fails closed.
+    // The candidate probe advertises the same capabilities a real boot
+    // would, including the operator's builder designation.
     let capability_tags = tabbify_supervisor::capability_tags::capability_tags(
         tabbify_supervisor::firecracker::kvm_available(),
         tabbify_supervisor::docker::docker_available(),
+        config.builder,
     );
     let joined_mesh = if config.no_mesh {
         true
