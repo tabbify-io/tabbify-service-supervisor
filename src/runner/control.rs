@@ -84,6 +84,17 @@ pub struct RunnerLifecycle {
     /// duplicate the sender (only one `send` must fire; clones share the same
     /// slot and the first `take` wins).
     pub(crate) shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// The OCI image ref the CURRENTLY-active runtime was built from (the
+    /// manifest's `runtime.registry_ref` at start, then the last successfully
+    /// deployed ref). `None` when the initial build had no explicit ref (a
+    /// source/S3 build with no deployed version).
+    ///
+    /// Shared via `Arc<Mutex<…>>` because the lifecycle handle is cloned
+    /// per-connection (see [`serve`]); a same-ref re-deploy guard reads this and
+    /// a successful swap writes it, so the value MUST be shared across clones,
+    /// not duplicated. Guards [`RunnerLifecycle::deploy`] against a wasteful
+    /// rebuild + tap collision when the requested ref already runs healthily.
+    pub(crate) current_ref: Arc<Mutex<Option<String>>>,
 }
 
 impl RunnerLifecycle {
@@ -160,6 +171,24 @@ impl RunnerLifecycle {
     ///   unhealthy — in both cases the OLD runtime stays in service (no
     ///   downtime).
     async fn deploy(&self, reff: &str) -> Reply {
+        // Same-ref re-deploy guard: if the requested ref is ALREADY the live
+        // ref and the active runtime is healthy, a rebuild is a wasteful no-op —
+        // and worse, the new VM would derive the SAME `uuid:reff` tap as the
+        // still-running old VM and collide on it. Short-circuit with Ok.
+        {
+            let current = self.current_ref.lock().await;
+            if current.as_deref() == Some(reff)
+                && self.active.health().await == RuntimeHealth::Serving
+            {
+                tracing::info!(
+                    uuid = %self.uuid,
+                    reff = %reff,
+                    "deploy: requested ref already live and healthy — skipping rebuild (no-op)"
+                );
+                return Reply::Ok;
+            }
+        }
+
         // Build the new runtime from the app's manifest with the deploy ref
         // applied: the runtime is always Firecracker, which pulls `reff` from the
         // mesh registry, converts the OCI image to a rootfs.ext4, and boots it.
@@ -191,6 +220,9 @@ impl RunnerLifecycle {
         .await
         {
             Ok(()) => {
+                // The swap flipped the active runtime to the one built from
+                // `reff`; record it so a subsequent same-ref deploy short-circuits.
+                *self.current_ref.lock().await = Some(reff.to_owned());
                 tracing::info!(uuid = %self.uuid, reff = %reff, "deploy: zero-downtime swap complete");
                 Reply::Ok
             }
@@ -394,6 +426,7 @@ mod tests {
             fc: FcConfig::default(),
             data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            current_ref: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -474,5 +507,65 @@ mod tests {
             Arc::ptr_eq(&before, &lc.active.load()),
             "a failed deploy must NOT swap the active runtime (no downtime)"
         );
+    }
+
+    /// A deploy of the SAME ref that is already live (and healthy) is a no-op:
+    /// it returns `Ok` WITHOUT rebuilding, so the active runtime allocation is
+    /// untouched (no wasteful build, no `uuid:reff` tap collision with the live
+    /// VM). This is the same-ref re-deploy guard.
+    #[tokio::test]
+    async fn deploy_same_ref_when_healthy_is_noop() {
+        let lc = fake_lifecycle(RuntimeHealth::Serving);
+        let live_ref = "[fd5a::1]:5000/acme/app:sha-live";
+        // Seed the current ref to the ref we are about to "re-deploy".
+        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        let before = lc.active.load();
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: live_ref.to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        assert!(
+            matches!(reply, Reply::Ok),
+            "same-ref deploy of a healthy runtime must reply Ok, got {reply:?}"
+        );
+        // No rebuild/swap happened — the active runtime is the SAME allocation.
+        assert!(
+            Arc::ptr_eq(&before, &lc.active.load()),
+            "same-ref deploy must NOT rebuild/swap the active runtime"
+        );
+    }
+
+    /// The same-ref guard does NOT short-circuit when the active runtime is
+    /// unhealthy: even if the requested ref matches the live ref, an unhealthy
+    /// runtime must still attempt a rebuild (here it fails the FC build against
+    /// an unreachable ref, proving the guard was bypassed and the build ran).
+    #[tokio::test]
+    async fn deploy_same_ref_when_unhealthy_does_not_short_circuit() {
+        let lc = fake_lifecycle(RuntimeHealth::Unavailable("guest down".to_owned()));
+        let live_ref = "[fd5a::1]:5000/acme/app:sha";
+        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: live_ref.to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        // The guard was bypassed (unhealthy), so the FC build ran and failed on
+        // the unreachable ref — an Err, NOT the no-op Ok.
+        match reply {
+            Reply::Err { message } => assert!(
+                message.contains("deploy"),
+                "error must mention deploy, got: {message}"
+            ),
+            other => panic!("expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"),
+        }
     }
 }
