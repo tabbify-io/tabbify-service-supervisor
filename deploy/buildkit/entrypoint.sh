@@ -11,8 +11,14 @@
 
 ok=false
 finish() {
-  mkdir -p /scratch 2>/dev/null
   echo "{\"ok\":$ok}" > /scratch/result.json 2>/dev/null
+  sync
+  # Mark the ext4s CLEAN on the way out: stop buildkitd, then unmount cache
+  # (persistent — a dirty cache forces a host-side e2fsck/quarantine) and
+  # scratch. Best-effort; the host also e2fscks the cache before reuse.
+  kill "$BK_PID" 2>/dev/null
+  umount /cache 2>/dev/null
+  umount /scratch 2>/dev/null
   sync
   # Power off: sysrq 'o'. Fallback: exit PID1 (kernel panic also ends the VM,
   # just noisier in the console log).
@@ -34,7 +40,9 @@ mount -t tmpfs tmpfs /run 2>/dev/null
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
 
-# DNS for base-image pulls (the kernel ip= config set the iface + route).
+# The rootfs is mounted READ-ONLY (shared, digest-cached). Back /etc with a
+# tmpfs so DNS for base-image pulls can be written without touching the image.
+mount -t tmpfs tmpfs /etc 2>/dev/null
 echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
 mkdir -p /scratch/out /cache/buildkit /cache/bk
@@ -45,6 +53,7 @@ mkdir -p /scratch/out /cache/buildkit /cache/bk
 # kernel-feature dependency.
 buildkitd --root /cache/buildkit --oci-worker-snapshotter=native \
   > /scratch/out/buildkitd.log 2>&1 &
+BK_PID=$!
 
 i=0
 while [ ! -S /run/buildkit/buildkitd.sock ]; do

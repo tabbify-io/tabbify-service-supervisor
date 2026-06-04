@@ -15,21 +15,32 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
 use super::linux::{
-    VM_SEQ, api_put_sock, console_stdio, derive_guest_mac, derive_link_ips, run_ip,
-    setup_guest_nat, setup_tap,
+    api_put_sock, derive_link_ips, run_ip, setup_guest_nat, setup_tap, teardown_guest_nat,
 };
 use super::protocol::{
-    aux_drive_body, boot_source_body, instance_start_body, machine_config_body,
-    network_iface_body, rootfs_drive_body,
+    aux_drive_body, boot_source_body, instance_start_body, machine_config_body, network_iface_body,
+    rootfs_drive_body,
 };
 use crate::config::FcConfig;
+
+/// Build VMs live in their OWN address/tap/MAC namespace, DISJOINT from the
+/// serving runtime's `VM_SEQ`-derived `fc-tap<seq>` / `02:FC:…` / first-/30
+/// space. Builds are serialized (one at a time per host) and ephemeral, so a
+/// single fixed identity is enough — and critically, the build path must
+/// NEVER name, address, or `ip link del` a device a serving app VM in the
+/// SAME host netns could own (serving + build runners share one netns).
+pub(crate) const BUILD_TAP: &str = "fc-bld0";
+/// `02:FB:…` (locally-administered, distinct from serving's `02:FC:…`).
+pub(crate) const BUILD_MAC: &str = "02:FB:00:00:00:01";
+/// /30 carved from the TOP of the tap /16 (172.31.255.x), where the serving
+/// `VM_SEQ` counter — climbing from .0.1 — realistically never reaches.
+pub(crate) const BUILD_SEQ: u32 = 0xFFFF / 4 - 1;
 
 /// Hard ceiling on one sandboxed build. A build that hasn't finished by then
 /// is killed (the VM is the cleanup boundary — nothing leaks onto the host).
@@ -79,31 +90,49 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
         }
     }
 
-    let seq = VM_SEQ.fetch_add(1, Ordering::SeqCst);
-    let (host_ip, guest_ip) = derive_link_ips(&spec.cfg.tap_subnet, seq)
-        .with_context(|| format!("derive /30 from subnet {}", spec.cfg.tap_subnet))?;
-    let tap_name = format!("fc-tap{seq}");
-    let guest_mac = derive_guest_mac(seq);
+    // Build-owned identity — never overlaps serving (see BUILD_* consts).
+    let (host_ip, guest_ip) = derive_link_ips(&spec.cfg.tap_subnet, BUILD_SEQ)
+        .with_context(|| format!("derive build /30 from subnet {}", spec.cfg.tap_subnet))?;
+    let tap_name = BUILD_TAP;
+    let guest_mac = BUILD_MAC;
 
-    let _ = run_ip(&["link", "del", &tap_name]).await;
-    setup_tap(&tap_name, host_ip)
+    // Pre-clean ONLY our own build tap (a prior build's leak); never a
+    // serving app's fc-tap*.
+    let _ = run_ip(&["link", "del", tap_name]).await;
+    setup_tap(tap_name, host_ip)
         .await
         .context("build VM tap setup (need CAP_NET_ADMIN/root)")?;
     // Egress NAT: the guest pulls BASE image layers (FROM …) over the tap.
     // No mesh access, no clone token — outbound internet only.
-    setup_guest_nat(&tap_name, &spec.cfg.tap_subnet).await;
+    setup_guest_nat(tap_name, &spec.cfg.tap_subnet).await;
+
+    // Tear down our tap + NAT rules on EVERY exit (success/boot-error/
+    // timeout-kill) so the host accrues nothing across builds.
+    let cleanup = || async {
+        let _ = teardown_guest_nat(tap_name).await;
+        let _ = run_ip(&["link", "del", tap_name]).await;
+    };
 
     let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
     let _ = std::fs::remove_file(&api_sock);
-    let (stdout, stderr) = console_stdio(Some(spec.console_log));
-    let mut child = Command::new(&spec.cfg.bin)
+    // Builds ALWAYS capture the console (ephemeral, single-tenant — the
+    // serving path's /dev/null-by-default rationale doesn't apply); it's the
+    // last-resort build log if the scratch comes back unreadable.
+    let (stdout, stderr) = build_console_stdio(spec.console_log);
+    let mut child = match Command::new(&spec.cfg.bin)
         .arg("--api-sock")
         .arg(&api_sock)
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .with_context(|| format!("spawn {} for build VM", spec.cfg.bin))?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup().await;
+            return Err(e).with_context(|| format!("spawn {} for build VM", spec.cfg.bin));
+        }
+    };
 
     // Configure + boot. Any failure here kills the half-configured VM.
     let boot = async {
@@ -118,14 +147,21 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
         api_put_sock(
             &api_sock,
             "/boot-source",
-            &boot_source_body(&spec.cfg.kernel, &guest_ip.to_string(), &host_ip.to_string()),
+            &boot_source_body(
+                &spec.cfg.kernel,
+                &guest_ip.to_string(),
+                &host_ip.to_string(),
+            ),
         )
         .await
         .context("PUT /boot-source")?;
         api_put_sock(
             &api_sock,
             "/drives/rootfs",
-            &rootfs_drive_body(&spec.rootfs.to_string_lossy()),
+            // READ-ONLY: the toolchain rootfs is shared + digest-cached
+            // across builds; a writable mount would let one build corrupt
+            // the cached image. The guest tmpfs-mounts its few write paths.
+            &rootfs_drive_body(&spec.rootfs.to_string_lossy(), true),
         )
         .await
         .context("PUT /drives/rootfs")?;
@@ -146,7 +182,7 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
         api_put_sock(
             &api_sock,
             "/network-interfaces/eth0",
-            &network_iface_body(&tap_name, &guest_mac),
+            &network_iface_body(tap_name, guest_mac),
         )
         .await
         .context("PUT /network-interfaces/eth0")?;
@@ -186,8 +222,23 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
 
     // VM-scoped host state dies with the VM, success or not.
     let _ = std::fs::remove_file(&api_sock);
-    let _ = run_ip(&["link", "del", &tap_name]).await;
+    cleanup().await;
     outcome
+}
+
+/// Console stdio for a build VM: ALWAYS capture to `console_log` (truncate
+/// per build), falling back to `/dev/null` only if the file can't be opened.
+fn build_console_stdio(console_log: &Path) -> (Stdio, Stdio) {
+    if let Some(parent) = console_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::File::create(console_log) {
+        Ok(f) => match f.try_clone() {
+            Ok(f2) => (Stdio::from(f), Stdio::from(f2)),
+            Err(_) => (Stdio::from(f), Stdio::null()),
+        },
+        Err(_) => (Stdio::null(), Stdio::null()),
+    }
 }
 
 /// The firecracker API socket appears asynchronously after spawn; poll
@@ -199,5 +250,8 @@ async fn wait_for_api_sock(api_sock: &Path) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    bail!("firecracker API socket never appeared at {}", api_sock.display())
+    bail!(
+        "firecracker API socket never appeared at {}",
+        api_sock.display()
+    )
 }

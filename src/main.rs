@@ -85,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("no Docker daemon — docker apps unsupported on this host");
     }
     if config.builder {
-        tracing::info!("designated BUILDER (SUPERVISOR_BUILDER) — advertising `builder` capability");
+        tracing::info!(
+            "designated BUILDER (SUPERVISOR_BUILDER) — advertising `builder` capability"
+        );
         if !docker {
             // Warn, not fatal: the daemon may come up later, and the node's
             // builder selection happens against the roster tag — a build

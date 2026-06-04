@@ -422,7 +422,7 @@ impl FirecrackerRuntime {
         )
         .await
         .context("PUT /boot-source")?;
-        self.api_put("/drives/rootfs", &rootfs_drive_body(rootfs_str))
+        self.api_put("/drives/rootfs", &rootfs_drive_body(rootfs_str, false))
             .await
             .context("PUT /drives/rootfs")?;
         self.api_put(
@@ -836,6 +836,30 @@ pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
         }
     }
     tracing::info!(%tap_name, uplink = %uplink, subnet = %tap_subnet, "fc nat: guest egress enabled");
+}
+
+/// Best-effort teardown of the two tap-keyed `FORWARD ACCEPT` rules
+/// [`setup_guest_nat`] installed for `tap_name` (the shared subnet
+/// MASQUERADE rule is left — all VMs share it). Without this, every
+/// cold-boot/build leaks two FORWARD rules (tap names come from a
+/// never-reused monotonic seq). Errors are ignored: the rule may already be
+/// gone, and a leaked rule on a now-dead tap is inert.
+pub(crate) async fn teardown_guest_nat(tap_name: &str) -> Result<()> {
+    let Some(uplink) = default_route_dev().await else {
+        return Ok(());
+    };
+    let dirs: [[&str; 8]; 2] = [
+        [
+            "-D", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
+        ],
+        [
+            "-D", "FORWARD", "-o", &uplink, "-i", tap_name, "-j", "ACCEPT",
+        ],
+    ];
+    for d in dirs {
+        let _ = Command::new("iptables").args(d).output().await;
+    }
+    Ok(())
 }
 
 /// Ensure an iptables rule exists: run the `-C` (check) form; if absent, run

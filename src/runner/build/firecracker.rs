@@ -286,22 +286,24 @@ async fn build_rootfs_ext4_inner(
     //    positional is OMITTED so the OUTPUT path stays the final argv element.
     //    `-m 0` reclaims the 5% root-reserved blocks a single-purpose rootfs
     //    does not need; `-N` pins the inode count to the real file count.
+    // ATOMIC publish: mkfs into a per-process temp on the SAME dir, then
+    // rename onto the final name only on success. A crashed/killed conversion
+    // therefore never leaves a PARTIAL rootfs.ext4 that a later run would
+    // treat as a valid digest-cache hit. rename(2) within one dir is atomic.
     let rootfs = out_dir.join(ROOTFS_NAME);
+    let tmp = out_dir.join(format!(".{ROOTFS_NAME}.{}.tmp", std::process::id()));
     {
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&rootfs)
+            .open(&tmp)
             .await
-            .with_context(|| format!("create rootfs image {}", rootfs.display()))?;
+            .with_context(|| format!("create rootfs image {}", tmp.display()))?;
         file.set_len(u64::from(effective_mib) * 1024 * 1024)
             .await
             .with_context(|| {
-                format!(
-                    "size rootfs image {} to {effective_mib}MiB",
-                    rootfs.display()
-                )
+                format!("size rootfs image {} to {effective_mib}MiB", tmp.display())
             })?;
     }
     let (made, _) = (runner)(vec![
@@ -313,21 +315,25 @@ async fn build_rootfs_ext4_inner(
         inodes.to_string(), // explicit inode table sized to the content
         "-d".to_owned(),
         staging.to_string_lossy().into_owned(),
-        rootfs.to_string_lossy().into_owned(),
+        tmp.to_string_lossy().into_owned(),
     ])
     .await;
     if !made {
+        let _ = tokio::fs::remove_file(&tmp).await;
         bail!(
             "mkfs.ext4 -d failed for OCI layout {} (sized {effective_mib}MiB, {inodes} inodes for {file_count} files / {content_bytes} bytes; see preceding 'command failed' log for the e2fsprogs diagnostic)",
             layout.display()
         );
     }
-    if !rootfs.is_file() {
+    if !tmp.is_file() {
         bail!(
             "mkfs.ext4 reported success but {} is missing",
-            rootfs.display()
+            tmp.display()
         );
     }
+    tokio::fs::rename(&tmp, &rootfs)
+        .await
+        .with_context(|| format!("atomically publish rootfs {}", rootfs.display()))?;
     Ok(rootfs)
 }
 

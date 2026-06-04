@@ -143,10 +143,16 @@ pub async fn run_build(
             // builds, the host pushes — no docker daemon anywhere.
             if fc_sandbox::enabled() {
                 let fc_runner = firecracker::production_fc_build_runner();
+                // The one-shot build child resolves data_dir from
+                // SUPERVISOR_DATA_DIR (the spawner injects the supervisor's
+                // resolved value); fall back to the install default.
+                let data_dir = std::env::var("SUPERVISOR_DATA_DIR")
+                    .unwrap_or_else(|_| "/var/lib/tabbify".to_owned());
                 let layout = fc_sandbox::run_sandboxed_build(
                     &job.app_uuid,
                     &src,
                     &job.registry_ula,
+                    std::path::Path::new(&data_dir),
                     workdir,
                     &fc_runner,
                 )

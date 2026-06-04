@@ -103,10 +103,17 @@ async fn build_rootfs_unpacks_layers_then_mkfs_with_d_flag() {
         !mkfs.iter().any(|a| a == "sudo" || a.contains("loop")),
         "rootless + loopless; got {mkfs:?}"
     );
-    assert_eq!(
-        mkfs.last().map(String::as_str),
-        Some(out_dir.join("rootfs.ext4").to_str().unwrap())
+    // ATOMIC write: mkfs targets a temp file in the SAME dir; only a
+    // successful conversion is renamed onto the final `rootfs.ext4` (so a
+    // crashed mkfs never leaves a partial valid-looking cache entry).
+    let target = mkfs.last().map(String::as_str).unwrap();
+    assert!(
+        target.starts_with(out_dir.join(".rootfs.ext4.").to_str().unwrap())
+            && target.ends_with(".tmp"),
+        "mkfs must target the atomic temp; got {target}"
     );
+    // The publish must land on the real name.
+    assert!(out_dir.join("rootfs.ext4").is_file());
 }
 
 /// A failing external runner (untar OR mkfs) surfaces a clear error and

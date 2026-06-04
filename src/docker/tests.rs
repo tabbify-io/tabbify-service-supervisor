@@ -257,10 +257,18 @@ async fn run_docker_build_bails_with_push_stderr() {
         artifact_path: None,
     };
 
-    let err = run_build(&job, &backend, &git, &skopeo_runner, "skopeo", "oras", dir.path())
-        .await
-        .expect_err("push failure → run_build must bail")
-        .to_string();
+    let err = run_build(
+        &job,
+        &backend,
+        &git,
+        &skopeo_runner,
+        "skopeo",
+        "oras",
+        dir.path(),
+    )
+    .await
+    .expect_err("push failure → run_build must bail")
+    .to_string();
 
     assert!(
         err.contains("unauthorized: authentication required"),

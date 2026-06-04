@@ -64,6 +64,11 @@ pub trait BuildSpawner: Send + Sync {
 pub struct ProcessBuildSpawner {
     /// Absolute path to the `tabbify-runner` binary.
     pub runner_bin: std::path::PathBuf,
+    /// Supervisor-resolved data dir, injected as `SUPERVISOR_DATA_DIR` into
+    /// the build child so the sandboxed build path (cache/lock/logs) lands
+    /// under the SAME dir as the daemon, regardless of how the daemon
+    /// resolved it (env vs `--data-dir`).
+    pub data_dir: std::path::PathBuf,
 }
 
 impl BuildSpawner for ProcessBuildSpawner {
@@ -79,6 +84,7 @@ impl BuildSpawner for ProcessBuildSpawner {
         let runner_bin = self.runner_bin.clone();
         let spec_path = spec_path.to_path_buf();
         let app_uuid = app_uuid.to_owned();
+        let data_dir = self.data_dir.clone();
         Box::pin(async move {
             let out = Command::new(&runner_bin)
                 .args([
@@ -87,6 +93,7 @@ impl BuildSpawner for ProcessBuildSpawner {
                     "--build-spec",
                     spec_path.to_string_lossy().as_ref(),
                 ])
+                .env("SUPERVISOR_DATA_DIR", &data_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 // NOTE: no setsid, no kill_on_drop override — this is a captured
@@ -124,6 +131,7 @@ impl Orchestrator {
             job,
             &ProcessBuildSpawner {
                 runner_bin: self.shared().runner_bin.clone(),
+                data_dir: self.shared().data_dir.clone(),
             },
         )
         .await
@@ -608,6 +616,7 @@ mod tests {
 
         let spawner = ProcessBuildSpawner {
             runner_bin: wrapper.clone(),
+            data_dir: dir.path().to_path_buf(),
         };
 
         let spec_file = dir.path().join("spec.json");

@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn rootfs_drive_body_is_root_and_writable() {
-        let b = rootfs_drive_body("/var/lib/tabbify/rootfs.ext4");
+        let b = rootfs_drive_body("/var/lib/tabbify/rootfs.ext4", false);
         assert_eq!(b["drive_id"], "rootfs");
         assert_eq!(b["path_on_host"], "/var/lib/tabbify/rootfs.ext4");
         assert_eq!(b["is_root_device"], true);

@@ -57,12 +57,12 @@ pub fn boot_source_body(kernel_image_path: &str, guest_ip: &str, host_ip: &str) 
 
 /// Build the `PUT /drives/rootfs` body: the app's rootfs image, mounted as
 /// the (writable) root device.
-pub fn rootfs_drive_body(path_on_host: &str) -> Value {
+pub fn rootfs_drive_body(path_on_host: &str, read_only: bool) -> Value {
     json!({
         "drive_id": "rootfs",
         "path_on_host": path_on_host,
         "is_root_device": true,
-        "is_read_only": false,
+        "is_read_only": read_only,
     })
 }
 
