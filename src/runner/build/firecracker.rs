@@ -1081,6 +1081,7 @@ pub async fn run_firecracker_build(
     fc: &crate::config::FcConfig,
     data_dir: &Path,
     runner: &FcBuildRunner,
+    is_swap: bool,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let reff = fetched
         .manifest
@@ -1136,7 +1137,9 @@ pub async fn run_firecracker_build(
         &fetched.manifest.runtime,
         fc,
         uuid,
+        reff,
         data_dir,
+        is_swap,
     )
     .await?;
     Ok(std::sync::Arc::new(vm))

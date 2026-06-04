@@ -38,8 +38,11 @@ use crate::config::FcConfig;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod build_vm;
+// `pub(crate)` so crate-internal tests (e.g. `fc_sandbox`'s build-VM identity
+// disjointness check) can reach helpers like `derive_link_ips`; the public
+// surface is still only the `FirecrackerRuntime` re-export below.
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 pub(crate) mod pidfile;
 mod protocol;
 pub(crate) mod snapshot;

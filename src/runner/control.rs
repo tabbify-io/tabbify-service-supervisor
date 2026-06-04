@@ -164,7 +164,10 @@ impl RunnerLifecycle {
         // applied: the runtime is always Firecracker, which pulls `reff` from the
         // mesh registry, converts the OCI image to a rootfs.ext4, and boots it.
         let next_fetched = fetched_with_ref(&self.fetched, reff);
-        let new_runtime = match build_runtime(&self.uuid, &next_fetched, &self.fc, &self.data_dir)
+        // Deploy (`is_swap = true`): the OLD runtime keeps serving until
+        // `perform_swap` flips; the new VM cold-boots `reff` on its own
+        // `uuid:reff` tap so both coexist (no reconcile-kill of the old).
+        let new_runtime = match build_runtime(&self.uuid, &next_fetched, &self.fc, &self.data_dir, true)
             .await
         {
             Ok(rt) => rt,

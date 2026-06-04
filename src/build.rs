@@ -38,14 +38,21 @@ pub async fn build_runtime(
     fetched: &FetchedApp,
     fc: &FcConfig,
     data_dir: &std::path::Path,
+    is_swap: bool,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     // Generic Firecracker (D11): convert the deployed OCI image into a
     // rootfs.ext4 (cached by digest) + a PID-1 init, then boot it via the
     // existing FirecrackerRuntime contract. The conversion shells out to
     // docker/tar/mkfs.ext4 via the production runner.
+    //
+    // `is_swap` distinguishes a DEPLOY (true: the old VM keeps serving, so the
+    // launch must not reconcile-kill it, and a fresh `uuid:reff` tap lets old +
+    // new coexist) from a COLD START (false: reconcile + warm-restore).
     let runner = crate::runner::build::firecracker::production_fc_build_runner();
-    crate::runner::build::firecracker::run_firecracker_build(uuid, fetched, fc, data_dir, &runner)
-        .await
+    crate::runner::build::firecracker::run_firecracker_build(
+        uuid, fetched, fc, data_dir, &runner, is_swap,
+    )
+    .await
 }
 
 /// Return a clone of `fetched` with its docker `registry_ref` overridden to
