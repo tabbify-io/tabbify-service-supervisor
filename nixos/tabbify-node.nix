@@ -224,8 +224,10 @@ in {
     # tools the supervisor execs at runtime must be on its PATH (oras + tar(busybox) + mkfs.ext4 = docker-less FC);
     # curl + jq back the ExecStartPre joiner self-update (svc #5 / NX-4);
     # iptables for per-tap guest-egress NAT (MASQUERADE/FORWARD) set up after the
-    # FC tap so the in-VM node can reach the public mesh coordinator (B3):
-    path = [ pkgs.firecracker pkgs.iproute2 pkgs.iptables pkgs.busybox pkgs.e2fsprogs pkgs.oras pkgs.coreutils pkgs.curl pkgs.jq ];
+    # FC tap so the in-VM node can reach the public mesh coordinator (B3);
+    # git clones the source on the HOST when this node is a `builder` (the
+    # FC-build sandbox clones host-side so the token never enters the guest):
+    path = [ pkgs.firecracker pkgs.iproute2 pkgs.iptables pkgs.busybox pkgs.e2fsprogs pkgs.oras pkgs.coreutils pkgs.curl pkgs.jq pkgs.git ];
     environment = {
       SUPERVISOR_NAME        = nodeName;
       SUPERVISOR_DATA_DIR    = "${dataDir}/data";

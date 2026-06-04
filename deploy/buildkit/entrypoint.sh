@@ -30,19 +30,35 @@ trap finish EXIT
 
 set -x
 
-# Mounts the minimal microVM init doesn't provide.
-mkdir -p /scratch /cache /tmp /run
-mount /dev/vdb /scratch || exit 1
-mount /dev/vdc /cache || exit 1
+# HOME on a WRITABLE path: the root user's default HOME is `/` (the RO
+# rootfs), so buildctl's `mkdir ~/.docker` fails. Point HOME + DOCKER_CONFIG
+# at the /run tmpfs (mounted below).
+export HOME=/run
+export DOCKER_CONFIG=/run/.docker
+
+# The rootfs is READ-ONLY: /scratch and /cache are baked into the image
+# (Dockerfile), /tmp /run /etc /sys exist in the moby/buildkit base + are
+# tmpfs/sysfs-mounted here. No mkdir on the rootfs.
+#
+# devtmpfs populates /dev with the virtio-blk nodes: the kernel only mounts
+# the ROOT device (/dev/vda) before init; the scratch (/dev/vdb) + cache
+# (/dev/vdc) nodes only appear once devtmpfs is mounted over /dev.
+mount -t devtmpfs none /dev 2>/dev/null || true
+mount -t ext4 /dev/vdb /scratch || exit 1
+mount -t ext4 /dev/vdc /cache || exit 1
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
-# runc (buildkit's executor) wants cgroup2.
-mkdir -p /sys/fs/cgroup
+# runc (buildkit's executor) wants cgroup2 (the dir exists under sysfs).
 mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
 
-# The rootfs is mounted READ-ONLY (shared, digest-cached). Back /etc with a
-# tmpfs so DNS for base-image pulls can be written without touching the image.
-mount -t tmpfs tmpfs /etc 2>/dev/null
+# DNS: the RO rootfs's /etc/resolv.conf is empty (Docker does NOT persist
+# writes to it in an image layer), so buildkitd falls back to [::1]:53 and
+# base-image pulls fail. Overlay /etc on a WRITABLE tmpfs — but copy the
+# existing /etc across FIRST so the CA bundle (/etc/ssl, needed for registry
+# TLS) survives — then write a working resolv.conf.
+cp -a /etc /run/etc-copy
+mount -t tmpfs tmpfs /etc
+cp -a /run/etc-copy/. /etc/
 echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
 mkdir -p /scratch/out /cache/buildkit /cache/bk

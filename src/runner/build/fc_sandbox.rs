@@ -365,7 +365,43 @@ async fn read_back_debugfs(
     tar::Archive::new(f)
         .unpack(&layout)
         .context("extract OCI layout tarball")?;
+    // buildkit tags the OCI manifest with whatever `name=` it was given (and
+    // may qualify it, e.g. `build:latest`), but the registry push reads the
+    // layout by the fixed tag the push args use. Normalize the FIRST image
+    // manifest's `org.opencontainers.image.ref.name` to that tag so the oras
+    // `--from-oci-layout <dir>:build` always resolves.
+    normalize_layout_tag(&layout)?;
     Ok(layout)
+}
+
+/// Force the first image manifest in `<layout>/index.json` to carry the
+/// `ref.name` the push expects (`build` — see `skopeo::LAYOUT_TAG`), so the
+/// host oras push finds it regardless of how buildkit named the build.
+#[cfg(target_os = "linux")]
+fn normalize_layout_tag(layout: &Path) -> Result<()> {
+    let index_path = layout.join("index.json");
+    let raw = std::fs::read_to_string(&index_path).context("read built OCI layout index.json")?;
+    let mut index: serde_json::Value =
+        serde_json::from_str(&raw).context("parse OCI layout index.json")?;
+    let manifests = index
+        .get_mut("manifests")
+        .and_then(serde_json::Value::as_array_mut)
+        .filter(|m| !m.is_empty())
+        .context("OCI layout index.json has no manifests")?;
+    let ann = manifests[0]
+        .as_object_mut()
+        .context("OCI manifest descriptor is not an object")?
+        .entry("annotations")
+        .or_insert_with(|| serde_json::json!({}));
+    ann.as_object_mut()
+        .context("manifest annotations is not an object")?
+        .insert(
+            "org.opencontainers.image.ref.name".to_owned(),
+            serde_json::Value::String("build".to_owned()),
+        );
+    std::fs::write(&index_path, serde_json::to_vec(&index)?)
+        .context("rewrite OCI layout index.json with normalized tag")?;
+    Ok(())
 }
 
 /// Cross-process exclusive advisory lock (`flock(LOCK_EX)`) on a lockfile,
@@ -524,6 +560,53 @@ mod tests {
         let err = stage_scratch(&staging, &src).unwrap_err().to_string();
         assert!(err.contains("over the"), "got: {err}");
         assert!(!staging.join("src").exists(), "must not copy on reject");
+    }
+
+    /// The push reads the layout by a fixed tag, so the extracted layout's
+    /// first manifest must be normalized to that tag regardless of how
+    /// buildkit named the build (`build`, `build:latest`, or unnamed).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normalize_layout_tag_sets_ref_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = tmp.path().join("oci-out");
+        std::fs::create_dir_all(&layout).unwrap();
+        // buildkit-style index with a different ref.name.
+        std::fs::write(
+            layout.join("index.json"),
+            r#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:abc","size":1,"annotations":{"org.opencontainers.image.ref.name":"build:latest"}}]}"#,
+        )
+        .unwrap();
+        normalize_layout_tag(&layout).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.join("index.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
+            "build"
+        );
+    }
+
+    /// An unnamed manifest gains the ref.name annotation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normalize_layout_tag_adds_missing_annotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = tmp.path().join("oci-out");
+        std::fs::create_dir_all(&layout).unwrap();
+        std::fs::write(
+            layout.join("index.json"),
+            r#"{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:abc","size":1}]}"#,
+        )
+        .unwrap();
+        normalize_layout_tag(&layout).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.join("index.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
+            "build"
+        );
     }
 
     /// The build VM's tap / MAC / /30 identity must be DISJOINT from any the
