@@ -32,6 +32,16 @@ pub fn files_present(cache_dir: &Path) -> bool {
     vmstate_path(cache_dir).is_file() && mem_path(cache_dir).is_file()
 }
 
+/// Remove any snapshot files in `cache_dir` (best-effort). Called on a deploy:
+/// the snapshot is keyed per-uuid (not per-image), so a stale snapshot from the
+/// PREVIOUS image must NOT be warm-restored over the newly-deployed one. After
+/// clearing, the deploy's cold boot recreates a fresh snapshot for the new
+/// image, keeping later restarts correct.
+pub fn clear(cache_dir: &Path) {
+    let _ = std::fs::remove_file(vmstate_path(cache_dir));
+    let _ = std::fs::remove_file(mem_path(cache_dir));
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

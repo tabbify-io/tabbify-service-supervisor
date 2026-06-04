@@ -45,7 +45,7 @@ async fn oci_image_boots_as_firecracker_and_serves_200() {
     let fetched = make_fc_fetched(uuid, &digest);
 
     let runner = production_fc_build_runner();
-    let rt = run_firecracker_build(uuid, &fetched, &FcConfig::default(), tmp.path(), &runner)
+    let rt = run_firecracker_build(uuid, &fetched, &FcConfig::default(), tmp.path(), &runner, false)
         .await
         .expect("convert + boot firecracker microVM");
 

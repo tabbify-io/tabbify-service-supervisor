@@ -224,7 +224,9 @@ impl RunnerServe {
 
         let fetched = resolve_app(&cfg).await?;
 
-        let initial_runtime = build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.data_dir)
+        // Cold start (first boot / monitor respawn): reconcile a stale VM +
+        // warm-restore allowed (`is_swap = false`).
+        let initial_runtime = build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.data_dir, false)
             .await
             .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 

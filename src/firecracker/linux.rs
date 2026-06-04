@@ -96,8 +96,11 @@ pub(crate) fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
 /// on the build VM's `/30`.
 const SERVING_LINK_SLOTS: u32 = 16_382;
 
-/// Deterministic, **per-uuid** firecracker host identity — replaces the old
-/// process-global `VM_SEQ` counter.
+/// Deterministic firecracker host identity from a `key` — replaces the old
+/// process-global `VM_SEQ` counter. The key is the app `uuid` on a cold start
+/// and `"uuid:reff"` on a deploy, so the new microVM of a zero-downtime swap
+/// gets a DIFFERENT tap than the old one it replaces (different `reff`) yet is
+/// still unique per app (the `uuid` is in the key).
 ///
 /// The previous `VM_SEQ` was a `static AtomicU32::new(0)` LIVING IN THE RUNNER
 /// PROCESS. Since every app runs in its OWN `tabbify-runner` process, the
@@ -108,18 +111,18 @@ const SERVING_LINK_SLOTS: u32 = 16_382;
 /// under a live microVM → unhealthy → monitor crash-loop. (`app_ula` was
 /// already per-uuid, so only the host-side plumbing collided.)
 ///
-/// Deriving the identity from the uuid (same `blake3` source as
-/// [`crate::app_ula`]) makes it STABLE per app and collision-free in practice:
+/// Deriving the identity from the key (same `blake3` source as
+/// [`crate::app_ula`]) makes it STABLE and collision-free in practice:
 /// - `tap_name`: `fc-<48-bit blake3 hex>` — 15 chars, the IFNAMSIZ limit; also
 ///   names the `/tmp/firecracker-<tap>.sock` api socket. 48 bits ⇒ two distinct
-///   uuids effectively never share a tap device or socket.
+///   keys effectively never share a tap device or socket.
 /// - `link_idx`: `hash % SERVING_LINK_SLOTS` — the `/30` + MAC index fed to
 ///   [`derive_link_ips`] / [`derive_guest_mac`]. Only 14 bits (the `/16` holds
 ///   16384 `/30`s), so a same-`link_idx` (different-`tap_name`) clash is rare
 ///   and surfaces as a hard `ip addr add` duplicate-address error rather than
 ///   silent corruption.
-fn fc_identity_for_uuid(uuid: &str) -> (String, u32) {
-    let digest = blake3::hash(uuid.as_bytes());
+fn fc_identity_for_key(key: &str) -> (String, u32) {
+    let digest = blake3::hash(key.as_bytes());
     let b = digest.as_bytes();
     let hash48: u64 = (u64::from(b[0]) << 40)
         | (u64::from(b[1]) << 32)
@@ -187,7 +190,7 @@ impl FirecrackerRuntime {
         cfg: &FcConfig,
         cache_dir: Option<&Path>,
         console_log: Option<&Path>,
-        uuid: &str,
+        vm_key: &str,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -196,10 +199,11 @@ impl FirecrackerRuntime {
             bail!("firecracker rootfs not found at {}", rootfs.display());
         }
 
-        // Per-uuid host identity (tap/api-sock/link/MAC) — STABLE per app and
-        // collision-free across concurrent apps + respawns (see
-        // `fc_identity_for_uuid`).
-        let (tap_name, link_idx) = fc_identity_for_uuid(uuid);
+        // Host identity (tap/api-sock/link/MAC) from the `uuid:reff` key —
+        // STABLE per (app, version), collision-free across concurrent apps,
+        // respawns, AND the old/new VMs of a zero-downtime swap (see
+        // `fc_identity_for_key`).
+        let (tap_name, link_idx) = fc_identity_for_key(vm_key);
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_mac = derive_guest_mac(link_idx);
@@ -270,17 +274,18 @@ impl FirecrackerRuntime {
         Ok(me)
     }
 
-    /// [`Self::launch`] with per-uuid pidfile reconciliation and snapshot
-    /// warm-start.
+    /// Launch a microVM for `uuid` running image `reff`, in one of two modes.
     ///
-    /// Decision flow:
-    /// 1. Kill any stale VM recorded in `<data_dir>/tabbify-fc-<uuid>.pid`.
-    /// 2. If `<data_dir>/apps/<uuid>/cache/snap.vmstate` + `snap.mem` both
-    ///    exist → attempt a warm start via [`Self::launch_from_snapshot`].
-    ///    If the load fails (corrupt snapshot, kernel mismatch, etc.) → fall
-    ///    back to cold boot automatically.
-    /// 3. On the first (cold) boot, a snapshot is created in the cache dir
-    ///    after the guest app is ready. Subsequent restarts will be warm.
+    /// `is_swap == false` (COLD START — first boot / monitor respawn):
+    /// 1. Kill any stale VM recorded in the per-uuid pidfile.
+    /// 2. Warm-restore from the per-uuid snapshot if present, else cold boot.
+    /// 3. A cold boot writes a snapshot so later restarts are warm.
+    ///
+    /// `is_swap == true` (DEPLOY — zero-downtime swap to a NEW image):
+    /// 1. Do NOT reconcile-kill: the OLD microVM keeps serving until
+    ///    `perform_swap` flips to this new one and drains it.
+    /// 2. Clear the (old-image) snapshot and COLD-boot `reff`; the host tap is
+    ///    `uuid:reff`-derived, distinct from the old VM's, so they coexist.
     ///
     /// # Notes
     /// Snapshots are host-kernel + CPU-template specific. This supervisor
@@ -294,44 +299,59 @@ impl FirecrackerRuntime {
         rt: &Runtime,
         cfg: &FcConfig,
         uuid: &str,
+        reff: &str,
         data_dir: &Path,
+        is_swap: bool,
     ) -> Result<Self> {
-        // Reconcile: kill any stale VM for this uuid before spawning fresh.
-        if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
-            pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
-        }
-
-        // Per-app snapshot cache: <data_dir>/apps/<uuid>/cache/
+        // Per-app paths (pidfile / snapshot cache / console) are keyed on the
+        // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
+        // /30 link), by contrast, is keyed on `uuid:reff` so a deploy's NEW
+        // microVM and the OLD one it replaces get DISTINCT taps and can coexist
+        // during the zero-downtime swap.
+        let vm_key = format!("{uuid}:{reff}");
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
-        // Per-app console log: <data_dir>/fc/<uuid>.console.log. Only written
-        // when SUPERVISOR_FC_DEBUG is truthy (see `console_stdio`).
+        // Per-app console log: <data_dir>/fc/<uuid>.console.log (only written
+        // when SUPERVISOR_FC_DEBUG is truthy — see `console_stdio`).
         let console_log = pidfile::console_log_path(data_dir, uuid);
 
-        let vm = if snapshot::files_present(&cache_dir) {
-            // Warm path: try to restore from a previously-taken snapshot.
-            // Fall back to cold boot on any failure (corrupt files, kernel
-            // mismatch, etc.) so the app always comes up eventually.
-            match Self::launch_from_snapshot(&cache_dir, cfg, Some(&console_log), uuid).await {
-                Ok(warm_vm) => {
-                    tracing::info!(uuid, "warm start from snapshot");
-                    warm_vm
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        uuid,
-                        error = %e,
-                        "snapshot load failed; falling back to cold boot"
-                    );
-                    Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), uuid)
-                        .await?
-                }
-            }
+        let vm = if is_swap {
+            // DEPLOY / SWAP: the OLD microVM stays LIVE — `perform_swap` health-
+            // gates the new one and only then flips + drains the old. So we must
+            // NOT reconcile-kill the old VM here (doing so dropped it mid-deploy,
+            // the serve loop saw it die, and the runner exited before the flip).
+            // The snapshot is per-uuid ⇒ it belongs to the OLD image; clear it
+            // and COLD-boot the NEW image (a warm restore would resurrect the
+            // old image). The cold boot writes a fresh snapshot for the new
+            // image, so later restarts come up on the deployed version.
+            snapshot::clear(&cache_dir);
+            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), &vm_key).await?
         } else {
-            // Cold path: first boot — take a snapshot on the way out.
-            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), uuid).await?
+            // COLD START (first boot / monitor respawn): reconcile a stale VM
+            // left by a crashed predecessor, then warm-restore if a snapshot
+            // exists (same image as the on-disk record) else cold boot.
+            if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
+                pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
+            }
+            if snapshot::files_present(&cache_dir) {
+                match Self::launch_from_snapshot(&cache_dir, cfg, Some(&console_log), &vm_key).await
+                {
+                    Ok(warm_vm) => {
+                        tracing::info!(uuid, "warm start from snapshot");
+                        warm_vm
+                    }
+                    Err(e) => {
+                        tracing::warn!(uuid, error = %e, "snapshot load failed; cold boot");
+                        Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), &vm_key)
+                            .await?
+                    }
+                }
+            } else {
+                Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), &vm_key)
+                    .await?
+            }
         };
 
-        // Record the new child PID so a future restart can clean it up.
+        // Record the active VM's pid for cold-start reconciliation.
         if let Some(pid) = vm.child.as_ref().and_then(|c| c.id()) {
             pidfile::write(data_dir, uuid, pid);
         }
@@ -360,7 +380,7 @@ impl FirecrackerRuntime {
         cache_dir: &Path,
         cfg: &FcConfig,
         console_log: Option<&Path>,
-        uuid: &str,
+        vm_key: &str,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -376,8 +396,9 @@ impl FirecrackerRuntime {
             .to_str()
             .ok_or_else(|| anyhow!("snapshot mem path is not valid UTF-8"))?;
 
-        // Per-uuid tap + /30 — MATCHES the cold boot that took the snapshot.
-        let (tap_name, link_idx) = fc_identity_for_uuid(uuid);
+        // `uuid:reff` tap + /30 — MATCHES the cold boot that took the snapshot
+        // (same key ⇒ same tap/IP as the baked-in guest networking).
+        let (tap_name, link_idx) = fc_identity_for_key(vm_key);
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);

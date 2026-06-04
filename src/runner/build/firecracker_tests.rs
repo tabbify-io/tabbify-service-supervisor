@@ -742,7 +742,9 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
 
     // The VM boot at the end has no real Firecracker/KVM here, so this errors;
     // the docker-or-not assertion below holds on the recorded argv regardless.
-    let _ = super::run_firecracker_build("uuid-nodocker", &fetched, &fc, tmp.path(), &runner).await;
+    let _ =
+        super::run_firecracker_build("uuid-nodocker", &fetched, &fc, tmp.path(), &runner, false)
+            .await;
 
     let recorded = calls.lock().unwrap().clone();
     assert!(
@@ -1500,7 +1502,7 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
 
     // Tag ref must NOT bail; the boot at the end errors (no KVM) — irrelevant to
     // the digest-derivation assertion below.
-    let _ = super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner).await;
+    let _ = super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner, false).await;
 
     let recorded = calls.lock().unwrap().clone();
     // It pulled the layout (oras) for the tag ref instead of bailing.

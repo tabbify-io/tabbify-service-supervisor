@@ -38,7 +38,9 @@ impl FirecrackerRuntime {
         _rt: &Runtime,
         _cfg: &FcConfig,
         _uuid: &str,
+        _reff: &str,
         _data_dir: &std::path::Path,
+        _is_swap: bool,
     ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }
