@@ -5,9 +5,10 @@
 //! written to a `runner_dir` (e.g. `/var/lib/tabbify/runners/<uuid>.json`) so a
 //! restarted supervisor can rediscover its living runners (Task 2.5).
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,17 @@ pub struct RunnerHandle {
     /// `deny_unknown_fields` to this struct, or old records would fail to load.
     #[serde(default)]
     pub requested_runtime: Option<String>,
+    /// Tenant network slug this runner is scoped to (Phase-2 contract). Set on a
+    /// network-scoped deploy and forwarded to a RESPAWN as `--network <slug>` so
+    /// the runner rejoins the same tenant network. `None` (the default) = an
+    /// unscoped runner (today's behavior). The scoped JOIN TOKEN is NOT persisted
+    /// (short-lived, minted per deploy by the node); a respawn rejoins via the
+    /// runner's sticky per-uuid keypair.
+    ///
+    /// `#[serde(default)]` keeps old on-disk records (written before this field
+    /// existed) loading — they get `None`.
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -180,6 +192,7 @@ mod tests {
             restart: Default::default(),
             image_ref: None,
             requested_runtime: None,
+            network: None,
         }
     }
 
@@ -194,6 +207,7 @@ mod tests {
             restart: Default::default(),
             image_ref: None,
             requested_runtime: None,
+            network: None,
         }
     }
 
@@ -381,6 +395,48 @@ mod tests {
             h.requested_runtime.as_deref(),
             Some("docker"),
             "the legacy value is read but inert (never used for dispatch)"
+        );
+    }
+
+    // ── network field (Phase-2) ───────────────────────────────────────────────
+
+    /// A handle with a tenant `network` slug must round-trip through save → load
+    /// so a respawn rejoins the same network (`--network <slug>`).
+    #[test]
+    fn network_round_trips_via_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.network = Some("n_jpegxik72nng".to_owned());
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded.network.as_deref(),
+            Some("n_jpegxik72nng"),
+            "network must survive save/load for respawn scoping"
+        );
+        assert_eq!(loaded, h);
+    }
+
+    /// JSON written before the `network` field was added (no `"network"` key)
+    /// must deserialize with `network = None` so old records still load.
+    #[test]
+    fn network_defaults_to_none_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000,
+            "image_ref": null
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert!(
+            h.network.is_none(),
+            "missing network key must deserialize as None"
         );
     }
 

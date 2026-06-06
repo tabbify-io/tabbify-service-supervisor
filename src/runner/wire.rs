@@ -4,8 +4,7 @@
 //! Extracted from the binary entrypoint so integration tests can exercise the
 //! same config → serve → control wiring path without spawning a subprocess.
 
-use crate::runner::config::RunnerConfig;
-use crate::runner::serve::ServeConfig;
+use crate::runner::{config::RunnerConfig, serve::ServeConfig};
 
 /// Map a parsed [`RunnerConfig`] to the [`ServeConfig`] that
 /// [`crate::runner::serve::RunnerServe::start`] accepts.
@@ -31,5 +30,11 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         fc: cfg.firecracker.clone(),
         docker: cfg.docker.clone(),
         image_ref: cfg.image_ref.clone(),
+        // Phase-2: thread the tenant network slug (`--network`) + the scoped
+        // node-join token (from `TABBIFY_RUNNER_JOIN_TOKEN`, resolved in
+        // `RunnerConfig::parse_with_env`) into the serve config so the runner's
+        // mesh join is scoped to its tenant network.
+        network: cfg.network.clone(),
+        runner_join_token: cfg.runner_join_token.clone(),
     }
 }

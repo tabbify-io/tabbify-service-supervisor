@@ -6,15 +6,17 @@
 //! the pieces together — matching the `supervisord` `main.rs` pattern.
 
 use anyhow::Context;
-use clap::Parser;
-use tabbify_supervisor::RunnerConfig;
-use tabbify_supervisor::runner::build;
-use tabbify_supervisor::runner::control;
-use tabbify_supervisor::runner::serve::{RunnerExit, RunnerServe, run_until_exit};
-use tabbify_supervisor::runner::wire::serve_config_from;
 // `ActiveRuntime` implements `AppRuntime`; the trait must be in scope so the
 // clean-shutdown path can call `runtime.shutdown()` on the active-runtime cell.
 use tabbify_supervisor::runtime::AppRuntime;
+use tabbify_supervisor::{
+    RunnerConfig,
+    runner::{
+        build, control,
+        serve::{RunnerExit, RunnerServe, run_until_exit},
+        wire::serve_config_from,
+    },
+};
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
@@ -22,7 +24,10 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let cfg = RunnerConfig::parse();
+    // `parse_with_env` reads the scoped node-join token from
+    // `TABBIFY_RUNNER_JOIN_TOKEN` (Phase-2) — intentionally not a clap flag, so
+    // the credential never appears in `--help` / `ps`.
+    let cfg = RunnerConfig::parse_with_env();
 
     // ── Builder mode ────────────────────────────────────────────────────────
     // If `--build-spec` is provided, run a one-shot build and exit.

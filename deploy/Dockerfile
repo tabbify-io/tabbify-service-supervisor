@@ -6,8 +6,9 @@
 # + set DOCKER_ARCH.
 #
 # supervisord IS the entrypoint — it reads env (coordinator baked in,
-# overridable), self-detects capabilities (/dev/kvm -> firecracker, reachable
-# docker -> docker, wasm always), joins the mesh, and runs the orchestrator.
+# overridable), self-detects capability tags (/dev/kvm -> firecracker,
+# reachable docker -> docker; builder is opt-in via SUPERVISOR_BUILDER), joins
+# the mesh, and runs the orchestrator. Apps always run as Firecracker microVMs.
 #
 #   docker run -d --device /dev/net/tun --cap-add NET_ADMIN \
 #     [--device /dev/kvm] [-v /var/run/docker.sock:/var/run/docker.sock] \

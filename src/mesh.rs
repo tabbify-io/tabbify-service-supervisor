@@ -5,8 +5,7 @@
 //! the CONTROL listener, and hands out an [`Arc<dyn MeshHost>`] the per-app-ULA
 //! hosting layer ([`crate::host::AppHost`]) uses to route app-ULAs.
 
-use std::net::Ipv6Addr;
-use std::sync::Arc;
+use std::{net::Ipv6Addr, sync::Arc};
 
 use anyhow::Context;
 use mesh_joiner::{JoinConfig, Joiner};
@@ -44,6 +43,32 @@ pub struct JoinMetadata {
     /// The peer's running binary release version (`build.rs`-embedded). `None`
     /// means unknown and MUST never be treated as a downgrade trigger.
     pub software_version: Option<String>,
+    /// Node-join JWT (Phase-2 contract §join-token). Sent to the coordinator as
+    /// `Authorization: Bearer <token>` on register so a validating coordinator
+    /// derives the peer's authoritative `network` + `tags` from the claims.
+    /// `None` (the default) keeps today's behavior — only works against a
+    /// coordinator started without `AUTH_URL` (the dev/E1 escape hatch). When
+    /// `None`, [`build_supervisor_join_config`] falls back to the
+    /// `TABBIFY_JOIN_TOKEN` environment variable so infra peers (supervisor /
+    /// node / registry joiners) pick the token up from their env transparently.
+    pub join_token: Option<String>,
+}
+
+/// Environment variable infra peers read their node-join token from (Phase-2
+/// contract). Empty / unset = no token (current, backward-compatible behavior).
+pub const JOIN_TOKEN_ENV: &str = "TABBIFY_JOIN_TOKEN";
+
+/// Resolve the supervisor's node-join token: an explicit
+/// [`JoinMetadata::join_token`] wins; otherwise fall back to the
+/// `TABBIFY_JOIN_TOKEN` env (Phase-2 contract). A present-but-empty env value
+/// is treated as absent so an `export TABBIFY_JOIN_TOKEN=` does not send a blank
+/// bearer.
+fn resolve_join_token(metadata_token: Option<String>) -> Option<String> {
+    metadata_token.or_else(|| {
+        std::env::var(JOIN_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+    })
 }
 
 impl MeshMembership {
@@ -191,6 +216,11 @@ fn build_supervisor_join_config(
         // version drift is visible. `None` stays back-compatible (the joiner
         // never invents a value).
         software_version: metadata.software_version,
+        // Node-join token: explicit metadata wins, else the `TABBIFY_JOIN_TOKEN`
+        // env (Phase-2 contract). The coordinator validates it and derives the
+        // peer's authoritative network + tags from the claims. `None` keeps the
+        // current tokenless behavior (dev/E1 coordinator without `AUTH_URL`).
+        join_token: resolve_join_token(metadata.join_token),
         // Explicit DERP-style relay endpoint (`TABBIFY_MESH_RELAY_URL`). `Some`
         // makes the joiner connect its relay over this url verbatim instead of
         // deriving `ws://` from the coordinator URL — the corporate-firewall
@@ -209,8 +239,7 @@ fn build_supervisor_join_config(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv6Addr;
-    use std::sync::Arc;
+    use std::{net::Ipv6Addr, sync::Arc};
 
     use anyhow::Result;
     use dashmap::DashMap;
@@ -347,6 +376,59 @@ mod tests {
             !config.source_scoped_routes,
             "supervisor must keep main-table routes (runners scope themselves)"
         );
+    }
+
+    /// An explicit `JoinMetadata::join_token` rides onto the supervisor's
+    /// `JoinConfig.join_token` so a validating coordinator can authenticate the
+    /// register and derive the peer's authoritative network + tags (Phase-2).
+    #[test]
+    fn build_config_wires_explicit_join_token() {
+        let md = JoinMetadata {
+            join_token: Some("infra-join-jwt".to_owned()),
+            ..Default::default()
+        };
+        let config = build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None);
+        assert_eq!(
+            config.join_token.as_deref(),
+            Some("infra-join-jwt"),
+            "explicit metadata join_token must ride onto JoinConfig"
+        );
+    }
+
+    /// `resolve_join_token` prefers an explicit metadata token and otherwise
+    /// reads the `TABBIFY_JOIN_TOKEN` env, treating a blank value as absent.
+    /// (Env-var mutation is process-global, so all cases live in ONE test to
+    /// avoid cross-test races.)
+    #[test]
+    fn resolve_join_token_prefers_metadata_then_env() {
+        // SAFETY: single-threaded test body; we set + clear the env around the
+        // assertions and restore the prior value at the end. `set_var` /
+        // `remove_var` are `unsafe` since the 2024 edition.
+        let prior = std::env::var(JOIN_TOKEN_ENV).ok();
+
+        // No metadata + no env → None.
+        unsafe { std::env::remove_var(JOIN_TOKEN_ENV) };
+        assert_eq!(resolve_join_token(None), None);
+
+        // Env set → falls back to env.
+        unsafe { std::env::set_var(JOIN_TOKEN_ENV, "env-token") };
+        assert_eq!(resolve_join_token(None).as_deref(), Some("env-token"));
+
+        // Metadata wins over env.
+        assert_eq!(
+            resolve_join_token(Some("md-token".to_owned())).as_deref(),
+            Some("md-token")
+        );
+
+        // Blank env is treated as absent (no blank bearer).
+        unsafe { std::env::set_var(JOIN_TOKEN_ENV, "   ") };
+        assert_eq!(resolve_join_token(None), None);
+
+        // Restore prior env so other tests are unaffected.
+        match prior {
+            Some(v) => unsafe { std::env::set_var(JOIN_TOKEN_ENV, v) },
+            None => unsafe { std::env::remove_var(JOIN_TOKEN_ENV) },
+        }
     }
 
     /// Absent `relay_url` (the default) leaves `JoinConfig.relay_url` `None`, so

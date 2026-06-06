@@ -30,10 +30,12 @@ pub mod monitor;
 pub mod restart;
 pub mod spawn;
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 pub use api::{AppState, AppSummary};
 pub use client::ControlClient;
@@ -114,6 +116,12 @@ impl SharedRunnerConfig {
             relay_url: self.relay_url.clone(),
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
+            // Phase-2: a RESPAWN rejoins the SAME tenant network the record was
+            // scoped to (`--network <slug>`). The scoped join token is NOT
+            // persisted (short-lived, minted per deploy), so a respawn rejoins
+            // via the runner's sticky per-uuid keypair — `None` here.
+            network: record.network.clone(),
+            runner_join_token: None,
             // The runtime is no longer selectable — every app builds as
             // Firecracker, and a by-ref deploy synthesizes a firecracker manifest
             // — so the record's (now inert) `requested_runtime` is NOT read here.
@@ -317,6 +325,7 @@ mod tests {
             restart: Default::default(),
             image_ref: None,
             requested_runtime: None,
+            network: None,
         }
     }
 
@@ -338,6 +347,26 @@ mod tests {
         assert_eq!(spec.uuid, rec.uuid);
         assert_eq!(spec.control_sock, rec.control_sock);
         assert_eq!(spec.parent, rec.parent);
+    }
+
+    /// Phase-2: a respawn carries the record's tenant `network` forward (so the
+    /// runner rejoins scoped) but NEVER a join token (it is short-lived; the
+    /// respawn rejoins via the runner's sticky per-uuid keypair).
+    #[test]
+    fn spawn_spec_for_respawn_keeps_network_drops_token() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.network = Some("n_jpegxik72nng".to_owned());
+        let spec = cfg.spawn_spec_for(&rec);
+        assert_eq!(
+            spec.network.as_deref(),
+            Some("n_jpegxik72nng"),
+            "respawn must rejoin the same tenant network"
+        );
+        assert!(
+            spec.runner_join_token.is_none(),
+            "respawn must NOT carry a (stale) join token"
+        );
     }
 
     /// A record with no parent reconstructs a parent-less spec (standalone).
@@ -385,7 +414,10 @@ mod tests {
         let orch = Orchestrator::new(shared(), PathBuf::from("/run/tabbify/runners"));
         let uuid = "0191e7c2-1111-7222-8333-444455556666";
 
-        assert!(!orch.is_deploying(uuid), "not deploying before begin_deploy");
+        assert!(
+            !orch.is_deploying(uuid),
+            "not deploying before begin_deploy"
+        );
         {
             let _guard = orch.begin_deploy(uuid);
             assert!(orch.is_deploying(uuid), "in-flight while the guard is held");
@@ -421,6 +453,9 @@ mod tests {
 
         let _guard = orch.begin_deploy(a);
         assert!(orch.is_deploying(a));
-        assert!(!orch.is_deploying(b), "guard must be scoped to its own uuid");
+        assert!(
+            !orch.is_deploying(b),
+            "guard must be scoped to its own uuid"
+        );
     }
 }

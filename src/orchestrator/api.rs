@@ -20,20 +20,22 @@
 //! on disk are the single source of truth (so a restarted supervisor re-adopts
 //! the living runners). Every op here loads/saves those records.
 
-use std::net::Ipv6Addr;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{net::Ipv6Addr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use crate::app_ula::derive_app_ula;
-use crate::control_proto::Reply;
-use crate::orchestrator::client::ControlClient;
-use crate::orchestrator::handle::RunnerHandle;
-use crate::orchestrator::restart::{self, BackoffParams, RestartStatus};
-use crate::orchestrator::spawn::{SpawnSpec, spawn_runner};
-use crate::orchestrator::{MONITOR_INTERVAL, Orchestrator};
+use crate::{
+    app_ula::derive_app_ula,
+    control_proto::Reply,
+    orchestrator::{
+        MONITOR_INTERVAL, Orchestrator,
+        client::ControlClient,
+        handle::RunnerHandle,
+        restart::{self, BackoffParams, RestartStatus},
+        spawn::{SpawnSpec, spawn_runner},
+    },
+};
 
 /// How long [`Orchestrator::start_app`] waits for a freshly-spawned runner to
 /// answer its control socket before giving up. A cold start fetches the
@@ -92,6 +94,24 @@ pub struct AppSummary {
     pub requested_runtime: Option<String>,
 }
 
+/// Phase-2 tenant-network parameters carried on a deploy request.
+///
+/// The node resolves the deploying tenant's network (slug) and mints a SCOPED
+/// node-join token, then passes BOTH here. They are threaded into a COLD spawn
+/// so the runner joins the mesh scoped to its tenant network
+/// (`--network <slug>` + `TABBIFY_RUNNER_JOIN_TOKEN`). Both `None`
+/// (the [`Default`]) keeps today's unscoped, tokenless behavior.
+#[derive(Debug, Clone, Default)]
+pub struct DeployNetwork {
+    /// Tenant network slug (`network=<slug>`), forwarded to the runner as
+    /// `--network <slug>` and persisted in the runner record for respawn.
+    pub network: Option<String>,
+    /// Scoped node-minted node-join JWT (`network=<slug>`,
+    /// `tags=["tag:net-<slug>"]`, `subject=<app-uuid>`) passed to the runner via
+    /// `TABBIFY_RUNNER_JOIN_TOKEN`. NOT persisted (short-lived).
+    pub runner_join_token: Option<String>,
+}
+
 impl Orchestrator {
     /// Deterministic per-uuid control-socket path under this orchestrator's
     /// runner dir (`<runner_dir>/<uuid>.sock`). The runner binds it; the
@@ -132,6 +152,10 @@ impl Orchestrator {
             relay_url: shared.relay_url.clone(),
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
+            // A plain start carries no tenant scoping; `deploy_app` overrides
+            // these on a network-scoped cold spawn.
+            network: None,
+            runner_join_token: None,
         }
     }
 
@@ -362,6 +386,13 @@ impl Orchestrator {
     /// a by-ref deploy is always the Firecracker pull source, so the override is
     /// NOT threaded into the control `Deploy` message or the spawned runner.
     ///
+    /// `net` carries the Phase-2 tenant-network scoping (slug + node-minted
+    /// scoped runner token). It is threaded into a COLD spawn only: a live
+    /// zero-downtime swap does NOT re-key the running runner's mesh peer (the
+    /// runner already holds its scoped identity), so network scoping takes effect
+    /// when a fresh runner is spawned. [`DeployNetwork::default`] (both `None`)
+    /// keeps today's unscoped behavior.
+    ///
     /// # Errors
     /// - `uuid` is not a valid UUID;
     /// - the control-socket deploy fails (runner returned `Reply::Err`);
@@ -371,6 +402,7 @@ impl Orchestrator {
         uuid: &str,
         reff: &str,
         runtime_override: Option<&str>,
+        net: DeployNetwork,
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
@@ -400,6 +432,13 @@ impl Orchestrator {
                 .with_context(|| format!("load runner record for {uuid} after deploy"))?
                 .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
             record.image_ref = Some(reff.to_owned());
+            // Phase-2: if this deploy supplied a tenant network, persist it so a
+            // future RESPAWN rejoins scoped (the live runner itself is not
+            // re-keyed — it keeps its current mesh identity). A `None` network
+            // leaves the record's existing scoping untouched (back-compat).
+            if net.network.is_some() {
+                record.network = net.network.clone();
+            }
             record
                 .save(self.runner_dir())
                 .with_context(|| format!("save runner record for {uuid} after deploy"))?;
@@ -418,6 +457,11 @@ impl Orchestrator {
             // Firecracker, so the override is not threaded into the spec.
             let mut spec = self.spawn_spec_for_uuid(uuid);
             spec.image_ref = Some(reff.to_owned());
+            // Phase-2: scope the cold spawn to the tenant network. `--network`
+            // (persisted for respawn) + the scoped node-join token (via env,
+            // NOT persisted). Both `None` keeps the unscoped spawn.
+            spec.network = net.network.clone();
+            spec.runner_join_token = net.runner_join_token.clone();
             let (handle, _child) = spawn_runner(&spec, self.runner_dir())
                 .await
                 .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -638,8 +682,9 @@ mod tests {
     /// and assert restart_status == "crashloop" and restart_count == 5.
     #[test]
     fn app_summary_fields_crashloop() {
-        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
         use tempfile::TempDir;
+
+        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
 
         let dir = TempDir::new().unwrap();
 
@@ -661,6 +706,7 @@ mod tests {
             restart,
             image_ref: None,
             requested_runtime: None,
+            network: None,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -711,8 +757,9 @@ mod tests {
     /// which is the core guarantee of reset.
     #[tokio::test]
     async fn reset_app_clears_restart_state_on_disk() {
-        use crate::orchestrator::restart::{RestartState, should_respawn};
         use tempfile::TempDir;
+
+        use crate::orchestrator::restart::{RestartState, should_respawn};
 
         let dir = TempDir::new().unwrap();
         let o = orch(dir.path().to_path_buf());
@@ -734,6 +781,7 @@ mod tests {
             restart: crashed_restart,
             image_ref: None,
             requested_runtime: None,
+            network: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -796,9 +844,14 @@ mod tests {
     async fn deploy_app_rejects_bad_uuid() {
         let o = orch(PathBuf::from("/run/tabbify/runners"));
         assert!(
-            o.deploy_app("not-a-uuid", "reg:5000/a/b:sha", None)
-                .await
-                .is_err(),
+            o.deploy_app(
+                "not-a-uuid",
+                "reg:5000/a/b:sha",
+                None,
+                DeployNetwork::default()
+            )
+            .await
+            .is_err(),
             "malformed uuid must be rejected"
         );
     }
@@ -813,7 +866,14 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
 
         // No runner binary → spawn will fail → deploy returns Err.
-        let result = o.deploy_app(APP_UUID, "[fd5a::1]:5000/a/b:sha", None).await;
+        let result = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/a/b:sha",
+                None,
+                DeployNetwork::default(),
+            )
+            .await;
         assert!(
             result.is_err(),
             "deploy_app must fail when the runner binary is missing"
@@ -829,9 +889,12 @@ mod tests {
     #[tokio::test]
     async fn deploy_app_live_path_persists_image_ref() {
         use std::time::Duration;
+
         use tempfile::TempDir;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
 
         let dir = TempDir::new().unwrap();
         let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
@@ -874,12 +937,15 @@ mod tests {
             restart: Default::default(),
             image_ref: None,
             requested_runtime: None,
+            network: None,
         };
         rec.save(dir.path()).unwrap();
 
         let o = orch(dir.path().to_path_buf());
         let reff = "[fd5a::1]:5000/acme/app:sha256abc";
-        let result = o.deploy_app(APP_UUID, reff, None).await;
+        let result = o
+            .deploy_app(APP_UUID, reff, None, DeployNetwork::default())
+            .await;
 
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
         let summary = result.unwrap();
@@ -894,6 +960,84 @@ mod tests {
             updated.image_ref.as_deref(),
             Some(reff),
             "image_ref must be persisted after a live deploy"
+        );
+    }
+
+    /// Phase-2: a live deploy that carries a tenant `network` persists it on the
+    /// record (so a future RESPAWN rejoins scoped). The scoped token is NOT
+    /// persisted — it is short-lived and minted per deploy by the node.
+    #[tokio::test]
+    async fn deploy_app_live_path_persists_network_not_token() {
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+
+        // Fake control server: Reply::Ok to health probe + deploy.
+        let sock_path_srv = sock_path.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            for _ in 0..5 {
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+            requested_runtime: None,
+            network: None,
+        };
+        rec.save(dir.path()).unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        let net = DeployNetwork {
+            network: Some("n_jpegxik72nng".to_owned()),
+            runner_join_token: Some("scoped-runner-jwt".to_owned()),
+        };
+        let result = o
+            .deploy_app(APP_UUID, "[fd5a::1]:5000/acme/app:sha256abc", None, net)
+            .await;
+        assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
+
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must exist after deploy");
+        assert_eq!(
+            updated.network.as_deref(),
+            Some("n_jpegxik72nng"),
+            "network must be persisted on a live network-scoped deploy"
+        );
+        // The on-disk record must never carry the short-lived join token.
+        let raw = std::fs::read_to_string(crate::orchestrator::handle::record_path(
+            dir.path(),
+            APP_UUID,
+        ))
+        .unwrap();
+        assert!(
+            !raw.contains("scoped-runner-jwt"),
+            "the join token must NEVER be persisted to disk; record: {raw}"
         );
     }
 }

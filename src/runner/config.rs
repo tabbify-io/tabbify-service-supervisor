@@ -4,13 +4,18 @@
 //! is `#[arg(long, env = "VAR")]`, matching the `supervisord` Config style
 //! (contract §0). Defaults reuse the same prod consts as [`crate::config`].
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
 use uuid::Uuid;
 
 use crate::config::{DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL, DockerConfig, FcConfig};
+
+/// Environment variable the runner reads its SCOPED node-join token from
+/// (Phase-2 contract). The node mints this per-deploy and the supervisor sets it
+/// on the runner's process env (never on the arg list — it is a credential).
+/// Empty / unset = no token (current, backward-compatible behavior).
+pub const RUNNER_JOIN_TOKEN_ENV: &str = "TABBIFY_RUNNER_JOIN_TOKEN";
 
 /// `tabbify-runner` configuration — one runner per app instance.
 #[derive(Debug, Clone, Parser)]
@@ -90,6 +95,23 @@ pub struct RunnerConfig {
     #[arg(long, env = "RUNNER_PORT", default_value_t = 8730)]
     pub port: u16,
 
+    /// Tenant network slug (Phase-2 contract). When set, the runner joins the
+    /// mesh scoped to this network — it advertises `tag:net-<slug>` and the
+    /// coordinator (when validating the scoped join token) stamps it
+    /// `network=<slug>`, `tags=["tag:net-<slug>"]`. The supervisor passes this
+    /// via `--network`. `None` ⇒ today's unscoped join.
+    #[arg(long, env = "RUNNER_NETWORK")]
+    pub network: Option<String>,
+
+    /// Scoped node-join JWT for THIS app's runner (Phase-2 contract). Read ONLY
+    /// from the `TABBIFY_RUNNER_JOIN_TOKEN` environment variable (no CLI flag —
+    /// it is a credential and must not appear in `ps`/process args); the
+    /// supervisor sets it on the runner's process env. Sent to the coordinator
+    /// as `Authorization: Bearer <token>` on register. `None` ⇒ tokenless join
+    /// (current behavior, valid against a coordinator without `AUTH_URL`).
+    #[arg(skip)]
+    pub runner_join_token: Option<String>,
+
     /// Firecracker microVM runtime configuration.
     #[command(flatten)]
     pub firecracker: FcConfig,
@@ -97,6 +119,32 @@ pub struct RunnerConfig {
     /// Docker container runtime configuration.
     #[command(flatten)]
     pub docker: DockerConfig,
+}
+
+/// Read the scoped runner-join token from the [`RUNNER_JOIN_TOKEN_ENV`]
+/// environment variable, treating a blank value as absent (no blank bearer).
+///
+/// Kept out of clap's `env=` derivation so the credential is never reflected in
+/// `--help` / usage and never becomes a CLI flag. The binary calls this after
+/// `parse()` to populate [`RunnerConfig::runner_join_token`]; a unit test can
+/// drive it directly.
+#[must_use]
+pub fn runner_join_token_from_env() -> Option<String> {
+    std::env::var(RUNNER_JOIN_TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+}
+
+impl RunnerConfig {
+    /// Parse from argv + env, then resolve the scoped runner-join token from
+    /// [`RUNNER_JOIN_TOKEN_ENV`] (it is intentionally NOT a clap field). This is
+    /// the binary's entry point so the token is wired exactly once.
+    #[must_use]
+    pub fn parse_with_env() -> Self {
+        let mut cfg = <Self as Parser>::parse();
+        cfg.runner_join_token = runner_join_token_from_env();
+        cfg
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +193,38 @@ mod tests {
         assert!(c.bind.is_none());
         assert!(c.parent.is_none());
         assert_eq!(c.data_dir, PathBuf::from("./data"));
+        // Phase-2 fields default to unscoped/tokenless.
+        assert!(c.network.is_none());
+        assert!(c.runner_join_token.is_none());
+    }
+
+    #[test]
+    fn parses_network_flag() {
+        let c = RunnerConfig::try_parse_from([
+            "tabbify-runner",
+            "--uuid",
+            "0191e7c2-1111-7222-8333-444455556666",
+            "--network",
+            "n_jpegxik72nng",
+        ])
+        .unwrap();
+        assert_eq!(c.network.as_deref(), Some("n_jpegxik72nng"));
+    }
+
+    /// The scoped runner-join token is NOT a clap flag (it is a credential):
+    /// attempting to pass it as `--runner-join-token` is a usage error.
+    #[test]
+    fn runner_join_token_is_not_a_cli_flag() {
+        let result = RunnerConfig::try_parse_from([
+            "tabbify-runner",
+            "--uuid",
+            "0191e7c2-1111-7222-8333-444455556666",
+            "--runner-join-token",
+            "secret",
+        ]);
+        assert!(
+            result.is_err(),
+            "--runner-join-token must not be a parseable flag (credential rides the env)"
+        );
     }
 }

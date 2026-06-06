@@ -33,23 +33,22 @@
 //! `/128` TUN alias re-assert is idempotent for the peer's already-assigned
 //! own ULA.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
-use crate::app_ula::derive_app_ula;
-use crate::build::build_runtime;
-use crate::config::{DockerConfig, FcConfig};
-use crate::fetcher::{FetchedApp, S3Fetcher};
-use crate::host::{AppHost, AppServe};
-use crate::mesh::MeshMembership;
-use crate::runner::active::ActiveRuntime;
-use crate::runner::control::RunnerLifecycle;
-use crate::runtime::{AppRuntime, ExitReason};
+use crate::{
+    app_ula::derive_app_ula,
+    build::build_runtime,
+    config::{DockerConfig, FcConfig},
+    fetcher::{FetchedApp, S3Fetcher},
+    host::{AppHost, AppServe},
+    mesh::MeshMembership,
+    runner::{active::ActiveRuntime, control::RunnerLifecycle},
+    runtime::{AppRuntime, ExitReason},
+};
 
 /// The outcome of the runner's main select loop.
 ///
@@ -179,6 +178,19 @@ pub struct ServeConfig {
     /// INITIAL [`build_runtime`], so a supervisor-driven respawn comes up on the
     /// deployed version. `None` = build from the S3 manifest as usual.
     pub image_ref: Option<String>,
+    /// Tenant network slug (Phase-2 contract). When `Some`, the runner joins the
+    /// mesh scoped to this network: [`build_runner_join_config`] advertises
+    /// `tag:net-<slug>` so the coordinator (when validating the scoped join
+    /// token) places this runner in the tenant's network. `None` (the default)
+    /// keeps today's unscoped `runner`-only tag.
+    pub network: Option<String>,
+    /// Scoped node-join JWT for THIS runner (Phase-2 contract), read from
+    /// `TABBIFY_RUNNER_JOIN_TOKEN`. [`build_runner_join_config`] sets it as
+    /// `JoinConfig.join_token` so the coordinator authenticates the register and
+    /// derives the runner's authoritative `network` + `tags` from the claims.
+    /// `None` keeps the current tokenless join (valid against a coordinator
+    /// without `AUTH_URL`).
+    pub runner_join_token: Option<String>,
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
@@ -410,6 +422,27 @@ pub fn runner_keypair_path(data_dir: &std::path::Path, uuid: &str) -> PathBuf {
     data_dir.join("runners").join(format!("{uuid}.meshkey"))
 }
 
+/// Prefix for the per-tenant network tag (Phase-2 contract): the runner's tag
+/// is `tag:net-<slug>` where `<slug>` is the auth network slug (e.g.
+/// `n_jpegxik72nng` → `tag:net-n_jpegxik72nng`).
+pub const NET_TAG_PREFIX: &str = "tag:net-";
+
+/// The mesh tags a runner advertises for the given optional network `slug`.
+///
+/// Always includes the base `runner` role tag; when a `slug` is present it ALSO
+/// includes `tag:net-<slug>` (Phase-2) so a non-validating coordinator routes
+/// the runner into its tenant network. A validating coordinator ignores these
+/// advisory tags and uses the scoped `join_token` claims instead. Pure +
+/// unit-tested so the tag-format contract is pinned without a live join.
+#[must_use]
+pub fn network_tags(slug: Option<&str>) -> Vec<String> {
+    let mut tags = vec!["runner".to_owned()];
+    if let Some(slug) = slug.filter(|s| !s.trim().is_empty()) {
+        tags.push(format!("{NET_TAG_PREFIX}{slug}"));
+    }
+    tags
+}
+
 /// Build the [`mesh_joiner::JoinConfig`] the runner uses to join the mesh.
 ///
 /// This is the runner's defining mesh contract (per-app-runner arch §0.2/§0.1):
@@ -441,11 +474,25 @@ pub fn runner_keypair_path(data_dir: &std::path::Path, uuid: &str) -> PathBuf {
 pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
     let app_uuid = Uuid::parse_str(&cfg.uuid).unwrap_or(Uuid::nil());
     let app_ula = derive_app_ula(app_uuid);
+    // Phase-2: scope the runner to its tenant network. The base `runner` tag is
+    // always advertised; when a network slug is set we ALSO advertise
+    // `tag:net-<slug>` so the coordinator's per-network self-rule
+    // (`tag:net-<slug>` ↔ `tag:net-<slug>`, PUT by auth on network-create) makes
+    // this runner visible to the rest of the tenant network and the system
+    // infra (`tag:system` → `tag:net-*`). These advisory tags are honored only
+    // by a coordinator WITHOUT `AUTH_URL`; a validating coordinator derives the
+    // authoritative tags from the scoped `join_token` claims instead. `None`
+    // keeps the unscoped `runner`-only tag (today's behavior).
+    let tags = network_tags(cfg.network.as_deref());
     mesh_joiner::JoinConfig {
         coordinator_url: cfg.coordinator_url.clone(),
         display_name: cfg.display_name.clone(),
-        tags: vec!["runner".to_owned()],
+        tags,
         insecure_no_mtls: true,
+        // Scoped node-join token (Phase-2). The coordinator validates it and
+        // stamps the runner `network=<slug>`, `tags=["tag:net-<slug>"]`. `None`
+        // keeps the current tokenless join.
+        join_token: cfg.runner_join_token.clone(),
         requested_ula: Some(app_ula.to_string()),
         // Per-uuid keypair → unique pubkey → coordinator honours requested_ula.
         keypair_path: Some(runner_keypair_path(&cfg.data_dir, &cfg.uuid)),
@@ -495,6 +542,8 @@ mod tests {
             fc: FcConfig::default(),
             docker: DockerConfig::default(),
             image_ref: None,
+            network: None,
+            runner_join_token: None,
         }
     }
 
@@ -564,6 +613,60 @@ mod tests {
             Some("wss://relay.tabbify.io/v1/mesh/relay"),
             "explicit relay_url must ride onto the runner's JoinConfig"
         );
+    }
+
+    /// Phase-2: with a network slug + scoped token set, the runner's join
+    /// config carries the token as `join_token` and advertises both `runner`
+    /// and `tag:net-<slug>` so the coordinator scopes it to the tenant network.
+    #[test]
+    fn runner_join_config_scopes_to_network_with_token() {
+        let mut cfg = mesh_cfg();
+        cfg.network = Some("n_jpegxik72nng".to_owned());
+        cfg.runner_join_token = Some("scoped-runner-jwt".to_owned());
+        let join = build_runner_join_config(&cfg);
+
+        assert_eq!(
+            join.join_token.as_deref(),
+            Some("scoped-runner-jwt"),
+            "scoped node-join token must ride onto JoinConfig.join_token"
+        );
+        assert!(
+            join.tags.iter().any(|t| t == "runner"),
+            "base runner tag must remain, got: {:?}",
+            join.tags
+        );
+        assert!(
+            join.tags.iter().any(|t| t == "tag:net-n_jpegxik72nng"),
+            "must advertise tag:net-<slug>, got: {:?}",
+            join.tags
+        );
+    }
+
+    /// With NO network/token (today's behavior), the runner joins unscoped: only
+    /// the `runner` tag, and `join_token` stays `None`.
+    #[test]
+    fn runner_join_config_unscoped_by_default() {
+        let join = build_runner_join_config(&mesh_cfg());
+        assert!(join.join_token.is_none(), "default join must be tokenless");
+        assert_eq!(
+            join.tags,
+            vec!["runner".to_owned()],
+            "default join must carry only the runner tag"
+        );
+    }
+
+    /// The `tag:net-<slug>` format is pinned by the contract; `network_tags`
+    /// produces exactly `["runner", "tag:net-<slug>"]` (and drops a blank slug).
+    #[test]
+    fn network_tags_format_matches_contract() {
+        assert_eq!(
+            network_tags(Some("n_jpegxik72nng")),
+            vec!["runner".to_owned(), "tag:net-n_jpegxik72nng".to_owned()]
+        );
+        assert_eq!(network_tags(None), vec!["runner".to_owned()]);
+        // A blank slug is treated as no network (no empty `tag:net-` tag).
+        assert_eq!(network_tags(Some("   ")), vec!["runner".to_owned()]);
+        assert_eq!(NET_TAG_PREFIX, "tag:net-");
     }
 
     /// A runner ALWAYS shares its netns with the supervisor, so its joiner

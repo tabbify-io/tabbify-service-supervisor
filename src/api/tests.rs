@@ -10,10 +10,10 @@ use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 use super::*;
-use crate::fetcher::S3Fetcher;
-use crate::orchestrator::handle::RunnerHandle;
-use crate::orchestrator::restart::RestartState;
-use crate::orchestrator::{Orchestrator, SharedRunnerConfig};
+use crate::{
+    fetcher::S3Fetcher,
+    orchestrator::{Orchestrator, SharedRunnerConfig, handle::RunnerHandle, restart::RestartState},
+};
 
 const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
 const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
@@ -55,6 +55,7 @@ fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
         },
         image_ref: None,
         requested_runtime: None,
+        network: None,
     }
 }
 
@@ -153,6 +154,28 @@ fn deploy_body_oci_ref_round_trips() {
     assert_eq!(body.reff, "[fd5a::1]:5000/a/b:sha256abc");
 }
 
+/// Phase-2: DeployBody accepts `network` + `runner_join_token` from the node.
+#[test]
+fn deploy_body_parses_phase2_network_and_token() {
+    let json = r#"{
+        "ref": "[fd5a::1]:5000/a/b:sha",
+        "network": "n_jpegxik72nng",
+        "runner_join_token": "scoped-runner-jwt"
+    }"#;
+    let body: DeployBody = serde_json::from_str(json).unwrap();
+    assert_eq!(body.network.as_deref(), Some("n_jpegxik72nng"));
+    assert_eq!(body.runner_join_token.as_deref(), Some("scoped-runner-jwt"));
+}
+
+/// Phase-2 fields are OPTIONAL: a deploy body without them parses to `None`
+/// (backward-compatible — today's node/CLI still works).
+#[test]
+fn deploy_body_phase2_fields_default_to_none() {
+    let body: DeployBody = serde_json::from_str(r#"{"ref":"x"}"#).unwrap();
+    assert!(body.network.is_none());
+    assert!(body.runner_join_token.is_none());
+}
+
 // ── POST /v1/apps/:uuid/deploy — 404 for unknown uuid (no record) ─────────
 
 /// Posting deploy for a uuid that has no on-disk runner record and no live
@@ -186,8 +209,11 @@ async fn deploy_unknown_uuid_returns_error() {
 #[tokio::test]
 async fn deploy_known_uuid_with_live_runner_returns_200() {
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
+
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
 
     let dir = TempDir::new().unwrap();
     let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
@@ -221,6 +247,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
         restart: RestartState::default(),
         image_ref: None,
         requested_runtime: None,
+        network: None,
     };
     rec.save(dir.path()).unwrap();
 

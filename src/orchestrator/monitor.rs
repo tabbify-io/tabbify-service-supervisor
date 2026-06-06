@@ -36,13 +36,13 @@
 
 use std::time::Duration;
 
-use crate::orchestrator::Orchestrator;
-use crate::orchestrator::client::ControlClient;
-use crate::orchestrator::handle::RunnerHandle;
-use crate::orchestrator::restart::{
-    BackoffParams, RestartState, on_exit, on_healthy, should_respawn,
+use crate::orchestrator::{
+    Orchestrator,
+    client::ControlClient,
+    handle::RunnerHandle,
+    restart::{BackoffParams, RestartState, on_exit, on_healthy, should_respawn},
+    spawn::spawn_runner,
 };
-use crate::orchestrator::spawn::spawn_runner;
 
 /// Liveness probe for runner processes: returns `true` iff `pid` is a live,
 /// non-zombie process.
@@ -387,16 +387,20 @@ impl Orchestrator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use tempfile::TempDir;
 
     use super::*;
-    use crate::orchestrator::handle::RunnerHandle;
-    use crate::orchestrator::restart::RestartState;
-    use crate::orchestrator::{Orchestrator, SharedRunnerConfig};
+    use crate::orchestrator::{
+        Orchestrator, SharedRunnerConfig, handle::RunnerHandle, restart::RestartState,
+    };
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -649,6 +653,7 @@ mod tests {
             restart: RestartState::default(),
             image_ref: None,
             requested_runtime: None,
+            network: None,
         }
     }
 

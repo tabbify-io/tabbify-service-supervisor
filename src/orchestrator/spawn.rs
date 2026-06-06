@@ -23,16 +23,17 @@
 //! the returned [`Child`] handle MUST NOT kill the runner — that is the very
 //! property the integration test verifies.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
-use crate::app_ula::derive_app_ula;
-use crate::orchestrator::handle::RunnerHandle;
+use crate::{app_ula::derive_app_ula, orchestrator::handle::RunnerHandle};
 
 /// Filename of the per-app runner binary, resolved next to the current
 /// executable in production (both binaries ship side-by-side from one cargo
@@ -77,6 +78,20 @@ pub struct SpawnSpec {
     /// [`RunnerHandle::image_ref`](crate::orchestrator::handle::RunnerHandle) on
     /// a respawn; `None` on a fresh spawn.
     pub image_ref: Option<String>,
+    /// Tenant network slug (Phase-2 contract). Forwarded to the runner as
+    /// `--network <slug>` so it joins the mesh scoped to this network and the
+    /// coordinator stamps it `network=<slug>`, `tags=["tag:net-<slug>"]`.
+    /// Persisted in the runner record so a respawn rejoins the same network.
+    /// `None` (the default) = today's unscoped behavior.
+    pub network: Option<String>,
+    /// Scoped node-minted node-join JWT for THIS app's runner (Phase-2). Passed
+    /// to the runner via the `TABBIFY_RUNNER_JOIN_TOKEN` environment variable
+    /// (NOT a CLI arg — it is a credential, kept off the process arg list / ps
+    /// output) so a validating coordinator authenticates the runner's register.
+    /// NOT persisted to disk (it is short-lived + minted per deploy); `None` on
+    /// a respawn means the runner rejoins via its sticky per-uuid keypair.
+    /// `None` (the default) keeps the current tokenless behavior.
+    pub runner_join_token: Option<String>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -136,6 +151,14 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
         args.push("--image-ref".into());
         args.push(image_ref.as_str().into());
     }
+    // Phase-2: forward the tenant network slug so the runner joins the mesh
+    // scoped to `tag:net-<slug>`. Omitted when `None` (today's unscoped join).
+    // The scoped join TOKEN travels via the `TABBIFY_RUNNER_JOIN_TOKEN` env
+    // (set in `spawn_runner`), never on the arg list — it is a credential.
+    if let Some(network) = &spec.network {
+        args.push("--network".into());
+        args.push(network.as_str().into());
+    }
     args
 }
 
@@ -161,6 +184,21 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
 
     let mut cmd = Command::new(&spec.runner_bin);
     cmd.args(build_args(spec));
+
+    // Phase-2: pass the scoped node-join token to the runner via the environment
+    // (NOT the arg list, so the credential never lands in `ps`/process args).
+    // The runner reads it via clap `env = "TABBIFY_RUNNER_JOIN_TOKEN"`. When
+    // `None`, EXPLICITLY clear the var on the child so an ambient token in the
+    // supervisor's own env never leaks into an unscoped runner — today's
+    // tokenless behavior is preserved.
+    match &spec.runner_join_token {
+        Some(token) => {
+            cmd.env(crate::runner::config::RUNNER_JOIN_TOKEN_ENV, token);
+        }
+        None => {
+            cmd.env_remove(crate::runner::config::RUNNER_JOIN_TOKEN_ENV);
+        }
+    }
 
     // Detach: become a new session leader so the runner is not in the
     // supervisor's process group and survives the supervisor's death / signals.
@@ -251,6 +289,10 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // so old on-disk records (which may carry a `requested_runtime`) still
         // deserialize; it is inert and never read for dispatch.
         requested_runtime: None,
+        // Persist the tenant network slug so a respawn rejoins the same network
+        // (`--network <slug>`). `None` on a fresh/unscoped spawn = today's
+        // behavior. The scoped join token is NOT persisted (short-lived).
+        network: spec.network.clone(),
     };
 
     handle
@@ -304,6 +346,8 @@ mod tests {
             no_mesh: true,
             relay_url: None,
             image_ref: None,
+            network: None,
+            runner_join_token: None,
         }
     }
 
@@ -434,6 +478,69 @@ mod tests {
         );
     }
 
+    /// Phase-2: when `network` is set, the runner argv carries `--network
+    /// <slug>` so the runner joins the mesh scoped to `tag:net-<slug>`.
+    #[test]
+    fn build_args_includes_network_when_present() {
+        let mut s = spec();
+        s.network = Some("n_jpegxik72nng".to_owned());
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let idx = joined
+            .iter()
+            .position(|a| a == "--network")
+            .unwrap_or_else(|| panic!("missing --network in {joined:?}"));
+        assert_eq!(
+            joined.get(idx + 1).map(String::as_str),
+            Some("n_jpegxik72nng"),
+            "--network must be followed by the network slug"
+        );
+    }
+
+    /// When `network` is `None`, no `--network` arg is emitted (today's unscoped
+    /// join is unchanged).
+    #[test]
+    fn build_args_omits_network_when_none() {
+        let mut s = spec();
+        s.network = None;
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a == "--network"),
+            "no --network when None; got: {joined:?}"
+        );
+    }
+
+    /// The scoped node-join token is a CREDENTIAL: it MUST NOT appear on the
+    /// runner's arg list (it travels via the `TABBIFY_RUNNER_JOIN_TOKEN` env so
+    /// it never lands in `ps` output). Even with a token set, `build_args`
+    /// carries neither the token value nor a token flag.
+    #[test]
+    fn build_args_never_carries_join_token() {
+        let mut s = spec();
+        s.runner_join_token = Some("super-secret-jwt".to_owned());
+        s.network = Some("n_jpegxik72nng".to_owned());
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a.contains("super-secret-jwt")),
+            "the join token must never appear on the arg list; got: {joined:?}"
+        );
+        assert!(
+            !joined.iter().any(|a| a == "--runner-join-token"),
+            "no --runner-join-token flag (token rides the env); got: {joined:?}"
+        );
+    }
+
     /// The runtime is no longer selectable per app — every app builds as
     /// Firecracker — so the runner argv never carries a `--runtime-override`
     /// flag (the flag and the threading were removed).
@@ -455,8 +562,7 @@ mod tests {
     /// log-capture tests below: pointing `SpawnSpec.runner_bin` at it lets us
     /// drive the real detached spawn without a real `tabbify-runner`.
     fn write_echo_wrapper(dir: &Path, name: &str, out_text: &str, err_text: &str) -> PathBuf {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
 
         let wrapper = dir.join(name);
         {
@@ -507,6 +613,89 @@ mod tests {
         assert!(
             contents.contains("RUNNER_STDERR_LINE"),
             "log must contain captured stderr; got: {contents:?}"
+        );
+    }
+
+    /// Phase-2: the scoped node-join token is passed to the spawned runner via
+    /// the `TABBIFY_RUNNER_JOIN_TOKEN` env (a credential kept off the arg list).
+    /// We point the runner at a wrapper that prints that env var, then assert the
+    /// value lands in the captured log.
+    #[tokio::test]
+    async fn spawn_runner_passes_join_token_via_env() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A wrapper that echoes the token env var to stdout.
+        let wrapper = dir.path().join("env-echo.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'TOKEN=[%s]\\n' \"${{{env}}}\"\n",
+                env = crate::runner::config::RUNNER_JOIN_TOKEN_ENV
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-dddd-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.runner_join_token = Some("scoped-runner-jwt".to_owned());
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("TOKEN=[scoped-runner-jwt]"),
+            "the runner must receive the join token via TABBIFY_RUNNER_JOIN_TOKEN; got: {contents:?}"
+        );
+    }
+
+    /// With no token, the env var is unset for the runner (today's behavior):
+    /// the wrapper sees an empty value.
+    #[tokio::test]
+    async fn spawn_runner_omits_join_token_env_when_none() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("env-echo.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'TOKEN=[%s]\\n' \"${{{env}}}\"\n",
+                env = crate::runner::config::RUNNER_JOIN_TOKEN_ENV
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-eeee-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.runner_join_token = None;
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("TOKEN=[]"),
+            "no token env must be set when runner_join_token is None; got: {contents:?}"
         );
     }
 

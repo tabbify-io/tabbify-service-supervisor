@@ -3,21 +3,27 @@
 //! Each handler carries a `#[utoipa::path]` annotation so [`crate::openapi`]
 //! can enumerate it into the aggregated OpenAPI 3 document.
 
-use axum::Json;
-use axum::extract::{Path, State};
-use axum::response::{IntoResponse, Response};
+use axum::{
+    Json,
+    extract::{Path, State},
+    response::{IntoResponse, Response},
+};
 use http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 use utoipa::ToSchema;
 
-use super::SharedState;
-use super::dto::{
-    AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
-    AppStopResponse, ErrorResponse, HealthResponse,
+use super::{
+    SharedState,
+    dto::{
+        AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
+        AppStopResponse, ErrorResponse, HealthResponse,
+    },
 };
-use crate::fetcher::FetchError;
-use crate::orchestrator::{AppState, AppSummary};
+use crate::{
+    fetcher::FetchError,
+    orchestrator::{AppState, AppSummary},
+};
 
 /// Liveness probe + capability report.
 ///
@@ -257,6 +263,20 @@ pub struct DeployBody {
     /// Travels in the body only, never persisted to the manifest.
     #[serde(default)]
     pub(super) runtime: Option<crate::runtime::Runtime>,
+    /// Tenant network slug (Phase-2 contract). When `Some`, the spawned runner
+    /// joins the mesh scoped to this network — it is passed to the runner as
+    /// `--network <slug>` so the coordinator stamps it `network=<slug>`,
+    /// `tags=["tag:net-<slug>"]`. `None` (the default) keeps today's behavior
+    /// (the runner joins unscoped).
+    #[serde(default)]
+    pub(super) network: Option<String>,
+    /// Scoped node-join JWT the node minted for THIS app's runner (Phase-2
+    /// contract). Carries `network=<slug>`, `tags=["tag:net-<slug>"]`,
+    /// `subject=<app-uuid>`. Threaded to the runner as the
+    /// `TABBIFY_RUNNER_JOIN_TOKEN` env so a validating coordinator authenticates
+    /// the runner's register. `None` keeps the current tokenless behavior.
+    #[serde(default)]
+    pub(super) runner_join_token: Option<String>,
 }
 
 /// Request body for `POST /v1/apps/:uuid/start`. All fields optional so a
@@ -311,9 +331,19 @@ pub async fn deploy_app(
     // orchestrator and into `Cmd::Deploy.runtime`. `None` keeps the
     // manifest-default behaviour (D10).
     let runtime_override = body.runtime.map(|r| r.as_wire().to_owned());
+    // Phase-2 binding: the network slug + node-minted scoped runner token are
+    // threaded into a COLD spawn so the runner joins the tenant network. `None`
+    // for either keeps the current (unscoped, tokenless) behavior. A live
+    // zero-downtime swap does not re-key the runner's mesh peer, so network
+    // scoping only applies on a fresh spawn (the runner already holds its
+    // scoped identity when it is alive).
+    let net = crate::orchestrator::api::DeployNetwork {
+        network: body.network,
+        runner_join_token: body.runner_join_token,
+    };
     match state
         .orchestrator
-        .deploy_app(&uuid, &body.reff, runtime_override.as_deref())
+        .deploy_app(&uuid, &body.reff, runtime_override.as_deref(), net)
         .await
     {
         Ok(s) => running_json(&s).into_response(),
