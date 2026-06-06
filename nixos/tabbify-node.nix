@@ -261,6 +261,14 @@ in {
       ExecStartPre     = "${supervisorFetchJoiner}";
       ExecStart        = "${dataDir}/supervisord";   # symlink -> current/supervisord (svc #4)
       WorkingDirectory = dataDir;
+      # Phase-2 join token. A token-validating coordinator (AUTH_URL set) requires
+      # this node to present a join token on register; the coordinator then stamps
+      # the node's network + tags from the token CLAIMS. Kept OUT of the Nix store
+      # (no secret in git / world-readable store): drop it out-of-band into
+      #   /etc/tabbify/supervisor.env   ->   TABBIFY_JOIN_TOKEN=<jwt>   (chmod 600)
+      # before `nixos-rebuild switch`. The leading '-' makes a missing file
+      # non-fatal, so a dev / no-mesh node still starts.
+      EnvironmentFile  = "-/etc/tabbify/supervisor.env";
       # on-failure (NOT always): a clean exit during a watchdog rollback must
       # NOT auto-respawn the just-swapped-out binary. Exponential-ish backoff
       # (RestartSec grows over RestartSteps up to RestartMaxDelaySec) avoids a
