@@ -77,6 +77,15 @@ pub struct Config {
     )]
     pub relay_only: bool,
 
+    /// Explicit endpoint this peer **advertises to the coordinator** instead of
+    /// the reflexive (public) one. Useful on LAN-local nodes that share a NAT:
+    /// e.g. `10.17.21.133:51820` lets two peers on the same subnet hole-punch
+    /// each other directly without going through the relay. When unset (the
+    /// default) the coordinator uses the reflexive endpoint it observes on the
+    /// incoming UDP register — unchanged behavior for cloud/public peers.
+    #[arg(long = "mesh-advertise-endpoint", env = "TABBIFY_MESH_ADVERTISE_ENDPOINT")]
+    pub advertise_endpoint: Option<String>,
+
     /// Skip mesh join entirely and bind a plain loopback/`--bind` addr. Used
     /// for local runs/tests without root + TUN. Defaults off (join the mesh).
     #[arg(long, env = "SUPERVISOR_NO_MESH", default_value_t = false)]

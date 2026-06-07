@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
             },
             config.effective_relay_url(),
             config.relay_only,
+            config.advertise_endpoint.clone(),
         )
         .await
         .context("join mesh")?;

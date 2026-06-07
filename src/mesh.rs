@@ -91,6 +91,14 @@ impl MeshMembership {
     /// involving it, so the handshake completes single-sided over the relay.
     /// `false` keeps direct + hole-punch traversal.
     ///
+    /// `advertise_endpoint` overrides the endpoint the coordinator advertises to
+    /// other peers for this node. When `Some`, the coordinator uses this value
+    /// verbatim (e.g. `10.17.21.133:51820`) instead of the reflexive (public)
+    /// endpoint it observes on the incoming UDP register — useful for LAN-local
+    /// peers that share a NAT and want to hole-punch each other directly over
+    /// the LAN. `None` (the default) keeps reflexive-endpoint behavior,
+    /// unchanged for cloud/public peers (`TABBIFY_MESH_ADVERTISE_ENDPOINT`).
+    ///
     /// # Errors
     /// Propagates the broad `Joiner::join` failure surface (HTTP, TUN setup,
     /// UDP bind, sudo). On a host without root / TUN this fails — callers that
@@ -102,6 +110,7 @@ impl MeshMembership {
         metadata: JoinMetadata,
         relay_url: Option<String>,
         relay_only: bool,
+        advertise_endpoint: Option<String>,
     ) -> anyhow::Result<Self> {
         let config = build_supervisor_join_config(
             coordinator_url,
@@ -110,6 +119,7 @@ impl MeshMembership {
             metadata,
             relay_url,
             relay_only,
+            advertise_endpoint,
         );
         Self::from_config(config, "join mesh as supervisor").await
     }
@@ -208,6 +218,7 @@ fn build_supervisor_join_config(
     metadata: JoinMetadata,
     relay_url: Option<String>,
     relay_only: bool,
+    advertise_endpoint: Option<String>,
 ) -> JoinConfig {
     let mut tags = vec!["supervisor".to_owned()];
     tags.extend_from_slice(extra_tags);
@@ -244,6 +255,12 @@ fn build_supervisor_join_config(
         // peer (this supervisor + its runners) that has no reachable direct
         // endpoint behind a NAT/firewall. `false` keeps direct + hole-punch.
         relay_only,
+        // Explicit advertise endpoint (`TABBIFY_MESH_ADVERTISE_ENDPOINT`). When
+        // `Some`, the coordinator advertises THIS endpoint to other peers instead
+        // of the reflexive (public) one — enables same-LAN peers to hole-punch
+        // each other directly (e.g. `10.17.21.133:51820`). `None` keeps the
+        // default reflexive-endpoint behavior, unchanged for cloud/public peers.
+        advertise_endpoint,
         // The supervisor is the HOST daemon: it owns the main-table routes
         // (no source-scoping — its per-app runners scope themselves), and
         // it keeps the host firewall from dropping inbound overlay dials
@@ -331,7 +348,7 @@ mod tests {
             ..Default::default()
         };
         let config =
-            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false);
+            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false, None);
         assert_eq!(config.software_version.as_deref(), Some("1.4.0"));
         // The supervisor tag is always present; metadata fields ride through.
         assert!(config.tags.contains(&"supervisor".to_owned()));
@@ -348,6 +365,7 @@ mod tests {
             JoinMetadata::default(),
             None,
             false,
+            None,
         );
         assert!(config.software_version.is_none());
         assert!(config.tags.contains(&"firecracker".to_owned()));
@@ -366,6 +384,7 @@ mod tests {
             JoinMetadata::default(),
             Some("wss://relay.tabbify.io/v1/mesh/relay".to_owned()),
             false,
+            None,
         );
         assert_eq!(
             config.relay_url.as_deref(),
@@ -388,6 +407,7 @@ mod tests {
             JoinMetadata::default(),
             None,
             true,
+            None,
         );
         assert!(
             config.relay_only,
@@ -406,6 +426,7 @@ mod tests {
             JoinMetadata::default(),
             None,
             false,
+            None,
         );
         assert!(
             !config.relay_only,
@@ -427,6 +448,7 @@ mod tests {
             JoinMetadata::default(),
             None,
             false,
+            None,
         );
         assert!(
             config.manage_firewall,
@@ -448,7 +470,7 @@ mod tests {
             ..Default::default()
         };
         let config =
-            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false);
+            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false, None);
         assert_eq!(
             config.join_token.as_deref(),
             Some("infra-join-jwt"),
@@ -503,10 +525,55 @@ mod tests {
             JoinMetadata::default(),
             None,
             false,
+            None,
         );
         assert!(
             config.relay_url.is_none(),
             "None relay_url must keep the default coordinator-derived relay"
+        );
+    }
+
+    /// An explicit `advertise_endpoint` (from `TABBIFY_MESH_ADVERTISE_ENDPOINT`)
+    /// rides onto the supervisor's `JoinConfig.advertise_endpoint` verbatim, so
+    /// the coordinator advertises that endpoint to other peers instead of the
+    /// reflexive one — enables same-LAN peers to hole-punch each other directly
+    /// without going through the relay.
+    #[test]
+    fn build_config_wires_advertise_endpoint_onto_join_config() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+            false,
+            Some("10.17.21.133:51820".to_owned()),
+        );
+        assert_eq!(
+            config.advertise_endpoint.as_deref(),
+            Some("10.17.21.133:51820"),
+            "explicit advertise_endpoint must ride onto JoinConfig verbatim"
+        );
+    }
+
+    /// A `None` `advertise_endpoint` (the default) leaves
+    /// `JoinConfig.advertise_endpoint` `None`, so the coordinator uses the
+    /// reflexive (public) endpoint it observes — unchanged behavior for
+    /// cloud/public peers.
+    #[test]
+    fn build_config_omits_absent_advertise_endpoint() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+            false,
+            None,
+        );
+        assert!(
+            config.advertise_endpoint.is_none(),
+            "None advertise_endpoint must keep reflexive-endpoint behavior"
         );
     }
 }
