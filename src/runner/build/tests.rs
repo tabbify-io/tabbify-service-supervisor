@@ -103,6 +103,23 @@ fn git_without_dockerfile() -> GitRun {
     })
 }
 
+/// A [`GitRun`] that simulates a clone of a repo that ships its OWN
+/// `tabbify.toml` (plus a `Dockerfile`). Used by the repo-wins test: the inject
+/// step must NOT overwrite the repo's own toml.
+fn git_with_dockerfile_and_own_toml(own_toml: &'static str) -> GitRun {
+    Arc::new(move |args: Vec<String>, _env| {
+        let dest = init_dest(&args);
+        Box::pin(async move {
+            if let Some(dest) = dest {
+                std::fs::create_dir_all(&dest).ok();
+                std::fs::write(format!("{dest}/Dockerfile"), "FROM scratch\n").unwrap();
+                std::fs::write(format!("{dest}/tabbify.toml"), own_toml).unwrap();
+            }
+            Ok(())
+        })
+    })
+}
+
 /// Canonical minimal DOCKER [`BuildJob`] for tests (build_kind defaults to
 /// Docker so the docker path is exercised).
 fn test_job() -> BuildJob {
@@ -117,6 +134,7 @@ fn test_job() -> BuildJob {
         build_kind: BuildKind::Docker,
         build_cmd: None,
         artifact_path: None,
+        manifest_toml: None,
     }
 }
 
@@ -150,6 +168,7 @@ fn build_job_round_trips_json() {
         build_kind: BuildKind::Docker,
         build_cmd: None,
         artifact_path: None,
+        manifest_toml: None,
     };
     let s = serde_json::to_string(&job).unwrap();
     assert_eq!(serde_json::from_str::<BuildJob>(&s).unwrap(), job);
@@ -319,6 +338,7 @@ async fn run_build_ref_format_is_correct() {
         build_kind: BuildKind::Docker,
         build_cmd: None,
         artifact_path: None,
+        manifest_toml: None,
     };
     let art = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
         .await
@@ -338,6 +358,98 @@ fn build_kind_defaults_to_docker_when_absent() {
     let job: BuildJob = serde_json::from_str(json).unwrap();
     assert_eq!(job.build_kind, BuildKind::Docker);
     assert!(job.build_cmd.is_none() && job.artifact_path.is_none());
+}
+
+// ── managed tabbify.toml injection (repo-wins) ────────────────────────────
+
+const MANAGED_TOML: &str = r#"[app]
+name = "hello-deploy"
+
+[build]
+kind = "docker"
+dockerfile = "Dockerfile"
+
+[runtime]
+lifecycle = "on_request"
+memory_mb = 512
+vcpus = 1
+
+[routes]
+dynamic_prefixes = ["/"]
+"#;
+
+/// A clone tree WITHOUT its own `tabbify.toml` + a provided managed toml →
+/// `run_build` writes `<src>/tabbify.toml` with the managed content.
+#[tokio::test]
+async fn run_build_injects_managed_toml_when_repo_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_with_dockerfile(Arc::new(Mutex::new(None)));
+    let backend = FakeBackend {
+        built: Arc::new(Mutex::new(None)),
+    };
+    let skopeo_runner = record_runner(Arc::new(Mutex::new(Vec::new())));
+
+    let mut job = test_job();
+    job.manifest_toml = Some(MANAGED_TOML.to_owned());
+
+    run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .unwrap();
+
+    let toml_path = dir.path().join("src").join("tabbify.toml");
+    let written = std::fs::read_to_string(&toml_path)
+        .unwrap_or_else(|e| panic!("managed toml must be written to {toml_path:?}: {e}"));
+    assert_eq!(written, MANAGED_TOML, "the managed toml must be written verbatim");
+}
+
+/// A clone tree that ships its OWN `tabbify.toml` + a provided managed toml →
+/// the repo's own toml is left UNCHANGED (repo-wins).
+#[tokio::test]
+async fn run_build_keeps_repo_own_toml_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    const REPO_OWN_TOML: &str = "[app]\nname = \"repo-owned\"\n[build]\nkind = \"docker\"\n";
+    let git = git_with_dockerfile_and_own_toml(REPO_OWN_TOML);
+    let backend = FakeBackend {
+        built: Arc::new(Mutex::new(None)),
+    };
+    let skopeo_runner = record_runner(Arc::new(Mutex::new(Vec::new())));
+
+    let mut job = test_job();
+    job.manifest_toml = Some(MANAGED_TOML.to_owned());
+
+    run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .unwrap();
+
+    let toml_path = dir.path().join("src").join("tabbify.toml");
+    let kept = std::fs::read_to_string(&toml_path).unwrap();
+    assert_eq!(
+        kept, REPO_OWN_TOML,
+        "the repo's own tabbify.toml must NOT be overwritten by the managed one"
+    );
+}
+
+/// No managed toml + a repo with none → no `tabbify.toml` is created (today's
+/// behaviour is unchanged for a build with no managed config).
+#[tokio::test]
+async fn run_build_writes_no_toml_when_none_provided() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_with_dockerfile(Arc::new(Mutex::new(None)));
+    let backend = FakeBackend {
+        built: Arc::new(Mutex::new(None)),
+    };
+    let skopeo_runner = record_runner(Arc::new(Mutex::new(Vec::new())));
+
+    let job = test_job(); // manifest_toml: None
+    run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .unwrap();
+
+    let toml_path = dir.path().join("src").join("tabbify.toml");
+    assert!(
+        !toml_path.exists(),
+        "no managed toml provided + repo ships none → no tabbify.toml must be written"
+    );
 }
 
 // ── run_one_shot_build (I/O + parse) ──────────────────────────────────────

@@ -388,6 +388,11 @@ pub struct BuildBody {
     /// Inert wire field (formerly the wasm `artifact_path`); no build path consumes it.
     #[serde(default)]
     pub(super) artifact_path: Option<String>,
+    /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) for a connect-repo deploy.
+    /// Injected into the clone ONLY when the repo ships none (repo-wins), then
+    /// parsed to drive `[build]`/`[runtime]`/`[routes]`. `None` = no managed config.
+    #[serde(default)]
+    pub(super) manifest_toml: Option<String>,
 }
 
 /// `POST /v1/build` — dispatch a one-shot build: clone `repo_url`@`ref`, build
@@ -441,6 +446,9 @@ pub async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildB
         build_kind: body.build_kind,
         build_cmd: body.build_cmd,
         artifact_path: body.artifact_path,
+        // Managed `tabbify.toml`: injected into the clone if the repo ships none
+        // (repo-wins), then parsed to drive build + runtime in `run_build`.
+        manifest_toml: body.manifest_toml,
     };
     match state.orchestrator.spawn_build(&job).await {
         Ok(art) => axum::Json(art).into_response(),

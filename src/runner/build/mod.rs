@@ -78,6 +78,13 @@ pub struct BuildJob {
     /// build specs still parse; no build path consumes it.
     #[serde(default)]
     pub artifact_path: Option<String>,
+    /// The Tabbify-MANAGED `tabbify.toml` (a raw TOML string) for a connect-repo
+    /// deploy. Injected into the clone ONLY when the repo ships none (repo-wins);
+    /// then parsed to drive `[build]` (dockerfile/context) + `[runtime]`/`[routes]`.
+    /// `None` (the default) = no managed config (a `tcli`/local build, or a repo
+    /// expected to carry its own toml).
+    #[serde(default)]
+    pub manifest_toml: Option<String>,
 }
 
 /// The result of a build: the immutable image ref and (optionally) its digest.
@@ -129,6 +136,17 @@ pub async fn run_build(
     )
     .await
     .context("clone")?;
+
+    // Inject the Tabbify-MANAGED `tabbify.toml` ONLY when the repo ships none
+    // (repo-wins): a repo that carries its own `tabbify.toml` keeps using it,
+    // while a repo with none gets the managed default written at the clone root.
+    let toml_path = src.join("tabbify.toml");
+    if !toml_path.exists() {
+        if let Some(t) = &job.manifest_toml {
+            std::fs::write(&toml_path, t)
+                .with_context(|| format!("write managed tabbify.toml to {}", toml_path.display()))?;
+        }
+    }
 
     // Image ref: <registry_ula>/<tenant>/<app_uuid>:<git_ref>.
     let reff = format!(

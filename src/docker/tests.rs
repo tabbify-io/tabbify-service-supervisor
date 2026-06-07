@@ -255,6 +255,7 @@ async fn run_docker_build_bails_with_push_stderr() {
         build_kind: BuildKind::Docker,
         build_cmd: None,
         artifact_path: None,
+        manifest_toml: None,
     };
 
     let err = run_build(

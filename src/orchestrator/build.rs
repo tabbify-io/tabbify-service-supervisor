@@ -305,6 +305,7 @@ mod tests {
             build_kind: crate::runner::build::BuildKind::Docker,
             build_cmd: None,
             artifact_path: None,
+            manifest_toml: None,
         }
     }
 
