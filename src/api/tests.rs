@@ -58,6 +58,7 @@ fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
         requested_runtime: None,
         network: None,
         runner_join_token: None,
+        manifest_toml: None,
     }
 }
 
@@ -251,6 +252,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
         requested_runtime: None,
         network: None,
         runner_join_token: None,
+        manifest_toml: None,
     };
     rec.save(dir.path()).unwrap();
 

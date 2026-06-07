@@ -125,11 +125,11 @@ impl SharedRunnerConfig {
             relay_only: self.relay_only,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
-            // The managed `tabbify.toml` is re-supplied per deploy (not persisted
-            // in the record), so a RESPAWN-from-record falls back to the
-            // hardcoded FC defaults for a connect-repo app. Re-deploying re-applies
-            // the managed runtime. (A persisted copy is a follow-up — see report.)
-            manifest_toml: None,
+            // Reuse the PERSISTED managed `tabbify.toml` so a RESPAWN-from-record
+            // re-derives the connect-repo app's `[runtime]`/`[routes]` instead of
+            // reverting to the hardcoded FC defaults after a crash. `None` for an
+            // app with no managed config (a `tcli`/S3-manifest app).
+            manifest_toml: record.manifest_toml.clone(),
             // Phase-2: a RESPAWN rejoins the SAME tenant network the record was
             // scoped to (`--network <slug>`).
             network: record.network.clone(),
@@ -345,6 +345,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         }
     }
 
@@ -391,6 +392,35 @@ mod tests {
             spec.runner_join_token.as_deref(),
             Some("jwt.x"),
             "respawn must reuse the persisted join token (no 401)"
+        );
+    }
+
+    /// A record with a persisted managed `tabbify.toml` reconstructs a spec that
+    /// carries it, so a RESPAWN re-derives the connect-repo app's
+    /// `[runtime]`/`[routes]` instead of reverting to the hardcoded FC defaults.
+    #[test]
+    fn spawn_spec_for_respawn_keeps_manifest_toml() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.manifest_toml = Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
+        let spec = cfg.spawn_spec_for(&rec);
+        assert_eq!(
+            spec.manifest_toml.as_deref(),
+            Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n"),
+            "respawn must reuse the persisted managed tabbify.toml"
+        );
+    }
+
+    /// A record with no managed config reconstructs a spec with `manifest_toml`
+    /// None — a respawn keeps the hardcoded FC defaults (a `tcli`/S3-manifest app).
+    #[test]
+    fn spawn_spec_for_respawn_no_manifest_toml_when_absent() {
+        let cfg = shared();
+        let rec = record(); // record() has manifest_toml: None
+        let spec = cfg.spawn_spec_for(&rec);
+        assert!(
+            spec.manifest_toml.is_none(),
+            "a record with no managed config must reconstruct a spec without one"
         );
     }
 

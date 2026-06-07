@@ -96,6 +96,14 @@ pub struct RunnerHandle {
     /// and for records written before this field existed (serde default).
     #[serde(default)]
     pub runner_join_token: Option<String>,
+    /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) of the last deploy. PERSISTED
+    /// so a supervisor-driven RESPAWN re-applies the connect-repo app's
+    /// `[runtime]`/`[routes]` (memory/vcpus/lifecycle/routes) to its synthesized
+    /// manifest instead of reverting to the hardcoded FC defaults after a crash.
+    /// `None` for apps with no managed config (a `tcli`/S3-manifest app) and for
+    /// records written before this field existed (serde default).
+    #[serde(default)]
+    pub manifest_toml: Option<String>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -202,6 +210,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         }
     }
 
@@ -218,6 +227,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         }
     }
 
@@ -472,6 +482,51 @@ mod tests {
             "runner_join_token must survive save/load so a respawn re-joins"
         );
         assert_eq!(loaded, h);
+    }
+
+    // ── manifest_toml field ───────────────────────────────────────────────────
+
+    /// A handle with a persisted managed `tabbify.toml` must round-trip through
+    /// save → load so a supervisor-driven RESPAWN re-derives the connect-repo
+    /// app's `[runtime]`/`[routes]` instead of reverting to the FC defaults.
+    #[test]
+    fn manifest_toml_round_trips_via_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.manifest_toml = Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded.manifest_toml.as_deref(),
+            Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n"),
+            "manifest_toml must survive save/load so a respawn re-derives runtime"
+        );
+        assert_eq!(loaded, h);
+    }
+
+    /// JSON written before the `manifest_toml` field was added (no
+    /// `"manifest_toml"` key) must deserialize with `manifest_toml = None` so old
+    /// records still load.
+    #[test]
+    fn manifest_toml_defaults_to_none_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000,
+            "image_ref": null,
+            "network": "n_jpegxik72nng"
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert!(
+            h.manifest_toml.is_none(),
+            "missing manifest_toml key must deserialize as None"
+        );
     }
 
     /// JSON written before the `runner_join_token` field was added (no

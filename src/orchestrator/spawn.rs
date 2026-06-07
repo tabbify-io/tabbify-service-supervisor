@@ -336,6 +336,10 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // long-lived, a 1-year TTL minted by the node, so it outlives the
         // runner's idle-outs/crashes). `None` on an unscoped spawn.
         runner_join_token: spec.runner_join_token.clone(),
+        // Persist the managed `tabbify.toml` so a RESPAWN-from-record re-derives
+        // the connect-repo app's `[runtime]`/`[routes]` instead of reverting to
+        // the hardcoded FC defaults. `None` on a deploy with no managed config.
+        manifest_toml: spec.manifest_toml.clone(),
     };
 
     handle
@@ -850,6 +854,40 @@ mod tests {
             loaded.runner_join_token.as_deref(),
             Some("jwt.runner.token"),
             "the saved record must persist the join token for a respawn"
+        );
+    }
+
+    /// The spec's `manifest_toml` is PERSISTED into the saved [`RunnerHandle`] so
+    /// a supervisor-driven RESPAWN re-derives the connect-repo app's
+    /// `[runtime]`/`[routes]` instead of reverting to the FC defaults. We assert
+    /// both the returned handle and the on-disk record carry the toml.
+    #[tokio::test]
+    async fn spawn_runner_persists_manifest_toml_into_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = write_echo_wrapper(dir.path(), "noop.sh", "OUT", "ERR");
+
+        let toml = "[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n";
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-4040-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.manifest_toml = Some(toml.to_owned());
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(
+            handle.manifest_toml.as_deref(),
+            Some(toml),
+            "the returned handle must carry the spec's managed toml"
+        );
+        let loaded = RunnerHandle::load(dir.path(), &s.uuid).unwrap().unwrap();
+        assert_eq!(
+            loaded.manifest_toml.as_deref(),
+            Some(toml),
+            "the saved record must persist the managed toml for a respawn"
         );
     }
 

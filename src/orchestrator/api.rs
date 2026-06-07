@@ -721,6 +721,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -797,6 +798,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -956,6 +958,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1027,6 +1030,7 @@ mod tests {
             requested_runtime: None,
             network: None,
             runner_join_token: None,
+            manifest_toml: None,
         };
         rec.save(dir.path()).unwrap();
 
