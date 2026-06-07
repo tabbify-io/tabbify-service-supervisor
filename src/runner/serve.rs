@@ -187,6 +187,12 @@ pub struct ServeConfig {
     /// INITIAL [`build_runtime`], so a supervisor-driven respawn comes up on the
     /// deployed version. `None` = build from the S3 manifest as usual.
     pub image_ref: Option<String>,
+    /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) for a connect-repo deploy.
+    /// When `Some` and the app has NO S3 manifest (the BUILD-pipeline path),
+    /// [`crate::build::fetched_from_ref`] applies its `[runtime]`/`[routes]` to
+    /// the synthesized manifest instead of the hardcoded FC defaults. `None`
+    /// keeps today's defaults.
+    pub manifest_toml: Option<String>,
     /// Tenant network slug (Phase-2 contract). When `Some`, the runner joins the
     /// mesh scoped to this network: [`build_runner_join_config`] advertises
     /// `tag:net-<slug>` so the coordinator (when validating the scoped join
@@ -407,6 +413,7 @@ pub async fn resolve_app(cfg: &ServeConfig) -> Result<FetchedApp> {
         fetch_result,
         &cfg.uuid,
         cfg.image_ref.as_deref(),
+        cfg.manifest_toml.as_deref(),
         &cfg.data_dir,
     )
     .with_context(|| format!("fetch app {}", cfg.uuid))
@@ -559,6 +566,7 @@ mod tests {
             fc: FcConfig::default(),
             docker: DockerConfig::default(),
             image_ref: None,
+            manifest_toml: None,
             network: None,
             runner_join_token: None,
         }

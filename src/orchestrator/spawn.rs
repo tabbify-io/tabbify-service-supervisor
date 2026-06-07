@@ -100,6 +100,13 @@ pub struct SpawnSpec {
     /// a respawn means the runner rejoins via its sticky per-uuid keypair.
     /// `None` (the default) keeps the current tokenless behavior.
     pub runner_join_token: Option<String>,
+    /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) for a connect-repo deploy.
+    /// Passed to the runner via the `RUNNER_MANIFEST_TOML` environment variable
+    /// (an env, not an arg: the toml is multi-line and would clutter `ps`) so a
+    /// BUILD-pipeline app's `[runtime]`/`[routes]` drive its synthesized
+    /// manifest. NOT persisted to the runner record (it is re-supplied per
+    /// deploy). `None` (the default) keeps the hardcoded FC defaults.
+    pub manifest_toml: Option<String>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -215,6 +222,19 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         }
         None => {
             cmd.env_remove(crate::runner::config::RUNNER_JOIN_TOKEN_ENV);
+        }
+    }
+
+    // The managed `tabbify.toml` travels via the `RUNNER_MANIFEST_TOML` env (an
+    // env, not an arg: the toml is multi-line and would clutter `ps`). When
+    // `None`, clear it on the child so an ambient value never leaks into a deploy
+    // that has no managed config — today's hardcoded-default behavior is kept.
+    match &spec.manifest_toml {
+        Some(t) => {
+            cmd.env("RUNNER_MANIFEST_TOML", t);
+        }
+        None => {
+            cmd.env_remove("RUNNER_MANIFEST_TOML");
         }
     }
 
@@ -370,6 +390,7 @@ mod tests {
             relay_url: None,
             relay_only: false,
             image_ref: None,
+            manifest_toml: None,
             network: None,
             runner_join_token: None,
         }
@@ -715,6 +736,86 @@ mod tests {
         assert!(
             contents.contains("TOKEN=[scoped-runner-jwt]"),
             "the runner must receive the join token via TABBIFY_RUNNER_JOIN_TOKEN; got: {contents:?}"
+        );
+    }
+
+    /// The spec's `manifest_toml` is passed to the spawned runner via the
+    /// `RUNNER_MANIFEST_TOML` env so a connect-repo deploy's `[runtime]`/`[routes]`
+    /// reach the runner's synthesized manifest. We point the runner at a wrapper
+    /// that echoes that env var and assert the toml lands in the captured log.
+    #[tokio::test]
+    async fn spawn_runner_passes_manifest_toml_via_env() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("toml-echo.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'TOML=[%s]\\n' \"${{RUNNER_MANIFEST_TOML}}\"\n"
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-2020-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.manifest_toml = Some("[app]\nname = \"sized\"\n".to_owned());
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("name = \"sized\""),
+            "the runner must receive the managed toml via RUNNER_MANIFEST_TOML; got: {contents:?}"
+        );
+    }
+
+    /// With no managed toml, `RUNNER_MANIFEST_TOML` is unset on the child (today's
+    /// hardcoded-default behavior): the wrapper sees an empty value.
+    #[tokio::test]
+    async fn spawn_runner_omits_manifest_toml_env_when_none() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("toml-echo.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'TOML=[%s]\\n' \"${{RUNNER_MANIFEST_TOML}}\"\n"
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-3030-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.manifest_toml = None;
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("TOML=[]"),
+            "no managed toml → RUNNER_MANIFEST_TOML must be unset; got: {contents:?}"
         );
     }
 

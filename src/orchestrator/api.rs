@@ -156,6 +156,9 @@ impl Orchestrator {
             relay_only: shared.relay_only,
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
+            // A plain start carries no managed config; `deploy_app` overrides it
+            // on a connect-repo cold spawn.
+            manifest_toml: None,
             // A plain start carries no tenant scoping; `deploy_app` overrides
             // these on a network-scoped cold spawn.
             network: None,
@@ -406,6 +409,7 @@ impl Orchestrator {
         uuid: &str,
         reff: &str,
         runtime_override: Option<&str>,
+        manifest_toml: Option<&str>,
         net: DeployNetwork,
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
@@ -461,6 +465,10 @@ impl Orchestrator {
             // Firecracker, so the override is not threaded into the spec.
             let mut spec = self.spawn_spec_for_uuid(uuid);
             spec.image_ref = Some(reff.to_owned());
+            // Apply the managed `tabbify.toml` (when supplied) so a BUILD-pipeline
+            // app's `[runtime]`/`[routes]` drive its synthesized manifest. `None`
+            // keeps the hardcoded FC defaults.
+            spec.manifest_toml = manifest_toml.map(str::to_owned);
             // Phase-2: scope the cold spawn to the tenant network. `--network`
             // (persisted for respawn) + the scoped node-join token (via env,
             // NOT persisted). Both `None` keeps the unscoped spawn.
@@ -855,6 +863,7 @@ mod tests {
                 "not-a-uuid",
                 "reg:5000/a/b:sha",
                 None,
+                None,
                 DeployNetwork::default()
             )
             .await
@@ -877,6 +886,7 @@ mod tests {
             .deploy_app(
                 APP_UUID,
                 "[fd5a::1]:5000/a/b:sha",
+                None,
                 None,
                 DeployNetwork::default(),
             )
@@ -952,7 +962,7 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
         let reff = "[fd5a::1]:5000/acme/app:sha256abc";
         let result = o
-            .deploy_app(APP_UUID, reff, None, DeployNetwork::default())
+            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default())
             .await;
 
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
@@ -1026,7 +1036,7 @@ mod tests {
             runner_join_token: Some("scoped-runner-jwt".to_owned()),
         };
         let result = o
-            .deploy_app(APP_UUID, "[fd5a::1]:5000/acme/app:sha256abc", None, net)
+            .deploy_app(APP_UUID, "[fd5a::1]:5000/acme/app:sha256abc", None, None, net)
             .await;
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
 

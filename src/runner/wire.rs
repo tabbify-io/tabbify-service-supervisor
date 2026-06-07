@@ -31,6 +31,9 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         fc: cfg.firecracker.clone(),
         docker: cfg.docker.clone(),
         image_ref: cfg.image_ref.clone(),
+        // The managed `tabbify.toml` (from `RUNNER_MANIFEST_TOML`): drives the
+        // synthesized `[runtime]`/`[routes]` on the BUILD-pipeline path.
+        manifest_toml: cfg.manifest_toml.clone(),
         // Phase-2: thread the tenant network slug (`--network`) + the scoped
         // node-join token (from `TABBIFY_RUNNER_JOIN_TOKEN`, resolved in
         // `RunnerConfig::parse_with_env`) into the serve config so the runner's
@@ -77,5 +80,24 @@ mod tests {
         let cfg = parse(&[]);
         let serve = serve_config_from(&cfg);
         assert!(!serve.relay_only);
+    }
+
+    /// `serve_config_from` carries the managed `tabbify.toml` through so the
+    /// runner's `resolve_app` can apply `[runtime]`/`[routes]` on the
+    /// BUILD-pipeline path.
+    #[test]
+    fn serve_config_from_carries_manifest_toml() {
+        let cfg = parse(&["--manifest-toml", "[app]\nname = \"x\"\n"]);
+        let serve = serve_config_from(&cfg);
+        assert_eq!(serve.manifest_toml.as_deref(), Some("[app]\nname = \"x\"\n"));
+    }
+
+    /// Absent the managed toml, `serve_config_from` leaves `manifest_toml` None
+    /// (today's hardcoded-default behavior).
+    #[test]
+    fn serve_config_from_manifest_toml_defaults_none() {
+        let cfg = parse(&[]);
+        let serve = serve_config_from(&cfg);
+        assert!(serve.manifest_toml.is_none());
     }
 }

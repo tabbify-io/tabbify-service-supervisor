@@ -277,6 +277,12 @@ pub struct DeployBody {
     /// the runner's register. `None` keeps the current tokenless behavior.
     #[serde(default)]
     pub(super) runner_join_token: Option<String>,
+    /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) for a connect-repo deploy.
+    /// On a cold spawn its `[runtime]`/`[routes]` drive the synthesized manifest
+    /// for the BUILD-pipeline app (no S3 manifest). `None` keeps the hardcoded
+    /// FC defaults. Travels in the body only, never persisted.
+    #[serde(default)]
+    pub(super) manifest_toml: Option<String>,
 }
 
 /// Request body for `POST /v1/apps/:uuid/start`. All fields optional so a
@@ -343,7 +349,13 @@ pub async fn deploy_app(
     };
     match state
         .orchestrator
-        .deploy_app(&uuid, &body.reff, runtime_override.as_deref(), net)
+        .deploy_app(
+            &uuid,
+            &body.reff,
+            runtime_override.as_deref(),
+            body.manifest_toml.as_deref(),
+            net,
+        )
         .await
     {
         Ok(s) => running_json(&s).into_response(),

@@ -83,9 +83,43 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
 /// `cached_path` is set relative (`apps/<uuid>/deployed/context.tar.gz`);
 /// [`resolve_fetched`] rebases it under the real data dir AND materializes a
 /// placeholder file there.
+///
+/// `manifest_toml` carries the Tabbify-MANAGED `tabbify.toml` (the same string
+/// used by the connect-repo deploy): when `Some` and it parses, its `[runtime]`
+/// (`memory_mb`, `vcpus`, `lifecycle`, `idle_timeout_sec`) and `[routes]`
+/// (`dynamic_prefixes`) drive the synthesized manifest. `None` (or a toml that
+/// fails to parse) falls back to the hardcoded FC-sane defaults — synthesis is
+/// infallible so a broken toml never wedges a deploy here (build-time validation
+/// is the gate).
 #[must_use]
-pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
+pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> FetchedApp {
     use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
+
+    // Parse the managed toml when present; ignore a malformed one (fall back to
+    // defaults). The 2 GiB / 2-vCPU defaults boot an FC guest reliably (64 MiB
+    // starves a microVM: ACPI init fails, virtio-mmio devices aren't discovered,
+    // the guest panics on "Cannot open root device vda").
+    let managed = manifest_toml
+        .and_then(|t| toml::from_str::<crate::unified_manifest::UnifiedManifest>(t).ok());
+
+    let (mode, idle_timeout_sec, memory_mb, vcpus, dynamic_prefixes) = match &managed {
+        Some(m) => {
+            let mode = match m.runtime.lifecycle.as_str() {
+                "on_request" => LifecycleMode::OnRequest,
+                // A deployed app defaults to coming up immediately (always_on).
+                _ => LifecycleMode::AlwaysOn,
+            };
+            (
+                mode,
+                m.runtime.idle_timeout_sec,
+                m.runtime.memory_mb,
+                m.runtime.vcpus,
+                m.routes.dynamic_prefixes.clone(),
+            )
+        }
+        // Hardcoded FC-sane defaults (today's behaviour) when no managed toml.
+        None => (LifecycleMode::AlwaysOn, 300, 2048, 2, Vec::new()),
+    };
 
     FetchedApp {
         // No S3 `latest` exists for a build-pipeline app; the deployed image ref
@@ -100,25 +134,19 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
                 description: String::new(),
             },
             lifecycle: Lifecycle {
-                // A deployed app should come up immediately, not lazily.
-                mode: LifecycleMode::AlwaysOn,
-                idle_timeout_sec: 300,
+                mode,
+                idle_timeout_sec,
             },
             runtime: Runtime {
                 r#type: "firecracker".to_owned(),
                 entry: "context.tar.gz".to_owned(),
                 fuel_per_request: 0,
-                // The microVM's RAM. 64 MiB starves a microVM — ACPI table init
-                // fails under memory pressure, virtio-mmio devices aren't
-                // discovered, and the guest panics with "Cannot open root device
-                // vda" (intermittently). 2 GiB boots an FC guest reliably AND
-                // runs dind.
-                memory_mb: 2048,
-                vcpus: Some(2),
+                memory_mb,
+                vcpus: Some(vcpus),
                 kernel: None,
                 registry_ref: Some(reff.to_owned()),
             },
-            routes: Routes::default(),
+            routes: Routes { dynamic_prefixes },
         },
         wasm: bytes::Bytes::new(),
         cached_path: std::path::Path::new("apps")
@@ -138,7 +166,9 @@ pub fn fetched_from_ref(uuid: &str, reff: &str) -> FetchedApp {
 ///   return the fetched app unchanged.
 /// - S3 fetch **fails** with `image_ref` `Some` → synthesize a firecracker
 ///   [`FetchedApp`] from the ref via [`fetched_from_ref`] (the BUILD-pipeline
-///   app: image in the registry, no S3 manifest). The synthesized `cached_path`
+///   app: image in the registry, no S3 manifest). The managed `manifest_toml`
+///   (when threaded from the deploy) drives the synthesized `[runtime]`/`[routes]`.
+///   The synthesized `cached_path`
 ///   is rebased under `data_dir` and a placeholder build-context file is created
 ///   there so the launch precheck (which requires the context file to exist)
 ///   passes — the file is never read because a successful registry pull makes
@@ -158,6 +188,7 @@ pub fn resolve_fetched(
     fetch_result: Result<FetchedApp, crate::fetcher::FetchError>,
     uuid: &str,
     image_ref: Option<&str>,
+    manifest_toml: Option<&str>,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<FetchedApp> {
     use anyhow::Context as _;
@@ -170,7 +201,9 @@ pub fn resolve_fetched(
         Err(e) => match image_ref {
             Some(reff) => {
                 // BUILD-pipeline app: image in the mesh registry, no S3 manifest.
-                let mut fetched = fetched_from_ref(uuid, reff);
+                // The managed `tabbify.toml` (when threaded from the deploy)
+                // drives the synthesized `[runtime]`/`[routes]`.
+                let mut fetched = fetched_from_ref(uuid, reff, manifest_toml);
                 // Rebase the relative cached_path under the real data dir and
                 // materialize a placeholder build context so the launch precheck
                 // (context.is_file()) passes — never read (pull skips the build).
@@ -271,7 +304,7 @@ mod tests {
     #[test]
     fn fetched_from_ref_builds_firecracker_manifest_with_ref() {
         let reff = "[fd5a:1f00:0:3::1]:5000/tabbify/abc:main";
-        let f = fetched_from_ref("abc-uuid", reff);
+        let f = fetched_from_ref("abc-uuid", reff, None);
         assert_eq!(
             f.manifest.runtime.r#type, "firecracker",
             "synthesized runtime must be firecracker"
@@ -293,7 +326,71 @@ mod tests {
     /// immediately, not lazily) and is named from the uuid for diagnostics.
     #[test]
     fn fetched_from_ref_is_always_on() {
-        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main");
+        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", None);
+        assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
+    }
+
+    /// When a managed `tabbify.toml` is provided, `fetched_from_ref` applies its
+    /// `[runtime]` (`memory_mb`, `vcpus`, `lifecycle`) + `[routes]` to the
+    /// synthesized manifest instead of the hardcoded defaults.
+    #[test]
+    fn fetched_from_ref_applies_managed_runtime_and_routes() {
+        let toml = r#"
+[app]
+name = "sized"
+
+[build]
+kind = "docker"
+
+[runtime]
+memory_mb = 1024
+vcpus = 2
+lifecycle = "always_on"
+
+[routes]
+dynamic_prefixes = ["/api", "/health"]
+"#;
+        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
+        assert_eq!(f.manifest.runtime.memory_mb, 1024);
+        assert_eq!(f.manifest.runtime.vcpus, Some(2));
+        assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
+        assert_eq!(
+            f.manifest.routes.dynamic_prefixes,
+            vec!["/api".to_owned(), "/health".to_owned()]
+        );
+        // The deployed image ref is still carried.
+        assert_eq!(
+            f.manifest.runtime.registry_ref.as_deref(),
+            Some("reg:5000/x:main")
+        );
+    }
+
+    /// `on_request` lifecycle from the managed toml maps to `OnRequest` and
+    /// carries the idle timeout.
+    #[test]
+    fn fetched_from_ref_managed_on_request_lifecycle() {
+        let toml = r#"
+[app]
+name = "lazy"
+[build]
+kind = "docker"
+[runtime]
+lifecycle = "on_request"
+idle_timeout_sec = 120
+"#;
+        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
+        assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::OnRequest);
+        assert_eq!(f.manifest.lifecycle.idle_timeout_sec, 120);
+    }
+
+    /// A malformed managed toml falls back to the hardcoded defaults rather than
+    /// erroring (the synthesis is infallible; a broken toml should never wedge a
+    /// deploy here — build-time validation is the gate).
+    #[test]
+    fn fetched_from_ref_malformed_toml_falls_back_to_defaults() {
+        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some("not = = toml"));
+        assert_eq!(f.manifest.runtime.memory_mb, 2048);
+        assert_eq!(f.manifest.runtime.vcpus, Some(2));
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
     }
 
@@ -307,7 +404,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = docker_fetched(None);
         let reff = "[fd5a::1]:5000/acme/app:sha";
-        let resolved = resolve_fetched(Ok(base.clone()), "u", Some(reff), tmp.path()).unwrap();
+        let resolved = resolve_fetched(Ok(base.clone()), "u", Some(reff), None, tmp.path()).unwrap();
         // Override applied; every other field preserved (== fetched_with_ref).
         assert_eq!(
             resolved.manifest.runtime.registry_ref.as_deref(),
@@ -323,7 +420,7 @@ mod tests {
     fn resolve_fetched_s3_ok_no_ref_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let base = docker_fetched(Some("kept/ref:v1".to_owned()));
-        let resolved = resolve_fetched(Ok(base.clone()), "u", None, tmp.path()).unwrap();
+        let resolved = resolve_fetched(Ok(base.clone()), "u", None, None, tmp.path()).unwrap();
         assert_eq!(
             resolved.manifest.runtime.registry_ref.as_deref(),
             Some("kept/ref:v1")
@@ -345,6 +442,7 @@ mod tests {
             Err(crate::fetcher::FetchError::NotFound("abc".to_owned())),
             "abc",
             Some(reff),
+            None,
             tmp.path(),
         )
         .expect("S3 fetch failure + image_ref present must NOT error");
@@ -368,6 +466,7 @@ mod tests {
         let err = resolve_fetched(
             Err(crate::fetcher::FetchError::NotFound("abc".to_owned())),
             "abc",
+            None,
             None,
             tmp.path(),
         )

@@ -96,6 +96,15 @@ pub struct RunnerConfig {
     #[arg(long, env = "RUNNER_IMAGE_REF")]
     pub image_ref: Option<String>,
 
+    /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) for a connect-repo deploy,
+    /// forwarded by the supervisor via the `RUNNER_MANIFEST_TOML` environment
+    /// variable (an env, not an arg: the toml is multi-line and would clutter
+    /// `ps`). When set and the app has NO S3 manifest (the BUILD-pipeline path),
+    /// its `[runtime]`/`[routes]` drive the synthesized manifest. `None` keeps
+    /// the hardcoded FC defaults.
+    #[arg(long, env = "RUNNER_MANIFEST_TOML")]
+    pub manifest_toml: Option<String>,
+
     /// Path to a JSON build-spec file. When set the runner operates in
     /// one-shot builder mode: it reads the [`BuildJob`], runs the build
     /// pipeline, prints the [`ArtifactRef`] JSON to stdout, and exits.

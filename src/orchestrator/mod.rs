@@ -125,6 +125,11 @@ impl SharedRunnerConfig {
             relay_only: self.relay_only,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
+            // The managed `tabbify.toml` is re-supplied per deploy (not persisted
+            // in the record), so a RESPAWN-from-record falls back to the
+            // hardcoded FC defaults for a connect-repo app. Re-deploying re-applies
+            // the managed runtime. (A persisted copy is a follow-up — see report.)
+            manifest_toml: None,
             // Phase-2: a RESPAWN rejoins the SAME tenant network the record was
             // scoped to (`--network <slug>`).
             network: record.network.clone(),
