@@ -43,12 +43,16 @@ pub type CandidateProbe =
     Box<dyn Fn(PathBuf, PathBuf, Duration) -> BoxFut<'static, Result<bool>> + Send + Sync>;
 
 /// The production candidate probe: spawn the freshly-staged `supervisord` with
-/// `--check --candidate-identity-path <transient>` and a loopback ephemeral
-/// bind, wait up to `gate_timeout` for it to exit, and treat a clean exit-0 as
-/// a gate PASS (the candidate self-evaluates the 3-part gate in `--check`).
+/// the candidate-probe args ([`super::probe::candidate_probe_args`]) and a
+/// loopback ephemeral bind, wait up to `gate_timeout` for it to exit, and treat
+/// a clean exit-0 as a gate PASS (the candidate self-evaluates the gate in
+/// `--check`).
 ///
-/// The candidate joins the mesh with the TRANSIENT identity (so it never claims
-/// the sticky ULA), binds `127.0.0.1:0` (an OS-ephemeral port, never the
+/// The candidate runs `--no-mesh`: the gate is a LOCAL readiness check of the
+/// NEW BINARY (it boots, binds, and serves its control surface), NOT a
+/// production mesh join (which needs root to acquire a TUN and contends with the
+/// live supervisor — the root cause of the gate failing on every node; see
+/// [`super::probe`]). It binds `127.0.0.1:0` (an OS-ephemeral port, never the
 /// production bind), and exits 1 on any gate failure. A spawn error, a non-zero
 /// exit, or a timeout are all reported as "did NOT pass" (fail-closed).
 #[must_use]
@@ -57,9 +61,7 @@ pub fn production_candidate_probe() -> CandidateProbe {
         |candidate_bin: PathBuf, transient_identity: PathBuf, gate_timeout: Duration| {
             let fut: BoxFut<'static, Result<bool>> = Box::pin(async move {
                 let mut child = Command::new(&candidate_bin)
-                    .arg("--check")
-                    .arg("--candidate-identity-path")
-                    .arg(&transient_identity)
+                    .args(super::probe::candidate_probe_args(&transient_identity))
                     // Loopback ephemeral bind: the candidate must not contend
                     // for the sticky ULA / production bind. `--check` already
                     // defaults to a loopback ephemeral addr, but we pin it

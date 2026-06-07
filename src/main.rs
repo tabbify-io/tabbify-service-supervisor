@@ -304,36 +304,42 @@ fn spawn_post_restart_watchdog(bind_addr: SocketAddr) {
 }
 
 /// Run the out-of-band candidate probe (`--check`, spec §4) and return the
-/// 3-part gate outcome. The candidate joins the mesh with a TRANSIENT identity
-/// (`candidate_identity_path`), binds an alternate ephemeral loopback control
-/// addr, serves the router, then gathers the three gate signals: joined mesh
-/// (membership Ok), `GET /health` 200, and control liveness — a `GET /v1/about`
-/// round-trip on a DISTINCT route/handler (the candidate has no per-app runners
-/// to answer the control `Cmd::Ping → Pong`, so the plan folds pong into router
-/// liveness; we keep it honestly distinct from `/health`).
+/// 3-part gate outcome. The candidate binds an alternate ephemeral loopback
+/// control addr, serves the router, then gathers the three gate signals: the
+/// binary launched + bound its control listener, `GET /health` 200, and control
+/// liveness — a `GET /v1/about` round-trip on a DISTINCT route/handler (the
+/// candidate has no per-app runners to answer the control `Cmd::Ping → Pong`,
+/// so the plan folds pong into router liveness; we keep it honestly distinct
+/// from `/health`).
 ///
-/// All of this is bounded by the self-update gate timeout. The candidate NEVER
-/// claims the sticky ULA: it joins with its own `candidate_identity_path`, and
-/// this entrypoint fails closed if that transient identity is absent.
+/// The candidate does NOT join the production mesh. The gate answers "is the new
+/// binary good enough to swap to?" — that it boots, binds, and serves its
+/// control surface — which is exactly what a bad binary breaks and is
+/// INDEPENDENT of whether a throwaway identity can acquire a TUN and join the
+/// live coordinator. Requiring a real join was the root cause of the gate
+/// failing on every production node (it needs root for the TUN and contends
+/// with the live supervisor); the mesh fabric is exercised only by the full
+/// process restart after a swap, and the post-swap watchdog already validates
+/// health over local HTTP. See [`tabbify_supervisor::selfupdate::probe`].
+///
+/// All of this is bounded by the self-update gate timeout. The candidate still
+/// requires a TRANSIENT identity path (the production probe always passes it)
+/// so it never even incidentally touches the sticky identity; this entrypoint
+/// fails closed if that transient identity is absent.
 async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::probe::ProbeOutcome {
     use tabbify_supervisor::selfupdate::probe::{GateInputs, ProbeOutcome, evaluate_gate};
 
     let gate_timeout = tabbify_supervisor::selfupdate::SelfUpdateConfig::default().gate_timeout;
     let started = std::time::Instant::now();
 
-    // Fail closed if `--check` was passed without a TRANSIENT identity. Without
-    // `--candidate-identity-path` the pinned joiner (mesh-joiner de17a58,
-    // `resolve_identity`) falls through to the legacy keypair-only path
-    // (`~/.tabbify-mesh/keypair`, `sticky_ula = None`), so the sticky ULA is not
-    // claimed only *incidentally* — the safety hinges on an implicit caller
-    // contract. SU-3 requires a transient identity (spec §4); enforce it here so
-    // the "candidate never claims the sticky ULA" invariant is guaranteed, not
-    // accidental, rather than silently joining via the ambient keypair path.
+    // Fail closed if `--check` was passed without a TRANSIENT identity. The
+    // production probe always passes `--candidate-identity-path`; enforcing it
+    // here keeps the "candidate never touches the sticky identity" invariant
+    // guaranteed rather than accidental, even though the candidate now runs
+    // `--no-mesh` and never reaches the join path.
     if candidate_identity_required(config.check_mode, config.candidate_identity_path.is_some()) {
         return ProbeOutcome::Fail(
-            "candidate (--check) requires --candidate-identity-path (transient identity); \
-             refusing to join via the ambient keypair path"
-                .to_owned(),
+            "candidate (--check) requires --candidate-identity-path (transient identity)".to_owned(),
         );
     }
 
@@ -343,42 +349,11 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
         .bind
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
 
-    // 1. Join the mesh with the TRANSIENT identity (separate file, OS-ephemeral
-    //    WG port via the joiner default). On a host without root/TUN this fails
-    //    and the gate fails closed.
-    // The candidate probe advertises the same capabilities a real boot
-    // would, including the operator's builder designation.
-    let capability_tags = tabbify_supervisor::capability_tags::capability_tags(
-        tabbify_supervisor::firecracker::kvm_available(),
-        tabbify_supervisor::docker::docker_available(),
-        config.builder,
-    );
-    let joined_mesh = if config.no_mesh {
-        true
-    } else {
-        match MeshMembership::join(
-            &config.coordinator_url,
-            &config.display_name,
-            &capability_tags,
-            tabbify_supervisor::mesh::JoinMetadata {
-                identity_path: config.candidate_identity_path.clone(),
-                software_version: Some(tabbify_supervisor::version::binary_version().to_owned()),
-                ..Default::default()
-            },
-            config.effective_relay_url(),
-            config.relay_only,
-        )
-        .await
-        {
-            Ok(_membership) => true,
-            Err(e) => {
-                tracing::error!(error = %e, "candidate failed to join mesh with transient identity");
-                false
-            }
-        }
-    };
-
-    // 2 & 3. Bring up the router on the alt bind and self-check `/health`.
+    // 1, 2 & 3. Bring up the router on the alt bind and self-check both distinct
+    //    liveness routes. The candidate runs WITHOUT a production mesh join: the
+    //    `launched` signal is set once the control listener binds (a bad binary
+    //    crashes on boot or fails to bind before this), and the two HTTP probes
+    //    cover `/health` + the distinct `/v1/about` liveness route.
     let runner_dir = config.data_dir.join("candidate-runners");
     if let Err(e) = std::fs::create_dir_all(&runner_dir) {
         return tabbify_supervisor::selfupdate::probe::ProbeOutcome::Fail(format!(
@@ -409,27 +384,30 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
     .with_version(tabbify_supervisor::version::binary_version().to_owned());
     let app = router(state);
 
-    let (health_200, pong) = match TcpListener::bind(bind_addr).await {
+    // The `launched` signal: the binary booted far enough to bind its control
+    // listener. A bad binary panics on boot or fails to bind before this — the
+    // decoupled stand-in for the old "joined the mesh" signal.
+    let (launched, health_200, pong) = match TcpListener::bind(bind_addr).await {
         Ok(listener) => {
             let local = listener.local_addr().ok();
             let server = tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
-            let result = match local {
+            let (health_200, pong) = match local {
                 Some(addr) => self_check(addr, gate_timeout).await,
                 None => (false, false),
             };
             server.abort();
-            result
+            (true, health_200, pong)
         }
         Err(e) => {
             tracing::error!(error = %e, %bind_addr, "candidate failed to bind control addr");
-            (false, false)
+            (false, false, false)
         }
     };
 
     let inputs = GateInputs {
-        joined_mesh,
+        launched,
         health_200,
         pong,
         elapsed_secs: started.elapsed().as_secs(),
@@ -437,13 +415,14 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
     evaluate_gate(inputs, gate_timeout.as_secs())
 }
 
-/// Whether the probe entrypoint must fail closed before joining the mesh.
+/// Whether the probe entrypoint must fail closed for a missing transient
+/// identity.
 ///
-/// `--check` declares an out-of-band candidate that MUST join with a TRANSIENT
-/// identity (`--candidate-identity-path`). With no transient identity the pinned
-/// joiner silently uses the ambient keypair path, so refusing here keeps the
-/// "candidate never claims the sticky ULA" invariant enforced rather than
-/// incidental. Returns `true` when the entrypoint must abort.
+/// `--check` declares an out-of-band candidate. The production probe always
+/// passes `--candidate-identity-path`; enforcing it here keeps the "candidate
+/// never touches the sticky identity" invariant guaranteed rather than
+/// accidental, even though the candidate runs `--no-mesh` and never reaches the
+/// join path. Returns `true` when the entrypoint must abort.
 #[must_use]
 fn candidate_identity_required(check_mode: bool, has_candidate_identity: bool) -> bool {
     check_mode && !has_candidate_identity
@@ -496,8 +475,8 @@ mod tests {
 
     #[test]
     fn check_mode_without_candidate_identity_requires_failing_closed() {
-        // `--check` set, but no `--candidate-identity-path` → must abort before
-        // joining via the ambient keypair path.
+        // `--check` set, but no `--candidate-identity-path` → must abort so the
+        // candidate never even incidentally touches the sticky identity.
         assert!(candidate_identity_required(true, false));
     }
 
