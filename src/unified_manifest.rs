@@ -24,6 +24,22 @@ use crate::manifest::{
 use crate::runner::build::BuildKind;
 use crate::runtime::Runtime;
 
+/// Map a `[runtime].lifecycle` string to a [`LifecycleMode`].
+///
+/// CANONICAL fallback (single source of truth, used by both
+/// [`UnifiedManifest::derive_app_manifest`] and the connect-repo synthesis in
+/// [`crate::build::fetched_from_ref`]): `"on_request"` ⇒ `OnRequest`; everything
+/// else (`"always_on"` AND any unknown value) ⇒ `AlwaysOn`. `AlwaysOn` is the
+/// FC live-path default — a deployed app should come up immediately, and an
+/// unknown lifecycle must not silently flip an app to lazy-start.
+#[must_use]
+pub fn lifecycle_mode_from_str(lifecycle: &str) -> LifecycleMode {
+    match lifecycle {
+        "on_request" => LifecycleMode::OnRequest,
+        _ => LifecycleMode::AlwaysOn,
+    }
+}
+
 /// Top-level `tabbify.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UnifiedManifest {
@@ -190,10 +206,7 @@ impl UnifiedManifest {
     /// always Firecracker-from-OCI-image, so there is no override to thread.
     #[must_use]
     pub fn derive_app_manifest(&self) -> AppManifest {
-        let mode = match self.runtime.lifecycle.as_str() {
-            "always_on" => LifecycleMode::AlwaysOn,
-            _ => LifecycleMode::OnRequest,
-        };
+        let mode = lifecycle_mode_from_str(&self.runtime.lifecycle);
         AppManifest {
             app: AppMeta {
                 id: self.app.id,
@@ -505,5 +518,18 @@ lifecycle = "always_on"
         let m: UnifiedManifest = toml::from_str(src).unwrap();
         let am = m.derive_app_manifest();
         assert_eq!(am.lifecycle.mode, LifecycleMode::AlwaysOn);
+    }
+
+    /// CANONICAL lifecycle fallback (single source of truth shared with
+    /// `crate::build::fetched_from_ref`): `on_request` ⇒ OnRequest; `always_on`
+    /// AND any UNKNOWN value ⇒ AlwaysOn (the FC live-path default).
+    #[test]
+    fn lifecycle_mode_fallback_is_consistent() {
+        assert_eq!(lifecycle_mode_from_str("on_request"), LifecycleMode::OnRequest);
+        assert_eq!(lifecycle_mode_from_str("always_on"), LifecycleMode::AlwaysOn);
+        // Unknown → AlwaysOn (NOT OnRequest): aligns derive_app_manifest with the
+        // connect-repo synthesis so an unknown lifecycle never silently lazy-starts.
+        assert_eq!(lifecycle_mode_from_str("weird"), LifecycleMode::AlwaysOn);
+        assert_eq!(lifecycle_mode_from_str(""), LifecycleMode::AlwaysOn);
     }
 }

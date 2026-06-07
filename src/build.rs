@@ -11,6 +11,16 @@ use crate::config::FcConfig;
 use crate::fetcher::FetchedApp;
 use crate::runtime::AppRuntime;
 
+/// FC-sane default microVM RAM (MiB) for a connect-repo app with no managed
+/// `[runtime].memory_mb`. 64 MiB starves a microVM (ACPI init fails, virtio-mmio
+/// devices aren't discovered, the guest panics on "Cannot open root device
+/// vda"); 2 GiB boots reliably AND runs dind.
+const FC_DEFAULT_MEMORY_MB: u32 = 2048;
+/// FC-sane default vCPU count for a connect-repo app with no managed `[runtime].vcpus`.
+const FC_DEFAULT_VCPUS: u32 = 2;
+/// Default idle-stop timeout (seconds) when none is supplied.
+const FC_DEFAULT_IDLE_SEC: u64 = 300;
+
 /// Build the [`AppRuntime`] for a fetched app — always a KVM-gated
 /// [`FirecrackerRuntime`](crate::firecracker::FirecrackerRuntime) microVM
 /// (errors clearly on non-Linux / no `/dev/kvm`).
@@ -96,19 +106,14 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
     use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
 
     // Parse the managed toml when present; ignore a malformed one (fall back to
-    // defaults). The 2 GiB / 2-vCPU defaults boot an FC guest reliably (64 MiB
-    // starves a microVM: ACPI init fails, virtio-mmio devices aren't discovered,
-    // the guest panics on "Cannot open root device vda").
+    // the FC-sane defaults). Synthesis is infallible so a broken toml never
+    // wedges a deploy here (build-time validation is the gate).
     let managed = manifest_toml
         .and_then(|t| toml::from_str::<crate::unified_manifest::UnifiedManifest>(t).ok());
 
     let (mode, idle_timeout_sec, memory_mb, vcpus, dynamic_prefixes) = match &managed {
         Some(m) => {
-            let mode = match m.runtime.lifecycle.as_str() {
-                "on_request" => LifecycleMode::OnRequest,
-                // A deployed app defaults to coming up immediately (always_on).
-                _ => LifecycleMode::AlwaysOn,
-            };
+            let mode = crate::unified_manifest::lifecycle_mode_from_str(&m.runtime.lifecycle);
             (
                 mode,
                 m.runtime.idle_timeout_sec,
@@ -117,8 +122,14 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
                 m.routes.dynamic_prefixes.clone(),
             )
         }
-        // Hardcoded FC-sane defaults (today's behaviour) when no managed toml.
-        None => (LifecycleMode::AlwaysOn, 300, 2048, 2, Vec::new()),
+        // FC-sane defaults (today's behaviour) when no managed toml.
+        None => (
+            LifecycleMode::AlwaysOn,
+            FC_DEFAULT_IDLE_SEC,
+            FC_DEFAULT_MEMORY_MB,
+            FC_DEFAULT_VCPUS,
+            Vec::new(),
+        ),
     };
 
     FetchedApp {
@@ -389,8 +400,19 @@ idle_timeout_sec = 120
     #[test]
     fn fetched_from_ref_malformed_toml_falls_back_to_defaults() {
         let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some("not = = toml"));
-        assert_eq!(f.manifest.runtime.memory_mb, 2048);
-        assert_eq!(f.manifest.runtime.vcpus, Some(2));
+        assert_eq!(f.manifest.runtime.memory_mb, FC_DEFAULT_MEMORY_MB);
+        assert_eq!(f.manifest.runtime.vcpus, Some(FC_DEFAULT_VCPUS));
+        assert_eq!(f.manifest.lifecycle.idle_timeout_sec, FC_DEFAULT_IDLE_SEC);
+        assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
+    }
+
+    /// CONVENTION: an UNKNOWN `[runtime].lifecycle` value maps to `AlwaysOn`
+    /// (the FC live-path default), matching `derive_app_manifest` — an unknown
+    /// lifecycle must never silently flip a deployed app to lazy-start.
+    #[test]
+    fn fetched_from_ref_unknown_lifecycle_maps_to_always_on() {
+        let toml = "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nlifecycle = \"weird\"\n";
+        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
     }
 

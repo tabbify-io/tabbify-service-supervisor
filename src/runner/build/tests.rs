@@ -550,6 +550,74 @@ async fn run_build_defaults_to_root_dockerfile_without_toml() {
     );
 }
 
+// ── BuildSpec default-layout detection (fc-sandbox guard) ──────────────────
+
+/// No toml at the clone root → `resolve_build_spec` yields the default layout
+/// (`context "."` + `Dockerfile`), so `is_default_layout()` is true (the
+/// fc-sandbox path is allowed).
+#[test]
+fn resolve_build_spec_no_toml_is_default_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let spec = resolve_build_spec(&src, &src.join("tabbify.toml")).unwrap();
+    assert!(spec.is_default_layout());
+    assert_eq!(spec.raw_context, ".");
+    assert_eq!(spec.raw_dockerfile, "Dockerfile");
+}
+
+/// A toml with default `[build]` values (or none set) is still the default
+/// layout → `is_default_layout()` true.
+#[test]
+fn resolve_build_spec_default_toml_is_default_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let toml_path = src.join("tabbify.toml");
+    std::fs::write(&toml_path, "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n").unwrap();
+    let spec = resolve_build_spec(&src, &toml_path).unwrap();
+    assert!(
+        spec.is_default_layout(),
+        "absent [build].context/dockerfile default to \".\"/\"Dockerfile\""
+    );
+}
+
+/// A toml with a NON-default `[build].dockerfile` → `is_default_layout()` false
+/// (the fc-sandbox path must reject it rather than silently build the wrong
+/// context).
+#[test]
+fn resolve_build_spec_custom_dockerfile_is_not_default_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let toml_path = src.join("tabbify.toml");
+    std::fs::write(
+        &toml_path,
+        "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\ndockerfile = \"deploy/Dockerfile\"\n",
+    )
+    .unwrap();
+    let spec = resolve_build_spec(&src, &toml_path).unwrap();
+    assert!(!spec.is_default_layout());
+    assert_eq!(spec.raw_dockerfile, "deploy/Dockerfile");
+}
+
+/// A toml with a NON-default `[build].context` → `is_default_layout()` false.
+#[test]
+fn resolve_build_spec_custom_context_is_not_default_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let toml_path = src.join("tabbify.toml");
+    std::fs::write(
+        &toml_path,
+        "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\ncontext = \"service\"\n",
+    )
+    .unwrap();
+    let spec = resolve_build_spec(&src, &toml_path).unwrap();
+    assert!(!spec.is_default_layout());
+    assert_eq!(spec.raw_context, "service");
+}
+
 // ── run_one_shot_build (I/O + parse) ──────────────────────────────────────
 
 /// A missing spec file must return a read error (not a panic).

@@ -165,6 +165,25 @@ pub async fn run_build(
             // (explicit opt-in + KVM). The host clones (above), the VM
             // builds, the host pushes — no docker daemon anywhere.
             if fc_sandbox::enabled() {
+                // The fc-sandbox v1 guest contract (the prebuilt
+                // `tabbify/buildkit-toolchain` image) builds the DEFAULT layout
+                // only: context `.` + `Dockerfile` at the clone root. It cannot
+                // honor a `[build].dockerfile`/`[build].context` override (that
+                // needs a guest-image rebuild — TODO: job.json v2 + guest
+                // builder reads the override; tracked as a follow-up). Until
+                // then, REJECT a non-default layout here rather than silently
+                // building the wrong context.
+                if !build_spec.is_default_layout() {
+                    anyhow::bail!(
+                        "tabbify.toml sets a non-default [build] (context = {:?}, \
+                         dockerfile = {:?}), but the Firecracker build sandbox only \
+                         supports context \".\" + \"Dockerfile\" at the repo root. \
+                         Move the Dockerfile to the repo root, or build on a \
+                         host-docker builder.",
+                        build_spec.raw_context,
+                        build_spec.raw_dockerfile,
+                    );
+                }
                 let fc_runner = firecracker::production_fc_build_runner();
                 // The one-shot build child resolves data_dir from
                 // SUPERVISOR_DATA_DIR (the spawner injects the supervisor's
@@ -219,6 +238,24 @@ pub(crate) struct BuildSpec {
     /// The Dockerfile path (`<src>/<[build].dockerfile>`). `None` ⇒ Docker's
     /// default (`<context_dir>/Dockerfile`).
     pub dockerfile: Option<std::path::PathBuf>,
+    /// The raw `[build].context` from the toml (default `"."`). Kept verbatim so
+    /// the fc-sandbox path can detect a non-default value (the v1 guest contract
+    /// is parameter-free; honoring it requires a guest-image rebuild — see
+    /// [`run_build`]).
+    pub raw_context: String,
+    /// The raw `[build].dockerfile` from the toml (default `"Dockerfile"`). Kept
+    /// verbatim for the same fc-sandbox non-default detection.
+    pub raw_dockerfile: String,
+}
+
+impl BuildSpec {
+    /// `true` when `[build].context`/`[build].dockerfile` are at their defaults
+    /// (`"."` / `"Dockerfile"`). The fc-sandbox v1 guest contract only builds the
+    /// default layout, so a NON-default layout must be rejected on that path
+    /// rather than silently built wrong.
+    fn is_default_layout(&self) -> bool {
+        self.raw_context == "." && self.raw_dockerfile == "Dockerfile"
+    }
 }
 
 /// Resolve the [`BuildSpec`] from the `tabbify.toml` at `toml_path` (if present).
@@ -238,6 +275,8 @@ fn resolve_build_spec(src: &Path, toml_path: &Path) -> anyhow::Result<BuildSpec>
             clone_root: src.to_path_buf(),
             context_dir: src.to_path_buf(),
             dockerfile: None,
+            raw_context: ".".to_owned(),
+            raw_dockerfile: "Dockerfile".to_owned(),
         });
     }
     let text = std::fs::read_to_string(toml_path)
@@ -248,6 +287,8 @@ fn resolve_build_spec(src: &Path, toml_path: &Path) -> anyhow::Result<BuildSpec>
         clone_root: src.to_path_buf(),
         context_dir: src.join(manifest.context()),
         dockerfile: Some(src.join(manifest.dockerfile())),
+        raw_context: manifest.context().to_owned(),
+        raw_dockerfile: manifest.dockerfile().to_owned(),
     })
 }
 
