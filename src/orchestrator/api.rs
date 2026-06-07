@@ -440,6 +440,13 @@ impl Orchestrator {
                 .with_context(|| format!("load runner record for {uuid} after deploy"))?
                 .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
             record.image_ref = Some(reff.to_owned());
+            // Persist this deploy's managed `tabbify.toml` so the durable record
+            // always reflects the LATEST deploy's runtime config. Without this a
+            // warm zero-downtime swap (the live runner keeps serving) would leave
+            // the OLD toml on disk, and a later crash-respawn would re-derive
+            // STALE `[runtime]`/`[routes]`. `None` clears it (a deploy with no
+            // managed config), mirroring the cold-spawn branch.
+            record.manifest_toml = manifest_toml.map(str::to_owned);
             // Phase-2: if this deploy supplied a tenant network, persist it so a
             // future RESPAWN rejoins scoped (the live runner itself is not
             // re-keyed — it keeps its current mesh identity). A `None` network
@@ -1061,6 +1068,106 @@ mod tests {
         assert!(
             !raw.contains("scoped-runner-jwt"),
             "the join token must NEVER be persisted to disk; record: {raw}"
+        );
+    }
+
+    /// A live zero-downtime swap (the runner is already warm) that carries a NEW
+    /// managed `tabbify.toml` must write it back to the durable record, so a later
+    /// crash-respawn re-derives the LATEST runtime — not the stale toml the record
+    /// had before this redeploy. We seed a record with an OLD toml, redeploy with a
+    /// NEW one over a live (fake) runner, then assert (a) the saved record carries
+    /// the NEW toml and (b) a `spawn_spec_for` respawn yields the NEW toml.
+    #[tokio::test]
+    async fn deploy_app_live_swap_refreshes_record_manifest_toml() {
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+
+        // Fake control server: Reply::Ok to health probe + deploy.
+        let sock_path_srv = sock_path.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            for _ in 0..5 {
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Seed a record carrying the OLD managed toml (memory_mb = 256).
+        const OLD_TOML: &str =
+            "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nmemory_mb = 256\n";
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: Some(OLD_TOML.to_owned()),
+        };
+        rec.save(dir.path()).unwrap();
+
+        // Redeploy over the LIVE runner with a NEW toml (memory_mb = 2048).
+        const NEW_TOML: &str =
+            "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nmemory_mb = 2048\n";
+        let o = orch(dir.path().to_path_buf());
+        let result = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:sha256abc",
+                None,
+                Some(NEW_TOML),
+                DeployNetwork::default(),
+            )
+            .await;
+        assert!(result.is_ok(), "live-swap deploy must succeed: {result:?}");
+
+        // (a) The saved record now carries the NEW toml, not the old one.
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must exist after deploy");
+        assert_eq!(
+            updated.manifest_toml.as_deref(),
+            Some(NEW_TOML),
+            "live-swap must refresh the record's manifest_toml to the latest deploy's"
+        );
+
+        // (b) A respawn-from-record reconstructs a spec carrying the NEW toml, so
+        // a crash-respawn re-derives the latest runtime (not the stale 256 MiB).
+        let cfg = SharedRunnerConfig {
+            runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
+            s3_base_url: "http://s3.invalid".to_owned(),
+            data_dir: PathBuf::from("/var/lib/tabbify/data"),
+            parent: None,
+            no_mesh: true,
+            relay_url: None,
+            relay_only: false,
+        };
+        let spec = cfg.spawn_spec_for(&updated);
+        assert_eq!(
+            spec.manifest_toml.as_deref(),
+            Some(NEW_TOML),
+            "a respawn must reuse the refreshed (new) toml, not the stale one"
         );
     }
 }
