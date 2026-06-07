@@ -88,6 +88,14 @@ pub struct RunnerHandle {
     /// existed) loading — they get `None`.
     #[serde(default)]
     pub network: Option<String>,
+    /// Scoped mesh join-token (JWT) minted by the node for this runner's
+    /// tenant network. PERSISTED so a supervisor-driven RESPAWN re-joins the
+    /// validating coordinator with the SAME token instead of 401ing. The token
+    /// is long-lived (node mints a 1-year TTL), so it outlives idle-outs/crashes
+    /// for the app's whole life. `None` for unscoped runners (no tenant network)
+    /// and for records written before this field existed (serde default).
+    #[serde(default)]
+    pub runner_join_token: Option<String>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -193,6 +201,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         }
     }
 
@@ -208,6 +217,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         }
     }
 
@@ -437,6 +447,52 @@ mod tests {
         assert!(
             h.network.is_none(),
             "missing network key must deserialize as None"
+        );
+    }
+
+    // ── runner_join_token field ───────────────────────────────────────────────
+
+    /// A handle with a persisted `runner_join_token` must round-trip through
+    /// save → load so a supervisor-driven RESPAWN re-joins the validating
+    /// coordinator with the SAME token (the long-lived token outlives the
+    /// runner's idle-outs/crashes) instead of 401ing.
+    #[test]
+    fn runner_join_token_round_trips_via_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.runner_join_token = Some("jwt.runner.token".to_owned());
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded.runner_join_token.as_deref(),
+            Some("jwt.runner.token"),
+            "runner_join_token must survive save/load so a respawn re-joins"
+        );
+        assert_eq!(loaded, h);
+    }
+
+    /// JSON written before the `runner_join_token` field was added (no
+    /// `"runner_join_token"` key) must deserialize with
+    /// `runner_join_token = None` so old records still load.
+    #[test]
+    fn runner_join_token_defaults_to_none_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000,
+            "image_ref": null,
+            "network": "n_jpegxik72nng"
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert!(
+            h.runner_join_token.is_none(),
+            "missing runner_join_token key must deserialize as None"
         );
     }
 

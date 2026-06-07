@@ -126,11 +126,14 @@ impl SharedRunnerConfig {
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
             // Phase-2: a RESPAWN rejoins the SAME tenant network the record was
-            // scoped to (`--network <slug>`). The scoped join token is NOT
-            // persisted (short-lived, minted per deploy), so a respawn rejoins
-            // via the runner's sticky per-uuid keypair — `None` here.
+            // scoped to (`--network <slug>`).
             network: record.network.clone(),
-            runner_join_token: None,
+            // Reuse the runner's PERSISTED join token so a respawn re-joins the
+            // validating coordinator with the SAME token instead of 401ing. The
+            // token is long-lived (a 1-year TTL minted by the node), so it
+            // outlives the runner's idle-outs/crashes for the app's whole life.
+            // `None` for an unscoped runner (no tenant network).
+            runner_join_token: record.runner_join_token.clone(),
             // The runtime is no longer selectable — every app builds as
             // Firecracker, and a by-ref deploy synthesizes a firecracker manifest
             // — so the record's (now inert) `requested_runtime` is NOT read here.
@@ -336,6 +339,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         }
     }
 
@@ -361,23 +365,40 @@ mod tests {
         assert_eq!(spec.parent, rec.parent);
     }
 
-    /// Phase-2: a respawn carries the record's tenant `network` forward (so the
-    /// runner rejoins scoped) but NEVER a join token (it is short-lived; the
-    /// respawn rejoins via the runner's sticky per-uuid keypair).
+    /// A respawn carries the record's tenant `network` forward AND reuses the
+    /// record's PERSISTED join token, so the runner re-joins the validating
+    /// coordinator with the SAME token instead of 401ing. The token is
+    /// long-lived (a 1-year TTL minted by the node), so it outlives the runner's
+    /// idle-outs/crashes for the app's whole life.
     #[test]
-    fn spawn_spec_for_respawn_keeps_network_drops_token() {
+    fn spawn_spec_for_respawn_keeps_network_and_token() {
         let cfg = shared();
         let mut rec = record();
         rec.network = Some("n_jpegxik72nng".to_owned());
+        rec.runner_join_token = Some("jwt.x".to_owned());
         let spec = cfg.spawn_spec_for(&rec);
         assert_eq!(
             spec.network.as_deref(),
             Some("n_jpegxik72nng"),
             "respawn must rejoin the same tenant network"
         );
+        assert_eq!(
+            spec.runner_join_token.as_deref(),
+            Some("jwt.x"),
+            "respawn must reuse the persisted join token (no 401)"
+        );
+    }
+
+    /// An unscoped record (no tenant network, no token) reconstructs a tokenless
+    /// spec — the respawn stays unscoped, exactly as before.
+    #[test]
+    fn spawn_spec_for_respawn_no_token_when_unscoped() {
+        let cfg = shared();
+        let rec = record(); // record() has runner_join_token: None
+        let spec = cfg.spawn_spec_for(&rec);
         assert!(
             spec.runner_join_token.is_none(),
-            "respawn must NOT carry a (stale) join token"
+            "an unscoped record must reconstruct a tokenless spec"
         );
     }
 

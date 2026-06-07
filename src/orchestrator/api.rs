@@ -712,6 +712,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -787,6 +788,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -943,6 +945,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1013,6 +1016,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         };
         rec.save(dir.path()).unwrap();
 

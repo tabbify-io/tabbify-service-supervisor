@@ -309,8 +309,13 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         requested_runtime: None,
         // Persist the tenant network slug so a respawn rejoins the same network
         // (`--network <slug>`). `None` on a fresh/unscoped spawn = today's
-        // behavior. The scoped join token is NOT persisted (short-lived).
+        // behavior.
         network: spec.network.clone(),
+        // Persist the scoped join token so a supervisor-driven RESPAWN re-joins
+        // the validating coordinator with the SAME token (the token is
+        // long-lived, a 1-year TTL minted by the node, so it outlives the
+        // runner's idle-outs/crashes). `None` on an unscoped spawn.
+        runner_join_token: spec.runner_join_token.clone(),
     };
 
     handle
@@ -710,6 +715,64 @@ mod tests {
         assert!(
             contents.contains("TOKEN=[scoped-runner-jwt]"),
             "the runner must receive the join token via TABBIFY_RUNNER_JOIN_TOKEN; got: {contents:?}"
+        );
+    }
+
+    /// The spec's `runner_join_token` is PERSISTED into the saved
+    /// [`RunnerHandle`] so a supervisor-driven RESPAWN can re-join the validating
+    /// coordinator with the SAME token (instead of 401ing). We assert both the
+    /// returned handle and the on-disk record carry the token.
+    #[tokio::test]
+    async fn spawn_runner_persists_join_token_into_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = write_echo_wrapper(dir.path(), "noop.sh", "OUT", "ERR");
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-ffff-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.network = Some("n_jpegxik72nng".to_owned());
+        s.runner_join_token = Some("jwt.runner.token".to_owned());
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(
+            handle.runner_join_token.as_deref(),
+            Some("jwt.runner.token"),
+            "the returned handle must carry the spec's join token"
+        );
+        let loaded = RunnerHandle::load(dir.path(), &s.uuid).unwrap().unwrap();
+        assert_eq!(
+            loaded.runner_join_token.as_deref(),
+            Some("jwt.runner.token"),
+            "the saved record must persist the join token for a respawn"
+        );
+    }
+
+    /// A spawn with no token leaves the saved handle's `runner_join_token` as
+    /// `None` (an unscoped runner — today's behavior).
+    #[tokio::test]
+    async fn spawn_runner_handle_token_none_when_unscoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = write_echo_wrapper(dir.path(), "noop.sh", "OUT", "ERR");
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-1010-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.runner_join_token = None;
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        assert!(
+            handle.runner_join_token.is_none(),
+            "an unscoped spawn must leave the handle's join token None"
         );
     }
 

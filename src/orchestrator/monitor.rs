@@ -655,6 +655,7 @@ mod tests {
             image_ref: None,
             requested_runtime: None,
             network: None,
+            runner_join_token: None,
         }
     }
 
