@@ -21,8 +21,8 @@ use tokio::process::{Child, Command};
 use super::pidfile;
 use super::protocol::{
     boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
-    proxy_request, read_http_status, resume_body, rootfs_drive_body, snapshot_create_body,
-    snapshot_load_body,
+    proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
+    snapshot_create_body, snapshot_load_body,
 };
 use super::snapshot;
 use super::{FcConfig, kvm_available};
@@ -481,7 +481,7 @@ impl FirecrackerRuntime {
 
         self.api_put(
             "/machine-config",
-            &machine_config_body(cfg.vcpus, rt.memory_mb),
+            &machine_config_body(resolve_vcpus(rt, cfg), rt.memory_mb),
         )
         .await
         .context("PUT /machine-config")?;

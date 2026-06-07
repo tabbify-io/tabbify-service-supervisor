@@ -10,6 +10,21 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::config::FcConfig;
+use crate::manifest::Runtime;
+
+/// Resolve the effective microVM vCPU count for `PUT /machine-config`.
+///
+/// Mirrors how `memory_mb` already flows from the managed `tabbify.toml`
+/// `[runtime]`: the manifest's `vcpus` override wins, and `None` falls back to
+/// the supervisor's configured default (`FcConfig::vcpus`). This is the single
+/// source of truth so the FC `vcpu_count` always reflects the managed toml,
+/// not just memory.
+#[must_use]
+pub fn resolve_vcpus(rt: &Runtime, cfg: &FcConfig) -> u32 {
+    rt.vcpus.unwrap_or(cfg.vcpus)
+}
+
 /// Hop-by-hop headers (RFC 7230 §6.1) that MUST NOT be forwarded when
 /// proxying between the inbound request and the guest, nor copied back from
 /// the guest response. Lower-cased for case-insensitive match.

@@ -84,8 +84,24 @@ mod tests {
     use super::protocol::{
         boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
         kvm_available_with, machine_config_body, network_iface_body, parse_status_line, pause_body,
-        read_http_status, resume_body, rootfs_drive_body, snapshot_create_body, snapshot_load_body,
+        read_http_status, resolve_vcpus, resume_body, rootfs_drive_body, snapshot_create_body,
+        snapshot_load_body,
     };
+    use crate::config::FcConfig;
+    use crate::manifest::Runtime;
+
+    /// A firecracker [`Runtime`] fixture with the given optional `vcpus` override.
+    fn fc_runtime(vcpus: Option<u32>) -> Runtime {
+        Runtime {
+            r#type: "firecracker".to_owned(),
+            entry: "rootfs.ext4".to_owned(),
+            fuel_per_request: 0,
+            memory_mb: 1536,
+            vcpus,
+            kernel: None,
+            registry_ref: None,
+        }
+    }
 
     #[test]
     fn kvm_gate_reflects_the_injected_probe() {
@@ -99,6 +115,39 @@ mod tests {
         assert_eq!(b["vcpu_count"], 2);
         assert_eq!(b["mem_size_mib"], 512);
         assert_eq!(b["smt"], false);
+    }
+
+    /// The managed `[runtime].vcpus` override drives the FC machine-config:
+    /// `Some(2)` must win over the supervisor's configured default (1), exactly
+    /// as `memory_mb` already does. (Regression for the bug where a connect-repo
+    /// app with `vcpus = 2` cold-spawned with `vcpu_count = 1`.)
+    #[test]
+    fn resolve_vcpus_prefers_manifest_override_over_config_default() {
+        let cfg = FcConfig::default(); // cfg.vcpus == 1
+        let rt = fc_runtime(Some(2));
+        assert_eq!(resolve_vcpus(&rt, &cfg), 2);
+    }
+
+    /// When the manifest omits `vcpus`, the supervisor's configured default is
+    /// used (the documented `None` → `FcConfig::vcpus` contract).
+    #[test]
+    fn resolve_vcpus_falls_back_to_config_default_when_absent() {
+        let cfg = FcConfig {
+            vcpus: 4,
+            ..FcConfig::default()
+        };
+        let rt = fc_runtime(None);
+        assert_eq!(resolve_vcpus(&rt, &cfg), 4);
+    }
+
+    /// End-to-end: the resolved vcpu count flows into the machine-config body.
+    #[test]
+    fn machine_config_uses_resolved_manifest_vcpus() {
+        let cfg = FcConfig::default(); // default 1
+        let rt = fc_runtime(Some(2));
+        let b = machine_config_body(resolve_vcpus(&rt, &cfg), rt.memory_mb);
+        assert_eq!(b["vcpu_count"], 2);
+        assert_eq!(b["mem_size_mib"], 1536);
     }
 
     #[test]
