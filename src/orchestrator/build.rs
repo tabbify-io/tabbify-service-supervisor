@@ -287,6 +287,7 @@ mod tests {
                 parent: None,
                 no_mesh: true,
                 relay_url: None,
+                relay_only: false,
             },
             runner_dir,
         )

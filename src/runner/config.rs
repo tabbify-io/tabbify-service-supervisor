@@ -65,6 +65,21 @@ pub struct RunnerConfig {
     #[arg(long = "mesh-relay-url", env = "TABBIFY_MESH_RELAY_URL")]
     pub relay_url: Option<String>,
 
+    /// Declare this runner **relay-only**: it has NO reachable direct endpoint
+    /// (it shares the host's NAT/firewall with the supervisor). When `true` the
+    /// coordinator never synthesizes a reflexive direct endpoint for the runner
+    /// and never emits a hole-punch directive for any pair involving it, so the
+    /// runner's WG handshake completes single-sided over the relay. The supervisor
+    /// forwards this as the bare `--mesh-relay-only` flag; the `env=` fallback also
+    /// picks up an inherited `TABBIFY_MESH_RELAY_ONLY`. `false` (the default)
+    /// keeps direct + hole-punch traversal.
+    #[arg(
+        long = "mesh-relay-only",
+        env = "TABBIFY_MESH_RELAY_ONLY",
+        default_value_t = false
+    )]
+    pub relay_only: bool,
+
     /// S3 base URL for anonymous artifact fetch (overridable for tests).
     #[arg(long, env = "RUNNER_S3_BASE_URL", default_value = DEFAULT_S3_BASE_URL)]
     pub s3_base_url: String,
@@ -196,6 +211,22 @@ mod tests {
         // Phase-2 fields default to unscoped/tokenless.
         assert!(c.network.is_none());
         assert!(c.runner_join_token.is_none());
+        // Relay-only defaults off (direct + hole-punch traversal).
+        assert!(!c.relay_only);
+    }
+
+    #[test]
+    fn relay_only_flag_parses() {
+        // The bare `--mesh-relay-only` flag (forwarded by the supervisor) sets
+        // the runner's relay_only bool true.
+        let c = RunnerConfig::try_parse_from([
+            "tabbify-runner",
+            "--uuid",
+            "0191e7c2-1111-7222-8333-444455556666",
+            "--mesh-relay-only",
+        ])
+        .unwrap();
+        assert!(c.relay_only);
     }
 
     #[test]

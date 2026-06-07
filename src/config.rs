@@ -60,6 +60,23 @@ pub struct Config {
     #[arg(long = "mesh-relay-url", env = "TABBIFY_MESH_RELAY_URL")]
     pub relay_url: Option<String>,
 
+    /// Declare this supervisor (and every runner it spawns) **relay-only**: the
+    /// peer has NO reachable direct endpoint (it runs behind a NAT/firewall with
+    /// the WireGuard UDP port dropped, reachable ONLY over its outbound DERP
+    /// relay). When `true` the coordinator (a) never synthesizes a reflexive
+    /// direct endpoint for this peer and (b) never emits a hole-punch directive
+    /// for any pair involving it, so the WG handshake becomes single-sided and
+    /// completes cleanly over the relay — eliminating the simultaneous-init
+    /// thrash that otherwise stalls a relay-only ↔ NAT'd handshake. `false` (the
+    /// default) keeps direct + hole-punch traversal. A plain pass-through bool
+    /// (no `effective_*` baking, unlike `relay_url`).
+    #[arg(
+        long = "mesh-relay-only",
+        env = "TABBIFY_MESH_RELAY_ONLY",
+        default_value_t = false
+    )]
+    pub relay_only: bool,
+
     /// Skip mesh join entirely and bind a plain loopback/`--bind` addr. Used
     /// for local runs/tests without root + TUN. Defaults off (join the mesh).
     #[arg(long, env = "SUPERVISOR_NO_MESH", default_value_t = false)]
@@ -505,6 +522,24 @@ mod tests {
             cfg.relay_url.as_deref(),
             Some("wss://relay.tabbify.io/v1/mesh/relay")
         );
+    }
+
+    #[test]
+    fn relay_only_defaults_to_false() {
+        // Absent `--mesh-relay-only` / `TABBIFY_MESH_RELAY_ONLY` ⇒ the peer
+        // participates in direct + hole-punch traversal as usual (a plain
+        // pass-through bool, no baking).
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert!(!cfg.relay_only);
+    }
+
+    #[test]
+    fn relay_only_flag_parses() {
+        // The bare `--mesh-relay-only` flag (no value) sets the bool true: how
+        // an operator declares a NAT/firewalled peer with no reachable direct
+        // endpoint, and how the supervisor forwards it to runners.
+        let cfg = Config::try_parse_from(["supervisord", "--mesh-relay-only"]).unwrap();
+        assert!(cfg.relay_only);
     }
 
     #[test]

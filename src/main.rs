@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             config.effective_relay_url(),
+            config.relay_only,
         )
         .await
         .context("join mesh")?;
@@ -162,6 +163,11 @@ async fn main() -> anyhow::Result<()> {
         no_mesh: config.no_mesh,
         // Forward the supervisor's explicit relay endpoint to every runner.
         relay_url: config.effective_relay_url(),
+        // Forward the relay-only declaration so every spawned runner ALSO tells
+        // the coordinator it has no reachable direct endpoint (the supervisor +
+        // its runners share the host's NAT/firewall) — handshakes converge over
+        // the relay instead of thrashing on unreachable direct dials.
+        relay_only: config.relay_only,
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
 
@@ -360,6 +366,7 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
                 ..Default::default()
             },
             config.effective_relay_url(),
+            config.relay_only,
         )
         .await
         {
@@ -387,6 +394,9 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
         // The candidate forwards the relay endpoint too, so its probe runner
         // exercises the same relay path as production.
         relay_url: config.effective_relay_url(),
+        // The candidate forwards the relay-only declaration too, so its probe
+        // runner exercises the same single-sided-handshake path as production.
+        relay_only: config.relay_only,
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
@@ -529,6 +539,7 @@ mod tests {
             parent: None,
             no_mesh: true,
             relay_url: None,
+            relay_only: false,
         };
         let orchestrator = Orchestrator::new(shared, tmp.join("runners"));
         let fetcher = S3Fetcher::new("http://127.0.0.1:1/none", &tmp);

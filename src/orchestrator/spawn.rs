@@ -71,6 +71,14 @@ pub struct SpawnSpec {
     /// the supervisor (the corporate-firewall escape hatch). `None` (the
     /// default) lets the runner derive the relay from the coordinator URL.
     pub relay_url: Option<String>,
+    /// Relay-only declaration (`TABBIFY_MESH_RELAY_ONLY`), forwarded to the runner
+    /// as the bare `--mesh-relay-only` flag when `true` so the runner's OWN mesh
+    /// join tells the coordinator it has no reachable direct endpoint (it shares
+    /// the host's NAT/firewall with the supervisor) — the coordinator then
+    /// suppresses the runner's direct endpoint + hole-punch directives so its WG
+    /// handshake converges over the relay. `false` (the default) keeps direct +
+    /// hole-punch traversal.
+    pub relay_only: bool,
     /// OCI image ref of the last successful deploy, forwarded to the runner as
     /// `--image-ref <ref>` so a respawn comes up on the deployed version (the
     /// runner applies it to the manifest's `registry_ref`). `None` (the default)
@@ -145,6 +153,16 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
     if let Some(relay_url) = &spec.relay_url {
         args.push("--mesh-relay-url".into());
         args.push(relay_url.as_str().into());
+    }
+    // Forward the relay-only declaration so the runner tells the coordinator it
+    // has no reachable direct endpoint (the coordinator then suppresses its
+    // direct endpoint + hole-punch directives). A bare flag (no value), pushed
+    // ONLY when true; omitted when false keeps the runner's direct + hole-punch
+    // traversal. The runner ALSO reads `TABBIFY_MESH_RELAY_ONLY` via clap `env=`,
+    // so an inherited env is a safety net — but the explicit flag is the
+    // authoritative pass-through from the supervisor.
+    if spec.relay_only {
+        args.push("--mesh-relay-only".into());
     }
     // Forward the deployed image ref so a respawn comes up on that version.
     if let Some(image_ref) = &spec.image_ref {
@@ -345,6 +363,7 @@ mod tests {
             parent: Some("fd5a:1f00:1::1".to_owned()),
             no_mesh: true,
             relay_url: None,
+            relay_only: false,
             image_ref: None,
             network: None,
             runner_join_token: None,
@@ -475,6 +494,41 @@ mod tests {
         assert!(
             !joined.iter().any(|a| a == "--mesh-relay-url"),
             "no --mesh-relay-url when None; got: {joined:?}"
+        );
+    }
+
+    /// When `relay_only` is true, the runner argv carries the BARE
+    /// `--mesh-relay-only` flag (no value) so the runner declares no reachable
+    /// direct endpoint and its WG handshake converges over the relay.
+    #[test]
+    fn build_args_includes_relay_only_when_true() {
+        let mut s = spec();
+        s.relay_only = true;
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            joined.iter().any(|a| a == "--mesh-relay-only"),
+            "expected the bare --mesh-relay-only flag; got: {joined:?}"
+        );
+    }
+
+    /// When `relay_only` is false (the default), no `--mesh-relay-only` arg is
+    /// emitted — the runner keeps direct + hole-punch traversal.
+    #[test]
+    fn build_args_omits_relay_only_when_false() {
+        let mut s = spec();
+        s.relay_only = false;
+        let args = build_args(&s);
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a == "--mesh-relay-only"),
+            "no --mesh-relay-only when false; got: {joined:?}"
         );
     }
 

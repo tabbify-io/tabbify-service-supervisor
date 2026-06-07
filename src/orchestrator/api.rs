@@ -150,6 +150,10 @@ impl Orchestrator {
             // Forward the supervisor's relay endpoint so the runner routes its
             // relay over the same `wss://` url (corporate firewall).
             relay_url: shared.relay_url.clone(),
+            // Forward the relay-only declaration so the runner tells the
+            // coordinator it has no reachable direct endpoint (handshake over the
+            // relay behind the host's shared NAT/firewall).
+            relay_only: shared.relay_only,
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
             // A plain start carries no tenant scoping; `deploy_app` overrides
@@ -612,6 +616,7 @@ mod tests {
                 parent: None,
                 no_mesh: true,
                 relay_url: None,
+                relay_only: false,
             },
             runner_dir,
         )

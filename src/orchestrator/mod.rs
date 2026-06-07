@@ -92,6 +92,12 @@ pub struct SharedRunnerConfig {
     /// as the supervisor (the corporate-firewall escape hatch). `None` (the
     /// default) lets each runner derive the relay from the coordinator URL.
     pub relay_url: Option<String>,
+    /// Relay-only declaration (`TABBIFY_MESH_RELAY_ONLY`), forwarded to every
+    /// spawned runner as the bare `--mesh-relay-only` flag when `true` so the
+    /// runner's OWN mesh join tells the coordinator it has no reachable direct
+    /// endpoint (it shares the host's NAT/firewall with the supervisor). `false`
+    /// (the default) keeps the runner's direct + hole-punch traversal.
+    pub relay_only: bool,
 }
 
 impl SharedRunnerConfig {
@@ -114,6 +120,9 @@ impl SharedRunnerConfig {
             // Forward the supervisor's relay endpoint so a respawned runner
             // routes its relay over the same `wss://` url (corporate firewall).
             relay_url: self.relay_url.clone(),
+            // Forward the relay-only declaration so a respawned runner also
+            // declares no reachable direct endpoint (handshake over the relay).
+            relay_only: self.relay_only,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
             // Phase-2: a RESPAWN rejoins the SAME tenant network the record was
@@ -311,6 +320,7 @@ mod tests {
             parent: None,
             no_mesh: true,
             relay_url: None,
+            relay_only: false,
         }
     }
 
@@ -342,6 +352,8 @@ mod tests {
         assert_eq!(spec.s3_base_url, cfg.s3_base_url);
         assert_eq!(spec.data_dir, cfg.data_dir);
         assert_eq!(spec.no_mesh, cfg.no_mesh);
+        assert_eq!(spec.relay_url, cfg.relay_url);
+        assert_eq!(spec.relay_only, cfg.relay_only);
 
         // From the record.
         assert_eq!(spec.uuid, rec.uuid);
@@ -366,6 +378,20 @@ mod tests {
         assert!(
             spec.runner_join_token.is_none(),
             "respawn must NOT carry a (stale) join token"
+        );
+    }
+
+    /// A relay-only supervisor forwards `relay_only` onto every respawn spec, so
+    /// a respawned runner also declares no reachable direct endpoint (handshake
+    /// converges over the relay behind the host's shared NAT/firewall).
+    #[test]
+    fn spawn_spec_for_forwards_relay_only() {
+        let mut cfg = shared();
+        cfg.relay_only = true;
+        let spec = cfg.spawn_spec_for(&record());
+        assert!(
+            spec.relay_only,
+            "a relay-only supervisor must forward relay_only to its runners"
         );
     }
 

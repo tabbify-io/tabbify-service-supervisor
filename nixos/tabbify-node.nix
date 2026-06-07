@@ -240,6 +240,15 @@ in {
       # e2fsprogs) are on the service `path` above.
       SUPERVISOR_FC_BUILD    = "true";
       SUPERVISOR_BUILDER     = "true";
+      # This node is RELAY-ONLY: it sits behind a home NAT and every EC2 peer
+      # drops inbound UDP 51820, so a direct WireGuard endpoint can never land.
+      # Declaring relay_only makes the coordinator suppress this peer's reflexive
+      # direct endpoint AND any hole-punch directives for pairs involving it, so
+      # the WG handshake completes single-sided over the DERP relay instead of
+      # thrashing on unreachable direct dials. The supervisor reads this env and
+      # forwards `--mesh-relay-only` to every runner it spawns (which share this
+      # host's NAT/firewall), so the whole node converges over the relay.
+      TABBIFY_MESH_RELAY_ONLY = "true";
       RUST_LOG               = "info";
     };
     serviceConfig = {

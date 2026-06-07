@@ -84,6 +84,13 @@ impl MeshMembership {
     /// deriving `ws://` from the coordinator URL — required to reach the relay
     /// through corporate proxies/firewalls. `None` keeps the existing behavior.
     ///
+    /// `relay_only` declares the peer has NO reachable direct endpoint (behind a
+    /// NAT/firewall with the WG UDP port dropped, reachable ONLY over its
+    /// outbound relay): when `true` the coordinator never advertises a reflexive
+    /// direct endpoint for it nor emits a hole-punch directive for any pair
+    /// involving it, so the handshake completes single-sided over the relay.
+    /// `false` keeps direct + hole-punch traversal.
+    ///
     /// # Errors
     /// Propagates the broad `Joiner::join` failure surface (HTTP, TUN setup,
     /// UDP bind, sudo). On a host without root / TUN this fails — callers that
@@ -94,6 +101,7 @@ impl MeshMembership {
         extra_tags: &[String],
         metadata: JoinMetadata,
         relay_url: Option<String>,
+        relay_only: bool,
     ) -> anyhow::Result<Self> {
         let config = build_supervisor_join_config(
             coordinator_url,
@@ -101,6 +109,7 @@ impl MeshMembership {
             extra_tags,
             metadata,
             relay_url,
+            relay_only,
         );
         Self::from_config(config, "join mesh as supervisor").await
     }
@@ -198,6 +207,7 @@ fn build_supervisor_join_config(
     extra_tags: &[String],
     metadata: JoinMetadata,
     relay_url: Option<String>,
+    relay_only: bool,
 ) -> JoinConfig {
     let mut tags = vec!["supervisor".to_owned()];
     tags.extend_from_slice(extra_tags);
@@ -227,6 +237,13 @@ fn build_supervisor_join_config(
         // escape hatch (route the relay over `wss://`/443). `None` keeps the
         // default derivation, unchanged for AWS-side peers.
         relay_url,
+        // Relay-only declaration (`TABBIFY_MESH_RELAY_ONLY`). When `true` the
+        // coordinator never advertises a reflexive direct endpoint for this peer
+        // and never emits a hole-punch directive for any pair involving it, so
+        // the WG handshake completes single-sided over the relay — the fix for a
+        // peer (this supervisor + its runners) that has no reachable direct
+        // endpoint behind a NAT/firewall. `false` keeps direct + hole-punch.
+        relay_only,
         // The supervisor is the HOST daemon: it owns the main-table routes
         // (no source-scoping — its per-app runners scope themselves), and
         // it keeps the host firewall from dropping inbound overlay dials
@@ -313,7 +330,8 @@ mod tests {
             software_version: Some("1.4.0".to_owned()),
             ..Default::default()
         };
-        let config = build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None);
+        let config =
+            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false);
         assert_eq!(config.software_version.as_deref(), Some("1.4.0"));
         // The supervisor tag is always present; metadata fields ride through.
         assert!(config.tags.contains(&"supervisor".to_owned()));
@@ -329,6 +347,7 @@ mod tests {
             &["firecracker".to_owned()],
             JoinMetadata::default(),
             None,
+            false,
         );
         assert!(config.software_version.is_none());
         assert!(config.tags.contains(&"firecracker".to_owned()));
@@ -346,11 +365,51 @@ mod tests {
             &[],
             JoinMetadata::default(),
             Some("wss://relay.tabbify.io/v1/mesh/relay".to_owned()),
+            false,
         );
         assert_eq!(
             config.relay_url.as_deref(),
             Some("wss://relay.tabbify.io/v1/mesh/relay"),
             "explicit relay_url must ride onto JoinConfig verbatim"
+        );
+    }
+
+    /// A `true` `relay_only` (from `TABBIFY_MESH_RELAY_ONLY`) rides onto the
+    /// supervisor's `JoinConfig.relay_only`, so the coordinator never advertises a
+    /// reflexive direct endpoint for it nor emits a hole-punch directive — the WG
+    /// handshake completes single-sided over the relay (the fix for a peer with no
+    /// reachable direct endpoint behind a NAT/firewall).
+    #[test]
+    fn build_config_wires_relay_only_onto_join_config() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+            true,
+        );
+        assert!(
+            config.relay_only,
+            "relay_only=true must ride onto JoinConfig"
+        );
+    }
+
+    /// A `false` `relay_only` (the default) leaves `JoinConfig.relay_only` off, so
+    /// the peer participates in direct + hole-punch traversal as before.
+    #[test]
+    fn build_config_omits_relay_only_when_false() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+            false,
+        );
+        assert!(
+            !config.relay_only,
+            "relay_only=false must keep direct + hole-punch traversal"
         );
     }
 
@@ -367,6 +426,7 @@ mod tests {
             &[],
             JoinMetadata::default(),
             None,
+            false,
         );
         assert!(
             config.manage_firewall,
@@ -387,7 +447,8 @@ mod tests {
             join_token: Some("infra-join-jwt".to_owned()),
             ..Default::default()
         };
-        let config = build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None);
+        let config =
+            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false);
         assert_eq!(
             config.join_token.as_deref(),
             Some("infra-join-jwt"),
@@ -441,6 +502,7 @@ mod tests {
             &[],
             JoinMetadata::default(),
             None,
+            false,
         );
         assert!(
             config.relay_url.is_none(),

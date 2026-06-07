@@ -161,6 +161,15 @@ pub struct ServeConfig {
     /// from the coordinator URL — the corporate-firewall escape hatch. `None`
     /// (the default) keeps the coordinator-derived relay.
     pub relay_url: Option<String>,
+    /// Relay-only declaration (`TABBIFY_MESH_RELAY_ONLY`, forwarded by the
+    /// supervisor as `--mesh-relay-only`). When `true`, [`build_runner_join_config`]
+    /// sets `JoinConfig.relay_only` so the coordinator never advertises a reflexive
+    /// direct endpoint for this runner nor emits a hole-punch directive for any
+    /// pair involving it — the runner's WG handshake completes single-sided over
+    /// the relay (the runner has no reachable direct endpoint, sharing the host's
+    /// NAT/firewall with the supervisor). `false` (the default) keeps direct +
+    /// hole-punch traversal.
+    pub relay_only: bool,
     /// Human-readable display name advertised to the coordinator (mesh mode).
     pub display_name: String,
     /// ULA of the parent supervisor that spawned this runner, declared on the
@@ -504,6 +513,13 @@ pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
         // runner's relay over this url verbatim (corporate-firewall escape
         // hatch); `None` keeps the coordinator-derived relay, unchanged.
         relay_url: cfg.relay_url.clone(),
+        // Relay-only declaration (`--mesh-relay-only`, forwarded by the
+        // supervisor). `true` makes the coordinator suppress this runner's
+        // reflexive direct endpoint + any hole-punch directive, so the runner's
+        // WG handshake completes single-sided over the relay (it has no reachable
+        // direct endpoint behind the host's NAT/firewall). `false` keeps direct +
+        // hole-punch traversal, unchanged.
+        relay_only: cfg.relay_only,
         // A runner ALWAYS shares its netns with the supervisor (and other
         // runners), so its peer `/128`s must live in its own source-scoped
         // table — otherwise the supervisor's main-table routes win and the
@@ -536,6 +552,7 @@ mod tests {
             no_mesh: false,
             coordinator_url: "http://10.0.0.1:8888".to_owned(),
             relay_url: None,
+            relay_only: false,
             display_name: "runner-test".to_owned(),
             parent: Some("fd5a:1f00:0:3::1".to_owned()),
             port: 8730,
@@ -612,6 +629,33 @@ mod tests {
             join.relay_url.as_deref(),
             Some("wss://relay.tabbify.io/v1/mesh/relay"),
             "explicit relay_url must ride onto the runner's JoinConfig"
+        );
+    }
+
+    /// A `true` `relay_only` on the runner's [`ServeConfig`] (forwarded by the
+    /// supervisor as `--mesh-relay-only`) rides onto the runner's
+    /// [`mesh_joiner::JoinConfig`], so the coordinator suppresses the runner's
+    /// reflexive direct endpoint + hole-punch directives and its WG handshake
+    /// completes single-sided over the relay.
+    #[test]
+    fn runner_join_config_wires_relay_only() {
+        let mut cfg = mesh_cfg();
+        cfg.relay_only = true;
+        let join = build_runner_join_config(&cfg);
+        assert!(
+            join.relay_only,
+            "relay_only=true must ride onto the runner's JoinConfig"
+        );
+    }
+
+    /// The default `relay_only` (false) leaves the runner's `JoinConfig.relay_only`
+    /// off, so the runner keeps direct + hole-punch traversal.
+    #[test]
+    fn runner_join_config_omits_relay_only_when_false() {
+        let join = build_runner_join_config(&mesh_cfg());
+        assert!(
+            !join.relay_only,
+            "default ServeConfig must leave relay_only off"
         );
     }
 

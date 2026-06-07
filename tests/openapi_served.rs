@@ -36,6 +36,7 @@ fn make_state() -> (SupervisorState, tempfile::TempDir, tempfile::TempDir) {
         parent: None,
         no_mesh: true,
         relay_url: None,
+        relay_only: false,
     };
     let orchestrator = Orchestrator::new(shared, runner_dir.path().to_path_buf());
     let fetcher = S3Fetcher::new("http://s3.invalid", data_dir.path());
