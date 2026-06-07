@@ -12,19 +12,28 @@ use crate::runtime::BoxFut;
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Minimal fake [`BuildBackend`]: records `(context_dir, tag)` on each
-/// `build` call and returns `Ok(())`.
+/// The `(context_dir, tag, dockerfile)` recorded by [`FakeBackend`] on a build.
+type BuiltCall = (PathBuf, String, Option<PathBuf>);
+
+/// Minimal fake [`BuildBackend`]: records `(context_dir, tag, dockerfile)` on
+/// each `build` call and returns `Ok(())`.
 struct FakeBackend {
-    built: Arc<Mutex<Option<(PathBuf, String)>>>,
+    built: Arc<Mutex<Option<BuiltCall>>>,
 }
 
 impl BuildBackend for FakeBackend {
-    fn build<'a>(&'a self, context_dir: &'a Path, tag: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
+    fn build<'a>(
+        &'a self,
+        context_dir: &'a Path,
+        tag: &'a str,
+        dockerfile: Option<&'a Path>,
+    ) -> BoxFut<'a, anyhow::Result<()>> {
         let slot = self.built.clone();
         let dir = context_dir.to_path_buf();
         let tag = tag.to_owned();
+        let df = dockerfile.map(Path::to_path_buf);
         Box::pin(async move {
-            *slot.lock().unwrap() = Some((dir, tag));
+            *slot.lock().unwrap() = Some((dir, tag, df));
             Ok(())
         })
     }
@@ -33,7 +42,12 @@ impl BuildBackend for FakeBackend {
 /// Fake [`BuildBackend`] that always fails.
 struct FailBackend;
 impl BuildBackend for FailBackend {
-    fn build<'a>(&'a self, _ctx: &'a Path, _tag: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
+    fn build<'a>(
+        &'a self,
+        _ctx: &'a Path,
+        _tag: &'a str,
+        _dockerfile: Option<&'a Path>,
+    ) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async { anyhow::bail!("fake build failure") })
     }
 }
@@ -114,6 +128,27 @@ fn git_with_dockerfile_and_own_toml(own_toml: &'static str) -> GitRun {
                 std::fs::create_dir_all(&dest).ok();
                 std::fs::write(format!("{dest}/Dockerfile"), "FROM scratch\n").unwrap();
                 std::fs::write(format!("{dest}/tabbify.toml"), own_toml).unwrap();
+            }
+            Ok(())
+        })
+    })
+}
+
+/// A [`GitRun`] that simulates a clone shipping its own `tabbify.toml` pointing
+/// `[build].dockerfile` at a NON-ROOT path (`deploy/Dockerfile`), and creates
+/// that Dockerfile under the subdir. Used by the honor-[build] test.
+fn git_with_toml_custom_dockerfile() -> GitRun {
+    Arc::new(move |args: Vec<String>, _env| {
+        let dest = init_dest(&args);
+        Box::pin(async move {
+            if let Some(dest) = dest {
+                std::fs::create_dir_all(format!("{dest}/deploy")).ok();
+                std::fs::write(format!("{dest}/deploy/Dockerfile"), "FROM scratch\n").unwrap();
+                std::fs::write(
+                    format!("{dest}/tabbify.toml"),
+                    "[app]\nname = \"custom-df\"\n[build]\nkind = \"docker\"\ndockerfile = \"deploy/Dockerfile\"\n",
+                )
+                .unwrap();
             }
             Ok(())
         })
@@ -212,7 +247,7 @@ async fn run_build_clones_builds_pushes_and_returns_ref() {
     // backend.build must have been called with (<workdir>/src, local-tag).
     let b = built.lock().unwrap();
     assert!(b.is_some(), "backend.build must be called");
-    let (ctx, tag) = b.as_ref().unwrap();
+    let (ctx, tag, _df) = b.as_ref().unwrap();
     assert!(
         ctx.ends_with("src"),
         "build context must be <workdir>/src, got {ctx:?}"
@@ -449,6 +484,69 @@ async fn run_build_writes_no_toml_when_none_provided() {
     assert!(
         !toml_path.exists(),
         "no managed toml provided + repo ships none → no tabbify.toml must be written"
+    );
+}
+
+// ── honor [build] (dockerfile/context) from tabbify.toml ───────────────────
+
+/// A `tabbify.toml` with `[build].dockerfile = "deploy/Dockerfile"` → the docker
+/// build is invoked with that resolved Dockerfile path (under the clone root),
+/// not the hardcoded root `Dockerfile`.
+#[tokio::test]
+async fn run_build_honors_custom_dockerfile_from_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_with_toml_custom_dockerfile();
+    let built = Arc::new(Mutex::new(None));
+    let backend = FakeBackend {
+        built: built.clone(),
+    };
+    let skopeo_runner = record_runner(Arc::new(Mutex::new(Vec::new())));
+
+    let job = test_job(); // repo ships its own toml; manifest_toml: None
+    run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .unwrap();
+
+    let b = built.lock().unwrap();
+    let (ctx, _tag, df) = b.as_ref().expect("backend.build must be called");
+    let expected_df = dir.path().join("src").join("deploy").join("Dockerfile");
+    assert_eq!(
+        df.as_deref(),
+        Some(expected_df.as_path()),
+        "the build must use the toml's [build].dockerfile path"
+    );
+    // Context defaults to the clone root (`.` relative to <src>).
+    assert_eq!(
+        ctx,
+        &dir.path().join("src"),
+        "the build context must be the clone root by default"
+    );
+}
+
+/// With no toml and a repo shipping a root `Dockerfile`, the build defaults to
+/// the clone root as context and Docker's default Dockerfile (`None` passed to
+/// the backend so `docker build` resolves `<context>/Dockerfile`).
+#[tokio::test]
+async fn run_build_defaults_to_root_dockerfile_without_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_with_dockerfile(Arc::new(Mutex::new(None)));
+    let built = Arc::new(Mutex::new(None));
+    let backend = FakeBackend {
+        built: built.clone(),
+    };
+    let skopeo_runner = record_runner(Arc::new(Mutex::new(Vec::new())));
+
+    let job = test_job(); // no toml in tree, manifest_toml: None
+    run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .unwrap();
+
+    let b = built.lock().unwrap();
+    let (ctx, _tag, df) = b.as_ref().expect("backend.build must be called");
+    assert_eq!(ctx, &dir.path().join("src"));
+    assert!(
+        df.is_none(),
+        "no toml → no explicit -f; Docker resolves <context>/Dockerfile"
     );
 }
 

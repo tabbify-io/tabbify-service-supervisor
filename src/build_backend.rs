@@ -19,22 +19,29 @@ use crate::runtime::BoxFut;
 
 // ---- pure argv helpers -------------------------------------------------------
 
-/// `docker build -t <tag> <context_dir>` argv (sans the leading binary):
-/// build from a SOURCE-DIRECTORY context (not stdin). Used by
+/// `docker build [-f <dockerfile>] -t <tag> <context_dir>` argv (sans the leading
+/// binary): build from a SOURCE-DIRECTORY context (not stdin). Used by
 /// [`HostDockerBackend`] where the source tree is already checked out on disk.
+///
+/// When `dockerfile` is `Some`, a `-f <dockerfile>` is emitted so a
+/// `[build].dockerfile` from `tabbify.toml` (e.g. `deploy/Dockerfile`) is
+/// honoured; `None` falls back to Docker's default (`<context_dir>/Dockerfile`).
 ///
 /// Distinct from the existing `docker::protocol::build_args` which builds from
 /// a gzipped-tar piped on stdin (`docker build -t <tag> -`); this variant
 /// passes the directory path directly, which is the natural form for a
 /// post-`git clone` build.
 #[must_use]
-pub fn build_dir_args(tag: &str, context_dir: &Path) -> Vec<String> {
-    vec![
-        "build".to_owned(),
-        "-t".to_owned(),
-        tag.to_owned(),
-        context_dir.to_string_lossy().into_owned(),
-    ]
+pub fn build_dir_args(tag: &str, context_dir: &Path, dockerfile: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["build".to_owned()];
+    if let Some(df) = dockerfile {
+        args.push("-f".to_owned());
+        args.push(df.to_string_lossy().into_owned());
+    }
+    args.push("-t".to_owned());
+    args.push(tag.to_owned());
+    args.push(context_dir.to_string_lossy().into_owned());
+    args
 }
 
 // ---- trait -------------------------------------------------------------------
@@ -54,10 +61,20 @@ pub trait BuildBackend: Send + Sync {
     /// Build an OCI image from the source tree at `context_dir`, tagging the
     /// result as `tag` in the local Docker daemon.
     ///
+    /// `dockerfile` honours a `[build].dockerfile` from `tabbify.toml` (e.g.
+    /// `deploy/Dockerfile`): when `Some`, the build is issued with
+    /// `-f <dockerfile>`; `None` falls back to Docker's default
+    /// (`<context_dir>/Dockerfile`).
+    ///
     /// # Errors
     /// Any build failure: spawn error, non-zero `docker build` exit, timeout,
     /// or a backend-specific error.
-    fn build<'a>(&'a self, context_dir: &'a Path, tag: &'a str) -> BoxFut<'a, anyhow::Result<()>>;
+    fn build<'a>(
+        &'a self,
+        context_dir: &'a Path,
+        tag: &'a str,
+        dockerfile: Option<&'a Path>,
+    ) -> BoxFut<'a, anyhow::Result<()>>;
 }
 
 // ---- push helper -------------------------------------------------------------
@@ -125,11 +142,17 @@ impl HostDockerBackend {
 }
 
 impl BuildBackend for HostDockerBackend {
-    /// Run `docker build -t <tag> <context_dir>` via the injected runner and
-    /// return `Ok(())` on success or an error if the build fails.
-    fn build<'a>(&'a self, context_dir: &'a Path, tag: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
+    /// Run `docker build [-f <dockerfile>] -t <tag> <context_dir>` via the
+    /// injected runner and return `Ok(())` on success or an error if the build
+    /// fails.
+    fn build<'a>(
+        &'a self,
+        context_dir: &'a Path,
+        tag: &'a str,
+        dockerfile: Option<&'a Path>,
+    ) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            let args = build_dir_args(tag, context_dir);
+            let args = build_dir_args(tag, context_dir, dockerfile);
             match (self.runner)(args).await {
                 Ok(()) => Ok(()),
                 Err(e) => Err(anyhow::anyhow!(
@@ -156,12 +179,12 @@ mod tests {
 
     // ---- build_dir_args (pure, deterministic) --------------------------------
 
-    /// `build_dir_args` must produce `["build", "-t", <tag>, <dir>]`.
+    /// `build_dir_args` (no dockerfile) must produce `["build", "-t", <tag>, <dir>]`.
     #[test]
     fn build_dir_args_returns_correct_argv() {
         let dir = PathBuf::from("/work/src/my-app");
         assert_eq!(
-            build_dir_args("tbf-img-x", &dir),
+            build_dir_args("tbf-img-x", &dir, None),
             vec!["build", "-t", "tbf-img-x", "/work/src/my-app"]
         );
     }
@@ -170,11 +193,31 @@ mod tests {
     #[test]
     fn build_dir_args_preserves_full_path() {
         let dir = PathBuf::from("/clone/abc123/repo");
-        let args = build_dir_args("tbf-img-abc", &dir);
+        let args = build_dir_args("tbf-img-abc", &dir, None);
         assert_eq!(args[0], "build");
         assert_eq!(args[1], "-t");
         assert_eq!(args[2], "tbf-img-abc");
         assert_eq!(args[3], "/clone/abc123/repo");
+    }
+
+    /// With a `dockerfile`, `build_dir_args` emits `-f <dockerfile>` BEFORE the
+    /// `-t <tag> <context>` so a `[build].dockerfile` from `tabbify.toml` is
+    /// honoured.
+    #[test]
+    fn build_dir_args_emits_dockerfile_flag() {
+        let ctx = PathBuf::from("/work/src");
+        let df = PathBuf::from("/work/src/deploy/Dockerfile");
+        assert_eq!(
+            build_dir_args("tbf-img-y", &ctx, Some(&df)),
+            vec![
+                "build",
+                "-f",
+                "/work/src/deploy/Dockerfile",
+                "-t",
+                "tbf-img-y",
+                "/work/src",
+            ]
+        );
     }
 
     // ---- HostDockerBackend::build (injected runner) --------------------------
@@ -194,7 +237,7 @@ mod tests {
 
         let backend = HostDockerBackend::with_runner("docker".to_owned(), runner);
         let dir = PathBuf::from("/work/repo");
-        let result = backend.build(&dir, "tbf-img-x").await;
+        let result = backend.build(&dir, "tbf-img-x", None).await;
 
         assert!(result.is_ok(), "runner success → build must return Ok");
 
@@ -223,7 +266,7 @@ mod tests {
 
         let backend = HostDockerBackend::with_runner("docker".to_owned(), runner);
         let dir = PathBuf::from("/work/repo");
-        let result = backend.build(&dir, "tbf-img-fail").await;
+        let result = backend.build(&dir, "tbf-img-fail", None).await;
 
         assert!(
             result.is_err(),
@@ -240,7 +283,7 @@ mod tests {
             Box::new(HostDockerBackend::with_runner("docker".to_owned(), runner));
 
         let dir = PathBuf::from("/work/repo");
-        let result = backend.build(&dir, "tbf-img-trait").await;
+        let result = backend.build(&dir, "tbf-img-trait", None).await;
         assert!(result.is_ok(), "trait-object dispatch must succeed");
     }
 
@@ -253,7 +296,7 @@ mod tests {
             Arc::new(HostDockerBackend::with_runner("docker".to_owned(), runner));
 
         let dir = PathBuf::from("/work/repo");
-        let result = backend.build(&dir, "tbf-img-arc").await;
+        let result = backend.build(&dir, "tbf-img-arc", None).await;
         assert!(
             result.is_ok(),
             "Arc<dyn BuildBackend> dispatch must succeed"

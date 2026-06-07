@@ -2,21 +2,22 @@
 //! via the [`BuildBackend`], then push it to the mesh registry via the
 //! supervisor-side `skopeo`.
 
-use std::path::Path;
-
 use anyhow::Context as _;
 
-use super::{ArtifactRef, BuildJob};
+use super::{ArtifactRef, BuildJob, BuildSpec};
 use crate::build_backend::BuildBackend;
 use crate::docker::CommandRunner;
 
 /// The DOCKER build path: require a `Dockerfile`, build the local image via
 /// `backend`, then push it to the mesh registry via `skopeo`.
 ///
-/// The push runs `skopeo copy docker-daemon:<local_tag>:latest docker://<reff>`
-/// in the supervisor process (which is on the mesh): skopeo reads the built image
-/// straight from the local docker daemon and copies it to the registry, so the
-/// docker daemon itself never needs a mesh route (which it does not have).
+/// `[build]` from `tabbify.toml` is honoured via `spec`: the image is built from
+/// `spec.context_dir` (default the clone root) using `spec.dockerfile` (default
+/// `<context_dir>/Dockerfile`). The push runs `skopeo copy
+/// docker-daemon:<local_tag>:latest docker://<reff>` in the supervisor process
+/// (which is on the mesh): skopeo reads the built image straight from the local
+/// docker daemon and copies it to the registry, so the docker daemon itself never
+/// needs a mesh route (which it does not have).
 ///
 /// # Errors
 /// Missing `Dockerfile`, build error, or push failure.
@@ -26,22 +27,33 @@ pub(super) async fn run_docker_build(
     tool_runner: &CommandRunner,
     skopeo_bin: &str,
     oras_bin: &str,
-    src: &Path,
+    spec: &BuildSpec,
     reff: String,
 ) -> anyhow::Result<ArtifactRef> {
-    // Require a Dockerfile.
-    if !src.join("Dockerfile").is_file() {
+    // Resolve the Dockerfile to require + pass to the build: the
+    // `[build].dockerfile` (relative to the clone root) when the toml set one,
+    // else Docker's default `<context_dir>/Dockerfile`. When the toml is absent
+    // (`spec.dockerfile == None`) we pass `None` to the backend so the argv stays
+    // exactly today's `docker build -t <tag> <context>` (no explicit `-f`).
+    let dockerfile_for_check: std::path::PathBuf = spec
+        .dockerfile
+        .clone()
+        .unwrap_or_else(|| spec.context_dir.join("Dockerfile"));
+
+    // Require the resolved Dockerfile to exist.
+    if !dockerfile_for_check.is_file() {
         anyhow::bail!(
-            "no Dockerfile in {} (set build_kind=wasm for a wasm-component build)",
-            src.display()
+            "no Dockerfile at {} (set [build].dockerfile in tabbify.toml to point at it)",
+            dockerfile_for_check.display()
         );
     }
 
-    // Build the local image. Local tag is scoped to this build so concurrent
-    // builds don't collide.
+    // Build the local image from the resolved context, honouring the Dockerfile
+    // path when the toml specified one. Local tag is scoped to this build so
+    // concurrent builds don't collide.
     let local_tag = format!("tbf-build-{}", job.app_uuid);
     backend
-        .build(src, &local_tag)
+        .build(&spec.context_dir, &local_tag, spec.dockerfile.as_deref())
         .await
         .context("build image")?;
 
@@ -53,9 +65,10 @@ pub(super) async fn run_docker_build(
     // needs a mesh route. On failure bail with the captured stderr (e.g.
     // `unauthorized`) so the diagnostic survives instead of being collapsed
     // to just the image ref.
-    let layout_dir = src
+    let layout_dir = spec
+        .clone_root
         .parent()
-        .unwrap_or(src)
+        .unwrap_or(&spec.clone_root)
         .join("oci-out")
         .to_string_lossy()
         .into_owned();

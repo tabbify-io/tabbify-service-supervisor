@@ -148,6 +148,11 @@ pub async fn run_build(
         }
     }
 
+    // Resolve `[build]` (dockerfile/context) from the toml now present at the
+    // clone root (repo's own or the injected managed one). Absent ⇒ today's
+    // defaults: context = `<src>` and Docker's default `<src>/Dockerfile`.
+    let build_spec = resolve_build_spec(&src, &toml_path)?;
+
     // Image ref: <registry_ula>/<tenant>/<app_uuid>:<git_ref>.
     let reff = format!(
         "{}/{}/{}:{}",
@@ -187,10 +192,63 @@ pub async fn run_build(
                 }
                 return Ok(ArtifactRef { reff, digest: None });
             }
-            docker::run_docker_build(job, backend, tool_runner, skopeo_bin, oras_bin, &src, reff)
-                .await
+            docker::run_docker_build(
+                job,
+                backend,
+                tool_runner,
+                skopeo_bin,
+                oras_bin,
+                &build_spec,
+                reff,
+            )
+            .await
         }
     }
+}
+
+/// The resolved `[build]` directives for a docker build: the clone root, the
+/// context directory the image is built from, and the optional Dockerfile path.
+/// All are absolute paths under the clone root.
+#[derive(Debug, Clone)]
+pub(crate) struct BuildSpec {
+    /// The clone root (`<workdir>/src`); used to place the `oci-out` push layout
+    /// stably at `<workdir>/oci-out` regardless of a non-root build context.
+    pub clone_root: std::path::PathBuf,
+    /// The build context dir (`<src>/<[build].context>`, default `<src>`).
+    pub context_dir: std::path::PathBuf,
+    /// The Dockerfile path (`<src>/<[build].dockerfile>`). `None` ⇒ Docker's
+    /// default (`<context_dir>/Dockerfile`).
+    pub dockerfile: Option<std::path::PathBuf>,
+}
+
+/// Resolve the [`BuildSpec`] from the `tabbify.toml` at `toml_path` (if present).
+///
+/// - No toml at the clone root ⇒ today's defaults: `context_dir = src`,
+///   `dockerfile = None` (Docker's default `<src>/Dockerfile`).
+/// - Toml present ⇒ parse it with the vendored [`crate::unified_manifest::UnifiedManifest`]
+///   and resolve `[build].context` (default `.`) + `[build].dockerfile`
+///   (default `Dockerfile`) relative to `src`.
+///
+/// # Errors
+/// A malformed `tabbify.toml` (parse error) is surfaced so the build fails with
+/// a clear diagnostic rather than silently ignoring a broken managed config.
+fn resolve_build_spec(src: &Path, toml_path: &Path) -> anyhow::Result<BuildSpec> {
+    if !toml_path.exists() {
+        return Ok(BuildSpec {
+            clone_root: src.to_path_buf(),
+            context_dir: src.to_path_buf(),
+            dockerfile: None,
+        });
+    }
+    let text = std::fs::read_to_string(toml_path)
+        .with_context(|| format!("read tabbify.toml at {}", toml_path.display()))?;
+    let manifest: crate::unified_manifest::UnifiedManifest = toml::from_str(&text)
+        .with_context(|| format!("parse tabbify.toml at {}", toml_path.display()))?;
+    Ok(BuildSpec {
+        clone_root: src.to_path_buf(),
+        context_dir: src.join(manifest.context()),
+        dockerfile: Some(src.join(manifest.dockerfile())),
+    })
 }
 
 /// Read + parse a [`BuildJob`] from `spec_path` and run it with production
