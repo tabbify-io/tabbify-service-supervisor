@@ -527,6 +527,10 @@ pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
         // direct endpoint behind the host's NAT/firewall). `false` keeps direct +
         // hole-punch traversal, unchanged.
         relay_only: cfg.relay_only,
+        // Report the runner's version (= the supervisor's binary, same image) to
+        // the roster — matches how the supervisor sets its own in main.rs, so
+        // runners stop showing `software_version = null` in the admin.
+        software_version: Some(crate::version::binary_version().to_owned()),
         // A runner ALWAYS shares its netns with the supervisor (and other
         // runners), so its peer `/128`s must live in its own source-scoped
         // table — otherwise the supervisor's main-table routes win and the
