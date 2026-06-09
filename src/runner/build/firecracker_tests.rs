@@ -1480,11 +1480,21 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let calls2 = calls.clone();
     let target2 = target.clone();
+    // The tag-path now CLEARS `.pull` before pulling (so manifests[0] is the
+    // tag's current image, not a stale accumulated one). So the mock `oras` must
+    // (re)WRITE the layout like real `oras copy --to-oci-layout` does, rather than
+    // relying on a pre-staged dir that the clear removes.
+    let cfg_c = cfg.clone();
+    let l0_c = l0.clone();
+    let pull_c = pull_layout_dir.clone();
     let real = super::production_fc_build_runner();
     let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
         calls2.lock().unwrap().push(argv.clone());
         let target3 = target2.clone();
         let real = real.clone();
+        let cfg_c = cfg_c.clone();
+        let l0_c = l0_c.clone();
+        let pull_c = pull_c.clone();
         Box::pin(async move {
             match argv.first().map(String::as_str) {
                 Some("mkfs.ext4") => {
@@ -1494,8 +1504,18 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
                     }
                     (true, Vec::new())
                 }
-                Some("oras") => (true, Vec::new()), // pull no-op; layout pre-staged
-                _ => (real)(argv).await,            // real host tar for the unpack
+                // Simulate real `oras copy --to-oci-layout`: write the layout into
+                // the (freshly-cleared) `.pull/oci` dir.
+                Some("oras") => {
+                    std::fs::create_dir_all(&pull_c).unwrap();
+                    super::oci_fixtures::write_min_oci_layout(
+                        &pull_c,
+                        &cfg_c,
+                        &[("sha256:l0", &l0_c)],
+                    );
+                    (true, Vec::new())
+                }
+                _ => (real)(argv).await, // real host tar for the unpack
             }
         })
     });
@@ -1525,5 +1545,40 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
     assert!(
         target.is_file(),
         "the digest-keyed rootfs must be produced at {target:?}"
+    );
+}
+
+#[tokio::test]
+async fn fresh_tag_pull_dir_clears_a_stale_pull_layout() {
+    // The TAG-ref pull dir is REUSED across deploys. `oras copy --to-oci-layout`
+    // ACCUMULATES manifests in index.json, and `read_manifest_digest_from_layout`
+    // reads manifests[0] (the OLDEST) — so without clearing, every redeploy
+    // resolved to the FIRST-ever digest and `rootfs_is_cached` served the stale
+    // rootfs (the app stayed on its original version forever). The pull dir must
+    // be cleared before each pull so manifests[0] is the tag's CURRENT image.
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path();
+    let uuid = "0191e7c2-0000-7000-8000-000000000001";
+
+    // Simulate a leftover OCI layout from a previous deploy.
+    let pull = data_dir
+        .join("apps")
+        .join(uuid)
+        .join("fc")
+        .join(".pull")
+        .join("oci");
+    std::fs::create_dir_all(&pull).unwrap();
+    std::fs::write(pull.join("index.json"), b"{\"stale\":true}").unwrap();
+    assert!(pull.join("index.json").exists());
+
+    let work = super::fresh_tag_pull_dir(data_dir, uuid).await.unwrap();
+
+    assert_eq!(
+        work,
+        data_dir.join("apps").join(uuid).join("fc").join(".pull")
+    );
+    assert!(
+        !work.join("oci").join("index.json").exists(),
+        "a stale .pull layout must be cleared before the next tag pull"
     );
 }

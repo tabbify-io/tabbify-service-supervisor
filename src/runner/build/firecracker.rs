@@ -380,6 +380,24 @@ pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str) -> bool {
     cached_rootfs_path(data_dir, uuid, digest).is_file()
 }
 
+/// The per-app TAG-ref pull work dir (`<data_dir>/apps/<uuid>/fc/.pull`), CLEARED
+/// before returning so the OCI layout `oras copy --to-oci-layout` writes contains
+/// ONLY the current tag's manifest.
+///
+/// CRITICAL: this dir is reused across deploys. `oras copy --to-oci-layout` into
+/// a DIRTY layout ACCUMULATES manifests in `index.json`, and
+/// [`read_manifest_digest_from_layout`] reads `manifests[0]` — the OLDEST. So
+/// without clearing, a redeploy resolved the tag to the FIRST-ever digest,
+/// [`rootfs_is_cached`] hit the stale rootfs, and the app served its original
+/// version forever (a new `git push` "deployed" but never changed). Clearing the
+/// dir each time makes the digest resolve to the tag's CURRENT image.
+async fn fresh_tag_pull_dir(data_dir: &Path, uuid: &str) -> Result<PathBuf> {
+    let work = data_dir.join("apps").join(uuid).join("fc").join(".pull");
+    // Best-effort: a missing dir (first deploy) is success, not an error.
+    tokio::fs::remove_dir_all(&work).await.ok();
+    Ok(work)
+}
+
 /// The digest-keyed work dir for a digest `registry_ref` — the parent of
 /// [`cached_rootfs_path`], i.e. where the OCI layout is pulled and the converted
 /// `rootfs.ext4` lands. Only valid once the digest is known (digest refs); a TAG
@@ -1121,7 +1139,7 @@ pub async fn run_firecracker_build(
         // not yet known). `oras copy` resolves the tag, so the pull works without
         // the digest; we then read the digest from the resulting layout and the
         // digest-keyed `resolve_rootfs` writes the rootfs to its own digest dir.
-        let work = data_dir.join("apps").join(uuid).join("fc").join(".pull");
+        let work = fresh_tag_pull_dir(data_dir, uuid).await?;
         let layout = pull_oci_layout(reff, &work, runner).await?;
         let digest = read_manifest_digest_from_layout(&layout)?;
         if rootfs_is_cached(data_dir, uuid, &digest) {
