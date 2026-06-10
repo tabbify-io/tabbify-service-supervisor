@@ -74,6 +74,12 @@ pub fn take(dir: &Path, uuid: &str) -> Option<u32> {
 /// for the RnD-phase supervisor where runners are under direct operator
 /// control. A future hardening step could cross-check `/proc/<pid>/cmdline`.
 pub fn kill_stale_if_alive(pid: u32, is_alive: impl Fn(u32) -> bool) {
+    // pid 0 means "the caller's own process group" to kill(2): a corrupted
+    // pidfile carrying 0 must never SIGKILL the calling process's own group.
+    if pid == 0 {
+        tracing::warn!("refusing to kill pid 0 (own process group) — corrupted pidfile?");
+        return;
+    }
     if !is_alive(pid) {
         return;
     }

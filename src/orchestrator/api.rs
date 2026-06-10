@@ -497,9 +497,14 @@ impl Orchestrator {
             // app's `[runtime]`/`[routes]` drive its synthesized manifest. `None`
             // keeps the hardcoded FC defaults.
             spec.manifest_toml = manifest_toml.map(str::to_owned);
-            // Phase-2: scope the cold spawn to the tenant network. `--network`
-            // (persisted for respawn) + the scoped node-join token (via env,
-            // NOT persisted). Both `None` keeps the unscoped spawn.
+            // Phase-2: scope the cold spawn to the tenant network. Both the
+            // `--network` slug and the scoped join token are PERSISTED on the
+            // record (the token travels to the runner via env, never the arg
+            // list) so a future respawn re-joins the validating coordinator
+            // with the same long-lived token instead of 401ing. Both `None`
+            // keeps the unscoped spawn. The live path above applies the same
+            // Some-replaces/None-keeps policy; the only way to explicitly
+            // CLEAR a persisted token is purge + fresh deploy.
             spec.network = net.network.clone();
             spec.runner_join_token = net.runner_join_token.clone();
             // Bake the deploy-time extra env into the guest via the runner.

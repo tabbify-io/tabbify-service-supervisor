@@ -352,12 +352,13 @@ pub async fn deploy_app(
     // orchestrator and into `Cmd::Deploy.runtime`. `None` keeps the
     // manifest-default behaviour (D10).
     let runtime_override = body.runtime.map(|r| r.as_wire().to_owned());
-    // Phase-2 binding: the network slug + node-minted scoped runner token are
-    // threaded into a COLD spawn so the runner joins the tenant network. `None`
-    // for either keeps the current (unscoped, tokenless) behavior. A live
-    // zero-downtime swap does not re-key the runner's mesh peer, so network
-    // scoping only applies on a fresh spawn (the runner already holds its
-    // scoped identity when it is alive).
+    // Phase-2 binding: the network slug + node-minted scoped runner token. On a
+    // COLD spawn both are applied to the new runner AND persisted on its
+    // record; on a live zero-downtime swap the running runner keeps its mesh
+    // identity, but `Some` values are still persisted onto the record
+    // (Some-replaces/None-keeps) so a future crash-respawn re-joins with a
+    // valid token instead of 401ing. `None` keeps the previously-persisted
+    // value; explicit clearing = purge + fresh deploy.
     let net = crate::orchestrator::api::DeployNetwork {
         network: body.network,
         runner_join_token: body.runner_join_token,

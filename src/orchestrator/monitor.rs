@@ -60,6 +60,15 @@ use crate::{
 /// runners discovered via readopt after a supervisor restart — those are NOT
 /// children of the current supervisor process, so `waitpid` returns `ECHILD`).
 fn runner_is_alive(pid: u32) -> bool {
+    // pid 0 has process-GROUP semantics for waitpid(2)/kill(2): `waitpid(0)`
+    // waits on the caller's own process group and `kill(0, 0)` probes it —
+    // both would report pid 0 as "alive" (it is OUR group). A corrupted
+    // record/pidfile carrying pid 0 must read as DEAD, never as alive, or the
+    // hung-socket path would `kill_pid(0)` = SIGKILL the supervisor's own
+    // process group.
+    if pid == 0 {
+        return false;
+    }
     // SAFETY: waitpid is a POSIX syscall. WNOHANG makes it non-blocking: it
     // returns 0 if the child has not yet changed state, or `pid` if it has
     // (exited/stopped). ECHILD (-1 with errno ECHILD) means `pid` is not a
@@ -178,14 +187,22 @@ pub(crate) fn decide_pid_grace(
 /// true` on its record. A new deploy clears the flag; a supervisor restart
 /// respects the flag (parked runners stay parked until re-deployed).
 ///
-/// 10 attempts covers the full backoff ladder (10 s → 20 → 40 → 80 → 160 →
-/// 300 × 5 = total ≈ 22 min) so a transient coordinator outage is survived
-/// before the breaker trips.
+/// 10 attempts covers the full backoff ladder — the 9 waits before the 10th
+/// (parking) failure are 10+20+40+80+160 s, then 300 s × 4 = 1510 s ≈ 25 min,
+/// closer to ~30 min with monitor-tick granularity and per-attempt boot time —
+/// so a transient coordinator outage is survived before the breaker trips.
 pub const CRASH_LOOP_PARK_THRESHOLD: u32 = 10;
 
 /// Send `SIGKILL` to `pid`. Best-effort: logs on failure (e.g. permission
 /// error or already-reaped pid).
 fn kill_pid(pid: u32) {
+    // pid 0 means "the caller's own process group" to kill(2): SIGKILLing it
+    // would take down the supervisor (and, in tests, the test binary + cargo +
+    // shell). A corrupted record/pidfile with pid 0 must be a no-op here.
+    if pid == 0 {
+        tracing::warn!("refusing to SIGKILL pid 0 (own process group) — corrupted record?");
+        return;
+    }
     // SAFETY: `libc::kill` is a standard POSIX syscall. SIGKILL to a
     // (possibly dead) pid is harmless — ESRCH is simply logged.
     let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
@@ -851,13 +868,15 @@ mod tests {
             "pidfile must be written before reconcile"
         );
 
-        // Runner pid = 0 (dead / non-existent). Shared config points data_dir at
-        // our tempdir so kill_fc_child_for_uuid finds the pidfile there.
+        // Runner pid = 99_999_999 (dead / non-existent — the test convention;
+        // NEVER 0, which kill(2) treats as the caller's own process group).
+        // Shared config points data_dir at our tempdir so
+        // kill_fc_child_for_uuid finds the pidfile there.
         let mut cfg = shared_for_test();
         cfg.data_dir = dir.path().to_path_buf();
         let orch = Orchestrator::new(cfg, dir.path().to_path_buf());
 
-        let dead_record = unhealthy_record(uuid, 0, dir.path());
+        let dead_record = unhealthy_record(uuid, 99_999_999, dir.path());
         let outcome = orch.reconcile_record(&dead_record).await;
 
         // The reconcile attempts a respawn (fails on the non-existent binary).
@@ -893,7 +912,7 @@ mod tests {
         let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
         let uuid = "0191e7c2-park-7222-8333-444455556666";
 
-        let mut record = unhealthy_record(uuid, 0, dir.path());
+        let mut record = unhealthy_record(uuid, 99_999_999, dir.path());
         record.crash_looped = true;
 
         let outcome = orch.reconcile_record(&record).await;
@@ -922,7 +941,7 @@ mod tests {
             next_retry_at: 0, // already elapsed → RespawnNow
             last_healthy_at: 0,
         };
-        let mut record = unhealthy_record(uuid, 0, dir.path());
+        let mut record = unhealthy_record(uuid, 99_999_999, dir.path());
         record.restart = pre_threshold;
         record.save(dir.path()).unwrap();
 
@@ -1001,7 +1020,7 @@ mod tests {
         let uuid = "0191e7c2-clr-7222-8333-444455556666";
 
         // Park the runner (write a crash_looped record).
-        let mut parked = unhealthy_record(uuid, 0, dir.path());
+        let mut parked = unhealthy_record(uuid, 99_999_999, dir.path());
         parked.crash_looped = true;
         parked.save(dir.path()).unwrap();
 
@@ -1010,7 +1029,7 @@ mod tests {
         assert_eq!(outcome_before, RecordOutcome::CrashLooped);
 
         // Simulate a cold deploy: fresh record with crash_looped = false.
-        let fresh = unhealthy_record(uuid, 0, dir.path()); // crash_looped defaults false
+        let fresh = unhealthy_record(uuid, 99_999_999, dir.path()); // crash_looped defaults false
         fresh.save(dir.path()).unwrap();
 
         // Now reconcile must NOT return CrashLooped (it may fail the spawn, but
@@ -1020,6 +1039,37 @@ mod tests {
             outcome_after,
             RecordOutcome::CrashLooped,
             "a fresh record (crash_looped=false) must NOT be parked"
+        );
+    }
+
+    // ── pid 0 guard (regression) ─────────────────────────────────────────────
+
+    /// pid 0 has process-GROUP semantics for kill(2)/waitpid(2) — `kill(0, …)`
+    /// signals the CALLER'S OWN process group. A corrupted record/pidfile with
+    /// pid 0 must (a) read as DEAD and (b) never be killed: without the guard,
+    /// `runner_is_alive(0)` reported "alive" (kill(0,0) succeeds against our
+    /// own group), reconcile took the hung-socket path, and `kill_pid(0)`
+    /// SIGKILLed the test binary + cargo + shell.
+    #[tokio::test]
+    async fn pid_zero_is_dead_and_never_killed() {
+        // (a) pid 0 must be reported dead.
+        assert!(!runner_is_alive(0), "pid 0 must be reported dead");
+
+        // (b) kill_pid(0) must be a no-op. Surviving this call IS the
+        // assertion — without the guard it SIGKILLs our own process group.
+        kill_pid(0);
+
+        // (c) a reconcile on a pid-0 record must take the DEAD-pid path
+        // (respawn attempted, no kill): RespawnFailed on the missing binary,
+        // and the test process is still alive to observe it.
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let record = unhealthy_record("0191e7c2-aaaa-7222-8333-444455556666", 0, dir.path());
+        let outcome = orch.reconcile_record(&record).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::RespawnFailed,
+            "a pid-0 record must take the dead-pid respawn path"
         );
     }
 }
