@@ -96,6 +96,11 @@ pub fn kill_stale_if_alive(pid: u32, is_alive: impl Fn(u32) -> bool) {
 /// exists and is reachable (does NOT send a signal). Used by production
 /// code; tests inject a closure via [`kill_stale_if_alive`] instead.
 pub fn process_is_alive(pid: u32) -> bool {
+    // pid 0 has process-GROUP semantics for kill(2): kill(0, 0) probes the
+    // caller's own process group, not a single process — always report dead.
+    if pid == 0 {
+        return false;
+    }
     // SAFETY: kill(pid, 0) is a standard POSIX existence check — it never
     // delivers a signal; it only verifies the process exists + is owned.
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };

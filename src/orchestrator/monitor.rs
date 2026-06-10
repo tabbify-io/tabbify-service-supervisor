@@ -191,6 +191,9 @@ pub(crate) fn decide_pid_grace(
 /// (parking) failure are 10+20+40+80+160 s, then 300 s × 4 = 1510 s ≈ 25 min,
 /// closer to ~30 min with monitor-tick granularity and per-attempt boot time —
 /// so a transient coordinator outage is survived before the breaker trips.
+///
+/// Also covers spawn-error loops (`RespawnFailed`), where the count advances
+/// per tick past the backoff window rather than per raw spawn attempt.
 pub const CRASH_LOOP_PARK_THRESHOLD: u32 = 10;
 
 /// Send `SIGKILL` to `pid`. Best-effort: logs on failure (e.g. permission

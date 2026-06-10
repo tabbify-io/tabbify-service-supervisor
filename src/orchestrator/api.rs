@@ -450,6 +450,8 @@ impl Orchestrator {
             // the OLD toml on disk, and a later crash-respawn would re-derive
             // STALE `[runtime]`/`[routes]`. `None` clears it (a deploy with no
             // managed config), mirroring the cold-spawn branch.
+            // Unlike `runner_join_token` and `extra_env`, a `None` here is
+            // intentional clearance, not a nudge.
             record.manifest_toml = manifest_toml.map(str::to_owned);
             // Phase-2: if this deploy supplied a tenant network, persist it so a
             // future RESPAWN rejoins scoped (the live runner itself is not
