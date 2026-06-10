@@ -34,14 +34,17 @@
 //! concerns (pid/grace vs. socket) are each independently unit-testable.
 //! Integration-level socket behavior is covered by the existing 2.4/2.5 tests.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
-use crate::orchestrator::{
-    Orchestrator,
-    client::ControlClient,
-    handle::RunnerHandle,
-    restart::{BackoffParams, RestartState, on_exit, on_healthy, should_respawn},
-    spawn::spawn_runner,
+use crate::{
+    firecracker::pidfile,
+    orchestrator::{
+        Orchestrator,
+        client::ControlClient,
+        handle::RunnerHandle,
+        restart::{BackoffParams, RestartState, on_exit, on_healthy, should_respawn},
+        spawn::spawn_runner,
+    },
 };
 
 /// Liveness probe for runner processes: returns `true` iff `pid` is a live,
@@ -97,6 +100,9 @@ pub(crate) enum RecordOutcome {
     /// The runner is dead but its backoff window has not yet elapsed — no
     /// respawn this tick; the monitor will retry on the next pass.
     Backoff,
+    /// The runner has exceeded the crash-loop threshold and has been parked —
+    /// no further respawns until a new deploy clears the `crash_looped` flag.
+    CrashLooped,
 }
 
 /// Result of the pure backoff gate check.
@@ -167,6 +173,16 @@ pub(crate) fn decide_pid_grace(
     }
 }
 
+/// After this many consecutive failed respawns with no healthy window, the
+/// monitor parks the runner (stops respawning it) and sets `crash_looped =
+/// true` on its record. A new deploy clears the flag; a supervisor restart
+/// respects the flag (parked runners stay parked until re-deployed).
+///
+/// 10 attempts covers the full backoff ladder (10 s → 20 → 40 → 80 → 160 →
+/// 300 × 5 = total ≈ 22 min) so a transient coordinator outage is survived
+/// before the breaker trips.
+pub const CRASH_LOOP_PARK_THRESHOLD: u32 = 10;
+
 /// Send `SIGKILL` to `pid`. Best-effort: logs on failure (e.g. permission
 /// error or already-reaped pid).
 fn kill_pid(pid: u32) {
@@ -176,6 +192,30 @@ fn kill_pid(pid: u32) {
     if ret != 0 {
         let err = std::io::Error::last_os_error();
         tracing::warn!(pid, error = %err, "SIGKILL to hung runner failed (may already be gone)");
+    }
+}
+
+/// Kill the Firecracker child process for `uuid` by reading its pidfile from
+/// `data_dir`. Best-effort: logs if the pidfile is absent or the kill fails.
+///
+/// Mechanism: the runner writes `<data_dir>/tabbify-fc-<uuid>.pid` after
+/// spawning the firecracker child (via [`crate::firecracker::pidfile::write`]).
+/// When the runner is killed by the monitor the firecracker child is NOT
+/// automatically reaped — it was spawned by the runner (not the supervisor)
+/// and `setsid` is NOT called on the FC child, so it gets reparented to PID 1
+/// and spins forever at 100% CPU. Reading + consuming the pidfile here lets
+/// the supervisor kill the orphan before it spawns a fresh runner.
+///
+/// The pidfile is consumed by this call (removed from disk) so the fresh
+/// runner's own cold-start reconciliation does not re-kill the NEW FC.
+fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str) {
+    if let Some(fc_pid) = pidfile::take(data_dir, uuid) {
+        tracing::info!(
+            uuid,
+            fc_pid,
+            "killing orphaned FC child before runner respawn"
+        );
+        pidfile::kill_stale_if_alive(fc_pid, pidfile::process_is_alive);
     }
 }
 
@@ -216,6 +256,17 @@ impl Orchestrator {
     /// next-retry window has not yet elapsed, the function returns
     /// [`RecordOutcome::Backoff`] without touching the process table.
     pub(crate) async fn reconcile_record(&self, record: &RunnerHandle) -> RecordOutcome {
+        // Circuit breaker: if this runner is already parked (exceeded the
+        // crash-loop threshold), do NOT respawn it until a new deploy writes a
+        // fresh record with `crash_looped = false`.
+        if record.crash_looped {
+            tracing::debug!(
+                uuid = %record.uuid,
+                "runner is crash-looped (parked) — skipping respawn until re-deployed"
+            );
+            return RecordOutcome::CrashLooped;
+        }
+
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -232,13 +283,33 @@ impl Orchestrator {
                     );
                     return RecordOutcome::Backoff;
                 }
+
+                let new_restart = on_exit(record.restart, BackoffParams::default(), now_secs);
+
+                // Circuit breaker: park the runner after N consecutive failures.
+                if new_restart.consecutive_failures >= CRASH_LOOP_PARK_THRESHOLD {
+                    tracing::error!(
+                        uuid = %record.uuid,
+                        pid = record.pid,
+                        consecutive_failures = new_restart.consecutive_failures,
+                        threshold = CRASH_LOOP_PARK_THRESHOLD,
+                        "runner exceeded crash-loop threshold — parking (no further respawns until re-deployed)"
+                    );
+                    // Kill the FC orphan (best-effort) even when parking: the
+                    // runner is dead and the FC child is spinning at 100% CPU.
+                    kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
+                    return self.park_runner(record, new_restart).await;
+                }
+
                 tracing::warn!(
                     uuid = %record.uuid,
                     pid = record.pid,
                     control_sock = %record.control_sock.display(),
                     "runner is dead — respawning"
                 );
-                let new_restart = on_exit(record.restart, BackoffParams::default(), now_secs);
+                // Kill any lingering FC child left by the dead runner before
+                // spawning a fresh one so we do not accumulate orphaned VMs.
+                kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
                 self.do_respawn(record, None, new_restart).await
             }
 
@@ -294,6 +365,23 @@ impl Orchestrator {
                         );
                         return RecordOutcome::Backoff;
                     }
+
+                    let new_restart = on_exit(record.restart, BackoffParams::default(), now_secs);
+
+                    // Circuit breaker: park after N consecutive failures.
+                    if new_restart.consecutive_failures >= CRASH_LOOP_PARK_THRESHOLD {
+                        tracing::error!(
+                            uuid = %record.uuid,
+                            pid = record.pid,
+                            consecutive_failures = new_restart.consecutive_failures,
+                            threshold = CRASH_LOOP_PARK_THRESHOLD,
+                            "runner exceeded crash-loop threshold — parking (no further respawns until re-deployed)"
+                        );
+                        kill_pid(record.pid);
+                        kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
+                        return self.park_runner(record, new_restart).await;
+                    }
+
                     tracing::warn!(
                         uuid = %record.uuid,
                         pid = record.pid,
@@ -301,7 +389,7 @@ impl Orchestrator {
                         "runner alive but socket unhealthy past grace window — killing before respawn"
                     );
                     kill_pid(record.pid);
-                    let new_restart = on_exit(record.restart, BackoffParams::default(), now_secs);
+                    kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
                     self.do_respawn(record, Some(record.pid), new_restart).await
                 }
             }
@@ -379,6 +467,23 @@ impl Orchestrator {
                 RecordOutcome::RespawnFailed
             }
         }
+    }
+
+    /// Mark a runner as crash-looped (parked): persist the updated record with
+    /// `crash_looped = true` so neither this supervisor nor a restarted one
+    /// will respawn it until a new deploy writes a fresh record.
+    async fn park_runner(&self, record: &RunnerHandle, new_restart: RestartState) -> RecordOutcome {
+        let mut parked = record.clone();
+        parked.restart = new_restart;
+        parked.crash_looped = true;
+        if let Err(e) = parked.save(&self.runner_dir) {
+            tracing::warn!(
+                uuid = %record.uuid,
+                error = %e,
+                "failed to persist crash-looped state (runner will be parked in memory until next tick persists it)"
+            );
+        }
+        RecordOutcome::CrashLooped
     }
 }
 
@@ -658,6 +763,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         }
     }
 
@@ -718,5 +824,202 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // ── FC child reaping via pidfile (Fix 2) ──────────────────────────────────
+
+    /// When the monitor kills a dead runner, it reads the per-uuid FC pidfile
+    /// and kills the orphaned firecracker child. Test: write a real pidfile for
+    /// a live `sleep` child (simulating the FC orphan), let reconcile_record run
+    /// on a DEAD runner pid, then assert the pidfile is consumed AND the sleep
+    /// child is dead.
+    #[tokio::test]
+    async fn reconcile_kills_fc_child_via_pidfile_when_runner_dead() {
+        use crate::firecracker::pidfile;
+
+        let dir = TempDir::new().unwrap();
+        let uuid = "0191e7c2-dead-7222-8333-444455556666";
+
+        // Spin up a "FC orphan" — a real `sleep` child we can safely SIGKILL.
+        let mut fc_orphan = spawn_sleep_child();
+        let fc_pid = fc_orphan.id();
+
+        // Write a pidfile as the runner would after spawning firecracker.
+        pidfile::write(dir.path(), uuid, fc_pid);
+        assert!(
+            pidfile::path(dir.path(), uuid).exists(),
+            "pidfile must be written before reconcile"
+        );
+
+        // Runner pid = 0 (dead / non-existent). Shared config points data_dir at
+        // our tempdir so kill_fc_child_for_uuid finds the pidfile there.
+        let mut cfg = shared_for_test();
+        cfg.data_dir = dir.path().to_path_buf();
+        let orch = Orchestrator::new(cfg, dir.path().to_path_buf());
+
+        let dead_record = unhealthy_record(uuid, 0, dir.path());
+        let outcome = orch.reconcile_record(&dead_record).await;
+
+        // The reconcile attempts a respawn (fails on the non-existent binary).
+        assert_eq!(
+            outcome,
+            RecordOutcome::RespawnFailed,
+            "reconcile of a dead runner must attempt a respawn"
+        );
+
+        // The pidfile must have been consumed (removed from disk).
+        assert!(
+            !pidfile::path(dir.path(), uuid).exists(),
+            "pidfile must be removed after kill_fc_child_for_uuid"
+        );
+
+        // The FC orphan must be dead now.
+        // Give the kernel a moment to process the SIGKILL.
+        let fc_alive_after = runner_is_alive(fc_pid);
+        let _ = fc_orphan.wait();
+        assert!(
+            !fc_alive_after,
+            "FC orphan (pid {fc_pid}) must be killed by the monitor"
+        );
+    }
+
+    // ── Crash-loop circuit breaker (Fix 3) ───────────────────────────────────
+
+    /// A record that already has `crash_looped = true` must be returned as
+    /// `CrashLooped` immediately — no respawn is attempted.
+    #[tokio::test]
+    async fn reconcile_skips_parked_runner() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-park-7222-8333-444455556666";
+
+        let mut record = unhealthy_record(uuid, 0, dir.path());
+        record.crash_looped = true;
+
+        let outcome = orch.reconcile_record(&record).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::CrashLooped,
+            "a parked runner must return CrashLooped without attempting a respawn"
+        );
+    }
+
+    /// After N consecutive failed respawns the monitor must park the runner:
+    /// the on-disk record must have `crash_looped = true` and the outcome must
+    /// be `CrashLooped`.
+    #[tokio::test]
+    async fn reconcile_parks_runner_at_threshold() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-thr-7222-8333-444455556666";
+
+        // Build a RestartState with exactly CRASH_LOOP_PARK_THRESHOLD - 1
+        // consecutive failures. The next call to on_exit will push it to the
+        // threshold, which must trigger parking.
+        let pre_threshold = RestartState {
+            consecutive_failures: CRASH_LOOP_PARK_THRESHOLD - 1,
+            last_exit_at: 0,
+            next_retry_at: 0, // already elapsed → RespawnNow
+            last_healthy_at: 0,
+        };
+        let mut record = unhealthy_record(uuid, 0, dir.path());
+        record.restart = pre_threshold;
+        record.save(dir.path()).unwrap();
+
+        let outcome = orch.reconcile_record(&record).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::CrashLooped,
+            "hitting the park threshold must return CrashLooped"
+        );
+
+        // The on-disk record must be parked.
+        let updated = crate::orchestrator::handle::RunnerHandle::load(dir.path(), uuid)
+            .unwrap()
+            .expect("record must still exist after parking");
+        assert!(
+            updated.crash_looped,
+            "crash_looped must be true on the persisted record after parking"
+        );
+        assert_eq!(
+            updated.restart.consecutive_failures, CRASH_LOOP_PARK_THRESHOLD,
+            "failure count must be persisted at the threshold"
+        );
+    }
+
+    /// A healthy observation RESETS the consecutive-failure counter, so the
+    /// circuit breaker does NOT trip: a runner that heals before the threshold
+    /// must not be parked.
+    ///
+    /// This is a pure logic test on `on_exit` / `on_healthy` — no async I/O.
+    #[test]
+    fn crash_loop_counter_resets_on_healthy() {
+        use crate::orchestrator::restart::{BackoffParams, on_exit, on_healthy};
+
+        let p = BackoffParams::default();
+        let mut state = RestartState::default();
+        let mut t = 1_000u64;
+
+        // Simulate N-1 failures.
+        for _ in 0..(CRASH_LOOP_PARK_THRESHOLD - 1) {
+            state = on_exit(state, p, t);
+            t += 10;
+        }
+        assert_eq!(
+            state.consecutive_failures,
+            CRASH_LOOP_PARK_THRESHOLD - 1,
+            "should have N-1 failures before heal"
+        );
+
+        // Heal: advance time past stable_secs (60 s) so the counter resets.
+        t += p.stable_secs + 1;
+        state = on_healthy(state, p, t);
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "on_healthy after stable_secs must reset the failure counter"
+        );
+
+        // After the reset the next failure is only #1 — far from the threshold.
+        state = on_exit(state, p, t);
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(
+            state.consecutive_failures < CRASH_LOOP_PARK_THRESHOLD,
+            "a single failure after a heal must not reach the park threshold"
+        );
+    }
+
+    /// A deploy on a parked runner (cold path: deploy_app writes a fresh
+    /// record with crash_looped = false) must clear the park flag.
+    ///
+    /// This is tested indirectly: after parking, simulate a cold deploy by
+    /// writing a fresh record with crash_looped = false, then assert reconcile
+    /// returns something other than CrashLooped.
+    #[tokio::test]
+    async fn deploy_clears_crash_looped_flag() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-clr-7222-8333-444455556666";
+
+        // Park the runner (write a crash_looped record).
+        let mut parked = unhealthy_record(uuid, 0, dir.path());
+        parked.crash_looped = true;
+        parked.save(dir.path()).unwrap();
+
+        // Confirm it is parked.
+        let outcome_before = orch.reconcile_record(&parked).await;
+        assert_eq!(outcome_before, RecordOutcome::CrashLooped);
+
+        // Simulate a cold deploy: fresh record with crash_looped = false.
+        let fresh = unhealthy_record(uuid, 0, dir.path()); // crash_looped defaults false
+        fresh.save(dir.path()).unwrap();
+
+        // Now reconcile must NOT return CrashLooped (it may fail the spawn, but
+        // the parking gate must be cleared).
+        let outcome_after = orch.reconcile_record(&fresh).await;
+        assert_ne!(
+            outcome_after,
+            RecordOutcome::CrashLooped,
+            "a fresh record (crash_looped=false) must NOT be parked"
+        );
     }
 }

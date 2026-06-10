@@ -458,11 +458,23 @@ impl Orchestrator {
             if net.network.is_some() {
                 record.network = net.network.clone();
             }
+            // Phase-2: if this deploy supplied a scoped join token, persist it
+            // so a future RESPAWN re-joins the validating coordinator with the
+            // SAME token (the token is long-lived, 1-year TTL). A `None` token
+            // in the deploy body is a "nudge" re-deploy that must NOT destroy
+            // a previously-persisted token — keep the existing value so the
+            // runner's respawn path always has a valid token.
+            if net.runner_join_token.is_some() {
+                record.runner_join_token = net.runner_join_token.clone();
+            }
             // Persist this deploy's extra env so the durable record always
-            // reflects the LATEST deploy's baked-in vars. A `None` extra_env
-            // clears the previously-persisted map (a deploy with no extra env
-            // drops the old vars), mirroring the cold-spawn branch.
-            record.extra_env = extra_env.cloned();
+            // reflects the LATEST deploy's baked-in vars. A `Some` extra_env
+            // replaces the persisted map; a `None` here means the deploy body
+            // carried no extra env and we keep the previously-persisted map so
+            // a token-less nudge re-deploy does not wipe the runner's env vars.
+            if extra_env.is_some() {
+                record.extra_env = extra_env.cloned();
+            }
             record
                 .save(self.runner_dir())
                 .with_context(|| format!("save runner record for {uuid} after deploy"))?;
@@ -541,6 +553,9 @@ impl Orchestrator {
         // Clear the crash-loop / backoff state so the runner is immediately
         // eligible for a respawn (next_retry_at is zeroed by reset()).
         record.restart = restart::reset(record.restart);
+        // Also clear the circuit-breaker park flag so the monitor will resume
+        // respawning the runner.
+        record.crash_looped = false;
 
         // Persist the cleared state BEFORE triggering reconcile so a concurrent
         // monitor tick also sees the clean state.
@@ -779,6 +794,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -857,6 +873,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1020,6 +1037,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1045,27 +1063,18 @@ mod tests {
         );
     }
 
-    /// Phase-2: a live deploy that carries a tenant `network` persists it on the
-    /// record (so a future RESPAWN rejoins scoped). The scoped token is NOT
-    /// persisted — it is short-lived and minted per deploy by the node.
-    #[tokio::test]
-    async fn deploy_app_live_path_persists_network_not_token() {
-        use std::time::Duration;
-
-        use tempfile::TempDir;
+    /// Helper: spin up a fake control-server on `sock_path` that answers
+    /// `Reply::Ok` to the first `n` messages, then returns a tempdir for
+    /// cleanup.
+    async fn fake_control_server(sock_path: std::path::PathBuf, n: usize) {
         use tokio::{
             io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
             net::UnixListener,
+            time::Duration,
         };
-
-        let dir = TempDir::new().unwrap();
-        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
-
-        // Fake control server: Reply::Ok to health probe + deploy.
-        let sock_path_srv = sock_path.clone();
         tokio::spawn(async move {
-            let listener = UnixListener::bind(&sock_path_srv).unwrap();
-            for _ in 0..5 {
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            for _ in 0..n {
                 match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
                     Ok(Ok((stream, _))) => {
                         let mut reader = BufReader::new(stream);
@@ -1077,7 +1086,20 @@ mod tests {
                 }
             }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    /// Phase-2: a live deploy that carries a tenant `network` AND a
+    /// `runner_join_token` persists BOTH on the record so a future RESPAWN
+    /// rejoins the validating coordinator with the same long-lived token
+    /// instead of 401ing.  Also verifies `spawn_spec_for` picks up the token.
+    #[tokio::test]
+    async fn deploy_app_live_path_persists_network_and_token() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        fake_control_server(sock_path.clone(), 5).await;
 
         let rec = RunnerHandle {
             uuid: APP_UUID.to_owned(),
@@ -1093,6 +1115,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1121,15 +1144,79 @@ mod tests {
             Some("n_jpegxik72nng"),
             "network must be persisted on a live network-scoped deploy"
         );
-        // The on-disk record must never carry the short-lived join token.
-        let raw = std::fs::read_to_string(crate::orchestrator::handle::record_path(
-            dir.path(),
-            APP_UUID,
-        ))
-        .unwrap();
-        assert!(
-            !raw.contains("scoped-runner-jwt"),
-            "the join token must NEVER be persisted to disk; record: {raw}"
+        // The on-disk record must carry the long-lived join token so a respawn
+        // re-joins the validating coordinator instead of getting 401.
+        assert_eq!(
+            updated.runner_join_token.as_deref(),
+            Some("scoped-runner-jwt"),
+            "runner_join_token must be persisted on a live deploy so a respawn re-joins"
+        );
+        // spawn_spec_for must carry the token so the respawn uses it.
+        let spec = o.shared().spawn_spec_for(&updated);
+        assert_eq!(
+            spec.runner_join_token.as_deref(),
+            Some("scoped-runner-jwt"),
+            "spawn_spec_for must carry the persisted token to the respawned runner"
+        );
+    }
+
+    /// Phase-2: a live "nudge" re-deploy with NO token in the body must NOT
+    /// overwrite a previously-persisted token — the existing token must be
+    /// kept so the runner's respawn path always has a valid join token.
+    #[tokio::test]
+    async fn deploy_app_live_path_keeps_existing_token_when_body_has_none() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        fake_control_server(sock_path.clone(), 5).await;
+
+        // Seed a record that already has a persisted token from a prior deploy.
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+            requested_runtime: None,
+            network: Some("n_jpegxik72nng".to_owned()),
+            runner_join_token: Some("previously-persisted-jwt".to_owned()),
+            manifest_toml: None,
+            extra_env: None,
+            crash_looped: false,
+        };
+        rec.save(dir.path()).unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        // Nudge re-deploy: body carries no token (runner is already live and
+        // the operator just wants to push a new image ref).
+        let net = DeployNetwork {
+            network: None,
+            runner_join_token: None,
+        };
+        let result = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:sha256new",
+                None,
+                None,
+                net,
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "nudge deploy_app must succeed: {result:?}");
+
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must exist after nudge deploy");
+        // The previously-persisted token must NOT have been wiped.
+        assert_eq!(
+            updated.runner_join_token.as_deref(),
+            Some("previously-persisted-jwt"),
+            "a nudge deploy with no token must keep the existing persisted token"
         );
     }
 
@@ -1187,6 +1274,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: Some(OLD_TOML.to_owned()),
             extra_env: None,
+            crash_looped: false,
         };
         rec.save(dir.path()).unwrap();
 

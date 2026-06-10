@@ -269,9 +269,13 @@ impl Orchestrator {
             match self.reconcile_record(&record).await {
                 RecordOutcome::Adopted => summary.adopted.push(record.uuid),
                 RecordOutcome::Respawned => summary.respawned.push(record.uuid),
-                // A failed respawn or a backoff-gated skip are left out of both
-                // buckets; the periodic monitor will retry on the next tick.
-                RecordOutcome::RespawnFailed | RecordOutcome::Backoff => {}
+                // A failed respawn, a backoff-gated skip, or a crash-looped
+                // (parked) runner are left out of both buckets. The monitor
+                // will not retry a parked runner until it is re-deployed; other
+                // failures are retried on the next tick.
+                RecordOutcome::RespawnFailed
+                | RecordOutcome::Backoff
+                | RecordOutcome::CrashLooped => {}
             }
         }
 
@@ -352,6 +356,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         }
     }
 
@@ -408,7 +413,8 @@ mod tests {
     fn spawn_spec_for_respawn_keeps_manifest_toml() {
         let cfg = shared();
         let mut rec = record();
-        rec.manifest_toml = Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
+        rec.manifest_toml =
+            Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
         let spec = cfg.spawn_spec_for(&rec);
         assert_eq!(
             spec.manifest_toml.as_deref(),

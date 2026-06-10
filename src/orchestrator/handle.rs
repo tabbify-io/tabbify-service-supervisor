@@ -111,6 +111,15 @@ pub struct RunnerHandle {
     /// existed (serde default).
     #[serde(default)]
     pub extra_env: Option<std::collections::HashMap<String, String>>,
+    /// Crash-loop circuit-breaker flag. Set by the monitor after
+    /// `CRASH_LOOP_PARK_THRESHOLD` consecutive failed respawns with no healthy
+    /// window between them. A parked runner is NOT respawned until a new deploy
+    /// clears this flag (a cold-path `deploy_app` writes a fresh record with
+    /// `crash_looped: false`). `#[serde(default)]` ensures old on-disk records
+    /// (written before this field existed) decode correctly — they get `false`
+    /// (normal behavior, never parked).
+    #[serde(default)]
+    pub crash_looped: bool,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -219,6 +228,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         }
     }
 
@@ -237,6 +247,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            crash_looped: false,
         }
     }
 

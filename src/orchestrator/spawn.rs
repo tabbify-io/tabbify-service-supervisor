@@ -370,6 +370,9 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // same KEY=VALUE entries into the guest `/init` (devbox SSH key,
         // dev-session git vars, etc.). `None` on a deploy with no extra env.
         extra_env: spec.extra_env.clone(),
+        // A freshly-spawned runner always starts with the circuit breaker clear
+        // (not parked). The monitor sets this only after N consecutive failures.
+        crash_looped: false,
     };
 
     handle
