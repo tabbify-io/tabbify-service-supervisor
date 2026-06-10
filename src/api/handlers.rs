@@ -4,9 +4,9 @@
 //! can enumerate it into the aggregated OpenAPI 3 document.
 
 use axum::{
+    Json,
     extract::{Path, State},
     response::{IntoResponse, Response},
-    Json,
 };
 use http::StatusCode;
 use serde::Deserialize;
@@ -14,11 +14,11 @@ use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{
+    SharedState,
     dto::{
         AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
         AppStopResponse, ErrorResponse, HealthResponse,
     },
-    SharedState,
 };
 use crate::{
     fetcher::FetchError,

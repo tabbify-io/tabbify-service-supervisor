@@ -41,7 +41,7 @@ pub use api::{AppState, AppSummary};
 pub use client::ControlClient;
 pub use handle::RunnerHandle;
 use monitor::RecordOutcome;
-pub use spawn::{spawn_runner, SpawnSpec};
+pub use spawn::{SpawnSpec, spawn_runner};
 
 /// What a startup [`readopt`](Orchestrator::readopt) did to the recorded fleet.
 ///
@@ -408,13 +408,38 @@ mod tests {
     fn spawn_spec_for_respawn_keeps_manifest_toml() {
         let cfg = shared();
         let mut rec = record();
-        rec.manifest_toml =
-            Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
+        rec.manifest_toml = Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
         let spec = cfg.spawn_spec_for(&rec);
         assert_eq!(
             spec.manifest_toml.as_deref(),
             Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n"),
             "respawn must reuse the persisted managed tabbify.toml"
+        );
+    }
+
+    /// A record with a persisted deploy-time `extra_env` reconstructs a spec
+    /// that carries it, so a RESPAWN re-bakes the same KEY=VALUE entries into
+    /// the guest `/init` (devbox SSH key, dev-session git vars, etc.).
+    #[test]
+    fn spawn_spec_for_respawn_keeps_extra_env() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.extra_env = Some(
+            [(
+                "TABBIFY_DEVBOX_AUTHORIZED_KEY".to_owned(),
+                "ssh-ed25519 AAAA".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let spec = cfg.spawn_spec_for(&rec);
+        assert_eq!(
+            spec.extra_env
+                .as_ref()
+                .and_then(|m| m.get("TABBIFY_DEVBOX_AUTHORIZED_KEY"))
+                .map(String::as_str),
+            Some("ssh-ed25519 AAAA"),
+            "respawn must reuse the persisted deploy-time extra env"
         );
     }
 

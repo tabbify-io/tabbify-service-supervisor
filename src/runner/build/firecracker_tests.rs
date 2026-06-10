@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use super::oci_fixtures::{make_tar, write_min_oci_layout};
 use super::{
-    build_rootfs_ext4, cached_rootfs_path, ext4_geometry, extract_layer_blob, measure_tree,
-    render_init, Entrypoint, FcBuildRunner, OciExec,
+    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, ext4_geometry,
+    extract_layer_blob, measure_tree, merge_extra_env, render_init,
 };
 
 /// `oci-spec` links and parses an OCI image config's entrypoint/cmd/env/
@@ -37,11 +37,13 @@ fn oci_spec_parses_image_config_json() {
         &vec!["--port".to_owned(), "8080".to_owned()]
     );
     assert_eq!(inner.working_dir().as_ref().unwrap(), "/app");
-    assert!(inner
-        .env()
-        .as_ref()
-        .unwrap()
-        .contains(&"RUST_LOG=info".to_owned()));
+    assert!(
+        inner
+            .env()
+            .as_ref()
+            .unwrap()
+            .contains(&"RUST_LOG=info".to_owned())
+    );
 }
 
 /// `build_rootfs_ext4` must untar the layout's layers into a staging dir, then
@@ -325,11 +327,11 @@ fn render_init_shell_form_returns_clear_error() {
 
 // ── extra_env: deploy-time vars baked into the guest /init ───────────────
 
-/// When extra_env is merged into an OciExec before `render_init`, the rendered
-/// `/init` exports BOTH the OCI image's vars AND the extra vars. Extra entries
-/// appear AFTER the OCI vars so they win on key collision (POSIX: last export
-/// wins) — this is the contract the supervisor relies on to bake SSH keys and
-/// git remotes into the devbox/dev-session guest.
+/// `merge_extra_env` — the EXACT primitive `resolve_rootfs` calls before
+/// `render_init` — appends deploy-time entries AFTER the OCI image's vars, and
+/// the rendered `/init` exports BOTH sets in that order so extra entries win on
+/// key collision (POSIX: last export wins) — the contract the supervisor relies
+/// on to bake SSH keys and git remotes into the devbox/dev-session guest.
 #[test]
 fn extra_env_merged_after_oci_env_and_exported_in_order() {
     let mut exec = OciExec {
@@ -338,15 +340,14 @@ fn extra_env_merged_after_oci_env_and_exported_in_order() {
         env: vec!["A=1".to_owned(), "B=oci".to_owned()],
         workdir: "/".to_owned(),
     };
-    // Simulate what resolve_rootfs does: merge extra_env AFTER OCI env.
     let extra: std::collections::HashMap<String, String> = [
         ("B".to_owned(), "override".to_owned()),
         ("C".to_owned(), "new".to_owned()),
     ]
     .into_iter()
     .collect();
-    exec.env
-        .extend(extra.iter().map(|(k, v)| format!("{k}={v}")));
+    // The REAL production merge — the same fn `resolve_rootfs` invokes.
+    merge_extra_env(&mut exec.env, &extra);
 
     let init = render_init(&Entrypoint::Exec(exec)).unwrap();
 
@@ -371,6 +372,7 @@ fn extra_env_merged_after_oci_env_and_exported_in_order() {
 
 /// Extra env values with special shell characters (spaces, $, quotes) are
 /// single-quoted in the rendered init, just like OCI env values — no injection.
+/// Drives the same `merge_extra_env` → `render_init` pipeline as production.
 #[test]
 fn extra_env_values_are_single_quoted_in_init() {
     let mut exec = OciExec {
@@ -379,7 +381,11 @@ fn extra_env_values_are_single_quoted_in_init() {
         env: vec![],
         workdir: "/".to_owned(),
     };
-    exec.env.push("KEY=ssh-ed25519 AAAA spaced key".to_owned());
+    let extra: std::collections::HashMap<String, String> =
+        [("KEY".to_owned(), "ssh-ed25519 AAAA spaced key".to_owned())]
+            .into_iter()
+            .collect();
+    merge_extra_env(&mut exec.env, &extra);
 
     let init = render_init(&Entrypoint::Exec(exec)).unwrap();
     assert!(
@@ -1169,8 +1175,8 @@ async fn unpack_oci_layers_errors_on_diffid_count_mismatch() {
 }
 
 use super::oci_fixtures::{
-    make_tar_gzip, make_tar_gzip_modes, make_tar_zstd, write_min_oci_layout_typed, MEDIA_TAR_GZIP,
-    MEDIA_TAR_ZSTD,
+    MEDIA_TAR_GZIP, MEDIA_TAR_ZSTD, make_tar_gzip, make_tar_gzip_modes, make_tar_zstd,
+    write_min_oci_layout_typed,
 };
 
 /// PORTABLE (all-OS) prerequisite for the linux-gated real-conversion test: the

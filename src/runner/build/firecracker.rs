@@ -560,6 +560,18 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
     ))
 }
 
+/// Append deploy-time `extra` entries to `oci_env` AFTER the OCI image's own
+/// `config.Env` entries. `render_init` emits the env as `export KEY='value'`
+/// lines in order and POSIX sh honours the LAST definition of a variable, so
+/// deploy-time values win on key collision. This is the SINGLE merge primitive
+/// [`resolve_rootfs`] uses — tests exercise this exact production path.
+pub fn merge_extra_env(
+    oci_env: &mut Vec<String>,
+    extra: &std::collections::HashMap<String, String>,
+) {
+    oci_env.extend(extra.iter().map(|(k, v)| format!("{k}={v}")));
+}
+
 /// Resolve the bootable rootfs for an app: cache-hit by digest (fc-3) → return
 /// the cached `rootfs.ext4`; cache-miss → render the PID-1 init (fc-2) from the
 /// already-read OCI config and convert the image → `rootfs.ext4` (fc-1) at the
@@ -621,12 +633,10 @@ pub async fn resolve_rootfs(
     // `build_rootfs_ext4_inner` (fc-1) — we just pass `Some(&init)` so the init
     // is baked in.
     let mut entry = Entrypoint::from_oci(config);
-    // Merge deploy-time extra env AFTER the OCI config.Env. For exec-form
-    // entrypoints this appends KEY=VALUE strings to `OciExec.env`; `render_init`
-    // emits them as `export KEY='value'` lines in order, and POSIX sh honours the
-    // LAST definition of a variable, so extra-env entries win on collision.
+    // Merge deploy-time extra env AFTER the OCI config.Env (see
+    // [`merge_extra_env`] for the collision contract).
     if let (Some(map), Entrypoint::Exec(exec)) = (extra_env, &mut entry) {
-        exec.env.extend(map.iter().map(|(k, v)| format!("{k}={v}")));
+        merge_extra_env(&mut exec.env, map);
     }
     let init = render_init(&entry)?; // shell-form → clear error (D3)
 
@@ -1153,7 +1163,10 @@ pub async fn run_firecracker_build(
             let work = digest_work_dir(data_dir, uuid, digest)?;
             let layout = pull_oci_layout(reff, &work, runner).await?;
             let config = read_oci_config_from_layout(&layout)?;
-            resolve_rootfs(uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env).await?
+            resolve_rootfs(
+                uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env,
+            )
+            .await?
         }
     } else {
         // Tag ref: pull into a digest-INDEPENDENT `.pull` work dir (the digest is
@@ -1167,7 +1180,10 @@ pub async fn run_firecracker_build(
             cached_rootfs_path(data_dir, uuid, &digest)
         } else {
             let config = read_oci_config_from_layout(&layout)?;
-            resolve_rootfs(uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env).await?
+            resolve_rootfs(
+                uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env,
+            )
+            .await?
         }
     };
 

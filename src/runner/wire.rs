@@ -5,7 +5,7 @@
 //! same config → serve → control wiring path without spawning a subprocess.
 
 use crate::runner::{
-    config::{parse_extra_env, RunnerConfig},
+    config::{RunnerConfig, parse_extra_env},
     serve::ServeConfig,
 };
 
@@ -96,10 +96,7 @@ mod tests {
     fn serve_config_from_carries_manifest_toml() {
         let cfg = parse(&["--manifest-toml", "[app]\nname = \"x\"\n"]);
         let serve = serve_config_from(&cfg);
-        assert_eq!(
-            serve.manifest_toml.as_deref(),
-            Some("[app]\nname = \"x\"\n")
-        );
+        assert_eq!(serve.manifest_toml.as_deref(), Some("[app]\nname = \"x\"\n"));
     }
 
     /// Absent the managed toml, `serve_config_from` leaves `manifest_toml` None
@@ -109,5 +106,45 @@ mod tests {
         let cfg = parse(&[]);
         let serve = serve_config_from(&cfg);
         assert!(serve.manifest_toml.is_none());
+    }
+
+    /// `serve_config_from` decodes the `RUNNER_EXTRA_ENV` JSON (here via the
+    /// equivalent `--extra-env-json` flag) into the typed `extra_env` map so the
+    /// build pipeline can bake deploy-time vars into the guest `/init`.
+    #[test]
+    fn serve_config_from_carries_extra_env() {
+        let cfg = parse(&["--extra-env-json", r#"{"SSH_KEY":"ssh-ed25519 AAAA"}"#]);
+        let serve = serve_config_from(&cfg);
+        assert_eq!(
+            serve
+                .extra_env
+                .as_ref()
+                .and_then(|m| m.get("SSH_KEY"))
+                .map(String::as_str),
+            Some("ssh-ed25519 AAAA"),
+            "serve_config_from must decode RUNNER_EXTRA_ENV JSON into extra_env"
+        );
+    }
+
+    /// PINNED CONTRACT: a malformed `RUNNER_EXTRA_ENV` decodes to `None` (with a
+    /// warning) — broken JSON must never wedge the runner; the guest just gets
+    /// the OCI image's own env. Exercises the REAL `parse_extra_env` path.
+    #[test]
+    fn serve_config_from_malformed_extra_env_is_none() {
+        let cfg = parse(&["--extra-env-json", "{not-json"]);
+        let serve = serve_config_from(&cfg);
+        assert!(
+            serve.extra_env.is_none(),
+            "malformed RUNNER_EXTRA_ENV must decode to None, not panic/abort"
+        );
+    }
+
+    /// Absent extra env, `serve_config_from` leaves `extra_env` None (a normal
+    /// deploy: the guest gets exactly the OCI image's env).
+    #[test]
+    fn serve_config_from_extra_env_defaults_none() {
+        let cfg = parse(&[]);
+        let serve = serve_config_from(&cfg);
+        assert!(serve.extra_env.is_none());
     }
 }

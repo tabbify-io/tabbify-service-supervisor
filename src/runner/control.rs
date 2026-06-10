@@ -18,14 +18,14 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 use crate::build::{build_runtime, fetched_with_ref};
 use crate::config::{DockerConfig, FcConfig};
 use crate::control_proto::{Cmd, Reply};
 use crate::fetcher::{FetchedApp, S3Fetcher};
 use crate::host::HostedApp;
-use crate::runner::active::{perform_swap, ActiveRuntime};
+use crate::runner::active::{ActiveRuntime, perform_swap};
 use crate::runtime::{AppRuntime, RuntimeHealth};
 
 /// How long the in-flight (old) runtime keeps serving after a `Deploy` swap
@@ -202,10 +202,9 @@ impl RunnerLifecycle {
         // Deploy (`is_swap = true`): the OLD runtime keeps serving until
         // `perform_swap` flips; the new VM cold-boots `reff` on its own
         // `uuid:reff` tap so both coexist (no reconcile-kill of the old).
-        // Deploy (`is_swap = true`): the OLD runtime keeps serving; extra_env is
-        // the same deploy-time env the runner was launched with (populated from
-        // `RUNNER_EXTRA_ENV`), so the new rootfs gets the same vars as the
-        // initial build — no env drift across zero-downtime swaps.
+        // `extra_env` is the same deploy-time env the runner was launched with
+        // (populated from `RUNNER_EXTRA_ENV`), so the new rootfs gets the same
+        // vars as the initial build — no env drift across zero-downtime swaps.
         let new_runtime = match build_runtime(
             &self.uuid,
             &next_fetched,
@@ -583,9 +582,7 @@ mod tests {
                 message.contains("deploy"),
                 "error must mention deploy, got: {message}"
             ),
-            other => panic!(
-                "expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"
-            ),
+            other => panic!("expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"),
         }
     }
 }

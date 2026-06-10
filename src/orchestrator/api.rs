@@ -29,11 +29,11 @@ use crate::{
     app_ula::derive_app_ula,
     control_proto::Reply,
     orchestrator::{
+        MONITOR_INTERVAL, Orchestrator,
         client::ControlClient,
         handle::RunnerHandle,
         restart::{self, BackoffParams, RestartStatus},
-        spawn::{spawn_runner, SpawnSpec},
-        Orchestrator, MONITOR_INTERVAL,
+        spawn::{SpawnSpec, spawn_runner},
     },
 };
 
@@ -753,7 +753,7 @@ mod tests {
     fn app_summary_fields_crashloop() {
         use tempfile::TempDir;
 
-        use crate::orchestrator::restart::{status, BackoffParams, RestartState};
+        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
 
         let dir = TempDir::new().unwrap();
 
@@ -805,7 +805,7 @@ mod tests {
     /// restart_count == 0.
     #[test]
     fn app_summary_fields_default_is_running() {
-        use crate::orchestrator::restart::{status, BackoffParams, RestartState};
+        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
 
         let restart = RestartState::default();
         let now = 1_700_001_000u64;
@@ -831,7 +831,7 @@ mod tests {
     async fn reset_app_clears_restart_state_on_disk() {
         use tempfile::TempDir;
 
-        use crate::orchestrator::restart::{should_respawn, RestartState};
+        use crate::orchestrator::restart::{RestartState, should_respawn};
 
         let dir = TempDir::new().unwrap();
         let o = orch(dir.path().to_path_buf());

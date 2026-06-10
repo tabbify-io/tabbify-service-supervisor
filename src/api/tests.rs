@@ -12,7 +12,7 @@ use tower::ServiceExt as _;
 use super::*;
 use crate::{
     fetcher::S3Fetcher,
-    orchestrator::{handle::RunnerHandle, restart::RestartState, Orchestrator, SharedRunnerConfig},
+    orchestrator::{Orchestrator, SharedRunnerConfig, handle::RunnerHandle, restart::RestartState},
 };
 
 const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";

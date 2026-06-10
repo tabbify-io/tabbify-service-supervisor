@@ -9,7 +9,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::config::{DockerConfig, FcConfig, DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL};
+use crate::config::{DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL, DockerConfig, FcConfig};
 
 /// Environment variable the runner reads its SCOPED node-join token from
 /// (Phase-2 contract). The node mints this per-deploy and the supervisor sets it
