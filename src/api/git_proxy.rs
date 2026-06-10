@@ -95,7 +95,9 @@ pub async fn git_proxy(
     Path((cap, tail)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Response {
-    let cap_prefix = if cap.len() >= 8 { &cap[..8] } else { &cap };
+    // Byte-safe prefix: `cap` is untrusted VM input and may be multibyte UTF-8 —
+    // `&cap[..8]` would panic on a non-char-boundary; `get` returns None instead.
+    let cap_prefix = cap.get(..8).unwrap_or(&cap);
     tracing::debug!(cap = %cap_prefix, tail = %tail, "git proxy request");
 
     let Some((upstream, token)) = state.git_sessions.lookup(&cap) else {
@@ -211,7 +213,7 @@ mod tests {
     use http::{Request, StatusCode};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_bytes, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -256,7 +258,7 @@ mod tests {
         );
     }
 
-    async fn body_bytes(resp: axum::response::Response) -> bytes::Bytes {
+    async fn collect_body(resp: axum::response::Response) -> bytes::Bytes {
         resp.into_body()
             .collect()
             .await
@@ -310,7 +312,7 @@ mod tests {
             "Content-Type must round-trip from upstream; got: {ct}"
         );
 
-        let body = body_bytes(resp).await;
+        let body = collect_body(resp).await;
         assert_eq!(
             &body[..],
             b"001e# service=git-upload-pack\n0000",
@@ -329,6 +331,13 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/git-upload-pack"))
+            // Pin the proxied request body: a dropped/garbled stream must fail
+            // the match (the mock then 404s and `.expect(1)` fails on verify).
+            .and(body_bytes(pack_request.clone()))
+            .and(header(
+                "Content-Type",
+                "application/x-git-upload-pack-request",
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(pack_request.clone())
@@ -362,7 +371,7 @@ mod tests {
             "Content-Type must round-trip; got: {ct}"
         );
 
-        let body = body_bytes(resp).await;
+        let body = collect_body(resp).await;
         assert_eq!(
             &body[..],
             &pack_request[..],
@@ -413,6 +422,33 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── 4b. Multibyte-UTF-8 cap must not panic the handler ───────────────────
+
+    /// Regression: an untrusted VM can send a multibyte-UTF-8 cap (here `€€€`,
+    /// 9 bytes / 3 chars — byte 8 is NOT a char boundary). The old
+    /// `&cap[..8]` log-prefix slice panicked "not a char boundary"; the
+    /// byte-safe `cap.get(..8)` must instead fall through to a clean 403.
+    #[tokio::test]
+    async fn git_proxy_multibyte_cap_does_not_panic() {
+        let state = make_state();
+        let app = router(state);
+
+        // Percent-encoded `€€€` — axum decodes the path param to the raw UTF-8.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/git/%E2%82%AC%E2%82%AC%E2%82%AC/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+
+        // A handler panic would propagate out of `oneshot` and fail the test.
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "multibyte cap must be a clean 403, not a panic/500"
+        );
     }
 
     // ── 5. Unlisted tail → 404, upstream gets zero requests ──────────────────
