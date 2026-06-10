@@ -566,12 +566,15 @@ impl Orchestrator {
 
     /// Last `lines` lines of the per-app runner log (the spawned runner's
     /// stdout/stderr land there — see `spawn.rs::open_runner_log`). Best-effort
-    /// diagnostics for spawn failures: a missing or unreadable file returns `None`.
+    /// diagnostics for spawn failures: a missing, unreadable, or EMPTY file
+    /// returns `None` (spawn pre-creates the log before exec'ing the runner, so
+    /// a failed exec leaves an empty file — an empty tail is noise, not signal).
     pub async fn runner_log_tail(&self, uuid: &str, lines: usize) -> Option<String> {
         let path = crate::orchestrator::spawn::runner_log_path(&self.shared().data_dir, uuid);
-        let text = tokio::fs::read_to_string(&path).await.ok()?;
-        let tail: Vec<&str> = text.lines().rev().take(lines).collect();
-        Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+        read_last_lines(&path, lines)
+            .await
+            .ok()
+            .filter(|t| !t.trim().is_empty())
     }
 
     /// Remove `uuid`'s on-disk runner record (best-effort; a missing file is
@@ -619,6 +622,30 @@ async fn wait_healthy(client: &ControlClient, timeout: Duration) -> Result<Reply
     Err(anyhow::anyhow!(
         "control socket never became healthy within {timeout:?}: {last_err:?}"
     ))
+}
+
+/// Bounded tail: reads at most the last `CHUNK` bytes of `path`, then keeps the
+/// final `lines` lines. Runner logs are never rotated — a crash-looping runner
+/// grows them unbounded, so this must NEVER slurp the whole file (an
+/// error-path heap spike on a multi-hundred-MB log). The seek can land
+/// mid-UTF-8-codepoint, so the chunk decodes lossily rather than erroring.
+///
+/// NOTE: the tail surfaces whatever the runner printed — keep this API
+/// mesh-internal; do not propagate to external callers unredacted.
+async fn read_last_lines(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    const CHUNK: u64 = 8192;
+    let mut f = tokio::fs::File::open(path).await?;
+    let len = f.metadata().await?.len();
+    f.seek(std::io::SeekFrom::Start(len.saturating_sub(CHUNK)))
+        .await?;
+    let mut buf = Vec::with_capacity(CHUNK as usize);
+    // `take` keeps the read bounded even if the (append-active) log grows
+    // between the metadata call and the read.
+    f.take(CHUNK).read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf);
+    let tail: Vec<&str> = text.lines().rev().take(lines).collect();
+    Ok(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
 }
 
 #[cfg(test)]
@@ -1185,5 +1212,65 @@ mod tests {
             Some(NEW_TOML),
             "a respawn must reuse the refreshed (new) toml, not the stale one"
         );
+    }
+
+    // ── read_last_lines (bounded tail) ────────────────────────────────────────
+
+    /// A log far larger than the 8KB chunk: the tail must still surface a
+    /// marker that sits within the last few lines — and never slurp the file.
+    #[tokio::test]
+    async fn read_last_lines_bounded_finds_marker_in_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        // ~40KB of filler lines, then the marker among the last 5 lines.
+        let mut content = String::new();
+        for i in 0..1000 {
+            content.push_str(&format!("filler line {i} padded to make it long\n"));
+        }
+        content.push_str("almost there 1\n");
+        content.push_str("FATAL: tap device failed\n");
+        content.push_str("almost there 2\n");
+        std::fs::write(&path, &content).unwrap();
+        assert!(content.len() > 8192, "fixture must exceed the chunk size");
+
+        let tail = read_last_lines(&path, 5).await.unwrap();
+        assert!(
+            tail.contains("FATAL: tap device failed"),
+            "bounded tail must surface the marker; got: {tail}"
+        );
+    }
+
+    /// Multi-byte UTF-8 around the seek boundary must not error: the chunk
+    /// decodes lossily, so a split codepoint degrades to U+FFFD instead of
+    /// failing the whole tail.
+    #[tokio::test]
+    async fn read_last_lines_survives_utf8_split_at_seek_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf8.log");
+        // Fill the file with multi-byte chars ("я" is 2 bytes) so the seek to
+        // len-8192 is overwhelmingly likely to land mid-codepoint, then end
+        // with an ASCII marker line.
+        let mut content = "я".repeat(10_000); // 20_000 bytes
+        content.push_str("\nFATAL: marker\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let tail = read_last_lines(&path, 3)
+            .await
+            .expect("a mid-codepoint seek must not error");
+        assert!(
+            tail.contains("FATAL: marker"),
+            "tail must contain the marker; got: {tail}"
+        );
+    }
+
+    /// A short file (smaller than the chunk) tails from byte 0 unharmed.
+    #[tokio::test]
+    async fn read_last_lines_short_file_returns_all_requested_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.log");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let tail = read_last_lines(&path, 2).await.unwrap();
+        assert_eq!(tail, "two\nthree");
     }
 }

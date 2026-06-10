@@ -363,15 +363,8 @@ pub async fn deploy_app(
     {
         Ok(s) => running_json(&s).into_response(),
         Err(e) => {
-            // Preserve the 404 contract for "no runner record found" errors.
-            // For all other failures surface the runner log tail in the 500 body.
-            let msg = e.to_string();
-            if msg.contains("no runner record found") {
-                return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": msg })))
-                    .into_response();
-            }
             let tail = state.orchestrator.runner_log_tail(&uuid, 20).await;
-            anyhow_to_response_with_tail(&e, tail.as_deref())
+            anyhow_to_not_found_or_error_with_tail(&e, tail.as_deref())
         }
     }
 }
@@ -586,11 +579,22 @@ pub(super) fn anyhow_to_response_with_tail(e: &anyhow::Error, tail: Option<&str>
 /// to 404. Used by [`reset_app`] so a reset of an unknown uuid returns 404
 /// rather than 500.
 pub(super) fn anyhow_to_not_found_or_error(e: &anyhow::Error) -> Response {
+    anyhow_to_not_found_or_error_with_tail(e, None)
+}
+
+/// Like [`anyhow_to_not_found_or_error`] but appends `runner_log_tail` to 500
+/// bodies when `tail` is `Some`. The 404 contract is unchanged: a "no runner
+/// record found" error returns 404 WITHOUT a tail (there is no runner whose
+/// log could explain anything).
+pub(super) fn anyhow_to_not_found_or_error_with_tail(
+    e: &anyhow::Error,
+    tail: Option<&str>,
+) -> Response {
     let msg = e.to_string();
     if msg.contains("no runner record found") {
         return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": msg }))).into_response();
     }
-    anyhow_to_response(e)
+    anyhow_to_response_with_tail(e, tail)
 }
 
 fn error_json(status: StatusCode, msg: &str) -> Response {

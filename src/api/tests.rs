@@ -463,3 +463,43 @@ async fn deploy_500_includes_runner_log_tail() {
         "500 body must include runner log tail; got body: {json}"
     );
 }
+
+// ── POST /v1/apps/:uuid/deploy — 500 WITHOUT a log omits the tail key ─────
+
+/// A deploy that fails with NO pre-existing runner log must return a plain
+/// 500 whose JSON body has NO `runner_log_tail` key (the tail is best-effort:
+/// absent, not an empty string / null). Note the spawn machinery pre-creates
+/// an EMPTY log before exec'ing the runner, so this also pins "empty file →
+/// key omitted", not just "missing file → key omitted".
+#[tokio::test]
+async fn deploy_500_without_log_omits_tail_key() {
+    let dir = TempDir::new().unwrap();
+    // NO <data_dir>/runners/<uuid>.log fixture written.
+    let state = make_state_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/apps/{APP_UUID}/deploy"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"ref":"reg:5000/a/b:sha"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "deploy with no runner binary must return 500"
+    );
+
+    let body = body_bytes(resp).await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json.get("error").is_some(),
+        "500 body must still carry 'error'; got: {json}"
+    );
+    assert!(
+        json.get("runner_log_tail").is_none(),
+        "500 body must OMIT 'runner_log_tail' when no log exists; got: {json}"
+    );
+}
