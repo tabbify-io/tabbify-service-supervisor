@@ -14,7 +14,9 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api::{
     AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
-    AppStopResponse, BuildBody, DeployBody, ErrorResponse, HealthResponse, SupervisorState,
+    AppStopResponse, BuildBody, CreateDevSessionBody, DeployBody, DevSessionCreated,
+    DevSessionPurged, DevSessionRow, ErrorResponse, GitTokenRefreshed, HealthResponse,
+    RefreshGitTokenBody, SupervisorState,
 };
 use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
 
@@ -39,6 +41,10 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         crate::api::reset_app,
         crate::api::deploy_app,
         crate::api::build_app,
+        crate::api::create_dev_session,
+        crate::api::refresh_git_token,
+        crate::api::delete_dev_session,
+        crate::api::list_dev_sessions,
     ),
     components(schemas(
         HealthResponse,
@@ -54,6 +60,12 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         BuildJob,
         BuildKind,
         ArtifactRef,
+        CreateDevSessionBody,
+        DevSessionCreated,
+        RefreshGitTokenBody,
+        GitTokenRefreshed,
+        DevSessionPurged,
+        DevSessionRow,
     ))
 )]
 pub struct ApiDoc;
@@ -89,6 +101,9 @@ mod tests {
             "/v1/apps/{uuid}/reset",
             "/v1/apps/{uuid}/deploy",
             "/v1/build",
+            "/v1/dev-sessions",
+            "/v1/dev-sessions/{id}/git-token",
+            "/v1/dev-sessions/{id}",
         ] {
             assert!(paths.contains_key(expected), "missing path {expected}");
         }

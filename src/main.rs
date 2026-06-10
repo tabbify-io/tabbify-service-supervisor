@@ -195,6 +195,23 @@ async fn main() -> anyhow::Result<()> {
         .with_version(tabbify_supervisor::version::binary_version().to_owned())
         .with_firecracker(kvm)
         .with_docker(docker);
+
+    // Spawn the dev-session idle reaper now that `state` (and its Arc) exists.
+    // Scans every 60 s for sessions that exceeded idle or max-TTL thresholds.
+    let reaper_state = std::sync::Arc::new(state.clone());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            tabbify_supervisor::api::sweep_expired(
+                &reaper_state,
+                tabbify_supervisor::api::DEV_SESSION_IDLE_TTL,
+                tabbify_supervisor::api::DEV_SESSION_MAX_TTL,
+            )
+            .await;
+        }
+    });
+
     let app = router(state);
 
     let listener = TcpListener::bind(bind_addr)
@@ -340,7 +357,8 @@ async fn run_check_mode(config: &Config) -> tabbify_supervisor::selfupdate::prob
     // `--no-mesh` and never reaches the join path.
     if candidate_identity_required(config.check_mode, config.candidate_identity_path.is_some()) {
         return ProbeOutcome::Fail(
-            "candidate (--check) requires --candidate-identity-path (transient identity)".to_owned(),
+            "candidate (--check) requires --candidate-identity-path (transient identity)"
+                .to_owned(),
         );
     }
 

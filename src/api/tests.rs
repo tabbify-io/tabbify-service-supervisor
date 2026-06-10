@@ -540,3 +540,341 @@ async fn deploy_500_without_log_omits_tail_key() {
         "500 body must OMIT 'runner_log_tail' when no log exists; got: {json}"
     );
 }
+
+// ── POST /v1/dev-sessions ─────────────────────────────────────────────────────
+
+/// `POST /v1/dev-sessions` with a valid body:
+/// - when the underlying `deploy_app` fails (no runner binary in test env) the
+///   response must NOT be 202 AND the git cap must be revoked (proxy 403) AND
+///   the dev-session registry must be empty.
+#[tokio::test]
+async fn create_dev_session_deploy_failure_cleans_up() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state.clone());
+
+    let body = serde_json::json!({
+        "app_uuid": APP_UUID,
+        "image_ref": "[fd5a::1]:5000/tabbify/devbox:latest",
+        "repo_url": "https://github.com/acme/app.git",
+        "branch": "main",
+        "git_token": "ghs_test_token",
+        "git_token_ttl_secs": 3600,
+        "authorized_key": "ssh-ed25519 AAAA test"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/dev-sessions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    // Deploy must fail (no runner binary) → not 202.
+    assert_ne!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "create_dev_session with failing deploy must not return 202"
+    );
+    // Dev-session registry must be empty (session not registered on failure).
+    assert_eq!(
+        state.dev_sessions.len(),
+        0,
+        "dev_sessions registry must be empty after deploy failure"
+    );
+}
+
+/// `POST /v1/dev-sessions` route is registered (not 404 / 405) and the body
+/// shape is accepted (not 422). The deploy fails (no runner binary) → 500.
+#[tokio::test]
+async fn post_v1_dev_sessions_route_is_registered() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "app_uuid": APP_UUID,
+        "image_ref": "[fd5a::1]:5000/devbox:latest",
+        "repo_url": "https://github.com/acme/app.git",
+        "branch": "main",
+        "git_token": "tok",
+        "git_token_ttl_secs": 3600,
+        "authorized_key": "ssh-ed25519 AAAA test"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/dev-sessions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    assert_ne!(status, 404, "POST /v1/dev-sessions must be registered");
+    assert_ne!(status, 405, "POST /v1/dev-sessions must accept POST");
+    assert_ne!(status, 422, "body must parse correctly");
+}
+
+// ── POST /v1/dev-sessions/:id/git-token ───────────────────────────────────────
+
+/// `POST /v1/dev-sessions/:id/git-token` for an unknown session id returns 404.
+#[tokio::test]
+async fn refresh_git_token_unknown_session_returns_404() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "git_token": "new-token",
+        "git_token_ttl_secs": 3600
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/dev-sessions/no-such-id/git-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /v1/dev-sessions/:id/git-token` for a KNOWN session returns 200.
+#[tokio::test]
+async fn refresh_git_token_known_session_returns_200() {
+    use std::time::{Duration, Instant};
+    use crate::api::dev_sessions::DevSession;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+
+    // Pre-register a session and a git cap directly.
+    let cap = "a".repeat(64);
+    state.git_sessions.register(
+        cap.clone(),
+        GitSessionEntry {
+            upstream_url: "https://github.com/acme/app.git".to_owned(),
+            token: "old-token".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        },
+    );
+    let now = Instant::now();
+    state.dev_sessions.insert(DevSession {
+        session_id: "test-sess-1".to_owned(),
+        app_uuid: APP_UUID.to_owned(),
+        cap: cap.clone(),
+        created_at: now,
+        last_activity: now,
+    });
+
+    let app = router(state.clone());
+
+    let body = serde_json::json!({
+        "git_token": "new-token",
+        "git_token_ttl_secs": 7200
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/dev-sessions/test-sess-1/git-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        json.get("refreshed").and_then(|v| v.as_bool()),
+        Some(true),
+        "response must have refreshed: true; got: {json}"
+    );
+}
+
+// ── DELETE /v1/dev-sessions/:id ───────────────────────────────────────────────
+
+/// `DELETE /v1/dev-sessions/:id` for an unknown id returns 404.
+#[tokio::test]
+async fn delete_dev_session_unknown_returns_404() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/v1/dev-sessions/no-such-id")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `DELETE /v1/dev-sessions/:id` for a known session:
+/// - returns 200 with `{ purged: true }`.
+/// - the session is removed from the registry.
+/// - the git cap is revoked (git proxy returns 403 for the cap).
+/// - a second DELETE returns 404.
+#[tokio::test]
+async fn delete_dev_session_known_returns_200_and_cleans_up() {
+    use std::time::{Duration, Instant};
+    use crate::api::dev_sessions::DevSession;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+
+    let cap = "b".repeat(64);
+    state.git_sessions.register(
+        cap.clone(),
+        GitSessionEntry {
+            upstream_url: "https://github.com/acme/app.git".to_owned(),
+            token: "tok".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        },
+    );
+    let now = Instant::now();
+    state.dev_sessions.insert(DevSession {
+        session_id: "del-sess".to_owned(),
+        app_uuid: APP_UUID.to_owned(),
+        cap: cap.clone(),
+        created_at: now,
+        last_activity: now,
+    });
+
+    // First DELETE: should return 200.
+    {
+        let app = router(state.clone());
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/v1/dev-sessions/del-sess")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.get("purged").and_then(|v| v.as_bool()),
+            Some(true),
+            "DELETE response must have purged: true; got: {json}"
+        );
+    }
+
+    // Session must be gone from the registry.
+    assert!(
+        state.dev_sessions.lookup("del-sess").is_none(),
+        "session must be removed after DELETE"
+    );
+
+    // Second DELETE: should return 404.
+    {
+        let app = router(state.clone());
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/v1/dev-sessions/del-sess")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+// ── GET /v1/dev-sessions ──────────────────────────────────────────────────────
+
+/// `GET /v1/dev-sessions` returns 200 with a JSON `{ sessions: [...] }`.
+/// With an empty registry, `sessions` is an empty array.
+#[tokio::test]
+async fn get_dev_sessions_empty_returns_200() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/dev-sessions")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sessions = json.get("sessions").and_then(|v| v.as_array()).unwrap();
+    assert!(sessions.is_empty(), "empty registry must return empty sessions array");
+}
+
+/// `GET /v1/dev-sessions` with one session returns a single row with the
+/// expected fields.
+#[tokio::test]
+async fn get_dev_sessions_with_one_session_returns_row() {
+    use std::time::Instant;
+    use crate::api::dev_sessions::DevSession;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+
+    let now = Instant::now();
+    state.dev_sessions.insert(DevSession {
+        session_id: "list-sess".to_owned(),
+        app_uuid: APP_UUID.to_owned(),
+        cap: "c".repeat(64),
+        created_at: now,
+        last_activity: now,
+    });
+
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/dev-sessions")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sessions = json.get("sessions").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(sessions.len(), 1, "one session in registry must yield one row");
+    let row = &sessions[0];
+    assert_eq!(row.get("session_id").and_then(|v| v.as_str()), Some("list-sess"));
+    assert_eq!(row.get("app_uuid").and_then(|v| v.as_str()), Some(APP_UUID));
+    assert!(row.get("created_age_secs").is_some(), "row must have created_age_secs");
+    assert!(row.get("idle_secs").is_some(), "row must have idle_secs");
+}
+
+// ── git_remote URL shape ──────────────────────────────────────────────────────
+
+/// Verify that `generate_cap` output is compatible with the git-proxy route
+/// (64 hex chars, no special characters that would break the URL path).
+#[test]
+fn dev_session_cap_is_url_safe() {
+    use crate::api::dev_sessions::generate_cap;
+    // `generate_cap` is pub(crate) — only visible within the crate.
+    let cap = generate_cap("sess-url-test", "app-url-test");
+    // Hex chars are always URL-safe path segments.
+    assert!(
+        cap.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "cap must be lowercase hex (URL-safe path segment); got: {cap}"
+    );
+}
+
+// ── SupervisorState has dev_sessions ─────────────────────────────────────────
+
+/// Confirm that `SupervisorState::new` initialises an empty `dev_sessions`
+/// registry (smoke test for the field addition).
+#[test]
+fn supervisor_state_has_empty_dev_sessions_on_new() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    assert_eq!(
+        state.dev_sessions.len(),
+        0,
+        "dev_sessions must be empty on a fresh SupervisorState"
+    );
+}

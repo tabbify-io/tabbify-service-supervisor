@@ -35,10 +35,16 @@ use axum::routing::{get, post};
 use crate::fetcher::S3Fetcher;
 use crate::orchestrator::Orchestrator;
 
+mod dev_sessions;
 mod dto;
 mod git_proxy;
 mod handlers;
 
+pub use dev_sessions::{
+    CreateDevSessionBody, DEV_SESSION_IDLE_TTL, DEV_SESSION_MAX_TTL, DevSessionCreated,
+    DevSessionPurged, DevSessionRegistry, DevSessionRow, GitTokenRefreshed, RefreshGitTokenBody,
+    sweep_expired,
+};
 pub use git_proxy::{GitSessionEntry, GitSessions};
 
 // ── Public re-exports — must remain stable for `crate::openapi` + tests. ─────
@@ -59,6 +65,11 @@ pub use handlers::{
 pub use handlers::{
     __path_about, __path_build_app, __path_deploy_app, __path_get_app, __path_health,
     __path_list_apps, __path_purge_app, __path_reset_app, __path_start_app, __path_stop_app,
+};
+#[doc(hidden)]
+pub use dev_sessions::{
+    __path_create_dev_session, __path_delete_dev_session, __path_list_dev_sessions,
+    __path_refresh_git_token,
 };
 
 /// Shared handler state.
@@ -89,6 +100,8 @@ pub struct SupervisorState {
     /// Credentials are injected here (outside VMs) and never forwarded to
     /// sandboxes. See [`git_proxy`].
     pub git_sessions: std::sync::Arc<GitSessions>,
+    /// Dev-session lifecycle registry: session_id → DevSession (app uuid + cap).
+    pub dev_sessions: std::sync::Arc<DevSessionRegistry>,
 }
 
 impl SupervisorState {
@@ -112,6 +125,7 @@ impl SupervisorState {
             version: String::new(),
             started_at: std::time::Instant::now(),
             git_sessions: std::sync::Arc::new(GitSessions::default()),
+            dev_sessions: std::sync::Arc::new(DevSessionRegistry::default()),
         }
     }
 
@@ -157,6 +171,19 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/reset", post(reset_app))
         .route("/v1/apps/:uuid/deploy", post(deploy_app))
         .route("/v1/build", post(build_app))
+        // Dev-session lifecycle endpoints.
+        .route(
+            "/v1/dev-sessions",
+            post(dev_sessions::create_dev_session).get(dev_sessions::list_dev_sessions),
+        )
+        .route(
+            "/v1/dev-sessions/:id/git-token",
+            post(dev_sessions::refresh_git_token),
+        )
+        .route(
+            "/v1/dev-sessions/:id",
+            axum::routing::delete(dev_sessions::delete_dev_session),
+        )
         // Git smart-HTTP proxy — tokenless in-VM remote (dev sessions).
         // Not in OpenAPI (wire protocol, not REST).
         .route(
