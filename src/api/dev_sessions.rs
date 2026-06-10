@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -232,11 +232,11 @@ pub struct DevSessionRow {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// `POST /v1/dev-sessions` — spawn an always-on dev-FC + register a git-proxy
-/// capability. Returns `202` with `{ session_id, app_uuid, git_remote }`.
+/// capability. Returns `200` with `{ session_id, app_uuid, git_remote }`.
 ///
-/// The deploy is SYNCHRONOUS (mirrors the existing `deploy_app` handler) — it
-/// returns when the VM is healthy. The caller (the node) tolerates long calls
-/// mesh-internally.
+/// The deploy is SYNCHRONOUS (mirrors the existing `deploy_app` handler, which
+/// also returns 200 only once the VM is healthy) — the caller (the node)
+/// tolerates long calls mesh-internally.
 #[utoipa::path(
     post,
     path = "/v1/dev-sessions",
@@ -246,7 +246,7 @@ pub struct DevSessionRow {
         content_type = "application/json"
     ),
     responses(
-        (status = 202, description = "Session created, VM healthy", body = DevSessionCreated),
+        (status = 200, description = "Session created, VM healthy", body = DevSessionCreated),
         (status = 500, description = "Deploy failure", body = crate::api::ErrorResponse),
     ),
 )]
@@ -306,10 +306,7 @@ pub async fn create_dev_session(
             // Revoke the cap so the git proxy rejects future requests.
             state.git_sessions.revoke(&cap);
             tracing::warn!(app_uuid = %body.app_uuid, error = %e, "dev-session deploy failed");
-            let tail = state
-                .orchestrator
-                .runner_log_tail(&body.app_uuid, 20)
-                .await;
+            let tail = state.orchestrator.runner_log_tail(&body.app_uuid, 20).await;
             crate::api::handlers::anyhow_to_response_with_tail(&e, tail.as_deref())
         }
         Ok(_summary) => {
@@ -324,15 +321,14 @@ pub async fn create_dev_session(
             };
             state.dev_sessions.insert(session);
 
-            (
-                StatusCode::ACCEPTED,
-                Json(DevSessionCreated {
-                    session_id,
-                    app_uuid: body.app_uuid,
-                    git_remote,
-                }),
-            )
-                .into_response()
+            // 200, not 202: the deploy is synchronous — by the time we answer
+            // the VM is healthy, so "Accepted (processing pending)" would lie.
+            Json(DevSessionCreated {
+                session_id,
+                app_uuid: body.app_uuid,
+                git_remote,
+            })
+            .into_response()
         }
     }
 }
@@ -428,12 +424,14 @@ pub async fn list_dev_sessions(State(state): State<SharedState>) -> Response {
         .dev_sessions
         .snapshot()
         .into_iter()
-        .map(|(session_id, app_uuid, _, created_at, last_activity)| DevSessionRow {
-            session_id,
-            app_uuid,
-            created_age_secs: now.duration_since(created_at).as_secs(),
-            idle_secs: now.duration_since(last_activity).as_secs(),
-        })
+        .map(
+            |(session_id, app_uuid, _, created_at, last_activity)| DevSessionRow {
+                session_id,
+                app_uuid,
+                created_age_secs: now.duration_since(created_at).as_secs(),
+                idle_secs: now.duration_since(last_activity).as_secs(),
+            },
+        )
         .collect();
     Json(json!({ "sessions": rows })).into_response()
 }
@@ -484,7 +482,11 @@ pub async fn sweep_expired(
                 "dev-session idle-reap purge_app failed (continuing)"
             );
         }
-        tracing::info!(session_id, app_uuid, "dev-session reaped (idle/max-ttl exceeded)");
+        tracing::info!(
+            session_id,
+            app_uuid,
+            "dev-session reaped (idle/max-ttl exceeded)"
+        );
         purged.push(session_id);
     }
     purged
@@ -505,7 +507,10 @@ mod tests {
     fn generate_cap_is_64_hex_chars() {
         let cap = generate_cap("sess-1", "app-1");
         assert_eq!(cap.len(), 64, "cap must be 64 hex chars; got {}", cap.len());
-        assert!(cap.chars().all(|c| c.is_ascii_hexdigit()), "cap must be hex");
+        assert!(
+            cap.chars().all(|c| c.is_ascii_hexdigit()),
+            "cap must be hex"
+        );
     }
 
     #[test]
@@ -521,7 +526,10 @@ mod tests {
         // (the extra entropy from now_v7 salt makes each call unique).
         let a = generate_cap("same-sess", "same-app");
         let b = generate_cap("same-sess", "same-app");
-        assert_ne!(a, b, "repeated calls must not be deterministic (salt randomness)");
+        assert_ne!(
+            a, b,
+            "repeated calls must not be deterministic (salt randomness)"
+        );
     }
 
     // ── DevSessionRegistry ────────────────────────────────────────────────────
@@ -554,7 +562,10 @@ mod tests {
         reg.insert(make_session("s2", "a2", "cap2"));
         let removed = reg.remove("s2");
         assert!(removed.is_some());
-        assert!(reg.lookup("s2").is_none(), "removed session must not be found");
+        assert!(
+            reg.lookup("s2").is_none(),
+            "removed session must not be found"
+        );
         assert_eq!(reg.len(), 0);
     }
 
@@ -568,7 +579,10 @@ mod tests {
     fn registry_bump_activity_on_known_session() {
         let reg = DevSessionRegistry::default();
         reg.insert(make_session("s3", "a3", "cap3"));
-        assert!(reg.bump_activity("s3"), "bump on known session must return true");
+        assert!(
+            reg.bump_activity("s3"),
+            "bump on known session must return true"
+        );
     }
 
     #[test]
@@ -647,15 +661,36 @@ mod tests {
     async fn sweep_removes_idle_expired_session() {
         let state = make_state_for_sweep();
         // idle = 2 min > short idle TTL of 1 min
-        insert_session_aged(&state, "idle-sess", "app-idle", "cap-idle", Duration::from_secs(10), Duration::from_secs(120));
+        insert_session_aged(
+            &state,
+            "idle-sess",
+            "app-idle",
+            "cap-idle",
+            Duration::from_secs(10),
+            Duration::from_secs(120),
+        );
         // fresh session: age = 5s, idle = 1s — well within any TTL
-        insert_session_aged(&state, "fresh-sess", "app-fresh", "cap-fresh", Duration::from_secs(5), Duration::from_secs(1));
+        insert_session_aged(
+            &state,
+            "fresh-sess",
+            "app-fresh",
+            "cap-fresh",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
 
-        let purged = sweep_expired(&state, Duration::from_secs(60), Duration::from_secs(3600)).await;
+        let purged =
+            sweep_expired(&state, Duration::from_secs(60), Duration::from_secs(3600)).await;
 
         assert_eq!(purged, vec!["idle-sess".to_owned()]);
-        assert!(state.dev_sessions.lookup("idle-sess").is_none(), "idle session must be removed");
-        assert!(state.dev_sessions.lookup("fresh-sess").is_some(), "fresh session must survive");
+        assert!(
+            state.dev_sessions.lookup("idle-sess").is_none(),
+            "idle session must be removed"
+        );
+        assert!(
+            state.dev_sessions.lookup("fresh-sess").is_some(),
+            "fresh session must survive"
+        );
     }
 
     /// Max-TTL-expired session is purged even if recently active.
@@ -663,9 +698,17 @@ mod tests {
     async fn sweep_removes_max_ttl_expired_session() {
         let state = make_state_for_sweep();
         // age = 2 min > short max TTL of 1 min; idle = 5s (still active)
-        insert_session_aged(&state, "old-sess", "app-old", "cap-old", Duration::from_secs(120), Duration::from_secs(5));
+        insert_session_aged(
+            &state,
+            "old-sess",
+            "app-old",
+            "cap-old",
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+        );
 
-        let purged = sweep_expired(&state, Duration::from_secs(3600), Duration::from_secs(60)).await;
+        let purged =
+            sweep_expired(&state, Duration::from_secs(3600), Duration::from_secs(60)).await;
 
         assert_eq!(purged, vec!["old-sess".to_owned()]);
         assert!(state.dev_sessions.lookup("old-sess").is_none());
@@ -675,10 +718,25 @@ mod tests {
     #[tokio::test]
     async fn sweep_removes_both_expired() {
         let state = make_state_for_sweep();
-        insert_session_aged(&state, "e1", "app-e1", "cap-e1", Duration::from_secs(10), Duration::from_secs(120));
-        insert_session_aged(&state, "e2", "app-e2", "cap-e2", Duration::from_secs(10), Duration::from_secs(120));
+        insert_session_aged(
+            &state,
+            "e1",
+            "app-e1",
+            "cap-e1",
+            Duration::from_secs(10),
+            Duration::from_secs(120),
+        );
+        insert_session_aged(
+            &state,
+            "e2",
+            "app-e2",
+            "cap-e2",
+            Duration::from_secs(10),
+            Duration::from_secs(120),
+        );
 
-        let mut purged = sweep_expired(&state, Duration::from_secs(60), Duration::from_secs(3600)).await;
+        let mut purged =
+            sweep_expired(&state, Duration::from_secs(60), Duration::from_secs(3600)).await;
         purged.sort();
 
         assert_eq!(purged, vec!["e1".to_owned(), "e2".to_owned()]);
@@ -689,10 +747,25 @@ mod tests {
     #[tokio::test]
     async fn sweep_keeps_fresh_sessions() {
         let state = make_state_for_sweep();
-        insert_session_aged(&state, "f1", "app-f1", "cap-f1", Duration::from_secs(5), Duration::from_secs(1));
-        insert_session_aged(&state, "f2", "app-f2", "cap-f2", Duration::from_secs(5), Duration::from_secs(1));
+        insert_session_aged(
+            &state,
+            "f1",
+            "app-f1",
+            "cap-f1",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        insert_session_aged(
+            &state,
+            "f2",
+            "app-f2",
+            "cap-f2",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
 
-        let purged = sweep_expired(&state, Duration::from_secs(3600), Duration::from_secs(7200)).await;
+        let purged =
+            sweep_expired(&state, Duration::from_secs(3600), Duration::from_secs(7200)).await;
 
         assert!(purged.is_empty(), "no sessions must be purged");
         assert_eq!(state.dev_sessions.len(), 2);
@@ -701,14 +774,37 @@ mod tests {
     /// After sweep, the git cap is revoked (proxy returns 403).
     #[tokio::test]
     async fn sweep_revokes_git_cap() {
+        use axum::body::Body;
+        use http::Request;
+        use tower::ServiceExt as _;
+
         let state = make_state_for_sweep();
-        insert_session_aged(&state, "cap-sess", "app-cap", "cap-to-revoke", Duration::from_secs(10), Duration::from_secs(120));
+        insert_session_aged(
+            &state,
+            "cap-sess",
+            "app-cap",
+            "cap-to-revoke",
+            Duration::from_secs(10),
+            Duration::from_secs(120),
+        );
 
         sweep_expired(&state, Duration::from_secs(60), Duration::from_secs(3600)).await;
 
-        // The cap must be revoked: git_sessions has no pub lookup; we confirm via
-        // the proxy route which returns 403 for unknown/revoked caps.
-        // We verify indirectly: the registry no longer holds the session.
         assert!(state.dev_sessions.lookup("cap-sess").is_none());
+
+        // The revoked cap must 403 at the git proxy (lookup happens BEFORE any
+        // upstream contact, so this never touches the network).
+        let app = crate::api::router((*state).clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/git/cap-to-revoke/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "swept session's cap must be revoked at the proxy"
+        );
     }
 }

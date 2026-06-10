@@ -62,14 +62,14 @@ pub use handlers::{
 // module as the handler. The aggregator `#[derive(OpenApi)] paths(crate::api::<fn>)`
 // looks for them under `crate::api`, so we re-export each one here.
 #[doc(hidden)]
-pub use handlers::{
-    __path_about, __path_build_app, __path_deploy_app, __path_get_app, __path_health,
-    __path_list_apps, __path_purge_app, __path_reset_app, __path_start_app, __path_stop_app,
-};
-#[doc(hidden)]
 pub use dev_sessions::{
     __path_create_dev_session, __path_delete_dev_session, __path_list_dev_sessions,
     __path_refresh_git_token,
+};
+#[doc(hidden)]
+pub use handlers::{
+    __path_about, __path_build_app, __path_deploy_app, __path_get_app, __path_health,
+    __path_list_apps, __path_purge_app, __path_reset_app, __path_start_app, __path_stop_app,
 };
 
 /// Shared handler state.

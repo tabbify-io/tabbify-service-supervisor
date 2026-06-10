@@ -545,12 +545,24 @@ async fn deploy_500_without_log_omits_tail_key() {
 
 /// `POST /v1/dev-sessions` with a valid body:
 /// - when the underlying `deploy_app` fails (no runner binary in test env) the
-///   response must NOT be 202 AND the git cap must be revoked (proxy 403) AND
-///   the dev-session registry must be empty.
+///   response must be 500 carrying `runner_log_tail` (the fixture log exists),
+///   the git cap must be revoked (no cap left registered → the proxy 403s every
+///   `/git/<cap>` request), and the dev-session registry must be empty.
 #[tokio::test]
 async fn create_dev_session_deploy_failure_cleans_up() {
     let dir = TempDir::new().unwrap();
-    let state = make_state(dir.path().to_path_buf());
+
+    // Pre-populate the runner log at <data_dir>/runners/<uuid>.log so the 500
+    // body carries the tail (same fixture as deploy_500_includes_runner_log_tail).
+    let runners_dir = dir.path().join("runners");
+    std::fs::create_dir_all(&runners_dir).unwrap();
+    std::fs::write(
+        runners_dir.join(format!("{APP_UUID}.log")),
+        "boot line 1\nFATAL: dev-FC spawn failed\n",
+    )
+    .unwrap();
+
+    let state = make_state_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
     let app = router(state.clone());
 
     let body = serde_json::json!({
@@ -571,17 +583,38 @@ async fn create_dev_session_deploy_failure_cleans_up() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    // Deploy must fail (no runner binary) → not 202.
-    assert_ne!(
+    // Deploy must fail (no runner binary) → 500 with the runner log tail.
+    assert_eq!(
         resp.status(),
-        StatusCode::ACCEPTED,
-        "create_dev_session with failing deploy must not return 202"
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "create_dev_session with failing deploy must return 500"
     );
+    let body = body_bytes(resp).await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tail = json
+        .get("runner_log_tail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        tail.contains("FATAL: dev-FC spawn failed"),
+        "500 body must include runner log tail; got body: {json}"
+    );
+
     // Dev-session registry must be empty (session not registered on failure).
     assert_eq!(
         state.dev_sessions.len(),
         0,
         "dev_sessions registry must be empty after deploy failure"
+    );
+
+    // The handler-generated cap must be REVOKED. It never leaves the handler on
+    // the error path, so assert via the registry snapshot: no caps remain — and
+    // with an empty registry the proxy 403s every `/git/<cap>` request (route
+    // behavior pinned by git_proxy_unknown_cap_403).
+    let leaked = state.git_sessions.registered_caps();
+    assert!(
+        leaked.is_empty(),
+        "git cap must be revoked after deploy failure; leaked caps: {leaked:?}"
     );
 }
 
@@ -645,8 +678,8 @@ async fn refresh_git_token_unknown_session_returns_404() {
 /// `POST /v1/dev-sessions/:id/git-token` for a KNOWN session returns 200.
 #[tokio::test]
 async fn refresh_git_token_known_session_returns_200() {
-    use std::time::{Duration, Instant};
     use crate::api::dev_sessions::DevSession;
+    use std::time::{Duration, Instant};
 
     let dir = TempDir::new().unwrap();
     let state = make_state(dir.path().to_path_buf());
@@ -722,8 +755,8 @@ async fn delete_dev_session_unknown_returns_404() {
 /// - a second DELETE returns 404.
 #[tokio::test]
 async fn delete_dev_session_known_returns_200_and_cleans_up() {
-    use std::time::{Duration, Instant};
     use crate::api::dev_sessions::DevSession;
+    use std::time::{Duration, Instant};
 
     let dir = TempDir::new().unwrap();
     let state = make_state(dir.path().to_path_buf());
@@ -771,6 +804,23 @@ async fn delete_dev_session_known_returns_200_and_cleans_up() {
         "session must be removed after DELETE"
     );
 
+    // The revoked cap must 403 at the git proxy (the lookup runs BEFORE any
+    // upstream contact, so this never touches the network).
+    {
+        let app = router(state.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/git/{cap}/info/refs?service=git-upload-pack"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "deleted session's cap must be revoked at the proxy"
+        );
+    }
+
     // Second DELETE: should return 404.
     {
         let app = router(state.clone());
@@ -805,15 +855,18 @@ async fn get_dev_sessions_empty_returns_200() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let sessions = json.get("sessions").and_then(|v| v.as_array()).unwrap();
-    assert!(sessions.is_empty(), "empty registry must return empty sessions array");
+    assert!(
+        sessions.is_empty(),
+        "empty registry must return empty sessions array"
+    );
 }
 
 /// `GET /v1/dev-sessions` with one session returns a single row with the
 /// expected fields.
 #[tokio::test]
 async fn get_dev_sessions_with_one_session_returns_row() {
-    use std::time::Instant;
     use crate::api::dev_sessions::DevSession;
+    use std::time::Instant;
 
     let dir = TempDir::new().unwrap();
     let state = make_state(dir.path().to_path_buf());
@@ -840,11 +893,21 @@ async fn get_dev_sessions_with_one_session_returns_row() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let sessions = json.get("sessions").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(sessions.len(), 1, "one session in registry must yield one row");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "one session in registry must yield one row"
+    );
     let row = &sessions[0];
-    assert_eq!(row.get("session_id").and_then(|v| v.as_str()), Some("list-sess"));
+    assert_eq!(
+        row.get("session_id").and_then(|v| v.as_str()),
+        Some("list-sess")
+    );
     assert_eq!(row.get("app_uuid").and_then(|v| v.as_str()), Some(APP_UUID));
-    assert!(row.get("created_age_secs").is_some(), "row must have created_age_secs");
+    assert!(
+        row.get("created_age_secs").is_some(),
+        "row must have created_age_secs"
+    );
     assert!(row.get("idle_secs").is_some(), "row must have idle_secs");
 }
 

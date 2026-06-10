@@ -61,6 +61,20 @@ impl GitSessions {
         }
     }
 
+    /// Test-only: snapshot the registered capability tokens. Lets the
+    /// dev-session tests assert a failed create leaves NO cap behind (the cap
+    /// never leaves the handler on the error path, so the registry is the only
+    /// place revocation is observable).
+    #[cfg(test)]
+    pub(crate) fn registered_caps(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .expect("git sessions lock")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Returns `(upstream_url, token)` if registered and unexpired.
     fn lookup(&self, cap: &str) -> Option<(String, String)> {
         let guard = self.0.lock().expect("git sessions lock");
