@@ -565,11 +565,18 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
 /// lines in order and POSIX sh honours the LAST definition of a variable, so
 /// deploy-time values win on key collision. This is the SINGLE merge primitive
 /// [`resolve_rootfs`] uses — tests exercise this exact production path.
+///
+/// Extra entries are emitted in SORTED key order: `HashMap` iteration is
+/// random-seeded per process, and an unsorted merge would make the rendered
+/// `/init` (and thus the rootfs bytes) nondeterministic across builds of the
+/// same image+env.
 pub fn merge_extra_env(
     oci_env: &mut Vec<String>,
     extra: &std::collections::HashMap<String, String>,
 ) {
-    oci_env.extend(extra.iter().map(|(k, v)| format!("{k}={v}")));
+    let mut pairs: Vec<_> = extra.iter().collect();
+    pairs.sort_by_key(|(k, _)| k.as_str());
+    oci_env.extend(pairs.into_iter().map(|(k, v)| format!("{k}={v}")));
 }
 
 /// Resolve the bootable rootfs for an app: cache-hit by digest (fc-3) → return
@@ -634,7 +641,15 @@ pub async fn resolve_rootfs(
     // is baked in.
     let mut entry = Entrypoint::from_oci(config);
     // Merge deploy-time extra env AFTER the OCI config.Env (see
-    // [`merge_extra_env`] for the collision contract).
+    // [`merge_extra_env`] for the collision contract). A shell-form entrypoint
+    // has no `OciExec.env` to merge into — `render_init` rejects it below (D3),
+    // but warn here so the dropped env is visible and not a silent surprise.
+    if extra_env.is_some() && !matches!(entry, Entrypoint::Exec(_)) {
+        tracing::warn!(
+            uuid,
+            "extra_env supplied but image entrypoint is shell-form; env cannot be merged"
+        );
+    }
     if let (Some(map), Entrypoint::Exec(exec)) = (extra_env, &mut entry) {
         merge_extra_env(&mut exec.env, map);
     }

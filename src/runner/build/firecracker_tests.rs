@@ -328,10 +328,13 @@ fn render_init_shell_form_returns_clear_error() {
 // ── extra_env: deploy-time vars baked into the guest /init ───────────────
 
 /// `merge_extra_env` — the EXACT primitive `resolve_rootfs` calls before
-/// `render_init` — appends deploy-time entries AFTER the OCI image's vars, and
-/// the rendered `/init` exports BOTH sets in that order so extra entries win on
-/// key collision (POSIX: last export wins) — the contract the supervisor relies
-/// on to bake SSH keys and git remotes into the devbox/dev-session guest.
+/// `render_init` — appends deploy-time entries AFTER the OCI image's vars
+/// (so extras win on key collision: POSIX, last export wins) and emits the
+/// extras in SORTED key order (`HashMap` iteration is random-seeded per
+/// process; unsorted extras would make the rendered `/init` — and the rootfs
+/// bytes — nondeterministic across builds). The exact-sequence assertion pins
+/// both contracts: insertion is deliberately NON-alphabetical so the unsorted
+/// impl fails this test with high probability.
 #[test]
 fn extra_env_merged_after_oci_env_and_exported_in_order() {
     let mut exec = OciExec {
@@ -340,9 +343,13 @@ fn extra_env_merged_after_oci_env_and_exported_in_order() {
         env: vec!["A=1".to_owned(), "B=oci".to_owned()],
         workdir: "/".to_owned(),
     };
+    // Five extra keys inserted in NON-alphabetical order; B collides with OCI B.
     let extra: std::collections::HashMap<String, String> = [
+        ("Z".to_owned(), "z".to_owned()),
         ("B".to_owned(), "override".to_owned()),
-        ("C".to_owned(), "new".to_owned()),
+        ("Q".to_owned(), "q".to_owned()),
+        ("D".to_owned(), "d".to_owned()),
+        ("M".to_owned(), "m".to_owned()),
     ]
     .into_iter()
     .collect();
@@ -351,22 +358,22 @@ fn extra_env_merged_after_oci_env_and_exported_in_order() {
 
     let init = render_init(&Entrypoint::Exec(exec)).unwrap();
 
-    // OCI var A must be present.
-    assert!(
-        init.contains("export A='1'"),
-        "OCI var A must be exported; got:\n{init}"
-    );
-    // Extra var C must be present.
-    assert!(
-        init.contains("export C='new'"),
-        "extra var C must be exported; got:\n{init}"
-    );
-    // B=oci (OCI) must appear BEFORE B=override (extra) so the last definition wins.
-    let oci_b_at = init.find("export B='oci'").expect("OCI B present");
-    let extra_b_at = init.find("export B='override'").expect("extra B present");
-    assert!(
-        oci_b_at < extra_b_at,
-        "OCI B must precede extra B so extra wins on collision; got:\n{init}"
+    // EXACT export sequence: OCI vars first (insertion order), then ALL extras
+    // in sorted key order. B appears twice — OCI first, extra last (so the
+    // extra definition wins in POSIX sh).
+    let exports: Vec<&str> = init.lines().filter(|l| l.starts_with("export ")).collect();
+    assert_eq!(
+        exports,
+        vec![
+            "export A='1'",
+            "export B='oci'",
+            "export B='override'",
+            "export D='d'",
+            "export M='m'",
+            "export Q='q'",
+            "export Z='z'",
+        ],
+        "exports must be: OCI vars in order, then extras in sorted key order; got:\n{init}"
     );
 }
 
