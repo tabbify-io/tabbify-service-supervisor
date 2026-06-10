@@ -1,6 +1,6 @@
 [package]
 name = "tabbify-service-supervisor"
-version = "1.4.39"
+version = "1.4.40"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -60,8 +60,9 @@ zstd = "0.13"
 # S3 fetch (anonymous HTTPS GET). rustls so musl static builds don't pull openssl.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
-# Identifiers / hashing / encoding
-uuid = { version = "1.23", features = ["v7", "serde"] }
+# Identifiers / hashing / encoding. `v4` exists for the dev-session git-proxy
+# capability salts (OS-CSPRNG randomness via the getrandom v7 already links).
+uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 blake3 = "1"
 # Base64 encoding for git proxy Basic auth header (git smart-HTTP dev sessions).
 base64 = "0.22"

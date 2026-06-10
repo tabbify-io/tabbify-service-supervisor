@@ -198,6 +198,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the dev-session idle reaper now that `state` (and its Arc) exists.
     // Scans every 60 s for sessions that exceeded idle or max-TTL thresholds.
+    // `state.clone()` shares the SAME registries as the router below: the
+    // `dev_sessions` / `git_sessions` / orchestrator fields are Arcs, so the
+    // clone is a handle, not a copy.
     let reaper_state = std::sync::Arc::new(state.clone());
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
