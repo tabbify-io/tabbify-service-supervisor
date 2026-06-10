@@ -179,7 +179,10 @@ pub async fn start_app(
         .await
     {
         Ok(s) => running_json(&s).into_response(),
-        Err(e) => anyhow_to_response(&e),
+        Err(e) => {
+            let tail = state.orchestrator.runner_log_tail(&uuid, 20).await;
+            anyhow_to_response_with_tail(&e, tail.as_deref())
+        }
     }
 }
 
@@ -359,7 +362,17 @@ pub async fn deploy_app(
         .await
     {
         Ok(s) => running_json(&s).into_response(),
-        Err(e) => anyhow_to_not_found_or_error(&e),
+        Err(e) => {
+            // Preserve the 404 contract for "no runner record found" errors.
+            // For all other failures surface the runner log tail in the 500 body.
+            let msg = e.to_string();
+            if msg.contains("no runner record found") {
+                return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": msg })))
+                    .into_response();
+            }
+            let tail = state.orchestrator.runner_log_tail(&uuid, 20).await;
+            anyhow_to_response_with_tail(&e, tail.as_deref())
+        }
     }
 }
 
@@ -547,10 +560,26 @@ fn fetch_error_response(e: &FetchError) -> Response {
 /// [`FetchError`] underneath maps via [`fetch_error_response`]; everything else
 /// is 500.
 fn anyhow_to_response(e: &anyhow::Error) -> Response {
+    anyhow_to_response_with_tail(e, None)
+}
+
+/// Like [`anyhow_to_response`] but appends `runner_log_tail` to the JSON body
+/// on 500 responses when `tail` is `Some`. Preserves the exact [`FetchError`]
+/// downcast behaviour: a `FetchError` still returns its own status code WITHOUT
+/// the tail (fetch errors are not spawn errors; their log is irrelevant).
+pub(super) fn anyhow_to_response_with_tail(e: &anyhow::Error, tail: Option<&str>) -> Response {
     if let Some(fe) = e.downcast_ref::<FetchError>() {
         return fetch_error_response(fe);
     }
-    error_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+    let msg = e.to_string();
+    match tail {
+        Some(t) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({ "error": msg, "runner_log_tail": t })),
+        )
+            .into_response(),
+        None => error_json(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+    }
 }
 
 /// Like [`anyhow_to_response`] but also maps "no runner record found" messages

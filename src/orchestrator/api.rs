@@ -564,6 +564,16 @@ impl Orchestrator {
         })
     }
 
+    /// Last `lines` lines of the per-app runner log (the spawned runner's
+    /// stdout/stderr land there — see `spawn.rs::open_runner_log`). Best-effort
+    /// diagnostics for spawn failures: a missing or unreadable file returns `None`.
+    pub async fn runner_log_tail(&self, uuid: &str, lines: usize) -> Option<String> {
+        let path = crate::orchestrator::spawn::runner_log_path(&self.shared().data_dir, uuid);
+        let text = tokio::fs::read_to_string(&path).await.ok()?;
+        let tail: Vec<&str> = text.lines().rev().take(lines).collect();
+        Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+    }
+
     /// Remove `uuid`'s on-disk runner record (best-effort; a missing file is
     /// success). After this the monitor will not respawn the runner.
     fn forget_record(&self, uuid: &str) {
@@ -1047,7 +1057,13 @@ mod tests {
             runner_join_token: Some("scoped-runner-jwt".to_owned()),
         };
         let result = o
-            .deploy_app(APP_UUID, "[fd5a::1]:5000/acme/app:sha256abc", None, None, net)
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:sha256abc",
+                None,
+                None,
+                net,
+            )
             .await;
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
 

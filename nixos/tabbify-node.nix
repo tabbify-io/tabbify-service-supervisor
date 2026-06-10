@@ -249,6 +249,11 @@ in {
       # forwards `--mesh-relay-only` to every runner it spawns (which share this
       # host's NAT/firewall), so the whole node converges over the relay.
       TABBIFY_MESH_RELAY_ONLY = "true";
+      # Always capture the Firecracker serial console: runners inherit this env
+      # and append guest console output to <data_dir>/fc/<uuid>.console.log
+      # (src/firecracker/linux.rs::console_stdio) — without it a spawn failure
+      # inside the guest is invisible (the 500 only carries the top-level error).
+      SUPERVISOR_FC_DEBUG    = "1";
       RUST_LOG               = "info";
     };
     serviceConfig = {

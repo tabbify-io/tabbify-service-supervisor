@@ -19,19 +19,26 @@ const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
 const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
 
 fn make_state(runner_dir: PathBuf) -> SupervisorState {
+    make_state_with_data_dir(runner_dir.clone(), PathBuf::from("/var/lib/tabbify/data"))
+}
+
+/// Like [`make_state`] but accepts an explicit `data_dir` (the directory where
+/// `<data_dir>/runners/<uuid>.log` lands). Used by tests that pre-populate a
+/// runner log fixture and want the orchestrator to find it.
+fn make_state_with_data_dir(runner_dir: PathBuf, data_dir: PathBuf) -> SupervisorState {
     let orchestrator = Orchestrator::new(
         SharedRunnerConfig {
             runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
             s3_base_url: "http://s3.invalid".to_owned(),
-            data_dir: PathBuf::from("/var/lib/tabbify/data"),
+            data_dir: data_dir.clone(),
             parent: None,
             no_mesh: true,
             relay_url: None,
             relay_only: false,
         },
-        runner_dir.clone(),
+        runner_dir,
     );
-    let fetcher = S3Fetcher::new("http://s3.invalid", PathBuf::from("/var/lib/tabbify/data"));
+    let fetcher = S3Fetcher::new("http://s3.invalid", data_dir);
     SupervisorState::new(
         orchestrator,
         fetcher,
@@ -401,5 +408,58 @@ async fn post_v1_build_rejects_bad_body() {
     assert!(
         status == 400 || status == 422,
         "malformed body must return 400 or 422, got {status}"
+    );
+}
+
+// ── POST /v1/apps/:uuid/deploy — 500 includes runner_log_tail ────────────
+
+/// A deploy that fails (no runner binary) AND has a pre-populated runner log
+/// must return 500 with `runner_log_tail` containing the last log line.
+///
+/// This pins the feature: spawn failures include the runner log tail in the
+/// 500 JSON body so remote diagnosis does not require SSH access to the worker.
+#[tokio::test]
+async fn deploy_500_includes_runner_log_tail() {
+    let dir = TempDir::new().unwrap();
+
+    // Pre-populate the runner log at <data_dir>/runners/<uuid>.log.
+    // The orchestrator's data_dir is the same temp dir for simplicity.
+    let runners_dir = dir.path().join("runners");
+    std::fs::create_dir_all(&runners_dir).unwrap();
+    std::fs::write(
+        runners_dir.join(format!("{APP_UUID}.log")),
+        "boot line 1\nboot line 2\nFATAL: tap device failed\n",
+    )
+    .unwrap();
+
+    // Use a state whose data_dir points at the temp dir so runner_log_tail
+    // can find the fixture file.
+    let state = make_state_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/apps/{APP_UUID}/deploy"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"ref":"reg:5000/a/b:sha"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    // Spawn must fail (no runner binary in test env) → 500.
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "deploy with no runner binary must return 500"
+    );
+
+    let body = body_bytes(resp).await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tail = json
+        .get("runner_log_tail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        tail.contains("FATAL: tap device failed"),
+        "500 body must include runner log tail; got body: {json}"
     );
 }

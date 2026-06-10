@@ -357,6 +357,16 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
     Ok((handle, child))
 }
 
+/// Canonical path of the per-app runner log: `<data_dir>/runners/<uuid>.log`.
+///
+/// Both [`open_runner_log`] (write side) and
+/// [`Orchestrator::runner_log_tail`](crate::orchestrator::Orchestrator::runner_log_tail)
+/// (read side) derive the path through this helper so the format lives in
+/// exactly one place.
+pub(crate) fn runner_log_path(data_dir: &Path, uuid: &str) -> PathBuf {
+    data_dir.join("runners").join(format!("{uuid}.log"))
+}
+
 /// Open (creating as needed) the per-app runner log at
 /// `<data_dir>/runners/<uuid>.log` for APPEND, returning the file handle.
 ///
@@ -366,9 +376,8 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
 /// than discarded to `/dev/null`. Append mode means a respawn does not clobber
 /// the previous run's log.
 fn open_runner_log(data_dir: &Path, uuid: &str) -> std::io::Result<std::fs::File> {
-    let log_dir = data_dir.join("runners");
-    std::fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!("{uuid}.log"));
+    let log_path = runner_log_path(data_dir, uuid);
+    std::fs::create_dir_all(log_path.parent().expect("runners/ dir always has a parent"))?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
