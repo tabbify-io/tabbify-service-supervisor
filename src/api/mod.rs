@@ -36,7 +36,10 @@ use crate::fetcher::S3Fetcher;
 use crate::orchestrator::Orchestrator;
 
 mod dto;
+mod git_proxy;
 mod handlers;
+
+pub use git_proxy::{GitSessionEntry, GitSessions};
 
 // ── Public re-exports — must remain stable for `crate::openapi` + tests. ─────
 
@@ -82,6 +85,10 @@ pub struct SupervisorState {
     pub version: String,
     /// When this process started serving — drives `/v1/about` uptime.
     pub started_at: std::time::Instant,
+    /// Dev-session git proxy registry: capability → upstream URL + token.
+    /// Credentials are injected here (outside VMs) and never forwarded to
+    /// sandboxes. See [`git_proxy`].
+    pub git_sessions: std::sync::Arc<GitSessions>,
 }
 
 impl SupervisorState {
@@ -104,6 +111,7 @@ impl SupervisorState {
             docker: false,
             version: String::new(),
             started_at: std::time::Instant::now(),
+            git_sessions: std::sync::Arc::new(GitSessions::default()),
         }
     }
 
@@ -133,6 +141,10 @@ impl SupervisorState {
 /// Build the axum [`Router`] with the supervisor CONTROL endpoints (no app
 /// serving — that lives on the per-app runners' own ULAs). Also mounts
 /// `/openapi.json` + `/swagger-ui` for the OpenAPI 3 doc.
+///
+/// The `/git/:cap/*tail` routes are the git smart-HTTP proxy for tokenless
+/// in-VM remotes (dev sessions). They are NOT included in the OpenAPI spec —
+/// they speak the git wire protocol, not REST.
 pub fn router(state: SupervisorState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -145,6 +157,12 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/reset", post(reset_app))
         .route("/v1/apps/:uuid/deploy", post(deploy_app))
         .route("/v1/build", post(build_app))
+        // Git smart-HTTP proxy — tokenless in-VM remote (dev sessions).
+        // Not in OpenAPI (wire protocol, not REST).
+        .route(
+            "/git/:cap/*tail",
+            get(git_proxy::git_proxy).post(git_proxy::git_proxy),
+        )
         .merge(crate::openapi::swagger_routes())
         .with_state(Arc::new(state))
 }

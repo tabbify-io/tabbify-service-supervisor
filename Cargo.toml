@@ -63,6 +63,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Identifiers / hashing / encoding
 uuid = { version = "1.23", features = ["v7", "serde"] }
 blake3 = "1"
+# Base64 encoding for git proxy Basic auth header (git smart-HTTP dev sessions).
+base64 = "0.22"
 # sha256 verification of fetched release binaries against the `latest` manifest
 # (self-update, contract spec §2). hex decodes/encodes the manifest digests.
 sha2 = "0.10"
