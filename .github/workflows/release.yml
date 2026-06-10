@@ -98,7 +98,9 @@ jobs:
             platform: linux/arm64
             legacy_key: ""
 
-    runs-on: ubuntu-latest
+    # Self-hosted Rust runner (Leo, 2026-06-11): heavy cargo builds run on the
+    # dedicated box; the light publish jobs below stay on ubuntu-latest.
+    runs-on: rust-runer
 
     steps:
       - name: Check out repository
