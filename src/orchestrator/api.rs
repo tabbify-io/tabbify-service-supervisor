@@ -29,11 +29,11 @@ use crate::{
     app_ula::derive_app_ula,
     control_proto::Reply,
     orchestrator::{
-        MONITOR_INTERVAL, Orchestrator,
         client::ControlClient,
         handle::RunnerHandle,
         restart::{self, BackoffParams, RestartStatus},
-        spawn::{SpawnSpec, spawn_runner},
+        spawn::{spawn_runner, SpawnSpec},
+        Orchestrator, MONITOR_INTERVAL,
     },
 };
 
@@ -163,6 +163,9 @@ impl Orchestrator {
             // these on a network-scoped cold spawn.
             network: None,
             runner_join_token: None,
+            // A plain start carries no deploy-time extra env; `deploy_app`
+            // overrides this on a cold spawn that supplies extra vars.
+            extra_env: None,
         }
     }
 
@@ -411,6 +414,7 @@ impl Orchestrator {
         runtime_override: Option<&str>,
         manifest_toml: Option<&str>,
         net: DeployNetwork,
+        extra_env: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
@@ -454,6 +458,11 @@ impl Orchestrator {
             if net.network.is_some() {
                 record.network = net.network.clone();
             }
+            // Persist this deploy's extra env so the durable record always
+            // reflects the LATEST deploy's baked-in vars. A `None` extra_env
+            // clears the previously-persisted map (a deploy with no extra env
+            // drops the old vars), mirroring the cold-spawn branch.
+            record.extra_env = extra_env.cloned();
             record
                 .save(self.runner_dir())
                 .with_context(|| format!("save runner record for {uuid} after deploy"))?;
@@ -481,6 +490,9 @@ impl Orchestrator {
             // NOT persisted). Both `None` keeps the unscoped spawn.
             spec.network = net.network.clone();
             spec.runner_join_token = net.runner_join_token.clone();
+            // Bake the deploy-time extra env into the guest via the runner.
+            // Persisted on the record so a RESPAWN re-bakes the same vars.
+            spec.extra_env = extra_env.cloned();
             let (handle, _child) = spawn_runner(&spec, self.runner_dir())
                 .await
                 .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -741,7 +753,7 @@ mod tests {
     fn app_summary_fields_crashloop() {
         use tempfile::TempDir;
 
-        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
+        use crate::orchestrator::restart::{status, BackoffParams, RestartState};
 
         let dir = TempDir::new().unwrap();
 
@@ -766,6 +778,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -792,7 +805,7 @@ mod tests {
     /// restart_count == 0.
     #[test]
     fn app_summary_fields_default_is_running() {
-        use crate::orchestrator::restart::{BackoffParams, RestartState, status};
+        use crate::orchestrator::restart::{status, BackoffParams, RestartState};
 
         let restart = RestartState::default();
         let now = 1_700_001_000u64;
@@ -818,7 +831,7 @@ mod tests {
     async fn reset_app_clears_restart_state_on_disk() {
         use tempfile::TempDir;
 
-        use crate::orchestrator::restart::{RestartState, should_respawn};
+        use crate::orchestrator::restart::{should_respawn, RestartState};
 
         let dir = TempDir::new().unwrap();
         let o = orch(dir.path().to_path_buf());
@@ -843,6 +856,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -910,7 +924,8 @@ mod tests {
                 "reg:5000/a/b:sha",
                 None,
                 None,
-                DeployNetwork::default()
+                DeployNetwork::default(),
+                None,
             )
             .await
             .is_err(),
@@ -935,6 +950,7 @@ mod tests {
                 None,
                 None,
                 DeployNetwork::default(),
+                None,
             )
             .await;
         assert!(
@@ -1003,13 +1019,14 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         };
         rec.save(dir.path()).unwrap();
 
         let o = orch(dir.path().to_path_buf());
         let reff = "[fd5a::1]:5000/acme/app:sha256abc";
         let result = o
-            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default())
+            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None)
             .await;
 
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
@@ -1075,6 +1092,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1090,6 +1108,7 @@ mod tests {
                 None,
                 None,
                 net,
+                None,
             )
             .await;
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
@@ -1167,6 +1186,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: Some(OLD_TOML.to_owned()),
+            extra_env: None,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1181,6 +1201,7 @@ mod tests {
                 None,
                 Some(NEW_TOML),
                 DeployNetwork::default(),
+                None,
             )
             .await;
         assert!(result.is_ok(), "live-swap deploy must succeed: {result:?}");

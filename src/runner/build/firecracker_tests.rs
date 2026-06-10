@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use super::oci_fixtures::{make_tar, write_min_oci_layout};
 use super::{
-    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, ext4_geometry,
-    extract_layer_blob, measure_tree, render_init,
+    build_rootfs_ext4, cached_rootfs_path, ext4_geometry, extract_layer_blob, measure_tree,
+    render_init, Entrypoint, FcBuildRunner, OciExec,
 };
 
 /// `oci-spec` links and parses an OCI image config's entrypoint/cmd/env/
@@ -37,13 +37,11 @@ fn oci_spec_parses_image_config_json() {
         &vec!["--port".to_owned(), "8080".to_owned()]
     );
     assert_eq!(inner.working_dir().as_ref().unwrap(), "/app");
-    assert!(
-        inner
-            .env()
-            .as_ref()
-            .unwrap()
-            .contains(&"RUST_LOG=info".to_owned())
-    );
+    assert!(inner
+        .env()
+        .as_ref()
+        .unwrap()
+        .contains(&"RUST_LOG=info".to_owned()));
 }
 
 /// `build_rootfs_ext4` must untar the layout's layers into a staging dir, then
@@ -325,6 +323,71 @@ fn render_init_shell_form_returns_clear_error() {
     );
 }
 
+// ── extra_env: deploy-time vars baked into the guest /init ───────────────
+
+/// When extra_env is merged into an OciExec before `render_init`, the rendered
+/// `/init` exports BOTH the OCI image's vars AND the extra vars. Extra entries
+/// appear AFTER the OCI vars so they win on key collision (POSIX: last export
+/// wins) — this is the contract the supervisor relies on to bake SSH keys and
+/// git remotes into the devbox/dev-session guest.
+#[test]
+fn extra_env_merged_after_oci_env_and_exported_in_order() {
+    let mut exec = OciExec {
+        entrypoint: vec!["/bin/app".to_owned()],
+        cmd: vec![],
+        env: vec!["A=1".to_owned(), "B=oci".to_owned()],
+        workdir: "/".to_owned(),
+    };
+    // Simulate what resolve_rootfs does: merge extra_env AFTER OCI env.
+    let extra: std::collections::HashMap<String, String> = [
+        ("B".to_owned(), "override".to_owned()),
+        ("C".to_owned(), "new".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    exec.env
+        .extend(extra.iter().map(|(k, v)| format!("{k}={v}")));
+
+    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+
+    // OCI var A must be present.
+    assert!(
+        init.contains("export A='1'"),
+        "OCI var A must be exported; got:\n{init}"
+    );
+    // Extra var C must be present.
+    assert!(
+        init.contains("export C='new'"),
+        "extra var C must be exported; got:\n{init}"
+    );
+    // B=oci (OCI) must appear BEFORE B=override (extra) so the last definition wins.
+    let oci_b_at = init.find("export B='oci'").expect("OCI B present");
+    let extra_b_at = init.find("export B='override'").expect("extra B present");
+    assert!(
+        oci_b_at < extra_b_at,
+        "OCI B must precede extra B so extra wins on collision; got:\n{init}"
+    );
+}
+
+/// Extra env values with special shell characters (spaces, $, quotes) are
+/// single-quoted in the rendered init, just like OCI env values — no injection.
+#[test]
+fn extra_env_values_are_single_quoted_in_init() {
+    let mut exec = OciExec {
+        entrypoint: vec!["/bin/app".to_owned()],
+        cmd: vec![],
+        env: vec![],
+        workdir: "/".to_owned(),
+    };
+    exec.env.push("KEY=ssh-ed25519 AAAA spaced key".to_owned());
+
+    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    assert!(
+        init.contains("export KEY='ssh-ed25519 AAAA spaced key'"),
+        "extra env value with spaces must be single-quoted in init; got:\n{init}"
+    );
+}
+
 /// `Entrypoint::from_oci` derives exec-form from a typed OCI config; an image
 /// with NO entrypoint AND no cmd is treated as shell-form (deferred).
 #[test]
@@ -479,6 +542,7 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
         digest,
         tmp.path(),
         &runner,
+        None,
     )
     .await
     .unwrap();
@@ -541,6 +605,7 @@ async fn resolve_rootfs_rejects_arch_mismatch_before_conversion() {
         digest,
         tmp.path(),
         &runner,
+        None,
     )
     .await
     .expect_err("arch mismatch must fail fast");
@@ -623,6 +688,7 @@ async fn resolve_rootfs_allows_matching_host_arch() {
         digest,
         tmp.path(),
         &runner,
+        None,
     )
     .await
     .expect("matching host arch must convert");
@@ -680,6 +746,7 @@ async fn run_fc_build_converts_on_cache_miss() {
         digest,
         tmp.path(),
         &runner,
+        None,
     )
     .await
     .unwrap();
@@ -742,9 +809,16 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
 
     // The VM boot at the end has no real Firecracker/KVM here, so this errors;
     // the docker-or-not assertion below holds on the recorded argv regardless.
-    let _ =
-        super::run_firecracker_build("uuid-nodocker", &fetched, &fc, tmp.path(), &runner, false)
-            .await;
+    let _ = super::run_firecracker_build(
+        "uuid-nodocker",
+        &fetched,
+        &fc,
+        tmp.path(),
+        &runner,
+        false,
+        None,
+    )
+    .await;
 
     let recorded = calls.lock().unwrap().clone();
     assert!(
@@ -1095,8 +1169,8 @@ async fn unpack_oci_layers_errors_on_diffid_count_mismatch() {
 }
 
 use super::oci_fixtures::{
-    MEDIA_TAR_GZIP, MEDIA_TAR_ZSTD, make_tar_gzip, make_tar_gzip_modes, make_tar_zstd,
-    write_min_oci_layout_typed,
+    make_tar_gzip, make_tar_gzip_modes, make_tar_zstd, write_min_oci_layout_typed, MEDIA_TAR_GZIP,
+    MEDIA_TAR_ZSTD,
 };
 
 /// PORTABLE (all-OS) prerequisite for the linux-gated real-conversion test: the
@@ -1522,7 +1596,8 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
 
     // Tag ref must NOT bail; the boot at the end errors (no KVM) — irrelevant to
     // the digest-derivation assertion below.
-    let _ = super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner, false).await;
+    let _ =
+        super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner, false, None).await;
 
     let recorded = calls.lock().unwrap().clone();
     // It pulled the layout (oras) for the tag ref instead of bailing.

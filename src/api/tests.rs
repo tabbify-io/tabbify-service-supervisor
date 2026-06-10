@@ -12,7 +12,7 @@ use tower::ServiceExt as _;
 use super::*;
 use crate::{
     fetcher::S3Fetcher,
-    orchestrator::{Orchestrator, SharedRunnerConfig, handle::RunnerHandle, restart::RestartState},
+    orchestrator::{handle::RunnerHandle, restart::RestartState, Orchestrator, SharedRunnerConfig},
 };
 
 const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
@@ -66,6 +66,7 @@ fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
         network: None,
         runner_join_token: None,
         manifest_toml: None,
+        extra_env: None,
     }
 }
 
@@ -186,6 +187,39 @@ fn deploy_body_phase2_fields_default_to_none() {
     assert!(body.runner_join_token.is_none());
 }
 
+/// A deploy body with an `env` map deserializes the map into `DeployBody.env`.
+/// This pins the serde path that the task spec requires.
+#[test]
+fn deploy_body_env_map_deserializes() {
+    let json = r#"{
+        "ref": "[fd5a::1]:5000/a/b:sha",
+        "env": {"TABBIFY_DEVBOX_AUTHORIZED_KEY": "ssh-ed25519 AAAA", "PORT": "9000"}
+    }"#;
+    let body: DeployBody = serde_json::from_str(json).unwrap();
+    let env = body.env.as_ref().expect("env field must be present");
+    assert_eq!(
+        env.get("TABBIFY_DEVBOX_AUTHORIZED_KEY").map(String::as_str),
+        Some("ssh-ed25519 AAAA"),
+        "TABBIFY_DEVBOX_AUTHORIZED_KEY must deserialize from body.env"
+    );
+    assert_eq!(
+        env.get("PORT").map(String::as_str),
+        Some("9000"),
+        "PORT must deserialize from body.env"
+    );
+}
+
+/// A deploy body WITHOUT `env` deserializes with `env = None` (normal deploy,
+/// backward-compatible — no env means the OCI image's own vars are used as-is).
+#[test]
+fn deploy_body_env_defaults_to_none() {
+    let body: DeployBody = serde_json::from_str(r#"{"ref":"x"}"#).unwrap();
+    assert!(
+        body.env.is_none(),
+        "env must be None when omitted from body"
+    );
+}
+
 // ── POST /v1/apps/:uuid/deploy — 404 for unknown uuid (no record) ─────────
 
 /// Posting deploy for a uuid that has no on-disk runner record and no live
@@ -260,6 +294,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
         network: None,
         runner_join_token: None,
         manifest_toml: None,
+        extra_env: None,
     };
     rec.save(dir.path()).unwrap();
 

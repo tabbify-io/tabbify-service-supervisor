@@ -4,7 +4,10 @@
 //! Extracted from the binary entrypoint so integration tests can exercise the
 //! same config → serve → control wiring path without spawning a subprocess.
 
-use crate::runner::{config::RunnerConfig, serve::ServeConfig};
+use crate::runner::{
+    config::{parse_extra_env, RunnerConfig},
+    serve::ServeConfig,
+};
 
 /// Map a parsed [`RunnerConfig`] to the [`ServeConfig`] that
 /// [`crate::runner::serve::RunnerServe::start`] accepts.
@@ -40,6 +43,10 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         // mesh join is scoped to its tenant network.
         network: cfg.network.clone(),
         runner_join_token: cfg.runner_join_token.clone(),
+        // Decode the `RUNNER_EXTRA_ENV` JSON string into the typed map so the
+        // build pipeline can merge deploy-time entries into the guest `/init`.
+        // A missing/blank/malformed value becomes `None` (safe fallback).
+        extra_env: parse_extra_env(cfg.extra_env_json.as_deref()),
     }
 }
 
@@ -89,7 +96,10 @@ mod tests {
     fn serve_config_from_carries_manifest_toml() {
         let cfg = parse(&["--manifest-toml", "[app]\nname = \"x\"\n"]);
         let serve = serve_config_from(&cfg);
-        assert_eq!(serve.manifest_toml.as_deref(), Some("[app]\nname = \"x\"\n"));
+        assert_eq!(
+            serve.manifest_toml.as_deref(),
+            Some("[app]\nname = \"x\"\n")
+        );
     }
 
     /// Absent the managed toml, `serve_config_from` leaves `manifest_toml` None

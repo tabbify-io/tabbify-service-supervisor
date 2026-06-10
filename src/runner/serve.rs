@@ -36,7 +36,7 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::{
@@ -206,6 +206,12 @@ pub struct ServeConfig {
     /// `None` keeps the current tokenless join (valid against a coordinator
     /// without `AUTH_URL`).
     pub runner_join_token: Option<String>,
+    /// Deploy-time extra `KEY=VALUE` environment variables baked into the guest
+    /// `/init`. Decoded from `RUNNER_EXTRA_ENV` (a JSON object) by the binary and
+    /// threaded into [`crate::build::build_runtime`] so the runner merges them
+    /// AFTER the OCI image's `config.Env` before calling `render_init`. `None`
+    /// means the guest gets exactly the OCI image's env (normal deploys).
+    pub extra_env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
@@ -252,10 +258,18 @@ impl RunnerServe {
         let fetched = resolve_app(&cfg).await?;
 
         // Cold start (first boot / monitor respawn): reconcile a stale VM +
-        // warm-restore allowed (`is_swap = false`).
-        let initial_runtime = build_runtime(&cfg.uuid, &fetched, &cfg.fc, &cfg.data_dir, false)
-            .await
-            .with_context(|| format!("build runtime for {}", cfg.uuid))?;
+        // warm-restore allowed (`is_swap = false`). Deploy-time extra env is
+        // merged AFTER the OCI image's config.Env inside run_firecracker_build.
+        let initial_runtime = build_runtime(
+            &cfg.uuid,
+            &fetched,
+            &cfg.fc,
+            &cfg.data_dir,
+            false,
+            cfg.extra_env.as_ref(),
+        )
+        .await
+        .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 
         // Wrap the initial runtime in a swappable cell so P2.3 can atomically
         // replace it for zero-downtime deploys without touching the listener or
@@ -340,6 +354,9 @@ impl RunnerServe {
             shutdown_tx: Arc::new(Mutex::new(None)),
             // Seed the same-ref guard with the initial build's ref.
             current_ref: Arc::new(Mutex::new(initial_ref)),
+            // Carry the deploy-time extra env into the lifecycle so a
+            // zero-downtime swap re-bakes the same vars into the new rootfs.
+            extra_env: cfg.extra_env,
         };
 
         Ok(Self {
@@ -573,6 +590,7 @@ mod tests {
             manifest_toml: None,
             network: None,
             runner_join_token: None,
+            extra_env: None,
         }
     }
 

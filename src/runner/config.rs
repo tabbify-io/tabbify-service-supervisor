@@ -9,7 +9,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::config::{DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL, DockerConfig, FcConfig};
+use crate::config::{DockerConfig, FcConfig, DEFAULT_COORDINATOR_URL, DEFAULT_S3_BASE_URL};
 
 /// Environment variable the runner reads its SCOPED node-join token from
 /// (Phase-2 contract). The node mints this per-deploy and the supervisor sets it
@@ -136,6 +136,15 @@ pub struct RunnerConfig {
     #[arg(skip)]
     pub runner_join_token: Option<String>,
 
+    /// Deploy-time extra `KEY=VALUE` environment variables baked into the guest
+    /// `/init`. Set by the supervisor via the `RUNNER_EXTRA_ENV` environment
+    /// variable as a JSON-encoded object (`{"KEY":"VALUE"}`); never a CLI flag
+    /// (the values may be credentials). Decoded once at startup and merged AFTER
+    /// the OCI image's `config.Env` so deploy-time entries win on key collision.
+    /// `None` ⇒ no extra env (guest gets exactly the OCI image's vars).
+    #[arg(long, env = "RUNNER_EXTRA_ENV")]
+    pub extra_env_json: Option<String>,
+
     /// Firecracker microVM runtime configuration.
     #[command(flatten)]
     pub firecracker: FcConfig,
@@ -157,6 +166,27 @@ pub fn runner_join_token_from_env() -> Option<String> {
     std::env::var(RUNNER_JOIN_TOKEN_ENV)
         .ok()
         .filter(|t| !t.trim().is_empty())
+}
+
+/// Decode the `RUNNER_EXTRA_ENV` JSON string into a `HashMap<String, String>`.
+/// Returns `None` when the string is absent or blank; logs a warning and returns
+/// `None` on a parse failure (a broken JSON must never wedge the runner).
+#[must_use]
+pub fn parse_extra_env(json: Option<&str>) -> Option<std::collections::HashMap<String, String>> {
+    let s = json?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<std::collections::HashMap<String, String>>(s) {
+        Ok(map) => Some(map),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "RUNNER_EXTRA_ENV is not valid JSON (ignoring); guest will use only the OCI image env"
+            );
+            None
+        }
+    }
 }
 
 impl RunnerConfig {

@@ -49,6 +49,7 @@ pub async fn build_runtime(
     fc: &FcConfig,
     data_dir: &std::path::Path,
     is_swap: bool,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     // Generic Firecracker (D11): convert the deployed OCI image into a
     // rootfs.ext4 (cached by digest) + a PID-1 init, then boot it via the
@@ -60,7 +61,7 @@ pub async fn build_runtime(
     // new coexist) from a COLD START (false: reconcile + warm-restore).
     let runner = crate::runner::build::firecracker::production_fc_build_runner();
     crate::runner::build::firecracker::run_firecracker_build(
-        uuid, fetched, fc, data_dir, &runner, is_swap,
+        uuid, fetched, fc, data_dir, &runner, is_swap, extra_env,
     )
     .await
 }
@@ -411,7 +412,8 @@ idle_timeout_sec = 120
     /// lifecycle must never silently flip a deployed app to lazy-start.
     #[test]
     fn fetched_from_ref_unknown_lifecycle_maps_to_always_on() {
-        let toml = "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nlifecycle = \"weird\"\n";
+        let toml =
+            "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nlifecycle = \"weird\"\n";
         let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
     }
@@ -426,7 +428,8 @@ idle_timeout_sec = 120
         let tmp = tempfile::tempdir().unwrap();
         let base = docker_fetched(None);
         let reff = "[fd5a::1]:5000/acme/app:sha";
-        let resolved = resolve_fetched(Ok(base.clone()), "u", Some(reff), None, tmp.path()).unwrap();
+        let resolved =
+            resolve_fetched(Ok(base.clone()), "u", Some(reff), None, tmp.path()).unwrap();
         // Override applied; every other field preserved (== fetched_with_ref).
         assert_eq!(
             resolved.manifest.runtime.registry_ref.as_deref(),

@@ -570,8 +570,20 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
 /// that layout by the caller ([`run_firecracker_build`]); `layout`/`config` are
 /// passed in here. On a cache hit neither is read.
 ///
+/// `extra_env` is merged AFTER the OCI `config.Env` entries so deploy-time
+/// values win on key collision (POSIX: last `export KEY=…` wins in the init
+/// script). When `None` the guest gets exactly the OCI image's env.
+///
+/// CACHE CONSTRAINT: the rootfs cache is keyed by `(uuid, digest)` —
+/// `cached_rootfs_path(data_dir, uuid, digest)`. Because `extra_env` is baked
+/// into the rootfs, changing env on the SAME uuid+digest would NOT rebuild the
+/// cache. In practice this is acceptable: a devbox always gets a fresh uuid on
+/// creation, and a dev-session also creates a fresh uuid, so the uuid+digest
+/// pair is always unique per deploy-time env configuration.
+///
 /// # Errors
 /// Shell-form entrypoint (D3) or conversion failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_rootfs(
     uuid: &str,
     fetched: &crate::fetcher::FetchedApp,
@@ -580,6 +592,7 @@ pub async fn resolve_rootfs(
     digest: &str,
     data_dir: &Path,
     runner: &FcBuildRunner,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<PathBuf> {
     let cached = cached_rootfs_path(data_dir, uuid, digest);
     if rootfs_is_cached(data_dir, uuid, digest) {
@@ -607,7 +620,14 @@ pub async fn resolve_rootfs(
     // (unpack → inject_init → mkfs) is the SINGLE shared primitive
     // `build_rootfs_ext4_inner` (fc-1) — we just pass `Some(&init)` so the init
     // is baked in.
-    let entry = Entrypoint::from_oci(config);
+    let mut entry = Entrypoint::from_oci(config);
+    // Merge deploy-time extra env AFTER the OCI config.Env. For exec-form
+    // entrypoints this appends KEY=VALUE strings to `OciExec.env`; `render_init`
+    // emits them as `export KEY='value'` lines in order, and POSIX sh honours the
+    // LAST definition of a variable, so extra-env entries win on collision.
+    if let (Some(map), Entrypoint::Exec(exec)) = (extra_env, &mut entry) {
+        exec.env.extend(map.iter().map(|(k, v)| format!("{k}={v}")));
+    }
     let init = render_init(&entry)?; // shell-form → clear error (D3)
 
     build_rootfs_ext4_inner(
@@ -1100,6 +1120,7 @@ pub async fn run_firecracker_build(
     data_dir: &Path,
     runner: &FcBuildRunner,
     is_swap: bool,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let reff = fetched
         .manifest
@@ -1132,7 +1153,7 @@ pub async fn run_firecracker_build(
             let work = digest_work_dir(data_dir, uuid, digest)?;
             let layout = pull_oci_layout(reff, &work, runner).await?;
             let config = read_oci_config_from_layout(&layout)?;
-            resolve_rootfs(uuid, fetched, &layout, &config, digest, data_dir, runner).await?
+            resolve_rootfs(uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env).await?
         }
     } else {
         // Tag ref: pull into a digest-INDEPENDENT `.pull` work dir (the digest is
@@ -1146,7 +1167,7 @@ pub async fn run_firecracker_build(
             cached_rootfs_path(data_dir, uuid, &digest)
         } else {
             let config = read_oci_config_from_layout(&layout)?;
-            resolve_rootfs(uuid, fetched, &layout, &config, &digest, data_dir, runner).await?
+            resolve_rootfs(uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env).await?
         }
     };
 

@@ -37,11 +37,11 @@
 use std::time::Duration;
 
 use crate::orchestrator::{
-    Orchestrator,
     client::ControlClient,
     handle::RunnerHandle,
-    restart::{BackoffParams, RestartState, on_exit, on_healthy, should_respawn},
+    restart::{on_exit, on_healthy, should_respawn, BackoffParams, RestartState},
     spawn::spawn_runner,
+    Orchestrator,
 };
 
 /// Liveness probe for runner processes: returns `true` iff `pid` is a live,
@@ -390,8 +390,8 @@ mod tests {
     use std::{
         path::PathBuf,
         sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         },
     };
 
@@ -399,7 +399,7 @@ mod tests {
 
     use super::*;
     use crate::orchestrator::{
-        Orchestrator, SharedRunnerConfig, handle::RunnerHandle, restart::RestartState,
+        handle::RunnerHandle, restart::RestartState, Orchestrator, SharedRunnerConfig,
     };
 
     fn now_secs() -> u64 {
@@ -657,6 +657,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         }
     }
 

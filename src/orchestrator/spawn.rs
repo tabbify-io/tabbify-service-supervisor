@@ -107,6 +107,14 @@ pub struct SpawnSpec {
     /// manifest. NOT persisted to the runner record (it is re-supplied per
     /// deploy). `None` (the default) keeps the hardcoded FC defaults.
     pub manifest_toml: Option<String>,
+    /// Deploy-time extra `KEY=VALUE` env vars baked into the guest `/init`.
+    /// Passed to the runner via the `RUNNER_EXTRA_ENV` environment variable as a
+    /// JSON-encoded object (same credential-safe pattern as `RUNNER_MANIFEST_TOML`).
+    /// The runner decodes it and appends entries AFTER the OCI image's `config.Env`
+    /// so deploy-time values win on key collision. PERSISTED on the runner record
+    /// so a respawn re-bakes the same env. `None` (the default) keeps the guest
+    /// env exactly as the OCI image declares it.
+    pub extra_env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -238,6 +246,24 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         }
     }
 
+    // Deploy-time extra env travels via the `RUNNER_EXTRA_ENV` env as a
+    // JSON-encoded `{"KEY":"VALUE"}` map (same credential-safe pattern as
+    // `RUNNER_MANIFEST_TOML` — stays off the arg list / `ps`). The runner
+    // decodes it and appends the entries AFTER the OCI config.Env so deploy-time
+    // values win on key collision. When `None`, clear the var on the child so an
+    // ambient value from the supervisor's own env never leaks into a deploy that
+    // carries no extra env.
+    match &spec.extra_env {
+        Some(map) => {
+            let encoded = serde_json::to_string(map)
+                .expect("extra_env HashMap<String,String> is always JSON-serialisable");
+            cmd.env("RUNNER_EXTRA_ENV", encoded);
+        }
+        None => {
+            cmd.env_remove("RUNNER_EXTRA_ENV");
+        }
+    }
+
     // Detach: become a new session leader so the runner is not in the
     // supervisor's process group and survives the supervisor's death / signals.
     //
@@ -340,6 +366,10 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // the connect-repo app's `[runtime]`/`[routes]` instead of reverting to
         // the hardcoded FC defaults. `None` on a deploy with no managed config.
         manifest_toml: spec.manifest_toml.clone(),
+        // Persist the deploy-time extra env so a RESPAWN-from-record re-bakes the
+        // same KEY=VALUE entries into the guest `/init` (devbox SSH key,
+        // dev-session git vars, etc.). `None` on a deploy with no extra env.
+        extra_env: spec.extra_env.clone(),
     };
 
     handle
@@ -406,6 +436,7 @@ mod tests {
             manifest_toml: None,
             network: None,
             runner_join_token: None,
+            extra_env: None,
         }
     }
 
@@ -897,6 +928,133 @@ mod tests {
             loaded.manifest_toml.as_deref(),
             Some(toml),
             "the saved record must persist the managed toml for a respawn"
+        );
+    }
+
+    /// The spec's `extra_env` is passed to the spawned runner via the
+    /// `RUNNER_EXTRA_ENV` env as a JSON-encoded map so deploy-time KEY=VALUE pairs
+    /// (SSH key, git remote, etc.) reach the runner process. We point the runner
+    /// at a wrapper that echoes that env var and assert the JSON lands in the log.
+    #[tokio::test]
+    async fn spawn_runner_passes_extra_env_via_env_var() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("extra-env-echo.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'EXTRA=[%s]\\n' \"${{RUNNER_EXTRA_ENV}}\"\n"
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-5050-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.extra_env = Some(
+            [("MY_KEY".to_owned(), "my_value".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("my_value"),
+            "the runner must receive extra_env via RUNNER_EXTRA_ENV (JSON); got: {contents:?}"
+        );
+    }
+
+    /// With no extra env, `RUNNER_EXTRA_ENV` is unset on the child so an ambient
+    /// value never leaks into a deploy that carries no extra env.
+    #[tokio::test]
+    async fn spawn_runner_omits_extra_env_var_when_none() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("extra-env-echo.sh");
+        {
+            let mut f = std::fs::File::create(&wrapper).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf 'EXTRA=[%s]\\n' \"${{RUNNER_EXTRA_ENV}}\"\n"
+            )
+            .unwrap();
+        }
+        let mut perm = std::fs::metadata(&wrapper).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perm).unwrap();
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-6060-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.extra_env = None;
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (_handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        let log_path = s.data_dir.join("runners").join(format!("{}.log", s.uuid));
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("EXTRA=[]"),
+            "no extra_env → RUNNER_EXTRA_ENV must be unset; got: {contents:?}"
+        );
+    }
+
+    /// The spec's `extra_env` is PERSISTED into the saved [`RunnerHandle`] so a
+    /// supervisor-driven RESPAWN re-bakes the same deploy-time env into the guest.
+    #[tokio::test]
+    async fn spawn_runner_persists_extra_env_into_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = write_echo_wrapper(dir.path(), "noop.sh", "OUT", "ERR");
+
+        let mut s = spec();
+        s.runner_bin = wrapper;
+        s.uuid = "0191e7c2-7070-7222-8333-444455556666".to_owned();
+        s.control_sock = dir.path().join("x.sock");
+        s.data_dir = dir.path().join("data");
+        s.extra_env = Some(
+            [("SSH_KEY".to_owned(), "ssh-ed25519 AAAA".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        std::fs::create_dir_all(&s.data_dir).unwrap();
+
+        let (handle, mut child) = spawn_runner(&s, dir.path()).await.unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(
+            handle
+                .extra_env
+                .as_ref()
+                .and_then(|m| m.get("SSH_KEY"))
+                .map(String::as_str),
+            Some("ssh-ed25519 AAAA"),
+            "the returned handle must carry the spec's extra_env"
+        );
+        let loaded = RunnerHandle::load(dir.path(), &s.uuid).unwrap().unwrap();
+        assert_eq!(
+            loaded
+                .extra_env
+                .as_ref()
+                .and_then(|m| m.get("SSH_KEY"))
+                .map(String::as_str),
+            Some("ssh-ed25519 AAAA"),
+            "the saved record must persist extra_env for a respawn"
         );
     }
 

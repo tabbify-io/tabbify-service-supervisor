@@ -4,9 +4,9 @@
 //! can enumerate it into the aggregated OpenAPI 3 document.
 
 use axum::{
-    Json,
     extract::{Path, State},
     response::{IntoResponse, Response},
+    Json,
 };
 use http::StatusCode;
 use serde::Deserialize;
@@ -14,11 +14,11 @@ use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{
-    SharedState,
     dto::{
         AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
         AppStopResponse, ErrorResponse, HealthResponse,
     },
+    SharedState,
 };
 use crate::{
     fetcher::FetchError,
@@ -286,6 +286,18 @@ pub struct DeployBody {
     /// FC defaults. Travels in the body only, never persisted.
     #[serde(default)]
     pub(super) manifest_toml: Option<String>,
+    /// Extra `KEY=VALUE` environment variables baked into the guest `/init` at
+    /// deploy time. Appended AFTER the OCI image's own `config.Env` so deploy-time
+    /// entries win on key collision (last `export` wins in a POSIX shell).
+    ///
+    /// Typical uses: `TABBIFY_DEVBOX_AUTHORIZED_KEY` for devbox SSH access,
+    /// `TABBIFY_GIT_REMOTE`/`TABBIFY_GIT_BRANCH` for dev-session git seeding.
+    ///
+    /// Persisted on the runner record so a respawn after a crash re-bakes the
+    /// same env (the guest is rebuilt from the same image+env). Omitted on normal
+    /// (non-devbox, non-dev-session) deploys.
+    #[serde(default)]
+    pub(super) env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Request body for `POST /v1/apps/:uuid/start`. All fields optional so a
@@ -358,6 +370,7 @@ pub async fn deploy_app(
             runtime_override.as_deref(),
             body.manifest_toml.as_deref(),
             net,
+            body.env.as_ref(),
         )
         .await
     {

@@ -18,14 +18,14 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{oneshot, Mutex};
 
 use crate::build::{build_runtime, fetched_with_ref};
 use crate::config::{DockerConfig, FcConfig};
 use crate::control_proto::{Cmd, Reply};
 use crate::fetcher::{FetchedApp, S3Fetcher};
 use crate::host::HostedApp;
-use crate::runner::active::{ActiveRuntime, perform_swap};
+use crate::runner::active::{perform_swap, ActiveRuntime};
 use crate::runtime::{AppRuntime, RuntimeHealth};
 
 /// How long the in-flight (old) runtime keeps serving after a `Deploy` swap
@@ -95,6 +95,12 @@ pub struct RunnerLifecycle {
     /// not duplicated. Guards [`RunnerLifecycle::deploy`] against a wasteful
     /// rebuild + tap collision when the requested ref already runs healthily.
     pub(crate) current_ref: Arc<Mutex<Option<String>>>,
+    /// Deploy-time extra `KEY=VALUE` env baked into the guest `/init`. Populated
+    /// from the runner's `RUNNER_EXTRA_ENV` at startup and passed into
+    /// [`build_runtime`] for both cold starts and zero-downtime swaps, so the
+    /// guest always gets the same deploy-time env regardless of how the runtime
+    /// is (re)built. `None` for a normal (non-devbox, non-dev-session) deploy.
+    pub(crate) extra_env: Option<std::collections::HashMap<String, String>>,
 }
 
 impl RunnerLifecycle {
@@ -196,8 +202,19 @@ impl RunnerLifecycle {
         // Deploy (`is_swap = true`): the OLD runtime keeps serving until
         // `perform_swap` flips; the new VM cold-boots `reff` on its own
         // `uuid:reff` tap so both coexist (no reconcile-kill of the old).
-        let new_runtime = match build_runtime(&self.uuid, &next_fetched, &self.fc, &self.data_dir, true)
-            .await
+        // Deploy (`is_swap = true`): the OLD runtime keeps serving; extra_env is
+        // the same deploy-time env the runner was launched with (populated from
+        // `RUNNER_EXTRA_ENV`), so the new rootfs gets the same vars as the
+        // initial build — no env drift across zero-downtime swaps.
+        let new_runtime = match build_runtime(
+            &self.uuid,
+            &next_fetched,
+            &self.fc,
+            &self.data_dir,
+            true,
+            self.extra_env.as_ref(),
+        )
+        .await
         {
             Ok(rt) => rt,
             Err(e) => {
@@ -427,6 +444,7 @@ mod tests {
             data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             current_ref: Arc::new(Mutex::new(None)),
+            extra_env: None,
         }
     }
 
@@ -565,7 +583,9 @@ mod tests {
                 message.contains("deploy"),
                 "error must mention deploy, got: {message}"
             ),
-            other => panic!("expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"),
+            other => panic!(
+                "expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"
+            ),
         }
     }
 }

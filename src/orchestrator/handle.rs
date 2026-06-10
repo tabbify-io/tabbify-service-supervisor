@@ -104,6 +104,13 @@ pub struct RunnerHandle {
     /// records written before this field existed (serde default).
     #[serde(default)]
     pub manifest_toml: Option<String>,
+    /// Deploy-time extra environment variables baked into the guest `/init`.
+    /// PERSISTED so a supervisor-driven RESPAWN re-bakes the same env (the guest
+    /// rootfs is rebuilt from the same image+env). `None` for apps with no
+    /// deploy-time env (normal deploys) and for records written before this field
+    /// existed (serde default).
+    #[serde(default)]
+    pub extra_env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -211,6 +218,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         }
     }
 
@@ -228,6 +236,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         }
     }
 
@@ -526,6 +535,64 @@ mod tests {
         assert!(
             h.manifest_toml.is_none(),
             "missing manifest_toml key must deserialize as None"
+        );
+    }
+
+    // ── extra_env field ───────────────────────────────────────────────────────
+
+    /// A handle with a persisted `extra_env` map must round-trip through
+    /// save → load so a supervisor-driven RESPAWN re-bakes the same deploy-time
+    /// env into the guest (devbox SSH key, dev-session git vars, etc.).
+    #[test]
+    fn extra_env_round_trips_via_save_load() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.extra_env = Some(
+            [
+                (
+                    "TABBIFY_DEVBOX_AUTHORIZED_KEY".to_owned(),
+                    "ssh-ed25519 AAAA…".to_owned(),
+                ),
+                ("PORT".to_owned(), "9000".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        h.save(dir.path()).unwrap();
+
+        let loaded = RunnerHandle::load(dir.path(), &h.uuid)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(
+            loaded
+                .extra_env
+                .as_ref()
+                .and_then(|m| m.get("TABBIFY_DEVBOX_AUTHORIZED_KEY"))
+                .map(String::as_str),
+            Some("ssh-ed25519 AAAA…"),
+            "extra_env must survive save/load so a respawn re-bakes the key"
+        );
+        assert_eq!(loaded, h);
+    }
+
+    /// JSON written before the `extra_env` field was added must deserialize with
+    /// `extra_env = None` so old records still load without breakage.
+    #[test]
+    fn extra_env_defaults_to_none_for_old_records() {
+        let json = r#"{
+            "uuid": "0191e7c2-1111-7222-8333-444455556666",
+            "pid": 12345,
+            "control_sock": "/var/run/tabbify/runners/0191e7c2.sock",
+            "app_ula": "fd5a:1f02:44a5:240b:121a::1",
+            "parent": null,
+            "spawned_at": 1700000000,
+            "image_ref": null,
+            "network": "n_jpegxik72nng"
+        }"#;
+        let h: RunnerHandle = serde_json::from_str(json).unwrap();
+        assert!(
+            h.extra_env.is_none(),
+            "missing extra_env key must deserialize as None"
         );
     }
 

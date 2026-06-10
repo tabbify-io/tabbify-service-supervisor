@@ -41,7 +41,7 @@ pub use api::{AppState, AppSummary};
 pub use client::ControlClient;
 pub use handle::RunnerHandle;
 use monitor::RecordOutcome;
-pub use spawn::{SpawnSpec, spawn_runner};
+pub use spawn::{spawn_runner, SpawnSpec};
 
 /// What a startup [`readopt`](Orchestrator::readopt) did to the recorded fleet.
 ///
@@ -139,6 +139,11 @@ impl SharedRunnerConfig {
             // outlives the runner's idle-outs/crashes for the app's whole life.
             // `None` for an unscoped runner (no tenant network).
             runner_join_token: record.runner_join_token.clone(),
+            // Reuse the PERSISTED deploy-time extra env so a RESPAWN-from-record
+            // re-bakes the same KEY=VALUE entries into the guest `/init` (devbox
+            // SSH key, dev-session git vars, etc.). `None` for an app with no
+            // deploy-time env (normal deploys without extra env).
+            extra_env: record.extra_env.clone(),
             // The runtime is no longer selectable — every app builds as
             // Firecracker, and a by-ref deploy synthesizes a firecracker manifest
             // — so the record's (now inert) `requested_runtime` is NOT read here.
@@ -346,6 +351,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             manifest_toml: None,
+            extra_env: None,
         }
     }
 
@@ -402,7 +408,8 @@ mod tests {
     fn spawn_spec_for_respawn_keeps_manifest_toml() {
         let cfg = shared();
         let mut rec = record();
-        rec.manifest_toml = Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
+        rec.manifest_toml =
+            Some("[app]\nname = \"sized\"\n[runtime]\nmemory_mb = 1024\n".to_owned());
         let spec = cfg.spawn_spec_for(&rec);
         assert_eq!(
             spec.manifest_toml.as_deref(),
