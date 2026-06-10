@@ -76,7 +76,15 @@ impl GitSessions {
 
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    // connect_timeout only — an unreachable provider must fail fast (502 to the
+    // VM) instead of hanging git ops on the OS TCP timeout (~2min). No TOTAL
+    // timeout: pack transfers are legitimately minutes-long.
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("git proxy http client")
+    })
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -132,13 +140,16 @@ pub async fn git_proxy(
     let auth_header = format!("Basic {credentials}");
 
     // Extract method, headers, and query BEFORE consuming the request body.
-    // Copy only the git wire-protocol headers (Content-Type + Accept).
+    // Copy only the git wire-protocol headers (Content-Type + Accept +
+    // Git-Protocol — modern git sends `Git-Protocol: version=2` on info/refs;
+    // dropping it silently downgrades to v1 and defeats `--filter` clones).
     // Notably we do NOT forward Authorization, Host, or any other header that
     // could carry credentials or routing hints from the VM.
     let method = req.method().clone();
     let inbound_headers = req.headers();
     let content_type = inbound_headers.get(http::header::CONTENT_TYPE).cloned();
     let accept = inbound_headers.get(http::header::ACCEPT).cloned();
+    let git_protocol = inbound_headers.get("git-protocol").cloned();
 
     // Stream the request body to the upstream so multi-MB pack files don't
     // buffer in memory.
@@ -159,6 +170,9 @@ pub async fn git_proxy(
     }
     if let Some(acc) = accept {
         builder = builder.header(reqwest::header::ACCEPT, acc.as_bytes());
+    }
+    if let Some(gp) = git_protocol {
+        builder = builder.header("Git-Protocol", gp.as_bytes());
     }
 
     let upstream_resp = match builder.body(body).send().await {
@@ -277,6 +291,9 @@ mod tests {
             .and(path("/info/refs"))
             .and(query_param("service", "git-upload-pack"))
             .and(header("Authorization", expected_auth.as_str()))
+            // Modern git negotiates protocol v2 via this header on info/refs;
+            // the proxy must forward it or clones silently downgrade to v1.
+            .and(header("Git-Protocol", "version=2"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(b"001e# service=git-upload-pack\n0000".to_vec())
@@ -296,6 +313,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/git/cap-abc/info/refs?service=git-upload-pack")
+            .header("Git-Protocol", "version=2")
             .body(Body::empty())
             .unwrap();
 
