@@ -350,6 +350,18 @@ fn git_remote_host_ip_matches_fc_launch_host_ip() {
         "git_remote host_ip must equal the FC tap's host_ip (the guest's default gateway)"
     );
 
+    // PIN: the equality assert above recomputes the same chain on both sides, so
+    // a key-format / derivation change would shift both together and pass
+    // silently. Pin the LITERAL host_ip for this fixed (uuid, image_ref, default
+    // subnet) so any such change fails here. Computed once from the real blake3
+    // derivation: vm_key = "cc4bfba2-…:[fd5a::1]:5000/tabbify/devbox:latest" →
+    // link_idx 394 → host 172.31.0.0 + 394*4 + 1 = 172.31.6.41.
+    assert_eq!(
+        derived, "172.31.6.41",
+        "host_ip for the pinned (uuid, image_ref, 172.31.0.0/16) must be the baked literal; \
+         a change here means the key-format or /30 derivation moved"
+    );
+
     // The full git_remote URL must carry the correct host and port.
     let cap = "testcap1234";
     let git_remote = format!("http://{derived}:{GIT_PROXY_IPV4_PORT}/git/{cap}");

@@ -956,6 +956,13 @@ pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
 /// Rules are idempotent (`-C ... || -I ...`). Called ONCE at startup from
 /// `main.rs` — not per-VM, because the port and subnet are host-global.
 ///
+/// SAFETY ORDERING: if the tap-subnet ACCEPT cannot be installed, we DO NOT
+/// install the uplink DROP — a DROP at INPUT position 1 without the preceding
+/// ACCEPT would also drop tap traffic and silently break guest `git clone`.
+///
+/// TODO: no teardown for these INPUT rules (idempotent `-C` guards dupes;
+/// revisit if port/subnet become dynamic). Matches the NAT teardown honesty.
+///
 /// FOLLOW-UP: consider restricting further with `--src-range` on the /30
 /// subnet; for now the /16 is narrow enough for a home/lab host.
 pub(crate) async fn setup_git_proxy_firewall(tap_subnet: &str, git_proxy_port: u16) {
@@ -983,7 +990,11 @@ pub(crate) async fn setup_git_proxy_firewall(tap_subnet: &str, git_proxy_port: u
         "-I", "INPUT", "1", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
     ];
     if let Err(e) = ensure_iptables(&accept_check, &accept_add).await {
-        tracing::warn!(error = %e, "git proxy firewall: INPUT ACCEPT for tap subnet failed (guests may be blocked)");
+        // CRITICAL: do NOT install the uplink DROP without the ACCEPT guard in
+        // place — a position-1 DROP would also drop tap traffic and silently
+        // break guest `git clone`. Bail (the cap is still the primary guard).
+        tracing::warn!(error = %e, "git proxy firewall: INPUT ACCEPT for tap subnet failed; skipping uplink DROP to avoid blocking guests");
+        return;
     }
 
     // DROP inbound on the uplink interface to the git proxy port. Inserted

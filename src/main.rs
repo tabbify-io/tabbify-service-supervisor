@@ -227,9 +227,12 @@ async fn main() -> anyhow::Result<()> {
     // port 8730 is unreachable from inside. This listener shares the SAME
     // `GitSessions` Arc as the mesh router (no second registry).
     //
-    // iptables guard (best-effort): DROP inbound on the WiFi uplink to this port;
-    // ACCEPT from the FC tap subnet. The 256-bit capability is the real auth gate;
-    // iptables is depth-in-defence. Only installed on Linux (where FC runs).
+    // ORDERING: bind → install the iptables guard → THEN spawn `serve`. The
+    // firewall (DROP inbound on the WiFi uplink, ACCEPT from the FC tap subnet)
+    // is awaited BEFORE the serve task accepts any connection, so port 8788 is
+    // never WiFi-reachable even for the ~hundreds of ms it takes to install the
+    // rules. The 256-bit capability is the real auth gate; iptables is
+    // depth-in-defence. Only installed on Linux (where FC runs).
     {
         let tap_subnet = config.firecracker.tap_subnet.clone();
         let ipv4_bind = SocketAddr::from(([0, 0, 0, 0], GIT_PROXY_IPV4_PORT));
@@ -239,15 +242,9 @@ async fn main() -> anyhow::Result<()> {
                     port = GIT_PROXY_IPV4_PORT,
                     "git proxy IPv4 listener bound (FC guest gateway reachable)"
                 );
-                let shared_state = std::sync::Arc::new(state.clone());
-                let ipv4_router = git_proxy_ipv4_router(shared_state);
-                tokio::spawn(async move {
-                    if let Err(e) = axum::serve(ipv4_listener, ipv4_router).await {
-                        tracing::error!(error = %e, "git proxy IPv4 listener error");
-                    }
-                });
 
-                // Best-effort iptables guard: only meaningful on Linux.
+                // Install the firewall BEFORE serving so the exposure window
+                // (bound but unguarded) is closed. Best-effort; only on Linux.
                 #[cfg(target_os = "linux")]
                 {
                     tabbify_supervisor::firecracker::linux::setup_git_proxy_firewall(
@@ -258,6 +255,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = tap_subnet;
+
+                // Only NOW start accepting connections — the guard is in place.
+                let shared_state = std::sync::Arc::new(state.clone());
+                let ipv4_router = git_proxy_ipv4_router(shared_state);
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(ipv4_listener, ipv4_router).await {
+                        tracing::error!(error = %e, "git proxy IPv4 listener error");
+                    }
+                });
             }
             Err(e) => {
                 tracing::warn!(
