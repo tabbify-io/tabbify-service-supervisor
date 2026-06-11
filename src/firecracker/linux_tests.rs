@@ -123,6 +123,7 @@ async fn real_vm_boots_and_serves() {
         fuel_per_request: 0,
         memory_mb: 256,
         vcpus: None,
+        port: None,
         kernel: None,
         registry_ref: None,
     };

@@ -155,6 +155,7 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
                 fuel_per_request: 0,
                 memory_mb,
                 vcpus: Some(vcpus),
+                port: None,
                 kernel: None,
                 registry_ref: Some(reff.to_owned()),
             },
@@ -269,6 +270,7 @@ mod tests {
                     fuel_per_request: 0,
                     memory_mb: 64,
                     vcpus: None,
+                    port: None,
                     kernel: None,
                     registry_ref,
                 },
@@ -412,7 +414,8 @@ idle_timeout_sec = 120
     /// lifecycle must never silently flip a deployed app to lazy-start.
     #[test]
     fn fetched_from_ref_unknown_lifecycle_maps_to_always_on() {
-        let toml = "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nlifecycle = \"weird\"\n";
+        let toml =
+            "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n[runtime]\nlifecycle = \"weird\"\n";
         let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
     }
@@ -427,7 +430,8 @@ idle_timeout_sec = 120
         let tmp = tempfile::tempdir().unwrap();
         let base = docker_fetched(None);
         let reff = "[fd5a::1]:5000/acme/app:sha";
-        let resolved = resolve_fetched(Ok(base.clone()), "u", Some(reff), None, tmp.path()).unwrap();
+        let resolved =
+            resolve_fetched(Ok(base.clone()), "u", Some(reff), None, tmp.path()).unwrap();
         // Override applied; every other field preserved (== fetched_with_ref).
         assert_eq!(
             resolved.manifest.runtime.registry_ref.as_deref(),

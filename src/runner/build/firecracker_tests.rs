@@ -499,6 +499,7 @@ fn fc_fetched_ref(registry_ref: &str) -> FetchedApp {
                 fuel_per_request: 0,
                 memory_mb: 128,
                 vcpus: Some(2),
+                port: None,
                 kernel: None,
                 registry_ref: Some(registry_ref.to_owned()),
             },

@@ -103,6 +103,7 @@ fn make_fc_fetched(uuid: &str, digest: &str) -> tabbify_supervisor::fetcher::Fet
                 fuel_per_request: 0,
                 memory_mb: 256,
                 vcpus: Some(1),
+                port: None,
                 kernel: None,
                 registry_ref: Some(format!("[fd5a::1]:5000/test/hello@{digest}")),
             },

@@ -89,8 +89,8 @@ mod tests {
     use super::protocol::{
         boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
         kvm_available_with, machine_config_body, network_iface_body, parse_status_line, pause_body,
-        read_http_status, resolve_vcpus, resume_body, rootfs_drive_body, snapshot_create_body,
-        snapshot_load_body,
+        read_http_status, resolve_port, resolve_vcpus, resume_body, rootfs_drive_body,
+        snapshot_create_body, snapshot_load_body,
     };
     use crate::config::FcConfig;
     use crate::manifest::Runtime;
@@ -103,6 +103,7 @@ mod tests {
             fuel_per_request: 0,
             memory_mb: 1536,
             vcpus,
+            port: None,
             kernel: None,
             registry_ref: None,
         }
@@ -153,6 +154,26 @@ mod tests {
         let b = machine_config_body(resolve_vcpus(&rt, &cfg), rt.memory_mb);
         assert_eq!(b["vcpu_count"], 2);
         assert_eq!(b["mem_size_mib"], 1536);
+    }
+
+    /// The managed `[runtime].port` override drives the readiness-probe / proxy
+    /// target: `Some(8788)` (e.g. www-backend) must win over the configured
+    /// default (8080), so a non-8080 image runs as an FC app unchanged.
+    #[test]
+    fn resolve_port_prefers_manifest_override_over_config_default() {
+        let cfg = FcConfig::default(); // cfg.app_port == 8080
+        let mut rt = fc_runtime(None);
+        rt.port = Some(8788);
+        assert_eq!(resolve_port(&rt, &cfg), 8788);
+    }
+
+    /// When the manifest omits `port`, the supervisor's configured default
+    /// (`FcConfig::app_port`) is used — preserves the 8080 status quo.
+    #[test]
+    fn resolve_port_falls_back_to_config_default_when_absent() {
+        let cfg = FcConfig::default(); // 8080
+        let rt = fc_runtime(None); // port: None
+        assert_eq!(resolve_port(&rt, &cfg), 8080);
     }
 
     #[test]

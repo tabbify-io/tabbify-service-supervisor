@@ -25,6 +25,17 @@ pub fn resolve_vcpus(rt: &Runtime, cfg: &FcConfig) -> u32 {
     rt.vcpus.unwrap_or(cfg.vcpus)
 }
 
+/// Resolve the guest port the supervisor probes + reverse-proxies for this app.
+///
+/// Mirrors [`resolve_vcpus`]: the manifest's `[runtime].port` override wins, and
+/// `None` falls back to the supervisor's configured default (`FcConfig::app_port`,
+/// 8080). This is the single source of truth so an image that serves a non-8080
+/// port (e.g. www's `8788`/`3000`) runs as an FC app without being forced onto 8080.
+#[must_use]
+pub fn resolve_port(rt: &Runtime, cfg: &FcConfig) -> u16 {
+    rt.port.unwrap_or(cfg.app_port)
+}
+
 /// Hop-by-hop headers (RFC 7230 §6.1) that MUST NOT be forwarded when
 /// proxying between the inbound request and the guest, nor copied back from
 /// the guest response. Lower-cased for case-insensitive match.

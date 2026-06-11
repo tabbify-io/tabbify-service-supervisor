@@ -119,6 +119,12 @@ pub struct RuntimeSection {
     /// vCPUs (firecracker).
     #[serde(default = "default_vcpus")]
     pub vcpus: u32,
+    /// Port the guest app listens on (firecracker). `None` → the supervisor's
+    /// configured default (8080). Lets a service whose image serves a non-8080
+    /// port (e.g. www-backend `8788`, www-frontend `3000`) run as an FC app
+    /// unchanged. Optional + forward-compat.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 impl Default for RuntimeSection {
@@ -128,6 +134,7 @@ impl Default for RuntimeSection {
             idle_timeout_sec: default_idle(),
             memory_mb: default_mem(),
             vcpus: default_vcpus(),
+            port: None,
         }
     }
 }
@@ -227,6 +234,7 @@ impl UnifiedManifest {
                 fuel_per_request: 1_000_000_000,
                 memory_mb: self.runtime.memory_mb,
                 vcpus: Some(self.runtime.vcpus),
+                port: self.runtime.port,
                 kernel: None,
                 registry_ref: None,
             },
@@ -525,8 +533,14 @@ lifecycle = "always_on"
     /// AND any UNKNOWN value ⇒ AlwaysOn (the FC live-path default).
     #[test]
     fn lifecycle_mode_fallback_is_consistent() {
-        assert_eq!(lifecycle_mode_from_str("on_request"), LifecycleMode::OnRequest);
-        assert_eq!(lifecycle_mode_from_str("always_on"), LifecycleMode::AlwaysOn);
+        assert_eq!(
+            lifecycle_mode_from_str("on_request"),
+            LifecycleMode::OnRequest
+        );
+        assert_eq!(
+            lifecycle_mode_from_str("always_on"),
+            LifecycleMode::AlwaysOn
+        );
         // Unknown → AlwaysOn (NOT OnRequest): aligns derive_app_manifest with the
         // connect-repo synthesis so an unknown lifecycle never silently lazy-starts.
         assert_eq!(lifecycle_mode_from_str("weird"), LifecycleMode::AlwaysOn);

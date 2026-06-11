@@ -21,7 +21,7 @@ use tokio::process::{Child, Command};
 use super::pidfile;
 use super::protocol::{
     boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
-    proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
+    proxy_request, read_http_status, resolve_port, resolve_vcpus, resume_body, rootfs_drive_body,
     snapshot_create_body, snapshot_load_body,
 };
 use super::snapshot;
@@ -210,7 +210,7 @@ impl FirecrackerRuntime {
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_mac = derive_guest_mac(link_idx);
-        let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
+        let guest_base = format!("http://{guest_ip}:{}", resolve_port(rt, cfg));
         tracing::debug!(
             link_idx,
             %host_ip,
@@ -345,7 +345,14 @@ impl FirecrackerRuntime {
                 pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
             }
             if snapshot::files_present(&cache_dir) {
-                match Self::launch_from_snapshot(&cache_dir, cfg, Some(&console_log), &vm_key).await
+                match Self::launch_from_snapshot(
+                    &cache_dir,
+                    cfg,
+                    Some(&console_log),
+                    &vm_key,
+                    resolve_port(rt, cfg),
+                )
+                .await
                 {
                     Ok(warm_vm) => {
                         tracing::info!(uuid, "warm start from snapshot");
@@ -407,6 +414,7 @@ impl FirecrackerRuntime {
         cfg: &FcConfig,
         console_log: Option<&Path>,
         vm_key: &str,
+        app_port: u16,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -427,7 +435,7 @@ impl FirecrackerRuntime {
         let (tap_name, link_idx) = fc_identity_for_key(vm_key);
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
-        let guest_base = format!("http://{guest_ip}:{}", cfg.app_port);
+        let guest_base = format!("http://{guest_ip}:{app_port}");
         tracing::debug!(
             link_idx,
             %host_ip,

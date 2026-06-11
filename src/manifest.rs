@@ -90,6 +90,14 @@ pub struct Runtime {
     /// future schema field never breaks parsing (no `deny_unknown_fields`).
     #[serde(default)]
     pub vcpus: Option<u32>,
+    /// Port the guest app listens on (firecracker only). `None` → the
+    /// supervisor's configured default (`FcConfig::app_port`, 8080). The
+    /// supervisor's readiness probe + reverse proxy target this port inside the
+    /// guest. Optional + forward-compat (no `deny_unknown_fields`). Lets a
+    /// service whose image serves a non-8080 port (e.g. www `8788`/`3000`) run
+    /// as an FC app without forcing every image onto 8080.
+    #[serde(default)]
+    pub port: Option<u16>,
     /// Guest kernel image path/name (firecracker only). `None` → the
     /// supervisor's configured default kernel.
     #[serde(default)]

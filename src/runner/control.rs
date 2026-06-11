@@ -417,6 +417,7 @@ mod tests {
                     fuel_per_request: 0,
                     memory_mb: 2048,
                     vcpus: Some(2),
+                    port: None,
                     kernel: None,
                     registry_ref: None,
                 },
@@ -582,7 +583,9 @@ mod tests {
                 message.contains("deploy"),
                 "error must mention deploy, got: {message}"
             ),
-            other => panic!("expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"),
+            other => panic!(
+                "expected Err (build attempted) for unhealthy same-ref deploy, got {other:?}"
+            ),
         }
     }
 }
