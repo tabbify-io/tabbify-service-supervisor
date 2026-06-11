@@ -247,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
                 // (bound but unguarded) is closed. Best-effort; only on Linux.
                 #[cfg(target_os = "linux")]
                 {
-                    tabbify_supervisor::firecracker::linux::setup_git_proxy_firewall(
+                    tabbify_supervisor::firecracker::setup_git_proxy_firewall(
                         &tap_subnet,
                         GIT_PROXY_IPV4_PORT,
                     )

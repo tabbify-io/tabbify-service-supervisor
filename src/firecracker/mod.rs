@@ -57,6 +57,11 @@ pub use linux::FirecrackerRuntime;
 #[cfg(not(target_os = "linux"))]
 pub use stub::FirecrackerRuntime;
 
+// Re-exported `pub` (the `linux` module itself is only `pub(crate)`) so the
+// `supervisord` binary can install the git-proxy IPv4 firewall at startup.
+#[cfg(target_os = "linux")]
+pub use linux::setup_git_proxy_firewall;
+
 /// Path to the KVM device node; presence + R/W openability gates firecracker.
 const DEV_KVM: &str = "/dev/kvm";
 

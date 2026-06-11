@@ -965,7 +965,7 @@ pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
 ///
 /// FOLLOW-UP: consider restricting further with `--src-range` on the /30
 /// subnet; for now the /16 is narrow enough for a home/lab host.
-pub(crate) async fn setup_git_proxy_firewall(tap_subnet: &str, git_proxy_port: u16) {
+pub async fn setup_git_proxy_firewall(tap_subnet: &str, git_proxy_port: u16) {
     let port_str = git_proxy_port.to_string();
     let Some(uplink) = default_route_dev().await else {
         tracing::warn!("git proxy firewall: no default-route uplink found; WiFi DROP rule skipped");
