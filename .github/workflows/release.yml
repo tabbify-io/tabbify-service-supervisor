@@ -98,9 +98,10 @@ jobs:
             platform: linux/arm64
             legacy_key: ""
 
-    # Self-hosted Rust runner (Leo, 2026-06-11): heavy cargo builds run on the
-    # dedicated box; the light publish jobs below stay on ubuntu-latest.
-    runs-on: rust-runer
+    # NOTE (2026-06-11): temporarily back on ubuntu-latest to unblock the 1.4.40
+    # release — the self-hosted `rust-runer` will be re-enabled once it runs on a
+    # stable always-on box (the Mac Docker Desktop proved too flaky over hotspot).
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
