@@ -162,6 +162,11 @@ mod tests {
         let args = b["boot_args"].as_str().unwrap();
         assert!(args.contains("ip=172.31.0.2::172.31.0.1:255.255.255.252::eth0:off"));
         assert!(args.contains("console=ttyS0"));
+        // root + init are emitted EXPLICITLY so the boot args do not depend on a
+        // kernel's built-in CONFIG_CMDLINE — lets the stock FC CI kernel (ACPI
+        // on, no idle core-spin) boot the generic-FC rootfs. Regression-loud.
+        assert!(args.contains("root=/dev/vda rw"));
+        assert!(args.contains("init=/init"));
     }
 
     #[test]

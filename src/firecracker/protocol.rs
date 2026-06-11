@@ -59,9 +59,19 @@ pub fn machine_config_body(vcpus: u32, mem_size_mib: u32) -> Value {
 /// static guest network config baked into the kernel command line. The
 /// `ip=` argument is the kernel's built-in IP autoconfiguration
 /// (`ip=<client>::<gw>:<mask>::<dev>:off`).
+///
+/// `root=/dev/vda rw init=/init` are passed EXPLICITLY (not relied upon from a
+/// kernel's built-in `CONFIG_CMDLINE`). The generic-FC rootfs always mounts as
+/// the first virtio device (`/dev/vda`) and the rendered PID-1 lives at `/init`
+/// (see [`super::super::runner::build::firecracker`] `render_init`). The legacy
+/// docker-capable guest kernel baked these (plus a busy-spin-inducing
+/// `acpi=off`) into its image; emitting them here makes the boot args
+/// kernel-agnostic so the stock Firecracker CI kernel (ACPI on → working LAPIC,
+/// no idle core-spin) boots the same rootfs. Duplicate-safe if a kernel also
+/// bakes them (kernel cmdline parsing is last-wins for `root=`/`init=`).
 pub fn boot_source_body(kernel_image_path: &str, guest_ip: &str, host_ip: &str) -> Value {
     let boot_args = format!(
-        "console=ttyS0 reboot=k panic=1 pci=off \
+        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init \
          ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
     );
     json!({
