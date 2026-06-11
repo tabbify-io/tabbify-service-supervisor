@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use tabbify_supervisor::api::{SupervisorState, router};
+use tabbify_supervisor::api::{GIT_PROXY_IPV4_PORT, SupervisorState, git_proxy_ipv4_router, router};
 use tabbify_supervisor::config::Config;
 use tabbify_supervisor::docker::docker_available;
 use tabbify_supervisor::fetcher::S3Fetcher;
@@ -194,7 +194,8 @@ async fn main() -> anyhow::Result<()> {
     let state = SupervisorState::new(orchestrator, fetcher, supervisor_id, ula_str)
         .with_version(tabbify_supervisor::version::binary_version().to_owned())
         .with_firecracker(kvm)
-        .with_docker(docker);
+        .with_docker(docker)
+        .with_tap_subnet(config.firecracker.tap_subnet.clone());
 
     // Spawn the dev-session idle reaper now that `state` (and its Arc) exists.
     // Scans every 60 s for sessions that exceeded idle or max-TTL thresholds.
@@ -215,7 +216,56 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app = router(state);
+    let app = router(state.clone());
+
+    // ── IPv4 git-proxy listener (B1) ─────────────────────────────────────────
+    // A separate listener on `0.0.0.0:GIT_PROXY_IPV4_PORT` so FC guests can
+    // reach the git proxy via their tap default gateway (host_ip). FC VMs are
+    // IPv4-only on a /30 tap — they have no IPv6/mesh access, so the mesh ULA
+    // port 8730 is unreachable from inside. This listener shares the SAME
+    // `GitSessions` Arc as the mesh router (no second registry).
+    //
+    // iptables guard (best-effort): DROP inbound on the WiFi uplink to this port;
+    // ACCEPT from the FC tap subnet. The 256-bit capability is the real auth gate;
+    // iptables is depth-in-defence. Only installed on Linux (where FC runs).
+    {
+        let tap_subnet = config.firecracker.tap_subnet.clone();
+        let ipv4_bind = SocketAddr::from(([0, 0, 0, 0], GIT_PROXY_IPV4_PORT));
+        match TcpListener::bind(ipv4_bind).await {
+            Ok(ipv4_listener) => {
+                tracing::info!(
+                    port = GIT_PROXY_IPV4_PORT,
+                    "git proxy IPv4 listener bound (FC guest gateway reachable)"
+                );
+                let shared_state = std::sync::Arc::new(state.clone());
+                let ipv4_router = git_proxy_ipv4_router(shared_state);
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(ipv4_listener, ipv4_router).await {
+                        tracing::error!(error = %e, "git proxy IPv4 listener error");
+                    }
+                });
+
+                // Best-effort iptables guard: only meaningful on Linux.
+                #[cfg(target_os = "linux")]
+                {
+                    tabbify_supervisor::firecracker::linux::setup_git_proxy_firewall(
+                        &tap_subnet,
+                        GIT_PROXY_IPV4_PORT,
+                    )
+                    .await;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = tap_subnet;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    port = GIT_PROXY_IPV4_PORT,
+                    error = %e,
+                    "git proxy IPv4 bind failed; FC guest git clone will not work"
+                );
+            }
+        }
+    }
 
     let listener = TcpListener::bind(bind_addr)
         .await

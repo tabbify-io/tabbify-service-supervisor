@@ -45,7 +45,7 @@ pub use dev_sessions::{
     DevSessionPurged, DevSessionRegistry, DevSessionRow, GitTokenRefreshed, RefreshGitTokenBody,
     sweep_expired,
 };
-pub use git_proxy::{GitSessionEntry, GitSessions};
+pub use git_proxy::{GIT_PROXY_IPV4_PORT, GitSessionEntry, GitSessions, git_proxy_ipv4_router};
 
 // ── Public re-exports — must remain stable for `crate::openapi` + tests. ─────
 
@@ -102,6 +102,10 @@ pub struct SupervisorState {
     pub git_sessions: std::sync::Arc<GitSessions>,
     /// Dev-session lifecycle registry: session_id → DevSession (app uuid + cap).
     pub dev_sessions: std::sync::Arc<DevSessionRegistry>,
+    /// FC tap subnet (CIDR, e.g. `172.31.0.0/16`). Used by `create_dev_session`
+    /// to derive the IPv4 `host_ip` for a dev-FC's tap link so the `git_remote`
+    /// URL points at the tap gateway the guest will see as its default route.
+    pub tap_subnet: String,
 }
 
 impl SupervisorState {
@@ -126,7 +130,16 @@ impl SupervisorState {
             started_at: std::time::Instant::now(),
             git_sessions: std::sync::Arc::new(GitSessions::default()),
             dev_sessions: std::sync::Arc::new(DevSessionRegistry::default()),
+            tap_subnet: crate::config::DEFAULT_FC_TAP_SUBNET.to_owned(),
         }
+    }
+
+    /// Override the FC tap subnet used by dev-session git_remote derivation.
+    /// Defaults to [`crate::config::DEFAULT_FC_TAP_SUBNET`] (`172.31.0.0/16`).
+    #[must_use]
+    pub fn with_tap_subnet(mut self, tap_subnet: String) -> Self {
+        self.tap_subnet = tap_subnet;
+        self
     }
 
     /// Set the running binary's release version reported on `/health` +

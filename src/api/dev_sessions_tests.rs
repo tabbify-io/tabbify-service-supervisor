@@ -1,4 +1,5 @@
-//! Tests for [`super`] (dev_sessions) — cap generation, registry, idle reaper.
+//! Tests for [`super`] (dev_sessions) — cap generation, registry, idle reaper,
+//! and B2: git_remote host_ip derivation correctness.
 //! Out-of-line module (`#[path]` in dev_sessions.rs) per the <500-line rule;
 //! the HTTP-handler tests live in `crate::api::tests` (router oneshot harness).
 
@@ -308,4 +309,84 @@ async fn sweep_revokes_git_cap() {
         StatusCode::FORBIDDEN,
         "swept session's cap must be revoked at the proxy"
     );
+}
+
+// ── B2: git_remote host_ip correctness ───────────────────────────────────────
+
+/// B2 (Linux-only): `derive_dev_fc_host_ip(uuid, subnet)` must equal the
+/// `host_ip` that `fc_identity_for_key(uuid)` + `derive_link_ips(subnet, idx)`
+/// produces — i.e. the same IP the FC launch will assign to the tap's host
+/// side, which is what the guest sees as its default gateway.
+///
+/// This is the load-bearing correctness test: if `git_remote` points at the
+/// wrong IP, the guest's `git clone` fails with a connection error.
+#[cfg(target_os = "linux")]
+#[test]
+fn git_remote_host_ip_matches_fc_launch_host_ip() {
+    use crate::api::GIT_PROXY_IPV4_PORT;
+    use crate::config::DEFAULT_FC_TAP_SUBNET;
+    use crate::firecracker::linux::{derive_link_ips, fc_identity_for_key};
+
+    let app_uuid = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
+    let subnet = DEFAULT_FC_TAP_SUBNET;
+
+    // What the FC launch will derive.
+    let (_, link_idx) = fc_identity_for_key(app_uuid);
+    let (expected_host_ip, _) = derive_link_ips(subnet, link_idx).unwrap();
+
+    // What derive_dev_fc_host_ip produces (used by create_dev_session).
+    let derived = super::derive_dev_fc_host_ip(app_uuid, subnet);
+
+    assert_eq!(
+        derived,
+        expected_host_ip.to_string(),
+        "git_remote host_ip must equal the FC tap's host_ip (the guest's default gateway)"
+    );
+
+    // The full git_remote URL must carry the correct host and port.
+    let cap = "testcap1234";
+    let git_remote = format!("http://{derived}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
+    assert!(
+        git_remote.starts_with(&format!("http://{}:", expected_host_ip)),
+        "git_remote must start with http://<host_ip>:<port>; got: {git_remote}"
+    );
+    assert!(
+        git_remote.contains(&format!(":{GIT_PROXY_IPV4_PORT}/")),
+        "git_remote must contain the IPv4 proxy port; got: {git_remote}"
+    );
+}
+
+/// B2-cross-app: two distinct app UUIDs must produce distinct host IPs
+/// (each gets its own /30 tap).
+#[cfg(target_os = "linux")]
+#[test]
+fn git_remote_host_ip_distinct_for_distinct_uuids() {
+    use crate::config::DEFAULT_FC_TAP_SUBNET;
+
+    let uuid_a = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
+    let uuid_b = "78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3";
+    let subnet = DEFAULT_FC_TAP_SUBNET;
+
+    let ip_a = super::derive_dev_fc_host_ip(uuid_a, subnet);
+    let ip_b = super::derive_dev_fc_host_ip(uuid_b, subnet);
+
+    assert_ne!(
+        ip_a, ip_b,
+        "distinct app UUIDs must produce distinct host IPs (each gets its own /30)"
+    );
+}
+
+/// B2-determinism: calling `derive_dev_fc_host_ip` twice with the same uuid
+/// returns the same IP (stable identity, just like fc_identity_for_key).
+#[cfg(target_os = "linux")]
+#[test]
+fn git_remote_host_ip_is_stable_per_uuid() {
+    use crate::config::DEFAULT_FC_TAP_SUBNET;
+
+    let uuid = "0191e7c2-1111-7222-8333-444455556666";
+    let subnet = DEFAULT_FC_TAP_SUBNET;
+
+    let ip1 = super::derive_dev_fc_host_ip(uuid, subnet);
+    let ip2 = super::derive_dev_fc_host_ip(uuid, subnet);
+    assert_eq!(ip1, ip2, "host_ip derivation must be deterministic for the same uuid");
 }

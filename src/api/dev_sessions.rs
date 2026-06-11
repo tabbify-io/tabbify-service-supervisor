@@ -28,7 +28,7 @@ use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::api::{GitSessionEntry, SharedState};
+use crate::api::{GIT_PROXY_IPV4_PORT, GitSessionEntry, SharedState};
 use crate::orchestrator::api::DeployNetwork;
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
@@ -128,6 +128,43 @@ impl DevSessionRegistry {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.0.lock().expect("dev session lock").is_empty()
+    }
+}
+
+// ── IPv4 git_remote derivation ────────────────────────────────────────────────
+
+/// Derive the `host_ip` for a dev-FC identified by `app_uuid`.
+///
+/// A dev-session FC is always a COLD SPAWN (no reff involved), so `vm_key =
+/// app_uuid` — exactly what [`crate::firecracker::linux::fc_identity_for_key`]
+/// uses when `launch_with_uuid(is_swap=false)` is called for a fresh VM.
+///
+/// The derivation is Linux-only in production (FC requires `/dev/kvm`), but
+/// the math is platform-independent. On non-Linux builds we fall back to
+/// `"127.0.0.1"` (functionally harmless — non-Linux hosts can't boot FC VMs;
+/// tests that need the real value must run on Linux or override the subnet).
+pub(crate) fn derive_dev_fc_host_ip(app_uuid: &str, tap_subnet: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let (_, link_idx) = crate::firecracker::linux::fc_identity_for_key(app_uuid);
+        match crate::firecracker::linux::derive_link_ips(tap_subnet, link_idx) {
+            Ok((host_ip, _)) => host_ip.to_string(),
+            Err(e) => {
+                tracing::warn!(
+                    app_uuid,
+                    error = %e,
+                    "dev-session: failed to derive host_ip; falling back to 127.0.0.1"
+                );
+                "127.0.0.1".to_owned()
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Non-Linux: FC VMs cannot run; return a sentinel. Dev-session create
+        // will succeed on Linux hosts in production.
+        let _ = (app_uuid, tap_subnet); // suppress unused warnings
+        "127.0.0.1".to_owned()
     }
 }
 
@@ -259,8 +296,13 @@ pub async fn create_dev_session(
     let session_id = Uuid::now_v7().to_string();
     let cap = generate_cap(&session_id, &body.app_uuid);
 
-    // Build the tokenless git remote URL: http://[<ula>]:8730/git/<cap>
-    let git_remote = format!("http://[{}]:8730/git/{}", state.ula, cap);
+    // Build the tokenless git remote URL on the IPv4 host_ip the guest sees as
+    // its default gateway. The guest is an IPv4-only FC VM on a /30 tap — it
+    // has no IPv6 or mesh access, so the old `http://[ula]:8730` was
+    // unreachable from inside. The IPv4 git-proxy listener (`GIT_PROXY_IPV4_PORT`)
+    // is bound on `0.0.0.0` and reachable via the tap's host_ip.
+    let host_ip = derive_dev_fc_host_ip(&body.app_uuid, &state.tap_subnet);
+    let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
 
     // Register the git proxy capability BEFORE spawning (so the VM can reach it
     // from first boot). Revoked below on deploy failure.

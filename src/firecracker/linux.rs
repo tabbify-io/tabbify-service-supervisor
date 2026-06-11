@@ -121,7 +121,7 @@ const SERVING_LINK_SLOTS: u32 = 16_382;
 ///   16384 `/30`s), so a same-`link_idx` (different-`tap_name`) clash is rare
 ///   and surfaces as a hard `ip addr add` duplicate-address error rather than
 ///   silent corruption.
-fn fc_identity_for_key(key: &str) -> (String, u32) {
+pub(crate) fn fc_identity_for_key(key: &str) -> (String, u32) {
     let digest = blake3::hash(key.as_bytes());
     let b = digest.as_bytes();
     let hash48: u64 = (u64::from(b[0]) << 40)
@@ -943,6 +943,75 @@ pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
         }
     }
     tracing::info!(%tap_name, uplink = %uplink, subnet = %tap_subnet, "fc nat: guest egress enabled");
+}
+
+/// Install iptables rules so the IPv4 git proxy port (`git_proxy_port`) is
+/// reachable only from the FC tap subnet, not from the WiFi uplink.
+///
+/// Rules (all best-effort — failure is logged, never fatal):
+/// 1. INPUT ACCEPT from `tap_subnet` to `git_proxy_port` (guests → proxy).
+/// 2. INPUT DROP from uplink to `git_proxy_port` (depth-in-defence; the
+///    256-bit capability is the real guard but this closes the WiFi exposure).
+///
+/// Rules are idempotent (`-C ... || -I ...`). Called ONCE at startup from
+/// `main.rs` — not per-VM, because the port and subnet are host-global.
+///
+/// FOLLOW-UP: consider restricting further with `--src-range` on the /30
+/// subnet; for now the /16 is narrow enough for a home/lab host.
+pub(crate) async fn setup_git_proxy_firewall(tap_subnet: &str, git_proxy_port: u16) {
+    let port_str = git_proxy_port.to_string();
+    let Some(uplink) = default_route_dev().await else {
+        tracing::warn!(
+            "git proxy firewall: no default-route uplink found; WiFi DROP rule skipped"
+        );
+        // Still try to install the ACCEPT rule for the tap subnet.
+        let accept_check: Vec<&str> = vec![
+            "-C", "INPUT", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+        ];
+        let accept_add: Vec<&str> = vec![
+            "-I", "INPUT", "1", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j",
+            "ACCEPT",
+        ];
+        if let Err(e) = ensure_iptables(&accept_check, &accept_add).await {
+            tracing::warn!(error = %e, "git proxy firewall: INPUT ACCEPT for tap subnet failed");
+        }
+        return;
+    };
+
+    // ACCEPT from tap subnet first (inserted at head so it precedes the DROP).
+    let accept_check: Vec<&str> = vec![
+        "-C", "INPUT", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+    ];
+    let accept_add: Vec<&str> = vec![
+        "-I", "INPUT", "1", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+    ];
+    if let Err(e) = ensure_iptables(&accept_check, &accept_add).await {
+        tracing::warn!(error = %e, "git proxy firewall: INPUT ACCEPT for tap subnet failed (guests may be blocked)");
+    }
+
+    // DROP inbound on the uplink interface to the git proxy port. Inserted
+    // after the ACCEPT so tap traffic is still allowed.
+    let drop_check: Vec<&str> = vec![
+        "-C", "INPUT", "-i", &uplink, "-p", "tcp", "--dport", &port_str, "-j", "DROP",
+    ];
+    let drop_add: Vec<&str> = vec![
+        "-I", "INPUT", "2", "-i", &uplink, "-p", "tcp", "--dport", &port_str, "-j", "DROP",
+    ];
+    if let Err(e) = ensure_iptables(&drop_check, &drop_add).await {
+        tracing::warn!(
+            error = %e,
+            uplink = %uplink,
+            port = git_proxy_port,
+            "git proxy firewall: DROP on uplink failed; port is WiFi-reachable (capability is still the primary guard)"
+        );
+    } else {
+        tracing::info!(
+            uplink = %uplink,
+            subnet = %tap_subnet,
+            port = git_proxy_port,
+            "git proxy firewall: ACCEPT from tap subnet + DROP on uplink installed"
+        );
+    }
 }
 
 /// Best-effort teardown of the two tap-keyed `FORWARD ACCEPT` rules
