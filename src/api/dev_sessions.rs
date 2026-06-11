@@ -133,20 +133,24 @@ impl DevSessionRegistry {
 
 // ── IPv4 git_remote derivation ────────────────────────────────────────────────
 
-/// Derive the `host_ip` for a dev-FC identified by `app_uuid`.
+/// Derive the `host_ip` for a dev-FC identified by `app_uuid` + `image_ref`.
 ///
-/// A dev-session FC is always a COLD SPAWN (no reff involved), so `vm_key =
-/// app_uuid` — exactly what [`crate::firecracker::linux::fc_identity_for_key`]
-/// uses when `launch_with_uuid(is_swap=false)` is called for a fresh VM.
+/// The FC launch uses `vm_key = format!("{uuid}:{reff}")` where `reff` is the
+/// OCI image ref (`runtime.registry_ref`). For a dev session, `reff` is the
+/// caller-supplied `image_ref` (e.g. `"[fd5a::1]:5000/tabbify/devbox:latest"`).
+/// We must hash the SAME key to get the same `/30` link_idx and thus the same
+/// `host_ip` as the FC launch.
 ///
 /// The derivation is Linux-only in production (FC requires `/dev/kvm`), but
 /// the math is platform-independent. On non-Linux builds we fall back to
 /// `"127.0.0.1"` (functionally harmless — non-Linux hosts can't boot FC VMs;
-/// tests that need the real value must run on Linux or override the subnet).
-pub(crate) fn derive_dev_fc_host_ip(app_uuid: &str, tap_subnet: &str) -> String {
+/// tests that need the real value must run on Linux).
+pub(crate) fn derive_dev_fc_host_ip(app_uuid: &str, image_ref: &str, tap_subnet: &str) -> String {
+    // vm_key matches `launch_with_uuid` cold-start: `format!("{uuid}:{reff}")`.
+    let vm_key = format!("{app_uuid}:{image_ref}");
     #[cfg(target_os = "linux")]
     {
-        let (_, link_idx) = crate::firecracker::linux::fc_identity_for_key(app_uuid);
+        let (_, link_idx) = crate::firecracker::linux::fc_identity_for_key(&vm_key);
         match crate::firecracker::linux::derive_link_ips(tap_subnet, link_idx) {
             Ok((host_ip, _)) => host_ip.to_string(),
             Err(e) => {
@@ -163,7 +167,7 @@ pub(crate) fn derive_dev_fc_host_ip(app_uuid: &str, tap_subnet: &str) -> String 
     {
         // Non-Linux: FC VMs cannot run; return a sentinel. Dev-session create
         // will succeed on Linux hosts in production.
-        let _ = (app_uuid, tap_subnet); // suppress unused warnings
+        let _ = (vm_key, tap_subnet); // suppress unused warnings
         "127.0.0.1".to_owned()
     }
 }
@@ -301,7 +305,10 @@ pub async fn create_dev_session(
     // has no IPv6 or mesh access, so the old `http://[ula]:8730` was
     // unreachable from inside. The IPv4 git-proxy listener (`GIT_PROXY_IPV4_PORT`)
     // is bound on `0.0.0.0` and reachable via the tap's host_ip.
-    let host_ip = derive_dev_fc_host_ip(&body.app_uuid, &state.tap_subnet);
+    //
+    // vm_key used by FC launch = `format!("{uuid}:{reff}")` where reff =
+    // registry_ref = image_ref — `derive_dev_fc_host_ip` takes both to match it.
+    let host_ip = derive_dev_fc_host_ip(&body.app_uuid, &body.image_ref, &state.tap_subnet);
     let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
 
     // Register the git proxy capability BEFORE spawning (so the VM can reach it

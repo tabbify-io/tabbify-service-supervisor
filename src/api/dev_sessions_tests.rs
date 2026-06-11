@@ -313,10 +313,14 @@ async fn sweep_revokes_git_cap() {
 
 // ── B2: git_remote host_ip correctness ───────────────────────────────────────
 
-/// B2 (Linux-only): `derive_dev_fc_host_ip(uuid, subnet)` must equal the
-/// `host_ip` that `fc_identity_for_key(uuid)` + `derive_link_ips(subnet, idx)`
-/// produces — i.e. the same IP the FC launch will assign to the tap's host
-/// side, which is what the guest sees as its default gateway.
+/// B2 (Linux-only): `derive_dev_fc_host_ip(uuid, image_ref, subnet)` must equal
+/// the `host_ip` that `fc_identity_for_key("uuid:image_ref")` + `derive_link_ips`
+/// produces — i.e. the same IP the FC launch will assign to the tap's host side,
+/// which is what the guest sees as its default gateway.
+///
+/// `vm_key = format!("{uuid}:{reff}")` in the FC launch path (linux.rs); `reff`
+/// is `runtime.registry_ref` = the OCI `image_ref` for a dev session. We hash
+/// the SAME composite key.
 ///
 /// This is the load-bearing correctness test: if `git_remote` points at the
 /// wrong IP, the guest's `git clone` fails with a connection error.
@@ -328,14 +332,17 @@ fn git_remote_host_ip_matches_fc_launch_host_ip() {
     use crate::firecracker::linux::{derive_link_ips, fc_identity_for_key};
 
     let app_uuid = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
+    let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
     let subnet = DEFAULT_FC_TAP_SUBNET;
+    // vm_key as constructed by launch_with_uuid (linux.rs ~315).
+    let vm_key = format!("{app_uuid}:{image_ref}");
 
     // What the FC launch will derive.
-    let (_, link_idx) = fc_identity_for_key(app_uuid);
+    let (_, link_idx) = fc_identity_for_key(&vm_key);
     let (expected_host_ip, _) = derive_link_ips(subnet, link_idx).unwrap();
 
     // What derive_dev_fc_host_ip produces (used by create_dev_session).
-    let derived = super::derive_dev_fc_host_ip(app_uuid, subnet);
+    let derived = super::derive_dev_fc_host_ip(app_uuid, image_ref, subnet);
 
     assert_eq!(
         derived,
@@ -356,8 +363,8 @@ fn git_remote_host_ip_matches_fc_launch_host_ip() {
     );
 }
 
-/// B2-cross-app: two distinct app UUIDs must produce distinct host IPs
-/// (each gets its own /30 tap).
+/// B2-cross-app: two distinct app UUIDs + same image_ref must produce distinct
+/// host IPs (each gets its own /30 tap).
 #[cfg(target_os = "linux")]
 #[test]
 fn git_remote_host_ip_distinct_for_distinct_uuids() {
@@ -365,10 +372,11 @@ fn git_remote_host_ip_distinct_for_distinct_uuids() {
 
     let uuid_a = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
     let uuid_b = "78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3";
+    let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
     let subnet = DEFAULT_FC_TAP_SUBNET;
 
-    let ip_a = super::derive_dev_fc_host_ip(uuid_a, subnet);
-    let ip_b = super::derive_dev_fc_host_ip(uuid_b, subnet);
+    let ip_a = super::derive_dev_fc_host_ip(uuid_a, image_ref, subnet);
+    let ip_b = super::derive_dev_fc_host_ip(uuid_b, image_ref, subnet);
 
     assert_ne!(
         ip_a, ip_b,
@@ -376,7 +384,7 @@ fn git_remote_host_ip_distinct_for_distinct_uuids() {
     );
 }
 
-/// B2-determinism: calling `derive_dev_fc_host_ip` twice with the same uuid
+/// B2-determinism: calling `derive_dev_fc_host_ip` twice with the same inputs
 /// returns the same IP (stable identity, just like fc_identity_for_key).
 #[cfg(target_os = "linux")]
 #[test]
@@ -384,9 +392,10 @@ fn git_remote_host_ip_is_stable_per_uuid() {
     use crate::config::DEFAULT_FC_TAP_SUBNET;
 
     let uuid = "0191e7c2-1111-7222-8333-444455556666";
+    let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
     let subnet = DEFAULT_FC_TAP_SUBNET;
 
-    let ip1 = super::derive_dev_fc_host_ip(uuid, subnet);
-    let ip2 = super::derive_dev_fc_host_ip(uuid, subnet);
-    assert_eq!(ip1, ip2, "host_ip derivation must be deterministic for the same uuid");
+    let ip1 = super::derive_dev_fc_host_ip(uuid, image_ref, subnet);
+    let ip2 = super::derive_dev_fc_host_ip(uuid, image_ref, subnet);
+    assert_eq!(ip1, ip2, "host_ip derivation must be deterministic for the same inputs");
 }
