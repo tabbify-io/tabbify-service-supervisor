@@ -32,6 +32,7 @@ use crate::{
         MONITOR_INTERVAL, Orchestrator,
         client::ControlClient,
         handle::RunnerHandle,
+        monitor::kill_fc_child_for_uuid,
         restart::{self, BackoffParams, RestartStatus},
         spawn::{SpawnSpec, spawn_runner},
     },
@@ -303,6 +304,15 @@ impl Orchestrator {
 
         // Forget the record so the monitor does not respawn it.
         self.forget_record(uuid);
+
+        // FIX C: reap any orphaned FC child. When a dev session is stopped the
+        // runner exits (Shutdown), but the firecracker process it spawned is NOT
+        // a child of the supervisor — it was spawned by the runner and gets
+        // reparented to PID 1 where it busy-spins at 100% CPU. The monitor
+        // already does this reap on its kill-before-respawn path; purge_app
+        // did not, leaving FC orphans alive until the next monitor tick found a
+        // dead runner. Call the same helper here, best-effort.
+        kill_fc_child_for_uuid(&self.shared().data_dir, uuid);
 
         // Reclaim the on-disk cache from our side too: the runner's own purge
         // already cleared it, but if the runner was unreachable we still want a
@@ -1388,5 +1398,90 @@ mod tests {
 
         let tail = read_last_lines(&path, 2).await.unwrap();
         assert_eq!(tail, "two\nthree");
+    }
+
+    // ── purge_app reaps the FC child (FIX C) ──────────────────────────────────
+
+    /// A helper that constructs an `Orchestrator` whose `data_dir` is the
+    /// supplied tempdir (so `kill_fc_child_for_uuid` finds pidfiles there).
+    fn orch_with_data_dir(
+        runner_dir: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+    ) -> Orchestrator {
+        Orchestrator::new(
+            SharedRunnerConfig {
+                runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
+                s3_base_url: "http://s3.invalid".to_owned(),
+                data_dir,
+                parent: None,
+                no_mesh: true,
+                relay_url: None,
+                relay_only: false,
+            },
+            runner_dir,
+        )
+    }
+
+    /// `purge_app` must reap the FC child recorded in the per-uuid pidfile.
+    ///
+    /// Mirrors the existing monitor test `reconcile_kills_fc_child_via_pidfile_when_runner_dead`:
+    /// spin up a real `sleep` child (the stand-in FC orphan), write its pid to
+    /// the pidfile, call `purge_app`, then assert the pidfile is removed AND
+    /// the child is dead.
+    #[tokio::test]
+    async fn purge_app_reaps_fc_child_via_pidfile() {
+        use crate::firecracker::pidfile;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = "0191e7c2-beef-7222-8333-444455556666";
+
+        // Spawn a real "FC orphan" child we can safely kill.
+        let mut fc_orphan = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep child");
+        let fc_pid = fc_orphan.id();
+
+        // Write the pidfile as the runner would after spawning firecracker.
+        pidfile::write(dir.path(), uuid, fc_pid);
+        assert!(
+            pidfile::path(dir.path(), uuid).exists(),
+            "pidfile must be written before purge"
+        );
+
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+
+        // purge_app will fail the control-socket calls (no real runner), but
+        // the FC reap + record forget must still happen regardless.
+        let _ = o.purge_app(uuid).await;
+
+        // The pidfile must have been consumed.
+        assert!(
+            !pidfile::path(dir.path(), uuid).exists(),
+            "purge_app must remove the FC pidfile"
+        );
+
+        // The FC orphan must be dead. Use waitpid(WNOHANG) (like the monitor's
+        // runner_is_alive) — it reaps the zombie AND detects exit, so it returns
+        // a non-zero value as soon as the child has exited (even if it is still a
+        // zombie). SIGKILL is near-instant; poll for up to 100 ms.
+        let mut fc_alive_after = true;
+        for _ in 0..10 {
+            let r = unsafe {
+                libc::waitpid(fc_pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
+            };
+            if r != 0 {
+                // Non-zero: either the pid was reaped (positive) or ECHILD (negative)
+                // — either way the child is gone.
+                fc_alive_after = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = fc_orphan.wait(); // best-effort cleanup
+        assert!(
+            !fc_alive_after,
+            "FC orphan (pid {fc_pid}) must be killed by purge_app"
+        );
     }
 }

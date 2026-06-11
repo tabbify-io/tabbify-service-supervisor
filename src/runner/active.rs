@@ -200,6 +200,10 @@ impl AppRuntime for ActiveRuntime {
         let rt = self.load();
         Box::pin(async move { rt.shutdown().await })
     }
+
+    fn guest_ssh_addr(&self) -> Option<std::net::SocketAddr> {
+        self.load().guest_ssh_addr()
+    }
 }
 
 // ---- Tests ------------------------------------------------------------------

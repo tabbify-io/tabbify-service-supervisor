@@ -58,6 +58,7 @@ pub mod runner;
 pub mod runtime;
 pub mod selfupdate;
 pub mod skopeo;
+pub mod tcp_forward;
 pub mod unified_manifest;
 pub mod version;
 

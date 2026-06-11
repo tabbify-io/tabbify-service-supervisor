@@ -11,6 +11,7 @@
 //! boxed-future aliases). Concrete runtimes live in their own modules.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -100,5 +101,20 @@ pub trait AppRuntime: Send + Sync {
     /// Default: **no-op** — a runtime with no external resources drops cleanly.
     fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
         Box::pin(async {})
+    }
+
+    /// The IPv4 TCP address of the guest's SSH daemon, if any.
+    ///
+    /// For a Firecracker microVM running a dev/devbox image, returns
+    /// `Some(<guest_ip>:2222)` — the host-side tap IPv4 address where the
+    /// guest's sshd is listening. The runner's L4 TCP forwarder
+    /// ([`crate::tcp_forward`]) binds `[app_ula]:2222` on the host mesh
+    /// interface and proxies every accepted connection here so the node can SSH
+    /// into the guest via `root@[app_ula]:2222`.
+    ///
+    /// Default: `None` — non-FC runtimes (docker, stub, test fakes) do not
+    /// expose a guest SSH target.
+    fn guest_ssh_addr(&self) -> Option<SocketAddr> {
+        None
     }
 }

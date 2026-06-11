@@ -48,6 +48,7 @@ use crate::{
     mesh::MeshMembership,
     runner::{active::ActiveRuntime, control::RunnerLifecycle},
     runtime::{AppRuntime, ExitReason},
+    tcp_forward::TcpForwarder,
 };
 
 /// The outcome of the runner's main select loop.
@@ -234,6 +235,12 @@ pub struct RunnerServe {
     /// runner's ULA would stop being reachable. Never read; held only to keep
     /// the mesh up.
     _membership: Option<MeshMembership>,
+    /// L4 SSH forwarder: bridges `[app_ula]:2222` → `{guest_ip}:2222` so the
+    /// node can SSH into a dev/devbox FC guest via the mesh address. `None`
+    /// when the runtime reports no guest SSH target (non-FC, `--no-mesh`).
+    /// Held so the forwarder task lives exactly as long as the runner; dropping
+    /// it aborts the accept loop and stops forwarding new SSH connections.
+    _ssh_fwd: Option<TcpForwarder>,
 }
 
 impl RunnerServe {
@@ -327,6 +334,38 @@ impl RunnerServe {
 
         let addr = hosted.addr;
 
+        // FIX A: L4 SSH forwarder — bind [app_ula]:2222 → guest_ip:2222 so
+        // the node can `ssh root@[app_ula]:2222` into the FC guest's sshd.
+        // Only started in mesh mode AND when the runtime exposes a guest SSH
+        // target (Firecracker dev/devbox image). Bind errors are logged and
+        // tolerated — they must not crash the runner.
+        let ssh_fwd = if cfg.no_mesh {
+            None
+        } else if let Some(ssh_target) = active.guest_ssh_addr() {
+            let ssh_bind = std::net::SocketAddr::new(std::net::IpAddr::V6(app_ula), 2222);
+            match crate::tcp_forward::spawn_forwarder(ssh_bind, ssh_target).await {
+                Ok(fwd) => {
+                    tracing::info!(
+                        bind = %ssh_bind,
+                        target = %ssh_target,
+                        "runner: SSH forwarder bound (app_ula:2222 → guest_ip:2222)"
+                    );
+                    Some(fwd)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bind = %ssh_bind,
+                        target = %ssh_target,
+                        error = %e,
+                        "runner: SSH forwarder bind failed (exec/devbox SSH unreachable via mesh)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // The ref the INITIAL runtime was built from: the resolved manifest's
         // `runtime.registry_ref` (a deployed version applied via `--image-ref`,
         // or `None` for a plain source/S3 build). Seeds the same-ref re-deploy
@@ -364,6 +403,7 @@ impl RunnerServe {
             active,
             lifecycle,
             _membership: membership,
+            _ssh_fwd: ssh_fwd,
         })
     }
 

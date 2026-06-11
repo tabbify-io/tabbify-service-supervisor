@@ -228,7 +228,10 @@ fn kill_pid(pid: u32) {
 ///
 /// The pidfile is consumed by this call (removed from disk) so the fresh
 /// runner's own cold-start reconciliation does not re-kill the NEW FC.
-fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str) {
+///
+/// Exposed as `pub(crate)` so [`crate::orchestrator::api::Orchestrator::purge_app`]
+/// can reuse the same reaping logic (FIX C: purge must also reap the FC orphan).
+pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str) {
     if let Some(fc_pid) = pidfile::take(data_dir, uuid) {
         tracing::info!(
             uuid,

@@ -152,6 +152,9 @@ pub struct FirecrackerRuntime {
     api_sock: PathBuf,
     /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
     guest_base: String,
+    /// The guest's IPv4 address on its /30 tap. Used by the L4 SSH forwarder
+    /// (`guest_ssh_addr`) to expose `guest_ip:2222` via `[app_ula]:2222`.
+    guest_ip: Ipv4Addr,
     client: reqwest::Client,
     /// Test-only injectable reachability probe. Production leaves this `None`
     /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
@@ -252,6 +255,7 @@ impl FirecrackerRuntime {
             tap_name,
             api_sock: api_sock.clone(),
             guest_base,
+            guest_ip,
             client: reqwest::Client::new(),
             #[cfg(test)]
             probe: None,
@@ -324,7 +328,15 @@ impl FirecrackerRuntime {
             // old image). The cold boot writes a fresh snapshot for the new
             // image, so later restarts come up on the deployed version.
             snapshot::clear(&cache_dir);
-            Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), &vm_key).await?
+            Self::cold_boot(
+                rootfs,
+                rt,
+                cfg,
+                Some(&cache_dir),
+                Some(&console_log),
+                &vm_key,
+            )
+            .await?
         } else {
             // COLD START (first boot / monitor respawn): reconcile a stale VM
             // left by a crashed predecessor, then warm-restore if a snapshot
@@ -341,13 +353,27 @@ impl FirecrackerRuntime {
                     }
                     Err(e) => {
                         tracing::warn!(uuid, error = %e, "snapshot load failed; cold boot");
-                        Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), &vm_key)
-                            .await?
+                        Self::cold_boot(
+                            rootfs,
+                            rt,
+                            cfg,
+                            Some(&cache_dir),
+                            Some(&console_log),
+                            &vm_key,
+                        )
+                        .await?
                     }
                 }
             } else {
-                Self::cold_boot(rootfs, rt, cfg, Some(&cache_dir), Some(&console_log), &vm_key)
-                    .await?
+                Self::cold_boot(
+                    rootfs,
+                    rt,
+                    cfg,
+                    Some(&cache_dir),
+                    Some(&console_log),
+                    &vm_key,
+                )
+                .await?
             }
         };
 
@@ -438,6 +464,7 @@ impl FirecrackerRuntime {
             tap_name,
             api_sock: api_sock.clone(),
             guest_base,
+            guest_ip,
             client: reqwest::Client::new(),
             #[cfg(test)]
             probe: None,
@@ -654,6 +681,7 @@ impl FirecrackerRuntime {
             tap_name: "fc-tap-test".to_owned(),
             api_sock: PathBuf::from("/tmp/firecracker-test.sock"),
             guest_base: guest_base.to_owned(),
+            guest_ip: Ipv4Addr::new(169, 254, 0, 2),
             client: reqwest::Client::new(),
             probe: Some(probe),
         }
@@ -743,6 +771,15 @@ impl AppRuntime for FirecrackerRuntime {
                 tracing::debug!(%tap, error = %e, "shutdown: ip link del tap (may already be gone)");
             }
         })
+    }
+
+    fn guest_ssh_addr(&self) -> Option<std::net::SocketAddr> {
+        // The guest's sshd listens on :2222 inside the VM (on its eth0,
+        // IPv4-only). The host reaches it at guest_ip:2222 via the /30 tap.
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(self.guest_ip),
+            2222,
+        ))
     }
 }
 
