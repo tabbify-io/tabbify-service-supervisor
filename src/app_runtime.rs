@@ -118,3 +118,28 @@ pub trait AppRuntime: Send + Sync {
         None
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A minimal runtime that relies entirely on the trait defaults — it only
+    /// implements the one required method, `handle`.
+    struct StubRuntime;
+
+    impl AppRuntime for StubRuntime {
+        fn handle<'a>(&'a self, _request: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async { Ok(Response::builder().status(200).body(Bytes::new()).unwrap()) })
+        }
+        // health / watch_for_exit / shutdown / guest_ssh_addr all use defaults.
+    }
+
+    /// The `AppRuntime::guest_ssh_addr` default returns `None`: a runtime that
+    /// does not override it (docker, stub, any non-FC fake) exposes no guest
+    /// SSH target, so the runner never starts an SSH forwarder for it.
+    #[test]
+    fn guest_ssh_addr_default_is_none() {
+        assert_eq!(StubRuntime.guest_ssh_addr(), None);
+    }
+}

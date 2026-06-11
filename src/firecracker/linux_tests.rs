@@ -46,7 +46,10 @@ fn fc_identity_swap_old_and_new_reff_get_distinct_taps() {
     let uuid = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
     let (tap_old, _) = fc_identity_for_key(&format!("{uuid}:registry/x:sha-OLD"));
     let (tap_new, _) = fc_identity_for_key(&format!("{uuid}:registry/x:sha-NEW"));
-    assert_ne!(tap_old, tap_new, "old/new reff must not share a tap during swap");
+    assert_ne!(
+        tap_old, tap_new,
+        "old/new reff must not share a tap during swap"
+    );
     // A different app at the SAME reff is still distinct (cross-app uniqueness).
     let (tap_other, _) =
         fc_identity_for_key("78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3:registry/x:sha-NEW");
@@ -65,7 +68,11 @@ fn fc_identity_tap_name_fits_ifnamsiz_and_is_prefixed() {
     ] {
         let (tap, _) = fc_identity_for_key(uuid);
         assert!(tap.starts_with("fc-"), "tap {tap} must start with fc-");
-        assert!(tap.len() <= 15, "tap {tap} exceeds IFNAMSIZ (len {})", tap.len());
+        assert!(
+            tap.len() <= 15,
+            "tap {tap} exceeds IFNAMSIZ (len {})",
+            tap.len()
+        );
     }
 }
 
@@ -79,7 +86,10 @@ fn fc_identity_link_idx_never_hits_build_slot() {
         "0191e7c2-2222-7222-8333-444455556666",
     ] {
         let (_, idx) = fc_identity_for_key(uuid);
-        assert!(idx < SERVING_LINK_SLOTS, "idx {idx} must be < {SERVING_LINK_SLOTS}");
+        assert!(
+            idx < SERVING_LINK_SLOTS,
+            "idx {idx} must be < {SERVING_LINK_SLOTS}"
+        );
         assert!(
             idx < crate::firecracker::build_vm::BUILD_SEQ,
             "idx {idx} collides build slot"
@@ -149,4 +159,26 @@ fn parse_default_dev_none_when_no_route_or_dev() {
     assert_eq!(parse_default_dev("blackhole 10.0.0.0/8"), None);
     // "dev" with no following token must not panic.
     assert_eq!(parse_default_dev("default via 10.0.0.1 dev"), None);
+}
+
+/// `FirecrackerRuntime::guest_ssh_addr()` must point at the guest's sshd:
+/// the runtime's own `guest_ip` on TCP :2222 (an IPv4 socket). This is what
+/// the runner's L4 forwarder targets so `[app_ula]:2222 → guest_ip:2222` works.
+#[test]
+fn guest_ssh_addr_targets_guest_ip_port_2222() {
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::Arc;
+
+    use crate::runtime::AppRuntime;
+
+    // `with_probe_for_test` bakes in guest_ip = 169.254.0.2 (see linux.rs).
+    let vm = FirecrackerRuntime::with_probe_for_test("http://169.254.0.2:8080", Arc::new(|_| true));
+    let expected_ip = Ipv4Addr::new(169, 254, 0, 2);
+
+    let ssh = vm
+        .guest_ssh_addr()
+        .expect("a Firecracker runtime must expose a guest SSH target");
+    assert_eq!(ssh, SocketAddr::new(IpAddr::V4(expected_ip), 2222));
+    assert!(ssh.is_ipv4(), "guest SSH target must be IPv4 (the /30 tap)");
+    assert_eq!(ssh.port(), 2222, "guest sshd listens on :2222");
 }
