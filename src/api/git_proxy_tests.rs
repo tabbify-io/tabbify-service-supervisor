@@ -372,7 +372,11 @@ async fn git_proxy_ipv4_router_forwards_known_cap() {
         .unwrap();
 
     let resp = ipv4_app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "IPv4 router must forward known cap");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "IPv4 router must forward known cap"
+    );
     server.verify().await;
 }
 
@@ -391,7 +395,11 @@ async fn git_proxy_ipv4_router_unknown_cap_403() {
         .unwrap();
 
     let resp = ipv4_app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "IPv4 router must 403 unknown cap");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "IPv4 router must 403 unknown cap"
+    );
 }
 
 /// B1-c: registry is SHARED — a cap registered once is accessible via both

@@ -961,16 +961,13 @@ pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
 pub(crate) async fn setup_git_proxy_firewall(tap_subnet: &str, git_proxy_port: u16) {
     let port_str = git_proxy_port.to_string();
     let Some(uplink) = default_route_dev().await else {
-        tracing::warn!(
-            "git proxy firewall: no default-route uplink found; WiFi DROP rule skipped"
-        );
+        tracing::warn!("git proxy firewall: no default-route uplink found; WiFi DROP rule skipped");
         // Still try to install the ACCEPT rule for the tap subnet.
         let accept_check: Vec<&str> = vec![
             "-C", "INPUT", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
         ];
         let accept_add: Vec<&str> = vec![
-            "-I", "INPUT", "1", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j",
-            "ACCEPT",
+            "-I", "INPUT", "1", "-s", tap_subnet, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
         ];
         if let Err(e) = ensure_iptables(&accept_check, &accept_add).await {
             tracing::warn!(error = %e, "git proxy firewall: INPUT ACCEPT for tap subnet failed");

@@ -11,7 +11,9 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use tabbify_supervisor::api::{GIT_PROXY_IPV4_PORT, SupervisorState, git_proxy_ipv4_router, router};
+use tabbify_supervisor::api::{
+    GIT_PROXY_IPV4_PORT, SupervisorState, git_proxy_ipv4_router, router,
+};
 use tabbify_supervisor::config::Config;
 use tabbify_supervisor::docker::docker_available;
 use tabbify_supervisor::fetcher::S3Fetcher;

@@ -397,5 +397,8 @@ fn git_remote_host_ip_is_stable_per_uuid() {
 
     let ip1 = super::derive_dev_fc_host_ip(uuid, image_ref, subnet);
     let ip2 = super::derive_dev_fc_host_ip(uuid, image_ref, subnet);
-    assert_eq!(ip1, ip2, "host_ip derivation must be deterministic for the same inputs");
+    assert_eq!(
+        ip1, ip2,
+        "host_ip derivation must be deterministic for the same inputs"
+    );
 }
