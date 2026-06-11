@@ -774,11 +774,12 @@ impl AppRuntime for FirecrackerRuntime {
     }
 
     fn guest_ssh_addr(&self) -> Option<std::net::SocketAddr> {
-        // The guest's sshd listens on :2222 inside the VM (on its eth0,
-        // IPv4-only). The host reaches it at guest_ip:2222 via the /30 tap.
+        // The guest's sshd listens on GUEST_SSH_PORT inside the VM (on its
+        // eth0, IPv4-only). The host reaches it at guest_ip:<port> via the /30
+        // tap.
         Some(std::net::SocketAddr::new(
             std::net::IpAddr::V4(self.guest_ip),
-            2222,
+            crate::tcp_forward::GUEST_SSH_PORT,
         ))
     }
 }

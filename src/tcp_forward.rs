@@ -9,30 +9,68 @@
 //! These are two entirely separate sockets — the kernel handles them independently.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
+use tokio::sync::Semaphore;
+
+/// TCP port the FC guest's sshd listens on (inside the VM, on its eth0). The
+/// runner binds `[app_ula]:GUEST_SSH_PORT` on the host mesh interface and
+/// forwards to `{guest_ip}:GUEST_SSH_PORT`. Shared by the serve-side bind and
+/// the runtime's `guest_ssh_addr()` so the two never drift.
+pub const GUEST_SSH_PORT: u16 = 2222;
+
+/// Max concurrently-forwarded connections per forwarder. Acquiring a permit
+/// before spawning a `forward_conn` task bounds the fds/tasks a stuck or
+/// still-booting guest can leak: with the guest's sshd unreachable, each dial
+/// would otherwise park a `TcpStream::connect` forever. 16 is ample for
+/// interactive exec/devbox use (one or two live SSH sessions).
+const MAX_INFLIGHT_CONNS: usize = 16;
+
+/// Backoff after a fatal `accept()` error so an exhausted-fd condition
+/// (EMFILE/ENFILE) does not busy-spin the accept loop at 100% CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Spawn a TCP L4 forwarder on `bind_addr` that proxies every accepted
 /// connection to `target_addr` using [`tokio::io::copy_bidirectional`].
 ///
-/// The forwarder task lives until `bind_addr`'s listener is dropped (i.e.
-/// until the returned `TcpForwarder` is dropped). Bind errors (e.g. the mesh
-/// ULA not yet assigned) are returned immediately so the caller can log and
-/// skip without crashing the runner.
+/// The listener is created with `SO_REUSEPORT` so that during a zero-downtime
+/// deploy/swap (or a purge → respawn) the NEW runner can bind the SAME
+/// `[app_ula]:2222` while the OLD runner still holds it: both sockets coexist
+/// briefly (the old keeps serving existing connections and accepting; the new
+/// also accepts), and the port is freed when the old forwarder drops. Without
+/// `SO_REUSEPORT` the new bind would `EADDRINUSE` → WARN+None → SSH silently
+/// dead until a later restart.
+///
+/// Bind errors (e.g. the mesh ULA not yet assigned) are returned immediately so
+/// the caller can log and skip without crashing the runner.
 ///
 /// Per-connection errors (connect-to-target failure, copy errors) are logged
 /// at debug level and do NOT abort the forwarder.
 ///
 /// # Errors
-/// Returns an error only if binding `bind_addr` fails.
+/// Returns an error only if creating, configuring, or binding the socket fails.
 pub async fn spawn_forwarder(
     bind_addr: SocketAddr,
     target_addr: SocketAddr,
 ) -> Result<TcpForwarder> {
-    let listener = TcpListener::bind(bind_addr)
-        .await
+    let sock = match bind_addr {
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+    }
+    .with_context(|| format!("L4 forwarder: create socket for {bind_addr}"))?;
+    // SO_REUSEPORT: lets the old + new runner both bind app_ula:2222 across a
+    // swap so the SSH path never has a bind-conflict gap (see fn docs).
+    sock.set_reuseport(true)
+        .with_context(|| format!("L4 forwarder: set SO_REUSEPORT on {bind_addr}"))?;
+    sock.bind(bind_addr)
         .with_context(|| format!("L4 forwarder: bind {bind_addr}"))?;
+    let listener = sock
+        .listen(1024)
+        .with_context(|| format!("L4 forwarder: listen on {bind_addr}"))?;
+
     let bound_addr = listener
         .local_addr()
         .with_context(|| "L4 forwarder: local_addr after bind")?;
@@ -46,20 +84,35 @@ pub async fn spawn_forwarder(
     Ok(TcpForwarder { _handle: handle })
 }
 
-/// Accept loop: accept connections on `listener` and spawn a bidirectional
-/// copy task for each one.
-async fn accept_loop(listener: TcpListener, target: SocketAddr) {
+/// Accept loop: accept connections on `listener` and, under a bounded
+/// semaphore, spawn a bidirectional copy task for each one.
+async fn accept_loop(listener: tokio::net::TcpListener, target: SocketAddr) {
+    let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_CONNS));
     loop {
         match listener.accept().await {
             Ok((inbound, peer)) => {
+                // Bound in-flight conns: acquire a permit (own it, so it is
+                // released when the conn task ends) before spawning. If all
+                // permits are held the accept loop awaits here, applying
+                // natural backpressure instead of leaking tasks/fds.
+                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                    // The semaphore is never closed while the loop runs, so
+                    // this is unreachable in practice; bail defensively.
+                    break;
+                };
                 tracing::debug!(%peer, %target, "L4 forwarder: accepted connection");
-                tokio::spawn(forward_conn(inbound, target));
+                tokio::spawn(async move {
+                    forward_conn(inbound, target).await;
+                    drop(permit);
+                });
             }
             Err(e) => {
-                // A bind-level error (e.g. the TUN going away) would show here.
-                // Log and continue — transient errors (EINTR, ECONNABORTED)
-                // should not abort the loop.
+                // A bind-level / resource error (TUN going away, EMFILE/ENFILE)
+                // surfaces here. Transient errors (EINTR, ECONNABORTED) must not
+                // abort the loop; back off briefly so an fd-exhaustion condition
+                // does not busy-spin this task at 100% CPU.
                 tracing::debug!(error = %e, %target, "L4 forwarder: accept error");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -92,11 +145,15 @@ async fn forward_conn(mut inbound: TcpStream, target: SocketAddr) {
 /// A running L4 TCP forwarder. Dropping this value aborts the accept loop and
 /// stops forwarding new connections; in-flight copy tasks run to completion.
 pub struct TcpForwarder {
-    /// The accept-loop task. Aborting it (via `JoinHandle::abort` on drop) is
-    /// not needed — the listener socket is dropped when the `JoinHandle` is,
-    /// which makes `accept()` return an error and the loop exit naturally.
-    /// We hold the handle so the task is NOT detached: it is tied to the
-    /// lifetime of `TcpForwarder`.
+    /// The accept-loop task handle. Held so the task is tied to this value's
+    /// lifetime; [`Drop`] calls `abort()` on it.
+    ///
+    /// NOTE: simply dropping a `JoinHandle` DETACHES the task (it keeps
+    /// running) — it does NOT cancel it, so the listener socket would stay
+    /// bound and the port held. The `abort()` in [`Drop`] is what actually
+    /// stops the task: abort → the accept loop's future is cancelled → the
+    /// `TcpListener` it owns is dropped → the port is freed. Do not remove the
+    /// `abort()` thinking the handle's drop suffices.
     _handle: tokio::task::JoinHandle<()>,
 }
 
@@ -109,7 +166,7 @@ impl Drop for TcpForwarder {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::SocketAddr;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -117,63 +174,38 @@ mod tests {
 
     use super::*;
 
-    /// Bind an echo server on loopback, then connect through the forwarder and
-    /// assert that bytes round-trip bidirectionally.
-    #[tokio::test]
-    async fn forwarder_round_trips_bytes() {
-        // Echo server: reads exactly N bytes and echoes them back.
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_addr = echo_listener.local_addr().unwrap();
-
+    /// Spawn an echo server on a fresh loopback port; returns its address. It
+    /// accepts one connection, reads up to `read_len` bytes, echoes them back.
+    async fn spawn_echo(read_len: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut stream, _) = echo_listener.accept().await.unwrap();
-            let mut buf = [0u8; 128];
-            let n = stream.read(&mut buf).await.unwrap();
-            stream.write_all(&buf[..n]).await.unwrap();
-        });
-
-        // Bind the forwarder on a loopback ephemeral port, forwarding to echo.
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let fwd = spawn_forwarder(bind_addr, echo_addr)
-            .await
-            .expect("forwarder must bind");
-        // Retrieve the actual bound address by trying a connect — we don't expose
-        // it directly, so just use the forwarder's listener port.
-        // Re-bind to get the address: instead, accept the fact that `spawn_forwarder`
-        // binds an ephemeral port and we need to find it. We'll use a known port.
-        drop(fwd);
-
-        // Re-run with a known port pair so we can address the forwarder directly.
-        let fwd_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let fwd2 = spawn_forwarder(fwd_bind, echo_addr).await.unwrap();
-
-        // We need the forwarder's port. Expose it via a second listener trick:
-        // spawn a minimal probe by re-binding on the forwarder's addr.
-        // Actually: since we used port 0, find the port via TcpListener + abort.
-        // Simpler: bind the forwarder on a fixed port in a tempdir range.
-        drop(fwd2);
-
-        // Cleaner approach: use a fixed pair of ports.
-        // Bind echo on :0, then forwarder on :0, then connect to forwarder via
-        // a secondary bind just to get the port.
-        let echo_listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_addr2 = echo_listener2.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut stream, _) = echo_listener2.accept().await.unwrap();
-            let mut buf = vec![0u8; 5];
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; read_len];
             stream.read_exact(&mut buf).await.unwrap();
             stream.write_all(&buf).await.unwrap();
         });
+        addr
+    }
 
-        // Bind the forwarder and get its address via a temp listener trick.
-        let fwd_listener_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fwd_port = fwd_listener_probe.local_addr().unwrap().port();
-        drop(fwd_listener_probe);
+    /// Reserve a free loopback port by binding then immediately dropping the
+    /// listener, so a forwarder can be addressed on a known port.
+    async fn free_loopback_addr() -> SocketAddr {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        addr
+    }
 
-        let fwd_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), fwd_port);
-        let _fwd = spawn_forwarder(fwd_addr, echo_addr2).await.unwrap();
+    /// Bytes sent through the forwarder must round-trip bidirectionally.
+    #[tokio::test]
+    async fn forwarder_round_trips_bytes() {
+        let echo_addr = spawn_echo(5).await;
+        let fwd_addr = free_loopback_addr().await;
 
+        let _fwd = spawn_forwarder(fwd_addr, echo_addr)
+            .await
+            .expect("forwarder must bind");
         // Give the forwarder a moment to start its accept loop.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -188,18 +220,37 @@ mod tests {
         );
     }
 
-    /// `spawn_forwarder` returns an error when the bind address is already in use.
+    /// TWO forwarders must be able to bind the SAME loopback address
+    /// concurrently thanks to `SO_REUSEPORT` — this is the swap case: the new
+    /// runner binds `[app_ula]:2222` while the old still holds it, so the SSH
+    /// path has no bind-conflict gap. Both then forward bytes successfully.
     #[tokio::test]
-    async fn forwarder_bind_failure_returns_error() {
-        // Bind a listener to occupy the port.
-        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = occupied.local_addr().unwrap();
+    async fn two_forwarders_share_addr_with_reuseport() {
+        let echo_addr = spawn_echo(5).await;
+        let shared_addr = free_loopback_addr().await;
 
-        // Attempting to bind the forwarder on the same port must fail.
-        let result = spawn_forwarder(addr, addr).await;
-        assert!(
-            result.is_err(),
-            "spawn_forwarder must return Err when the port is occupied"
+        // First forwarder (the "old" runner) binds the shared addr.
+        let _fwd_old = spawn_forwarder(shared_addr, echo_addr)
+            .await
+            .expect("first forwarder must bind the shared addr");
+
+        // Second forwarder (the "new" runner) MUST also bind the SAME addr
+        // (SO_REUSEPORT) instead of EADDRINUSE — the regression this guards.
+        let _fwd_new = spawn_forwarder(shared_addr, echo_addr)
+            .await
+            .expect("second forwarder must also bind the shared addr via SO_REUSEPORT");
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // A connection through the shared addr still round-trips (the kernel
+        // load-balances accepts across both listeners; either may serve it).
+        let mut client = tokio::net::TcpStream::connect(shared_addr).await.unwrap();
+        client.write_all(b"world").await.unwrap();
+        let mut resp = [0u8; 5];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(
+            &resp, b"world",
+            "a connection must still round-trip with two coexisting forwarders"
         );
     }
 
@@ -208,17 +259,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_forwarder_stops_accepting() {
         // Stand up a dummy target so spawn_forwarder succeeds.
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target_listener.local_addr().unwrap();
-
-        let fwd_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fwd_addr = fwd_probe.local_addr().unwrap();
-        drop(fwd_probe);
+        let target_addr = free_loopback_addr().await;
+        let fwd_addr = free_loopback_addr().await;
 
         let fwd = spawn_forwarder(fwd_addr, target_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        // Drop the forwarder — the listener task is aborted.
+        // Drop the forwarder — the listener task is aborted, freeing the port.
         drop(fwd);
         tokio::time::sleep(Duration::from_millis(5)).await;
 

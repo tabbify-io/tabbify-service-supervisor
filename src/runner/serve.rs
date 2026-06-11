@@ -334,15 +334,20 @@ impl RunnerServe {
 
         let addr = hosted.addr;
 
-        // FIX A: L4 SSH forwarder — bind [app_ula]:2222 → guest_ip:2222 so
-        // the node can `ssh root@[app_ula]:2222` into the FC guest's sshd.
-        // Only started in mesh mode AND when the runtime exposes a guest SSH
-        // target (Firecracker dev/devbox image). Bind errors are logged and
+        // FIX A: L4 SSH forwarder — bind [app_ula]:GUEST_SSH_PORT →
+        // guest_ip:GUEST_SSH_PORT so the node can `ssh root@[app_ula]:2222`
+        // into the FC guest's sshd. Only started in mesh mode AND when the
+        // runtime exposes a guest SSH target (Firecracker dev/devbox image).
+        // The listener uses SO_REUSEPORT, so a deploy/swap's NEW runner can
+        // bind while the OLD still holds the port. Bind errors are logged and
         // tolerated — they must not crash the runner.
         let ssh_fwd = if cfg.no_mesh {
             None
         } else if let Some(ssh_target) = active.guest_ssh_addr() {
-            let ssh_bind = std::net::SocketAddr::new(std::net::IpAddr::V6(app_ula), 2222);
+            let ssh_bind = std::net::SocketAddr::new(
+                std::net::IpAddr::V6(app_ula),
+                crate::tcp_forward::GUEST_SSH_PORT,
+            );
             match crate::tcp_forward::spawn_forwarder(ssh_bind, ssh_target).await {
                 Ok(fwd) => {
                     tracing::info!(
@@ -357,7 +362,7 @@ impl RunnerServe {
                         bind = %ssh_bind,
                         target = %ssh_target,
                         error = %e,
-                        "runner: SSH forwarder bind failed (exec/devbox SSH unreachable via mesh)"
+                        "runner: SSH forwarder bind failed — exec/ssh unavailable until rebind (next respawn/restart re-attempts)"
                     );
                     None
                 }
