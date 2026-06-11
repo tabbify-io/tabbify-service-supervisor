@@ -112,7 +112,7 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
     let managed = manifest_toml
         .and_then(|t| toml::from_str::<crate::unified_manifest::UnifiedManifest>(t).ok());
 
-    let (mode, idle_timeout_sec, memory_mb, vcpus, dynamic_prefixes) = match &managed {
+    let (mode, idle_timeout_sec, memory_mb, vcpus, port, dynamic_prefixes) = match &managed {
         Some(m) => {
             let mode = crate::unified_manifest::lifecycle_mode_from_str(&m.runtime.lifecycle);
             (
@@ -120,6 +120,7 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
                 m.runtime.idle_timeout_sec,
                 m.runtime.memory_mb,
                 m.runtime.vcpus,
+                m.runtime.port,
                 m.routes.dynamic_prefixes.clone(),
             )
         }
@@ -129,6 +130,7 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
             FC_DEFAULT_IDLE_SEC,
             FC_DEFAULT_MEMORY_MB,
             FC_DEFAULT_VCPUS,
+            None,
             Vec::new(),
         ),
     };
@@ -155,7 +157,7 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
                 fuel_per_request: 0,
                 memory_mb,
                 vcpus: Some(vcpus),
-                port: None,
+                port,
                 kernel: None,
                 registry_ref: Some(reff.to_owned()),
             },
@@ -359,6 +361,7 @@ kind = "docker"
 [runtime]
 memory_mb = 1024
 vcpus = 2
+port = 8788
 lifecycle = "always_on"
 
 [routes]
@@ -367,6 +370,9 @@ dynamic_prefixes = ["/api", "/health"]
         let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
         assert_eq!(f.manifest.runtime.memory_mb, 1024);
         assert_eq!(f.manifest.runtime.vcpus, Some(2));
+        // The managed `[runtime].port` (e.g. www-backend 8788) flows through so
+        // `resolve_port` targets the right guest port instead of the 8080 default.
+        assert_eq!(f.manifest.runtime.port, Some(8788));
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
         assert_eq!(
             f.manifest.routes.dynamic_prefixes,
