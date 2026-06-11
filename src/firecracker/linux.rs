@@ -759,14 +759,24 @@ impl AppRuntime for FirecrackerRuntime {
     }
 
     fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
-        // Graceful teardown: kill the VM (if still alive) + delete the tap.
-        // Idempotent — `Drop` repeats it as the safety net.
+        // Graceful teardown: kill the VM child (if still alive) + delete the tap.
+        //
+        // IMPORTANT — the SIGKILL is issued SYNCHRONOUSLY in the method body
+        // (before `Box::pin`), NOT inside the async block. This guarantees the
+        // firecracker process is killed at method-call time even if the caller
+        // drops the returned future before polling it (e.g. a detached drain task
+        // that is abandoned when the runner calls `process::exit`). The tap
+        // teardown is still async (it shells `ip link del`) and lives inside the
+        // returned future; if the future is dropped the tap may leak, but the
+        // critical goal — no orphaned spinning FC process — is already met by the
+        // synchronous kill above. `Drop` repeats both as a safety net (idempotent).
         let pid = self.child.as_ref().and_then(|c| c.id());
+        if let Some(pid) = pid {
+            tracing::info!(pid, tap = %self.tap_name, "fc shutdown: killing FC child");
+            pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
+        }
         let tap = self.tap_name.clone();
         Box::pin(async move {
-            if let Some(pid) = pid {
-                pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
-            }
             if let Err(e) = run_ip(&["link", "del", &tap]).await {
                 tracing::debug!(%tap, error = %e, "shutdown: ip link del tap (may already be gone)");
             }

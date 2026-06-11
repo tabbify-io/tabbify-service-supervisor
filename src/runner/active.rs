@@ -44,11 +44,16 @@ impl std::error::Error for SwapError {}
 /// The state machine:
 /// 1. **Health-gate.** Poll `new.health()` every [`SWAP_HEALTH_POLL`] until it
 ///    reports [`RuntimeHealth::Serving`] or `deadline` elapses.
-/// 2. **Flip (healthy).** Atomically [`ActiveRuntime::swap`] `new` in. Spawn a
-///    detached drain task that sleeps `drain`, then calls
-///    [`AppRuntime::shutdown`] on the OLD runtime. Return `Ok(())` immediately —
-///    in-flight requests on the old runtime finish because each request holds
-///    its own `Arc` clone of it (P2.2's design).
+/// 2. **Flip (healthy).** Atomically [`ActiveRuntime::swap`] `new` in. Spawn
+///    a detached drain task that calls `old.shutdown()` FIRST (before the
+///    drain sleep) so the synchronous kill in `FirecrackerRuntime::shutdown`
+///    fires the moment the task is first polled — typically microseconds after
+///    the swap — rather than after the full `drain` period. The future returned
+///    by `shutdown()` (tap teardown) is awaited after the `drain` sleep, giving
+///    in-flight requests time to drain off the old tap before it is removed.
+///    Return `Ok(())` immediately — in-flight requests on the old runtime
+///    finish because each request holds its own `Arc` clone of it (P2.2's
+///    design).
 /// 3. **Abort (timeout).** Call `new.shutdown()` and return [`SwapError`]. The
 ///    OLD runtime stays active, so a failed deploy causes **no downtime** and no
 ///    flip.
@@ -75,11 +80,23 @@ pub async fn perform_swap(
     let old = active.swap(new);
 
     // --- 3. drain the OLD runtime off the hot path (fire-and-forget) -------
-    // Spawned so `perform_swap` returns promptly after the flip; in-flight
-    // requests on `old` keep their own Arc clone alive until they complete.
+    // `old.shutdown()` is called at the START of the spawn body — BEFORE the
+    // drain sleep.  For FC runtimes, `shutdown()` issues SIGKILL to the old FC
+    // process SYNCHRONOUSLY in the method body (before `Box::pin`).  Because
+    // the kill is synchronous-at-call-time (not inside the returned future),
+    // it fires the moment the tokio task is first polled — which happens on the
+    // very next cooperative yield after `tokio::spawn` returns, typically
+    // microseconds after the swap.  This is vastly earlier than the old code
+    // where the kill was INSIDE the `Box::pin` async block and only ran after
+    // the full drain sleep (up to DEPLOY_DRAIN = 10 s).
+    //
+    // The returned future (tap teardown via `ip link del`) is awaited AFTER the
+    // drain sleep so in-flight requests on the old tap can finish before the
+    // tap device is removed.
     tokio::spawn(async move {
+        let tap_cleanup = old.shutdown(); // synchronous kill fires here (FC)
         tokio::time::sleep(drain).await;
-        old.shutdown().await;
+        tap_cleanup.await; // async tap teardown after drain
     });
 
     Ok(())
@@ -491,6 +508,100 @@ mod tests {
         );
         // ...and the new active runtime is again self-consistent across loads.
         assert!(Arc::ptr_eq(&active.load(), &active.load()));
+    }
+
+    // ---- eager-shutdown contract --------------------------------------------
+    //
+    // A runtime whose `shutdown()` records the call SYNCHRONOUSLY in the method
+    // body — not inside `Box::pin` — so we can assert that `perform_swap` issued
+    // the kill *before* any drain sleep.  This mirrors `FirecrackerRuntime`:
+    //   fn shutdown(&self) -> BoxFut<()> {
+    //       kill_child_now();          // ← synchronous, happens at call-time
+    //       Box::pin(async { tap_del() }) // ← async, happens when awaited
+    //   }
+    struct EagerShutdownFake {
+        tag: &'static str,
+        /// Set TRUE synchronously in `shutdown()` method body (not in the future).
+        shutdown_called_sync: Arc<AtomicBool>,
+    }
+
+    impl EagerShutdownFake {
+        fn new(tag: &'static str) -> (Arc<Self>, Arc<AtomicBool>) {
+            let flag = Arc::new(AtomicBool::new(false));
+            let rt = Arc::new(Self {
+                tag,
+                shutdown_called_sync: flag.clone(),
+            });
+            (rt, flag)
+        }
+    }
+
+    impl AppRuntime for EagerShutdownFake {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            let tag = self.tag;
+            Box::pin(async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .body(Bytes::from(tag))
+                    .unwrap())
+            })
+        }
+
+        fn health<'a>(&'a self) -> BoxFut<'a, RuntimeHealth> {
+            Box::pin(async { RuntimeHealth::Serving })
+        }
+
+        fn shutdown<'a>(&'a self) -> BoxFut<'a, ()> {
+            // Record the call synchronously — mirrors FirecrackerRuntime's
+            // synchronous SIGKILL in the method body (not inside the future).
+            self.shutdown_called_sync.store(true, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    /// CONTRACT: `perform_swap` must call `old.shutdown()` BEFORE the drain
+    /// sleep so the synchronous kill (e.g. SIGKILL on the FC child in
+    /// `FirecrackerRuntime::shutdown`) happens at the start of the drain task
+    /// — not after `drain` milliseconds.  This ensures the old FC process is
+    /// killed even if the runner calls `process::exit()` shortly after the
+    /// swap (within the drain window).
+    ///
+    /// The test uses a 500-ms drain and asserts the flag is set well before
+    /// the drain period elapses (within 100 ms), proving the kill does NOT
+    /// wait for the drain sleep.
+    #[tokio::test]
+    async fn perform_swap_calls_shutdown_before_drain_sleep() {
+        let (old, old_sync_shut) = EagerShutdownFake::new("OLD");
+        let (new, _) = SwapFake::healthy("NEW");
+        let active = ActiveRuntime::new(old);
+
+        // Use a 500-ms drain so we can clearly distinguish "happened before
+        // drain" (<100 ms) from "happened after drain" (≥500 ms).
+        perform_swap(
+            &active,
+            new,
+            Duration::from_millis(500), // long drain: kill must NOT wait for it
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("healthy swap must succeed");
+
+        // Poll for up to 100 ms — far less than the 500 ms drain.  If the kill
+        // happened before the drain sleep (correct), the flag is set quickly.
+        // If it only fires after the sleep (regression), this loop times out.
+        for _ in 0..20 {
+            if old_sync_shut.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            old_sync_shut.load(Ordering::SeqCst),
+            "OLD.shutdown() synchronous kill must happen BEFORE the drain sleep \
+             (within ~100 ms), not after 500 ms — old FC must not orphan on \
+             systemd if the runner exits within the drain window"
+        );
     }
 
     /// An unhealthy new runtime aborts the swap: the OLD runtime stays active
