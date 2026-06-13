@@ -158,6 +158,32 @@ if ! command -v oras >/dev/null 2>&1 && [ ! -x "$DATA/bin/oras" ]; then
   rm -rf "$tmp"
 fi
 
+# ── build-host tools (best-effort, never fatal) ─────────────────────────
+# The docker-less build path needs git (source clone), e2fsprogs (mkfs.ext4 +
+# debugfs for OCI->ext4), iproute2 (mesh TUN + tap), iptables (ip6tables firewall
+# trust), busybox (the FC readiness shim). A RUN-ONLY node works without them; a
+# BUILDER node does not. Auto-install via the host package manager so a fresh box
+# is a complete builder out of the box. `|| warn` keeps it non-fatal.
+install_build_deps() {
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+         git e2fsprogs iproute2 iptables busybox-static ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q git e2fsprogs iproute iptables busybox ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q git e2fsprogs iproute iptables busybox ca-certificates
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm --needed git e2fsprogs iproute2 iptables busybox ca-certificates
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache git e2fsprogs iproute2 iptables busybox ca-certificates
+  else
+    return 1
+  fi
+}
+log "installing build-host tools (git, e2fsprogs, iproute2, iptables, busybox) — best-effort"
+install_build_deps || warn "could not auto-install build-host tools; for a BUILDER node install git + e2fsprogs + iproute2 + iptables manually"
+
 # ── host capability warnings (informational, never fatal) ───────────────
 [ -e /dev/kvm ] || warn "no /dev/kvm — Firecracker microVM apps cannot run on this host"
 command -v ip >/dev/null 2>&1 || warn "iproute2 ('ip') missing — the mesh TUN cannot be configured; install iproute2"
@@ -169,13 +195,30 @@ command -v mkfs.ext4 >/dev/null 2>&1 || warn "mkfs.ext4 (e2fsprogs) missing — 
 # not exposed to local users, and so a re-run WITHOUT the token leaves an
 # existing token intact. The unit references it via `EnvironmentFile=-` (the `-`
 # makes a missing file non-fatal — a no-mesh / dev node still starts).
-if [ -n "$JOIN_TOKEN" ]; then
-  log "persisting join token to $ENV_FILE (0600)"
-  ( umask 077; printf 'TABBIFY_JOIN_TOKEN=%s\n' "$JOIN_TOKEN" > "$ENV_FILE.tmp" )
+# Mesh overrides (optional, passed in env). A NAT'd box passes
+# TABBIFY_MESH_RELAY_ONLY=true (the relay floor — a direct WG endpoint can never
+# land behind NAT, and declaring relay-only avoids the simultaneous-init thrash);
+# a LAN peer may pass TABBIFY_MESH_ADVERTISE_ENDPOINT=<lan-ip>:51820 for direct
+# hole-punch. Both ride in the same 0600 EnvironmentFile as the token.
+RELAY_ONLY="${TABBIFY_MESH_RELAY_ONLY:-}"
+ADVERTISE="${TABBIFY_MESH_ADVERTISE_ENDPOINT:-}"
+# A re-run preserves already-persisted values unless overridden in env, so
+# re-running WITHOUT the token (e.g. just to upgrade) never wipes it.
+if [ -f "$ENV_FILE" ]; then
+  : "${JOIN_TOKEN:=$(sed -n 's/^TABBIFY_JOIN_TOKEN=//p' "$ENV_FILE" | head -n1)}"
+  : "${RELAY_ONLY:=$(sed -n 's/^TABBIFY_MESH_RELAY_ONLY=//p' "$ENV_FILE" | head -n1)}"
+  : "${ADVERTISE:=$(sed -n 's/^TABBIFY_MESH_ADVERTISE_ENDPOINT=//p' "$ENV_FILE" | head -n1)}"
+fi
+if [ -n "$JOIN_TOKEN" ] || [ -n "$RELAY_ONLY" ] || [ -n "$ADVERTISE" ]; then
+  log "writing $ENV_FILE (0600): join token + mesh overrides"
+  ( umask 077
+    : > "$ENV_FILE.tmp"
+    if [ -n "$JOIN_TOKEN" ]; then printf 'TABBIFY_JOIN_TOKEN=%s\n' "$JOIN_TOKEN" >> "$ENV_FILE.tmp"; fi
+    if [ -n "$RELAY_ONLY" ]; then printf 'TABBIFY_MESH_RELAY_ONLY=%s\n' "$RELAY_ONLY" >> "$ENV_FILE.tmp"; fi
+    if [ -n "$ADVERTISE" ]; then printf 'TABBIFY_MESH_ADVERTISE_ENDPOINT=%s\n' "$ADVERTISE" >> "$ENV_FILE.tmp"; fi
+  )
   chmod 600 "$ENV_FILE.tmp"
   mv "$ENV_FILE.tmp" "$ENV_FILE"
-elif [ -f "$ENV_FILE" ]; then
-  log "keeping existing join token at $ENV_FILE"
 else
   warn "no TABBIFY_JOIN_TOKEN provided — this node will register WITHOUT a join token; a token-validating coordinator will reject it (401). Re-run with TABBIFY_JOIN_TOKEN=<jwt> to fix."
 fi
