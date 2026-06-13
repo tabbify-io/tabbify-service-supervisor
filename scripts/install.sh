@@ -208,6 +208,10 @@ Environment=SUPERVISOR_FC_KERNEL=$DATA/vmlinux
 Environment=RUST_LOG=info
 # $DATA/bin carries the fetched firecracker/oras helpers.
 Environment=PATH=$DATA/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# oras (docker-less registry I/O) aborts "\$HOME is not defined" without HOME;
+# a clean systemd unit has none. The binary also self-defaults this, but set it
+# here too so every child tool has it.
+Environment=HOME=/root
 Restart=on-failure
 RestartSec=3
 

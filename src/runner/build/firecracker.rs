@@ -1024,16 +1024,25 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
             let Some((prog, rest)) = argv.split_first() else {
                 return (false, Vec::new());
             };
-            match Command::new(prog)
-                .args(rest)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .await
-            {
-                Ok(out) => {
-                    if !out.status.success() {
+            // `oras` (registry pull over the relay-only mesh registry) is retried
+            // on transient failure — a large blob can break mid-transfer over the
+            // DERP relay (the registry proxy then 502s); local tools (`tar`,
+            // `mkfs.ext4`) run exactly once. Every spawn carries a valid `HOME`
+            // so `oras` never aborts "$HOME is not defined" on a clean install.
+            let attempts = crate::tool_exec::attempts_for(prog);
+            let mut last: (bool, Vec<u8>) = (false, Vec::new());
+            for attempt in 1..=attempts {
+                match Command::new(prog)
+                    .args(rest)
+                    .env("HOME", crate::tool_exec::tool_home())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => return (true, out.stdout),
+                    Ok(out) => {
                         // Surface the tool's own diagnostic (e.g. mkfs.ext4
                         // "Could not allocate N inodes" vs "too small") instead
                         // of discarding it — the caller only sees a bool.
@@ -1041,16 +1050,22 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
                             cmd = %argv.join(" "),
                             code = out.status.code().unwrap_or(-1),
                             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                            attempt,
+                            attempts,
                             "fc build: command failed"
                         );
+                        last = (false, out.stdout);
                     }
-                    (out.status.success(), out.stdout)
+                    Err(e) => {
+                        tracing::warn!(cmd = %argv.join(" "), error = %e, attempt, attempts, "fc build: command spawn failed");
+                        last = (false, Vec::new());
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(cmd = %argv.join(" "), error = %e, "fc build: command spawn failed");
-                    (false, Vec::new())
+                if attempt < attempts {
+                    tokio::time::sleep(crate::tool_exec::retry_backoff(attempt)).await;
                 }
             }
+            last
         });
         fut
     })

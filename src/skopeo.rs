@@ -111,39 +111,53 @@ pub fn production_tool_runner() -> CommandRunner {
 
     Arc::new(move |args: Vec<String>| {
         let fut: BoxFut<'static, Result<(), String>> = Box::pin(async move {
-            let Some((skopeo_bin, rest)) = args.split_first() else {
+            let Some((bin, rest)) = args.split_first() else {
                 return Err("tool runner: empty argv".to_owned());
             };
-            let skopeo_bin = skopeo_bin.clone();
+            let bin = bin.clone();
             let args: Vec<String> = rest.to_vec();
-            match Command::new(&skopeo_bin)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .await
-            {
-                Ok(out) if out.status.success() => Ok(()),
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let stderr = stderr.trim();
-                    let code = out
-                        .status
-                        .code()
-                        .map_or_else(|| "signal".to_owned(), |c| c.to_string());
-                    let argv = args.join(" ");
-                    Err(if stderr.is_empty() {
-                        format!("`{skopeo_bin} {argv}` exited with status {code}")
-                    } else {
-                        format!("`{skopeo_bin} {argv}` exited with status {code}: {stderr}")
-                    })
+            // `oras` (push to the relay-only mesh registry) is retried on
+            // transient failure — a large blob can break mid-transfer over the
+            // DERP relay (the registry proxy then 502s); the local `skopeo`
+            // daemon→layout step is deterministic and runs once. Every spawn
+            // carries a valid `HOME` so `oras` never aborts "$HOME is not
+            // defined" on a clean install.
+            let attempts = crate::tool_exec::attempts_for(&bin);
+            let mut last_err = String::from("tool runner: no attempt ran");
+            for attempt in 1..=attempts {
+                match Command::new(&bin)
+                    .args(&args)
+                    .env("HOME", crate::tool_exec::tool_home())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => return Ok(()),
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stderr = stderr.trim();
+                        let code = out
+                            .status
+                            .code()
+                            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+                        let argv = args.join(" ");
+                        last_err = if stderr.is_empty() {
+                            format!("`{bin} {argv}` exited with status {code}")
+                        } else {
+                            format!("`{bin} {argv}` exited with status {code}: {stderr}")
+                        };
+                    }
+                    Err(e) => {
+                        last_err = format!("failed to spawn `{bin} {}`: {e}", args.join(" "));
+                    }
                 }
-                Err(e) => Err(format!(
-                    "failed to spawn `{skopeo_bin} {}`: {e}",
-                    args.join(" ")
-                )),
+                if attempt < attempts {
+                    tokio::time::sleep(crate::tool_exec::retry_backoff(attempt)).await;
+                }
             }
+            Err(last_err)
         });
         fut
     })

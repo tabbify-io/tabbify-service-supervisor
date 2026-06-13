@@ -240,6 +240,10 @@ in {
       # e2fsprogs) are on the service `path` above.
       SUPERVISOR_FC_BUILD    = "true";
       SUPERVISOR_BUILDER     = "true";
+      # oras (docker-less registry I/O) aborts "$HOME is not defined" without a
+      # HOME; a systemd unit has none by default. The binary self-defaults this
+      # too, but set it here so every exec'd tool has it.
+      HOME                   = "/root";
       # This node is RELAY-ONLY: it sits behind a home NAT and every EC2 peer
       # drops inbound UDP 51820, so a direct WireGuard endpoint can never land.
       # Declaring relay_only makes the coordinator suppress this peer's reflexive

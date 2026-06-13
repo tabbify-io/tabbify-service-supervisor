@@ -46,15 +46,20 @@ const CACHE_MIB: u64 = 20 * 1024;
 /// `SUPERVISOR_BUILD_TOOLCHAIN` (e.g. to pin a digest while testing).
 pub const TOOLCHAIN_REPO: &str = "tabbify/buildkit-toolchain:v1";
 
-/// `true` when this supervisor should build inside Firecracker sandboxes:
-/// explicit opt-in (`SUPERVISOR_FC_BUILD=true`) AND a usable KVM. The docker
-/// path stays the default during the transition.
+/// `true` when this supervisor should build inside Firecracker sandboxes.
+///
+/// Default: build inside Firecracker whenever KVM is available — the docker-less
+/// path is the target, so a clean KVM host opts in automatically (no env, no
+/// `skopeo` needed). Explicit `SUPERVISOR_FC_BUILD=false`/`0` forces the legacy
+/// docker+skopeo path. KVM is required either way: a host without `/dev/kvm`
+/// cannot run a build microVM, so it always falls back to the docker path.
 #[must_use]
 pub fn enabled() -> bool {
-    let opted = std::env::var("SUPERVISOR_FC_BUILD")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    opted && crate::firecracker::kvm_available()
+    let disabled = matches!(
+        std::env::var("SUPERVISOR_FC_BUILD").as_deref(),
+        Ok("false") | Ok("0")
+    );
+    !disabled && crate::firecracker::kvm_available()
 }
 
 /// The toolchain image ref for `registry_ula` (env-overridable repo path).
