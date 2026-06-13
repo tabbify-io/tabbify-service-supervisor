@@ -151,12 +151,16 @@ mod tests {
     /// carries `--check` + the transient identity path.
     #[test]
     fn candidate_probe_args_decouple_from_the_production_mesh() {
-        let args = candidate_probe_args(std::path::Path::new("/opt/tabbify/candidate-identity.json"));
+        let args =
+            candidate_probe_args(std::path::Path::new("/opt/tabbify/candidate-identity.json"));
         assert!(
             args.contains(&"--no-mesh".to_owned()),
             "candidate probe MUST run --no-mesh so it never joins the live mesh: {args:?}"
         );
-        assert!(args.contains(&"--check".to_owned()), "must be a candidate probe");
+        assert!(
+            args.contains(&"--check".to_owned()),
+            "must be a candidate probe"
+        );
         assert!(
             args.contains(&"--candidate-identity-path".to_owned())
                 && args.contains(&"/opt/tabbify/candidate-identity.json".to_owned()),

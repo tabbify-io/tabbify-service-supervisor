@@ -96,7 +96,10 @@ mod tests {
     fn serve_config_from_carries_manifest_toml() {
         let cfg = parse(&["--manifest-toml", "[app]\nname = \"x\"\n"]);
         let serve = serve_config_from(&cfg);
-        assert_eq!(serve.manifest_toml.as_deref(), Some("[app]\nname = \"x\"\n"));
+        assert_eq!(
+            serve.manifest_toml.as_deref(),
+            Some("[app]\nname = \"x\"\n")
+        );
     }
 
     /// Absent the managed toml, `serve_config_from` leaves `manifest_toml` None

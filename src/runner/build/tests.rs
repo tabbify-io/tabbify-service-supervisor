@@ -434,7 +434,10 @@ async fn run_build_injects_managed_toml_when_repo_has_none() {
     let toml_path = dir.path().join("src").join("tabbify.toml");
     let written = std::fs::read_to_string(&toml_path)
         .unwrap_or_else(|e| panic!("managed toml must be written to {toml_path:?}: {e}"));
-    assert_eq!(written, MANAGED_TOML, "the managed toml must be written verbatim");
+    assert_eq!(
+        written, MANAGED_TOML,
+        "the managed toml must be written verbatim"
+    );
 }
 
 /// A clone tree that ships its OWN `tabbify.toml` + a provided managed toml →
@@ -574,7 +577,11 @@ fn resolve_build_spec_default_toml_is_default_layout() {
     let src = dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
     let toml_path = src.join("tabbify.toml");
-    std::fs::write(&toml_path, "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n").unwrap();
+    std::fs::write(
+        &toml_path,
+        "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n",
+    )
+    .unwrap();
     let spec = resolve_build_spec(&src, &toml_path).unwrap();
     assert!(
         spec.is_default_layout(),

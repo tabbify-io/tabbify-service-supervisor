@@ -83,7 +83,10 @@ pub struct Config {
     /// each other directly without going through the relay. When unset (the
     /// default) the coordinator uses the reflexive endpoint it observes on the
     /// incoming UDP register — unchanged behavior for cloud/public peers.
-    #[arg(long = "mesh-advertise-endpoint", env = "TABBIFY_MESH_ADVERTISE_ENDPOINT")]
+    #[arg(
+        long = "mesh-advertise-endpoint",
+        env = "TABBIFY_MESH_ADVERTISE_ENDPOINT"
+    )]
     pub advertise_endpoint: Option<String>,
 
     /// Skip mesh join entirely and bind a plain loopback/`--bind` addr. Used

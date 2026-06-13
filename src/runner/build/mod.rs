@@ -143,8 +143,9 @@ pub async fn run_build(
     let toml_path = src.join("tabbify.toml");
     if !toml_path.exists() {
         if let Some(t) = &job.manifest_toml {
-            std::fs::write(&toml_path, t)
-                .with_context(|| format!("write managed tabbify.toml to {}", toml_path.display()))?;
+            std::fs::write(&toml_path, t).with_context(|| {
+                format!("write managed tabbify.toml to {}", toml_path.display())
+            })?;
         }
     }
 
