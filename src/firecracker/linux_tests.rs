@@ -142,6 +142,62 @@ async fn real_vm_boots_and_serves() {
     drop(vm); // child killed + tap deleted
 }
 
+/// FIX (a): the warm-restore path must REAP a stale FC from a prior restore of
+/// the same uuid BEFORE spawning a new one (FCs were piling up — 3 FCs for 1
+/// runner). `launch_from_snapshot` now runs the SAME `pidfile::take` +
+/// `kill_stale_if_alive` reap the cold path uses. This test exercises that exact
+/// sequence against a real child (a stand-in for the stale FC) without needing
+/// KVM: it spawns a `sleep`, records its pid in the per-uuid pidfile, runs the
+/// reap sequence, and asserts the child is killed AND the pidfile is consumed.
+#[test]
+fn restore_reaps_prior_fc_via_pidfile() {
+    use super::pidfile;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = "0191e7c2-cafe-7222-8333-444455556666";
+
+    // A real "prior FC" we can safely kill.
+    let mut prior_fc = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn stale-fc stand-in");
+    let prior_pid = prior_fc.id();
+    pidfile::write(dir.path(), uuid, prior_pid);
+    assert!(pidfile::path(dir.path(), uuid).exists());
+
+    // The exact reap sequence launch_from_snapshot runs before its FC spawn.
+    if let Some(stale_pid) = pidfile::take(dir.path(), uuid) {
+        assert_eq!(stale_pid, prior_pid);
+        pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
+    } else {
+        panic!("pidfile must yield the prior FC pid");
+    }
+
+    // The pidfile must be consumed (so only one respawn runs at a time).
+    assert!(
+        !pidfile::path(dir.path(), uuid).exists(),
+        "reap must consume the pidfile"
+    );
+
+    // The prior FC must be dead. SIGKILL is near-instant; poll waitpid(WNOHANG)
+    // (reaps the zombie AND detects exit) for up to ~100ms.
+    let mut alive_after = true;
+    for _ in 0..10 {
+        let r =
+            unsafe { libc::waitpid(prior_pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) };
+        if r != 0 {
+            alive_after = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = prior_fc.wait();
+    assert!(
+        !alive_after,
+        "the prior FC (pid {prior_pid}) must be reaped before the new restore"
+    );
+}
+
 #[test]
 fn parse_default_dev_extracts_iface() {
     assert_eq!(

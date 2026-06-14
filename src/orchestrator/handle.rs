@@ -120,6 +120,19 @@ pub struct RunnerHandle {
     /// (normal behavior, never parked).
     #[serde(default)]
     pub crash_looped: bool,
+    /// Operator-stopped flag. Set by
+    /// [`stop_app`](crate::orchestrator::Orchestrator::stop_app): the runner is
+    /// shut down but its record is PRESERVED (so its `image_ref`/`manifest_toml`/
+    /// `extra_env`/`runner_join_token` survive for a later respawn/reset/deploy).
+    /// The monitor's reconcile treats a `stopped` record like a parked one — it
+    /// is NOT respawned — until something brings the app back up (a fresh
+    /// `spawn_runner` from `start_app`/`deploy_app` writes a new record with
+    /// `stopped: false`, and `reset_app` clears it explicitly). This replaces the
+    /// old "delete the record on stop" behavior, which bricked a later respawn by
+    /// dropping the deploy artifact. `#[serde(default)]` keeps old on-disk records
+    /// loading — they get `false` (never stopped).
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -229,6 +242,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         }
     }
 
@@ -248,6 +262,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         }
     }
 

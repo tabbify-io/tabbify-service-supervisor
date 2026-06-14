@@ -1099,6 +1099,18 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
 /// A failing `oras copy`.
 async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> Result<PathBuf> {
     let layout = out_dir.join("oci");
+    // SPEED + CORRECTNESS: for a MUTABLE tag ref (no `@sha256`), wipe the layout
+    // dir first so `oras copy --to-oci-layout` resolves the tag to its CURRENT
+    // digest. `oras copy` into a DIRTY layout ACCUMULATES manifests in
+    // `index.json`, and the readers take `manifests[0]` (the OLDEST) — so a
+    // re-published tag would otherwise resolve to a STALE manifest and the app
+    // would serve its original version forever. A digest-pinned ref
+    // (`…@sha256:…`) is immutable and content-addressed, so leave its (possibly
+    // already-cached) layout intact — no re-pull churn. `remove_dir_all` is
+    // idempotent (a missing dir is fine).
+    if !reff.contains("@sha256") {
+        tokio::fs::remove_dir_all(&layout).await.ok();
+    }
     tokio::fs::create_dir_all(&layout)
         .await
         .with_context(|| format!("create oci layout dir {}", layout.display()))?;

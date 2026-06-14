@@ -357,6 +357,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         }
     }
 

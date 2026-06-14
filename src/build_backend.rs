@@ -38,6 +38,13 @@ pub fn build_dir_args(tag: &str, context_dir: &Path, dockerfile: Option<&Path>) 
         args.push("-f".to_owned());
         args.push(df.to_string_lossy().into_owned());
     }
+    // Reuse unchanged layers from a previous build of the same tag (SPEED). On a
+    // rebuild the prior image is already in the local daemon, so `--cache-from
+    // <tag>` lets docker skip re-running unchanged layers. Idempotent: if the
+    // tag is absent locally (first build) docker simply finds no cache source
+    // and builds from scratch — no error.
+    args.push("--cache-from".to_owned());
+    args.push(tag.to_owned());
     args.push("-t".to_owned());
     args.push(tag.to_owned());
     args.push(context_dir.to_string_lossy().into_owned());
@@ -179,30 +186,48 @@ mod tests {
 
     // ---- build_dir_args (pure, deterministic) --------------------------------
 
-    /// `build_dir_args` (no dockerfile) must produce `["build", "-t", <tag>, <dir>]`.
+    /// `build_dir_args` (no dockerfile) must produce
+    /// `["build", "--cache-from", <tag>, "-t", <tag>, <dir>]` — the
+    /// `--cache-from <tag>` reuses unchanged layers from a prior build (SPEED).
     #[test]
     fn build_dir_args_returns_correct_argv() {
         let dir = PathBuf::from("/work/src/my-app");
         assert_eq!(
             build_dir_args("tbf-img-x", &dir, None),
-            vec!["build", "-t", "tbf-img-x", "/work/src/my-app"]
+            vec![
+                "build",
+                "--cache-from",
+                "tbf-img-x",
+                "-t",
+                "tbf-img-x",
+                "/work/src/my-app"
+            ]
         );
     }
 
-    /// `build_dir_args` preserves the full path including any subdirectories.
+    /// `build_dir_args` preserves the full path including any subdirectories
+    /// (the context dir stays the final argv element).
     #[test]
     fn build_dir_args_preserves_full_path() {
         let dir = PathBuf::from("/clone/abc123/repo");
         let args = build_dir_args("tbf-img-abc", &dir, None);
         assert_eq!(args[0], "build");
-        assert_eq!(args[1], "-t");
-        assert_eq!(args[2], "tbf-img-abc");
-        assert_eq!(args[3], "/clone/abc123/repo");
+        assert_eq!(args.last().map(String::as_str), Some("/clone/abc123/repo"));
+        // The tag is used for BOTH the cache source and the output tag.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--cache-from", "tbf-img-abc"]),
+            "must carry --cache-from <tag>; got: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-t", "tbf-img-abc"]),
+            "must carry -t <tag>; got: {args:?}"
+        );
     }
 
-    /// With a `dockerfile`, `build_dir_args` emits `-f <dockerfile>` BEFORE the
-    /// `-t <tag> <context>` so a `[build].dockerfile` from `tabbify.toml` is
-    /// honoured.
+    /// With a `dockerfile`, `build_dir_args` emits `-f <dockerfile>` then the
+    /// `--cache-from <tag> -t <tag> <context>` so a `[build].dockerfile` from
+    /// `tabbify.toml` is honoured and layer cache is reused.
     #[test]
     fn build_dir_args_emits_dockerfile_flag() {
         let ctx = PathBuf::from("/work/src");
@@ -213,6 +238,8 @@ mod tests {
                 "build",
                 "-f",
                 "/work/src/deploy/Dockerfile",
+                "--cache-from",
+                "tbf-img-y",
                 "-t",
                 "tbf-img-y",
                 "/work/src",
@@ -247,11 +274,13 @@ mod tests {
             cmds[0],
             vec![
                 "build".to_owned(),
+                "--cache-from".to_owned(),
+                "tbf-img-x".to_owned(),
                 "-t".to_owned(),
                 "tbf-img-x".to_owned(),
                 "/work/repo".to_owned(),
             ],
-            "must issue `docker build -t <tag> <dir>`"
+            "must issue `docker build --cache-from <tag> -t <tag> <dir>`"
         );
     }
 

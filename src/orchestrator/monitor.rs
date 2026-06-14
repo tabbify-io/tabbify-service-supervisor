@@ -279,6 +279,19 @@ impl Orchestrator {
     /// next-retry window has not yet elapsed, the function returns
     /// [`RecordOutcome::Backoff`] without touching the process table.
     pub(crate) async fn reconcile_record(&self, record: &RunnerHandle) -> RecordOutcome {
+        // Operator-stopped: `stop_app` shut the runner down but PRESERVED its
+        // record (so the deploy artifact survives for a later respawn/reset).
+        // A stopped record must NOT be respawned — treat it like a parked one
+        // until the app is brought back up (a fresh spawn writes `stopped:
+        // false`; `reset_app` clears it).
+        if record.stopped {
+            tracing::debug!(
+                uuid = %record.uuid,
+                "runner is operator-stopped — skipping respawn until restarted/reset/deployed"
+            );
+            return RecordOutcome::CrashLooped;
+        }
+
         // Circuit breaker: if this runner is already parked (exceeded the
         // crash-loop threshold), do NOT respawn it until a new deploy writes a
         // fresh record with `crash_looped = false`.
@@ -787,6 +800,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         }
     }
 

@@ -68,6 +68,7 @@ fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
         manifest_toml: None,
         extra_env: None,
         crash_looped: false,
+        stopped: false,
     }
 }
 
@@ -297,6 +298,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
         manifest_toml: None,
         extra_env: None,
         crash_looped: false,
+        stopped: false,
     };
     rec.save(dir.path()).unwrap();
 

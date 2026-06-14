@@ -373,6 +373,7 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // A freshly-spawned runner always starts with the circuit breaker clear
         // (not parked). The monitor sets this only after N consecutive failures.
         crash_looped: false,
+        stopped: false,
     };
 
     handle

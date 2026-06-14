@@ -31,8 +31,13 @@ use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
 
 /// How long to wait for the guest app's HTTP server to come up after boot.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Poll interval while waiting for the guest app.
+/// Per-poll HTTP timeout for the guest-app readiness probe. Each GET attempt is
+/// bounded by this; the overall budget is [`READY_TIMEOUT`].
 const READY_POLL: Duration = Duration::from_millis(250);
+/// Readiness-probe backoff: first sleep between polls.
+const READY_BACKOFF_START: Duration = Duration::from_millis(50);
+/// Readiness-probe backoff: cap on the sleep between polls.
+const READY_BACKOFF_CAP: Duration = Duration::from_secs(2);
 /// How long to wait for one firecracker API call over the unix socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -179,7 +184,7 @@ impl FirecrackerRuntime {
         // No per-app uuid context here (the bare entry, used by tests + simple
         // single-VM callers): a fixed identity is fine. The per-uuid production
         // path is `launch_with_uuid`.
-        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default").await
+        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default", None).await
     }
 
     /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
@@ -187,6 +192,10 @@ impl FirecrackerRuntime {
     /// `console_log` — when `Some` and `SUPERVISOR_FC_DEBUG` is truthy, the
     /// firecracker child's stdout+stderr are appended there; otherwise both go
     /// to `/dev/null` (the default, unchanged behavior).
+    /// `image_ref` — when `Some` AND a snapshot is created, the ref is recorded
+    /// in `<cache_dir>/.snapshot_ref` so a later warm restore can be invalidated
+    /// if the deployed image_ref changes (the snapshot cache is keyed by UUID
+    /// only — see [`snapshot::ref_matches`]).
     async fn cold_boot(
         rootfs: &Path,
         rt: &Runtime,
@@ -194,6 +203,7 @@ impl FirecrackerRuntime {
         cache_dir: Option<&Path>,
         console_log: Option<&Path>,
         vm_key: &str,
+        image_ref: Option<&str>,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -268,10 +278,16 @@ impl FirecrackerRuntime {
         me.wait_until_ready().await?;
 
         // Best-effort snapshot after first boot. A failure is logged and
-        // does NOT fail the launch — the VM continues to serve cold.
+        // does NOT fail the launch — the VM continues to serve cold. On a
+        // successful create, record the image_ref the snapshot was taken from so
+        // a later warm restore is invalidated when the deployed image changes
+        // (snapshot cache is keyed by UUID only — see `snapshot::ref_matches`).
         if let Some(dir) = cache_dir {
             if !snapshot::files_present(dir) {
                 me.try_create_snapshot(dir).await;
+                if let (Some(reff), true) = (image_ref, snapshot::files_present(dir)) {
+                    snapshot::write_ref(dir, reff);
+                }
             }
         }
 
@@ -335,22 +351,30 @@ impl FirecrackerRuntime {
                 Some(&cache_dir),
                 Some(&console_log),
                 &vm_key,
+                Some(reff),
             )
             .await?
         } else {
             // COLD START (first boot / monitor respawn): reconcile a stale VM
             // left by a crashed predecessor, then warm-restore if a snapshot
-            // exists (same image as the on-disk record) else cold boot.
+            // exists AND it was taken from the SAME image (else cold boot, which
+            // re-creates a fresh snapshot for the current image).
             if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
                 pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
             }
-            if snapshot::files_present(&cache_dir) {
+            // Invalidate the snapshot when the image_ref has changed: the cache
+            // is keyed by UUID only, so a respawn after a redeploy of a NEW image
+            // would otherwise warm-restore the STALE image. `ref_matches` is
+            // safe-by-default (mismatch / missing ref / read error → cold boot).
+            if snapshot::ref_matches(&cache_dir, reff) {
                 match Self::launch_from_snapshot(
                     &cache_dir,
                     cfg,
                     Some(&console_log),
                     &vm_key,
                     resolve_port(rt, cfg),
+                    data_dir,
+                    uuid,
                 )
                 .await
                 {
@@ -367,11 +391,23 @@ impl FirecrackerRuntime {
                             Some(&cache_dir),
                             Some(&console_log),
                             &vm_key,
+                            Some(reff),
                         )
                         .await?
                     }
                 }
             } else {
+                // No usable snapshot for THIS image (absent, or taken from a
+                // different image_ref): cold boot. If a stale snapshot from a
+                // prior image is on disk, clear it first so the fresh cold-boot
+                // snapshot + its `.snapshot_ref` replace it cleanly.
+                if snapshot::files_present(&cache_dir) {
+                    tracing::info!(
+                        uuid,
+                        "snapshot present but image_ref changed; clearing + cold boot"
+                    );
+                    snapshot::clear(&cache_dir);
+                }
                 Self::cold_boot(
                     rootfs,
                     rt,
@@ -379,6 +415,7 @@ impl FirecrackerRuntime {
                     Some(&cache_dir),
                     Some(&console_log),
                     &vm_key,
+                    Some(reff),
                 )
                 .await?
             }
@@ -415,9 +452,22 @@ impl FirecrackerRuntime {
         console_log: Option<&Path>,
         vm_key: &str,
         app_port: u16,
+        data_dir: &Path,
+        uuid: &str,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
+        }
+
+        // Reap a stale FC left by a PRIOR restore of the same uuid BEFORE
+        // spawning the new one. Without this, every warm restore spawned a fresh
+        // firecracker without killing the predecessor → FC processes piled up
+        // (observed 3 FCs for 1 runner). The cold-boot path already does this
+        // via the per-uuid pidfile; mirror the SAME pidfile mutual-exclusion
+        // semantics here so only one respawn runs at a time. (The active pid is
+        // re-written by `launch_with_uuid` after this returns.)
+        if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
+            pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
         }
 
         let vmstate = snapshot::vmstate_path(cache_dir);
@@ -629,6 +679,11 @@ impl FirecrackerRuntime {
         let start = tokio::time::Instant::now();
         let deadline = start + READY_TIMEOUT;
         let mut attempt: u32 = 0;
+        // Exponential backoff between polls (50ms → 100 → 250 → 500 → … capped
+        // at 2s): a healthy guest is detected sooner than the old fixed 250ms,
+        // while a slow one is still waited for within the same READY_TIMEOUT
+        // budget. The per-poll HTTP timeout stays READY_POLL.
+        let mut backoff = READY_BACKOFF_START;
         loop {
             attempt += 1;
             match self
@@ -657,7 +712,11 @@ impl FirecrackerRuntime {
                         error = %e,
                         "fc boot: guest app not ready yet; retrying"
                     );
-                    tokio::time::sleep(READY_POLL).await;
+                    // Don't oversleep past the deadline — clamp the final sleep
+                    // so the overall budget stays ~READY_TIMEOUT.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::sleep(backoff.min(remaining)).await;
+                    backoff = (backoff * 2).min(READY_BACKOFF_CAP);
                 }
                 Err(e) => {
                     tracing::error!(

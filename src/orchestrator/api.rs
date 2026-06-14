@@ -7,8 +7,9 @@
 //!   uuid, spawn one DETACHED and wait until its control socket is healthy;
 //!   idempotent if one is already running.
 //! - [`stop_app`](Orchestrator::stop_app) — `Shutdown` the runner (it exits,
-//!   KEEPING its on-disk artifacts + docker image for a fast restart) and forget
-//!   its record.
+//!   KEEPING its on-disk artifacts + docker image for a fast restart) and MARK
+//!   its record stopped (the record is PRESERVED so the deploy artifact survives
+//!   a later respawn/reset; the monitor will not respawn a stopped record).
 //! - [`purge_app`](Orchestrator::purge_app) — `Purge` the runner (it clears its
 //!   cache + removes its docker image) then `Shutdown` it, forget its record,
 //!   and reclaim its on-disk cache.
@@ -252,27 +253,62 @@ impl Orchestrator {
     }
 
     /// Stop `uuid`: shut its runner down (the runner exits, KEEPING its on-disk
-    /// artifacts + docker image for a fast restart) and forget its record so the
-    /// monitor does not respawn it. Idempotent — a missing runner is a no-op.
+    /// artifacts + docker image for a fast restart) and MARK the record stopped
+    /// so the monitor does not respawn it. Idempotent — a missing runner is a
+    /// no-op.
+    ///
+    /// The record is PRESERVED (not deleted): its
+    /// `image_ref`/`manifest_toml`/`extra_env`/`runner_join_token` are kept so a
+    /// later respawn/reset/deploy still has the deploy artifact. Deleting the
+    /// record here (the old behavior) bricked a later respawn — the runner died
+    /// "fetch app … not found at this version/object" because the `image_ref` was
+    /// gone. The full record DELETE now lives only in
+    /// [`purge_app`](Self::purge_app), the real teardown.
     ///
     /// # Errors
     /// Returns an error only if `uuid` is malformed. A `Shutdown` round-trip
     /// failure (e.g. the runner already gone) is logged + tolerated; the record
-    /// is removed regardless.
+    /// is marked stopped regardless.
     pub async fn stop_app(&self, uuid: &str) -> Result<()> {
         let _ = self.app_ula_for(uuid)?;
 
-        // Ask the runner to exit. Best-effort: if it is already gone the record
-        // removal below still cleans up.
+        // Mark the record stopped FIRST so a concurrent monitor tick cannot
+        // respawn the runner we are about to ask to exit. Preserve the deploy
+        // artifact (image_ref/manifest_toml/extra_env/runner_join_token); only
+        // the live identity (pid) is cleared so the monitor never adopts a stale
+        // live pid for a stopped app. A missing record is a no-op (already gone).
+        match RunnerHandle::load(self.runner_dir(), uuid) {
+            Ok(Some(mut record)) => {
+                record.stopped = true;
+                // Clear the live pid: pid 0 reads as DEAD to the monitor's
+                // liveness probe, and the `stopped` gate short-circuits the
+                // respawn anyway. (control_sock is left so a fast restart reuses
+                // the deterministic path.)
+                record.pid = 0;
+                if let Err(e) = record.save(self.runner_dir()) {
+                    tracing::warn!(uuid, error = %e, "failed to persist stopped runner record");
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(uuid, "stop_app: no runner record (already stopped/never started)");
+            }
+            Err(e) => {
+                tracing::warn!(uuid, error = %e, "stop_app: could not load runner record");
+            }
+        }
+
+        // Ask the runner to exit. Best-effort: if it is already gone the marked
+        // record still prevents a respawn.
         match self.client_for(uuid).shutdown().await {
             Ok(Reply::Ok) => {}
             Ok(other) => tracing::warn!(uuid, ?other, "unexpected reply to Shutdown"),
             Err(e) => tracing::warn!(uuid, error = %e, "Shutdown failed (runner may be gone)"),
         }
 
-        // Forget the record FIRST so a concurrent monitor tick cannot respawn
-        // the runner we just asked to exit.
-        self.forget_record(uuid);
+        // Reap any FC child the runner left behind (the FC process is not a
+        // child of the supervisor — it busy-spins until reaped). Mirrors
+        // purge_app's reap so a stopped app does not leak a 100%-CPU FC orphan.
+        kill_fc_child_for_uuid(&self.shared().data_dir, uuid);
         Ok(())
     }
 
@@ -573,6 +609,10 @@ impl Orchestrator {
         // Also clear the circuit-breaker park flag so the monitor will resume
         // respawning the runner.
         record.crash_looped = false;
+        // Clear the operator-stopped flag too: `reset` is an explicit "bring it
+        // back" — a stopped app must become respawn-eligible again (the preserved
+        // image_ref/manifest_toml/extra_env drive the cold start).
+        record.stopped = false;
 
         // Persist the cleared state BEFORE triggering reconcile so a concurrent
         // monitor tick also sees the clean state.
@@ -812,6 +852,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         };
         rec.save(dir.path()).unwrap();
         let loaded = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
@@ -891,6 +932,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1055,6 +1097,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1133,6 +1176,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1204,6 +1248,7 @@ mod tests {
             manifest_toml: None,
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1292,6 +1337,7 @@ mod tests {
             manifest_toml: Some(OLD_TOML.to_owned()),
             extra_env: None,
             crash_looped: false,
+            stopped: false,
         };
         rec.save(dir.path()).unwrap();
 
@@ -1483,5 +1529,111 @@ mod tests {
             !fc_alive_after,
             "FC orphan (pid {fc_pid}) must be killed by purge_app"
         );
+    }
+
+    // ── stop_app preserves the deploy artifact (FIX (c)) ──────────────────────
+
+    /// Build a runner record carrying a deployed `image_ref` + managed
+    /// `manifest_toml` + `extra_env`, persisted under `runner_dir`.
+    fn seed_deployed_record(runner_dir: &std::path::Path, uuid: &str) -> RunnerHandle {
+        let rec = RunnerHandle {
+            uuid: uuid.to_owned(),
+            pid: 4242,
+            control_sock: runner_dir.join(format!("{uuid}.sock")),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: Some("[fd5a::1]:5000/acme/app@sha256:deadbeef".to_owned()),
+            requested_runtime: None,
+            network: Some("n_jpegxik72nng".to_owned()),
+            runner_join_token: Some("jwt.runner.token".to_owned()),
+            manifest_toml: Some("[app]\nname = \"x\"\n[runtime]\nmemory_mb = 2048\n".to_owned()),
+            extra_env: Some(
+                [("PORT".to_owned(), "9000".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
+            crash_looped: false,
+            stopped: false,
+        };
+        rec.save(runner_dir).unwrap();
+        rec
+    }
+
+    /// `stop_app` must PRESERVE the record (image_ref/manifest_toml/extra_env/
+    /// runner_join_token) and only MARK it stopped — it must NOT delete the
+    /// record (the old behavior bricked a later respawn with no image_ref).
+    #[tokio::test]
+    async fn stop_app_preserves_record_and_marks_stopped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let seeded = seed_deployed_record(dir.path(), APP_UUID);
+
+        // No live runner (no socket server) → Shutdown round-trip fails, but the
+        // record must still be marked stopped + preserved.
+        o.stop_app(APP_UUID).await.unwrap();
+
+        let after = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("stop_app must NOT delete the record — it must be preserved");
+        assert!(after.stopped, "stop_app must mark the record stopped");
+        assert_eq!(after.pid, 0, "stop_app must clear the live pid");
+        // The deploy artifact must survive so a later respawn/reset/deploy works.
+        assert_eq!(after.image_ref, seeded.image_ref, "image_ref must be preserved");
+        assert_eq!(
+            after.manifest_toml, seeded.manifest_toml,
+            "manifest_toml must be preserved"
+        );
+        assert_eq!(after.extra_env, seeded.extra_env, "extra_env must be preserved");
+        assert_eq!(
+            after.runner_join_token, seeded.runner_join_token,
+            "runner_join_token must be preserved"
+        );
+    }
+
+    /// A `stopped` record must NOT be respawned by the monitor's reconcile (it is
+    /// treated like a parked runner until the app is brought back up).
+    #[tokio::test]
+    async fn monitor_does_not_respawn_stopped_record() {
+        use crate::orchestrator::monitor::RecordOutcome;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let mut rec = seed_deployed_record(dir.path(), APP_UUID);
+        rec.stopped = true;
+        rec.pid = 0;
+        rec.save(dir.path()).unwrap();
+
+        let outcome = o.reconcile_record(&rec).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::CrashLooped,
+            "a stopped record must be skipped (not respawned) by reconcile"
+        );
+    }
+
+    /// `reset_app` must clear the `stopped` flag so a stopped app becomes
+    /// respawn-eligible again (the preserved image_ref drives the cold start).
+    #[tokio::test]
+    async fn reset_app_clears_stopped_flag() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let mut rec = seed_deployed_record(dir.path(), APP_UUID);
+        rec.stopped = true;
+        rec.pid = 0;
+        rec.save(dir.path()).unwrap();
+
+        // reset_app's reconcile will try (and fail) to spawn a real runner — that
+        // is tolerated; we assert the persisted record has stopped cleared.
+        let _ = o.reset_app(APP_UUID).await;
+
+        let after = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
+        assert!(
+            !after.stopped,
+            "reset_app must clear the stopped flag so the app can come back"
+        );
+        // The deploy artifact is still intact for the cold start.
+        assert!(after.image_ref.is_some(), "image_ref must survive reset");
     }
 }
