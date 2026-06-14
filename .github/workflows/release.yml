@@ -297,8 +297,19 @@ jobs:
       # role carries ssm:SendCommand). The supervisor runs as the `supervisor`
       # service in the same compose project on that host. This step only runs
       # after the digest-confirm gate above passed. x86_64-only.
-      - name: Redeploy supervisor via SSM
+      #
+      # BEST-EFFORT (continue-on-error): this redeploys ONLY the ec2-serving
+      # docker supervisor — a target INDEPENDENT of the release artifacts. The
+      # binaries are already in S3 above, and `publish-latest` (the S3 `latest`
+      # manifest the self-hosted WORKERS' OTA engine reads) is a separate job. We
+      # must NOT let a flaky ec2-serving redeploy fail this job and thereby SKIP
+      # `publish-latest` — that exact coupling stranded the worker OTA on the
+      # previous version (the SSM-window timeout was the recurring "rerun after
+      # cache" costyl). A flake here surfaces as a red step + annotation and is
+      # retried independently; it never blocks the worker OTA.
+      - name: Redeploy supervisor via SSM (ec2-serving; best-effort)
         if: matrix.arch == 'x86_64'
+        continue-on-error: true
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}
@@ -333,7 +344,12 @@ jobs:
             --parameters "$(jq -n --arg s "$DEPLOY_SCRIPT" '{commands:[$s]}')" \
             --query Command.CommandId --output text)
           echo "SSM CommandId=${CMD_ID}"
-          for _ in $(seq 1 30); do
+          # Poll up to 15 min (90 × 10s). The ec2-serving host pulls the new
+          # supervisor image on a possibly-COLD docker cache, which routinely
+          # exceeded the old 5-min window — the root cause of the redeploy flake.
+          # 15 min comfortably fits a cold pull; combined with continue-on-error
+          # above this removes the "rerun after cache" costyl entirely.
+          for _ in $(seq 1 90); do
             sleep 10
             STATUS=$(aws ssm list-command-invocations --region "${AWS_REGION}" \
               --command-id "${CMD_ID}" --details \
@@ -348,7 +364,7 @@ jobs:
                 exit 1 ;;
             esac
           done
-          echo "timed out waiting for SSM redeploy"; exit 1
+          echo "timed out waiting for SSM redeploy (15 min)"; exit 1
 
   # After both per-arch images are pushed, stitch them into one multi-arch
   # `:latest` manifest so `docker run ghcr.io/tabbify-io/tabbify-supervisor`
