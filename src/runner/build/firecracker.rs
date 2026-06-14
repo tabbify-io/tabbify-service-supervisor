@@ -1095,6 +1095,14 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
 ///
 /// Returns the layout directory (`<out_dir>/oci`) for the config-read + unpack.
 ///
+/// Max `oras copy` attempts for ONE image pull. Each retry resumes (skips
+/// blobs already in the content-addressed layout), so a flaky relay that EOFs
+/// a multi-MB layer mid-stream converges over a few attempts instead of
+/// failing the whole pull (the home-NAT worker over a wss relay).
+pub(crate) const PULL_MAX_ATTEMPTS: usize = 8;
+/// Backoff between pull retries.
+const PULL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// # Errors
 /// A failing `oras copy`.
 async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> Result<PathBuf> {
@@ -1119,11 +1127,29 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
         reff,
         &layout.to_string_lossy(),
     ));
-    let (ok, _) = (runner)(argv).await;
-    if !ok {
-        bail!("oras copy of registry_ref {reff:?} into OCI layout failed");
+    // RESUMABLE pull: `oras copy` into a content-addressed OCI layout SKIPS
+    // blobs already present, so retrying into the SAME (un-wiped) dir resumes
+    // at blob granularity. A flaky relay that EOFs a multi-MB layer mid-stream
+    // then converges over a few attempts instead of failing the whole pull. The
+    // dir was wiped at most ONCE above (mutable-tag digest resolution); the
+    // retries MUST NOT re-wipe or they would discard the partial pull.
+    for attempt in 1..=PULL_MAX_ATTEMPTS {
+        let (ok, _) = (runner)(argv.clone()).await;
+        if ok {
+            return Ok(layout);
+        }
+        if attempt < PULL_MAX_ATTEMPTS {
+            tracing::warn!(
+                reff,
+                attempt,
+                max = PULL_MAX_ATTEMPTS,
+                "oras copy failed (relay may have broken a large blob mid-stream); \
+                 retrying — already-pulled blobs are skipped (blob-level resume)"
+            );
+            tokio::time::sleep(PULL_RETRY_BACKOFF).await;
+        }
     }
-    Ok(layout)
+    bail!("oras copy of registry_ref {reff:?} into OCI layout failed after {PULL_MAX_ATTEMPTS} attempts");
 }
 
 /// Ensure the buildkit TOOLCHAIN rootfs for SANDBOXED builds (phase 2 of

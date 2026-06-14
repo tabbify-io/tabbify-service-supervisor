@@ -904,7 +904,9 @@ async fn pull_oci_layout_uses_oras_copy_to_oci_layout() {
 }
 
 /// A failing oras copy surfaces a clear error naming the pull step.
-#[tokio::test]
+// `start_paused` so the bounded pull-retry backoff sleeps auto-advance (the
+// always-failing runner now retries PULL_MAX_ATTEMPTS times before bailing).
+#[tokio::test(start_paused = true)]
 async fn pull_oci_layout_errors_when_oras_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let runner: super::FcBuildRunner = Arc::new(|_| Box::pin(async { (false, Vec::new()) }));
@@ -1669,5 +1671,57 @@ async fn fresh_tag_pull_dir_clears_a_stale_pull_layout() {
     assert!(
         !work.join("oci").join("index.json").exists(),
         "a stale .pull layout must be cleared before the next tag pull"
+    );
+}
+
+// ── resumable image pull (survive a relay EOF on a large blob) ───────────────
+
+/// A flaky relay that EOFs `oras copy` a few times must NOT fail the whole
+/// pull: `pull_oci_layout` retries into the SAME content-addressed layout
+/// (blob-level resume), so a runner that fails twice then succeeds yields Ok.
+#[tokio::test(start_paused = true)]
+async fn pull_oci_layout_resumes_until_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls2 = calls.clone();
+    // Fail the first 2 attempts (relay broke a blob mid-stream), succeed on #3.
+    let runner: super::FcBuildRunner = Arc::new(move |_argv: Vec<String>| {
+        let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move { (n >= 3, Vec::new()) })
+    });
+    let layout = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+        .await
+        .expect("pull must converge after the relay-flaky attempts");
+    assert_eq!(layout, out_dir.join("oci"));
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "retried until success");
+}
+
+/// A pull that never succeeds bails AFTER the bounded number of attempts (so a
+/// genuinely broken pull can't retry forever), having tried exactly
+/// `PULL_MAX_ATTEMPTS` times.
+#[tokio::test(start_paused = true)]
+async fn pull_oci_layout_bails_after_max_attempts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls2 = calls.clone();
+    let runner: super::FcBuildRunner = Arc::new(move |_argv: Vec<String>| {
+        calls2.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { (false, Vec::new()) })
+    });
+    let err = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+        .await
+        .expect_err("an always-failing pull must error out");
+    assert!(
+        err.to_string().contains("after"),
+        "error mentions the attempt cap: {err}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        super::PULL_MAX_ATTEMPTS,
+        "tried exactly PULL_MAX_ATTEMPTS times then gave up"
     );
 }
