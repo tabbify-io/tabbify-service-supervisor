@@ -468,7 +468,10 @@ pub async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildB
     let job = BuildJob {
         repo_url: body.repo_url,
         git_ref: body.git_ref,
-        tenant: body.tenant,
+        // OCI repo names must be lowercase; normalize the GitHub owner at the
+        // boundary so the stored/echoed tenant is consistent (the push + pull
+        // ref builders also lowercase defensively).
+        tenant: body.tenant.to_lowercase(),
         app_uuid: body.app_uuid,
         registry_ula: body.registry_ula,
         clone_token: body.clone_token,

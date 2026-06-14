@@ -40,6 +40,28 @@ pub fn oras_copy_to_oci_layout_args(reff: &str, layout_dir: &str) -> Vec<String>
     ]
 }
 
+/// Lowercase the repository portion of an OCI reference, preserving the tag /
+/// digest. The OCI distribution spec requires repository names to be lowercase;
+/// a GitHub owner like `Lsneg` would otherwise make the registry reject the
+/// push AND the pull with `invalid reference: invalid repository "Lsneg/…"`. The
+/// tag (`:tag`) and digest (`@sha256:…`) keep their original case (the spec
+/// permits uppercase in a tag). The registry host (`[ula]:5000`) is hex/digits,
+/// so lowercasing it is a no-op. Used symmetrically by the build PUSH and the
+/// runtime PULL so the two refs always match.
+#[must_use]
+pub fn lowercase_oci_repo(reff: &str) -> String {
+    // The tag/digest boundary lives in the LAST path segment (after the final
+    // `/`), so the registry host's `:port` is never mistaken for a tag.
+    let seg_start = reff.rfind('/').map_or(0, |i| i + 1);
+    match reff[seg_start..].find(['@', ':']) {
+        Some(rel) => {
+            let split = seg_start + rel;
+            format!("{}{}", reff[..split].to_lowercase(), &reff[split..])
+        }
+        None => reff.to_lowercase(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -96,6 +118,36 @@ mod tests {
                 "--to-oci-layout",
                 "/out/oci",
             ]
+        );
+    }
+
+    // ---- lowercase_oci_repo --------------------------------------------------
+
+    /// The namespace/owner is lowercased; the `:tag` keeps its original case.
+    #[test]
+    fn lowercase_oci_repo_lowercases_namespace_keeps_tag() {
+        assert_eq!(
+            lowercase_oci_repo("[fd5a:1f00:0:3::1]:5000/Lsneg/98f9eba0-AB:Main"),
+            "[fd5a:1f00:0:3::1]:5000/lsneg/98f9eba0-ab:Main"
+        );
+    }
+
+    /// A digest ref: the `@sha256:…` boundary wins over the colon inside it, and
+    /// the digest is preserved verbatim while the repo path is lowercased.
+    #[test]
+    fn lowercase_oci_repo_preserves_digest() {
+        assert_eq!(
+            lowercase_oci_repo("[fd5a::1]:5000/Acme/App@sha256:ABCdef"),
+            "[fd5a::1]:5000/acme/app@sha256:ABCdef"
+        );
+    }
+
+    /// The registry host's `:port` must NOT be mistaken for a tag boundary.
+    #[test]
+    fn lowercase_oci_repo_host_port_not_a_tag() {
+        assert_eq!(
+            lowercase_oci_repo("[fd5a::1]:5000/Owner/app"),
+            "[fd5a::1]:5000/owner/app"
         );
     }
 }

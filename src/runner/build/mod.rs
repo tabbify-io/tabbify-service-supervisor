@@ -155,9 +155,16 @@ pub async fn run_build(
     let build_spec = resolve_build_spec(&src, &toml_path)?;
 
     // Image ref: <registry_ula>/<tenant>/<app_uuid>:<git_ref>.
+    // OCI distribution requires lowercase repository names; the tenant (GitHub
+    // owner, e.g. "Lsneg") is the only mixed-case component, so lowercase it —
+    // otherwise `oras`/`skopeo` reject the push with "invalid repository". The
+    // runtime PULL lowercases the same way (see firecracker.rs) so refs match.
     let reff = format!(
         "{}/{}/{}:{}",
-        job.registry_ula, job.tenant, job.app_uuid, job.git_ref
+        job.registry_ula,
+        job.tenant.to_lowercase(),
+        job.app_uuid,
+        job.git_ref
     );
 
     match job.build_kind {

@@ -1171,6 +1171,13 @@ pub async fn run_firecracker_build(
             anyhow::anyhow!("firecracker runtime requires a registry_ref (image to convert)")
         })?;
 
+    // OCI distribution requires lowercase repository names. Lowercase the repo
+    // path (preserving the tag/digest) so the PULL ref matches the build PUSH
+    // ref (which lowercases the tenant) — an uppercase GitHub owner like "Lsneg"
+    // would otherwise make `oras copy` fail with "invalid repository".
+    let reff = crate::oras::lowercase_oci_repo(reff);
+    let reff = reff.as_str();
+
     // Two ref shapes, both keyed by the IMMUTABLE digest (fc-3):
     //
     //   1. `…@sha256:…` (digest ref) — the digest is known up front, so we take
