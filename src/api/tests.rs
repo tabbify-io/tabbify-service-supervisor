@@ -701,6 +701,8 @@ async fn refresh_git_token_known_session_returns_200() {
         cap: cap.clone(),
         created_at: now,
         last_activity: now,
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
     });
 
     let app = router(state.clone());
@@ -777,6 +779,8 @@ async fn delete_dev_session_known_returns_200_and_cleans_up() {
         cap: cap.clone(),
         created_at: now,
         last_activity: now,
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
     });
 
     // First DELETE: should return 200.
@@ -878,6 +882,8 @@ async fn get_dev_sessions_with_one_session_returns_row() {
         cap: "c".repeat(64),
         created_at: now,
         last_activity: now,
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
     });
 
     let app = router(state);

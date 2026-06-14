@@ -33,15 +33,19 @@ use crate::orchestrator::api::DeployNetwork;
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
 
-/// Idle timeout: a session inactive for longer than this is reaped.
-///
-/// "Activity" is bumped ONLY by `POST /v1/dev-sessions/:id/git-token`. The node
-/// MUST call that endpoint on a sub-30-min cadence (it does so as a heartbeat
-/// on MCP tool calls) or the session is reaped despite active SSH exec.
-pub const DEV_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60); // 30 min
+/// Idle timeout. Dev sessions are PERSISTENT + resumable by design: a user who
+/// reconnects (e.g. a new MCP connection) must land back in the SAME existing
+/// container/project, not a fresh one. So idle NO LONGER reaps — this is set far
+/// beyond any real session so the idle branch never fires; a session lives until
+/// an explicit `DELETE` or the hard `DEV_SESSION_MAX_TTL` safety ceiling.
+/// (The node still refreshes the git-proxy token periodically so `git push`
+/// keeps working — that is independent of session lifetime.)
+pub const DEV_SESSION_IDLE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60); // ~never
 
-/// Hard ceiling: a session older than this is reaped regardless of activity.
-pub const DEV_SESSION_MAX_TTL: Duration = Duration::from_secs(4 * 60 * 60); // 4 h
+/// Hard ceiling: a truly-forgotten session (no explicit close) is reclaimed after
+/// this regardless of activity — a safety net against leaked VMs. Kept generous
+/// so persistence/resume works across long gaps.
+pub const DEV_SESSION_MAX_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 d
 
 // ── Registry ─────────────────────────────────────────────────────────────────
 
@@ -55,11 +59,16 @@ pub struct DevSession {
     pub cap: String,
     /// When this session was created.
     pub created_at: Instant,
-    /// Last activity timestamp; bumped ONLY by `POST .../git-token`. The node
-    /// MUST call that endpoint on a sub-30-min cadence (it does so as a
-    /// heartbeat on MCP tool calls) or the session is reaped despite active
-    /// SSH exec. See [`DEV_SESSION_IDLE_TTL`].
+    /// Last activity timestamp; bumped by `POST .../git-token`. With persistent
+    /// sessions this no longer drives reaping (see [`DEV_SESSION_IDLE_TTL`]); it
+    /// is still surfaced as `idle_secs` so a client can pick the freshest session.
     pub last_activity: Instant,
+    /// The repo this session was created for
+    /// (`https://github.com/owner/repo.git`). Surfaced in the list so a client
+    /// can find + REUSE the session for a given repo instead of duplicating it.
+    pub repo_url: String,
+    /// The branch checked out at `/workspace`.
+    pub branch: String,
 }
 
 /// Dev-session registry: `session_id` → `DevSession`.
@@ -100,9 +109,11 @@ impl DevSessionRegistry {
         }
     }
 
-    /// Returns a snapshot of `(session_id, app_uuid, cap, created_at, last_activity)`
-    /// for every session. Used by the list endpoint and the idle reaper.
-    pub fn snapshot(&self) -> Vec<(String, String, String, Instant, Instant)> {
+    /// Returns a snapshot of
+    /// `(session_id, app_uuid, cap, created_at, last_activity, repo_url, branch)`
+    /// for every session. Used by the list endpoint and the max-age reaper.
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot(&self) -> Vec<(String, String, String, Instant, Instant, String, String)> {
         let guard = self.0.lock().expect("dev session lock");
         guard
             .values()
@@ -113,6 +124,8 @@ impl DevSessionRegistry {
                     s.cap.clone(),
                     s.created_at,
                     s.last_activity,
+                    s.repo_url.clone(),
+                    s.branch.clone(),
                 )
             })
             .collect()
@@ -265,9 +278,14 @@ pub struct DevSessionRow {
     pub app_uuid: String,
     /// Seconds since session was created.
     pub created_age_secs: u64,
-    /// Seconds since the last `POST .../git-token` heartbeat (the only thing
-    /// that bumps activity — see [`DEV_SESSION_IDLE_TTL`]).
+    /// Seconds since the last `POST .../git-token` heartbeat (no longer drives
+    /// reaping — see [`DEV_SESSION_IDLE_TTL`]; freshness hint only).
     pub idle_secs: u64,
+    /// The repo this session is for (`https://github.com/owner/repo.git`) — lets
+    /// a client find + reuse the session for a given repo.
+    pub repo_url: String,
+    /// The branch checked out at `/workspace`.
+    pub branch: String,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -368,6 +386,8 @@ pub async fn create_dev_session(
                 cap,
                 created_at: now,
                 last_activity: now,
+                repo_url: body.repo_url,
+                branch: body.branch,
             };
             state.dev_sessions.insert(session);
 
@@ -474,11 +494,13 @@ pub async fn list_dev_sessions(State(state): State<SharedState>) -> Response {
         .snapshot()
         .into_iter()
         .map(
-            |(session_id, app_uuid, _, created_at, last_activity)| DevSessionRow {
+            |(session_id, app_uuid, _, created_at, last_activity, repo_url, branch)| DevSessionRow {
                 session_id,
                 app_uuid,
                 created_age_secs: now.duration_since(created_at).as_secs(),
                 idle_secs: now.duration_since(last_activity).as_secs(),
+                repo_url,
+                branch,
             },
         )
         .collect();
@@ -505,7 +527,7 @@ pub async fn sweep_expired(
         .dev_sessions
         .snapshot()
         .into_iter()
-        .filter_map(|(session_id, app_uuid, cap, created_at, last_activity)| {
+        .filter_map(|(session_id, app_uuid, cap, created_at, last_activity, _, _)| {
             let idle = now.duration_since(last_activity);
             let age = now.duration_since(created_at);
             if idle > idle_ttl || age > max_ttl {

@@ -48,6 +48,8 @@ fn make_session(id: &str, app: &str, cap: &str) -> DevSession {
         cap: cap.to_owned(),
         created_at: now,
         last_activity: now,
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
     }
 }
 
@@ -149,6 +151,8 @@ fn insert_session_aged(
         cap: cap.to_owned(),
         created_at: now - age,
         last_activity: now - idle,
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
     };
     state.dev_sessions.insert(session);
     // Also register a git cap so revoke has something to operate on.
