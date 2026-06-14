@@ -196,6 +196,15 @@ pub(crate) fn decide_pid_grace(
 /// per tick past the backoff window rather than per raw spawn attempt.
 pub const CRASH_LOOP_PARK_THRESHOLD: u32 = 10;
 
+/// Generous upper bound (seconds since spawn) for deferring the reap of a
+/// runner whose control socket is not healthy YET because it is still PULLING
+/// its image. A dev/FC image pull goes over the relay-only mesh, which on a
+/// slow home-NAT worker can take minutes; without this the monitor kills the
+/// runner mid-pull, the replacement re-pulls from scratch, and the runner never
+/// converges (an endless respawn loop). Bounded so a genuinely wedged pull is
+/// still eventually reaped via the normal path.
+pub const PULL_GRACE_SECS: u64 = 600;
+
 /// Send `SIGKILL` to `pid`. Best-effort: logs on failure (e.g. permission
 /// error or already-reaped pid).
 fn kill_pid(pid: u32) {
@@ -240,6 +249,57 @@ pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str) {
         );
         pidfile::kill_stale_if_alive(fc_pid, pidfile::process_is_alive);
     }
+}
+
+/// The path token that a live `oras` image pull for `uuid` carries in its
+/// argv (`oras copy … --to-oci-layout <data_dir>/apps/<uuid>/fc/.pull/oci`).
+/// Pure (testable); used by [`pull_in_progress`] to recognise the pull process.
+fn pull_path_needle(data_dir: &Path, uuid: &str) -> Option<String> {
+    data_dir
+        .join("apps")
+        .join(uuid)
+        .join("fc")
+        .join(".pull")
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// `true` when a process's `/proc/<pid>/cmdline` (NUL-separated argv) references
+/// `needle`. The pull path is a single argv token (no embedded NUL), so a plain
+/// substring search over the lossy-decoded bytes is correct. Pure (testable).
+fn cmdline_matches_pull(cmdline: &[u8], needle: &str) -> bool {
+    !needle.is_empty() && String::from_utf8_lossy(cmdline).contains(needle)
+}
+
+/// `true` if an `oras` image pull is STILL running for `uuid` — i.e. a live
+/// process's cmdline references this runner's `.pull` OCI-layout path. The
+/// monitor uses this to AVOID reaping a runner whose control socket is merely
+/// "not up yet because it is still pulling its image" over the slow relay (vs
+/// genuinely hung). Linux-only (scans `/proc`); returns `false` elsewhere,
+/// which is fine — FC runners only run on Linux.
+fn pull_in_progress(data_dir: &Path, uuid: &str) -> bool {
+    let Some(needle) = pull_path_needle(data_dir, uuid) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        // Only numeric `/proc/<pid>` entries carry a `cmdline`.
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) {
+            if cmdline_matches_pull(&bytes, &needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl Orchestrator {
@@ -389,6 +449,24 @@ impl Orchestrator {
                         uuid = %record.uuid,
                         pid = record.pid,
                         "deploy in progress; deferring reap (runner busy mid-deploy)"
+                    );
+                    RecordOutcome::Adopted
+                } else if pull_in_progress(&self.shared.data_dir, &record.uuid)
+                    && now_secs.saturating_sub(record.spawned_at) < PULL_GRACE_SECS
+                {
+                    // The control socket is not up yet because the runner is
+                    // STILL PULLING its image over the (slow, relay-only) mesh —
+                    // not hung. Reaping now kills the in-flight `oras` pull; the
+                    // replacement re-pulls from scratch and the runner never
+                    // converges (an endless respawn loop on a slow link). Defer
+                    // until the pull finishes (socket comes up) or the generous
+                    // PULL_GRACE_SECS cap elapses (a genuinely wedged pull is
+                    // then reaped via the normal path).
+                    tracing::info!(
+                        uuid = %record.uuid,
+                        pid = record.pid,
+                        age_secs = now_secs.saturating_sub(record.spawned_at),
+                        "image pull in progress over slow relay — deferring reap"
                     );
                     RecordOutcome::Adopted
                 } else {
@@ -548,6 +626,34 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    // ── image-pull-in-progress guard (don't reap a runner mid-pull) ───────────
+
+    #[test]
+    fn pull_path_needle_targets_the_runner_pull_dir() {
+        let needle = pull_path_needle(Path::new("/opt/tabbify/data"), "abc-123")
+            .expect("needle");
+        assert_eq!(needle, "/opt/tabbify/data/apps/abc-123/fc/.pull");
+    }
+
+    #[test]
+    fn cmdline_matches_pull_recognises_the_oras_pull_argv() {
+        let needle = pull_path_needle(Path::new("/opt/tabbify/data"), "abc-123").unwrap();
+        // Realistic /proc/<pid>/cmdline: NUL-separated argv of the live oras pull.
+        let cmdline = b"oras\0copy\0--from-plain-http\0[fd5a::1]:5000/tabbify/x:tag\0--to-oci-layout\0/opt/tabbify/data/apps/abc-123/fc/.pull/oci\0";
+        assert!(cmdline_matches_pull(cmdline, &needle), "pull argv must match");
+        // A different uuid's pull must NOT match (no false-positive defer).
+        let other = pull_path_needle(Path::new("/opt/tabbify/data"), "zzz-999").unwrap();
+        assert!(!cmdline_matches_pull(cmdline, &other), "other uuid must not match");
+        // An unrelated process (the FC itself) must NOT match.
+        let fc = b"firecracker\0--api-sock\0/tmp/firecracker-fc-deadbeef.sock\0";
+        assert!(!cmdline_matches_pull(fc, &needle), "unrelated proc must not match");
+    }
+
+    #[test]
+    fn cmdline_matches_pull_is_false_for_empty_needle() {
+        assert!(!cmdline_matches_pull(b"anything", ""));
     }
 
     // ── pid dead ─────────────────────────────────────────────────────────────
