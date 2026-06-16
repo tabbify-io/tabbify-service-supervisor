@@ -380,6 +380,158 @@ pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str) -> bool {
     cached_rootfs_path(data_dir, uuid, digest).is_file()
 }
 
+// ── GLOBAL digest-shared rootfs cache ───────────────────────────────────────────
+//
+// The per-uuid [`cached_rootfs_path`] only speeds a redeploy of the SAME app
+// (stable uuid). DEV-sessions get a FRESH uuid every start but reuse the SAME
+// dev base image, so they re-pulled (~minutes) + re-converted on every start.
+// This GLOBAL cache is keyed ONLY by the immutable image digest, so any uuid
+// needing the same content reuses one rootfs. The rootfs is mounted READ-ONLY
+// (see `firecracker::build_vm` — `is_read_only: true`), so concurrent VMs safely
+// share a single inode; per-uuid materialization is a HARD LINK (zero copy).
+
+/// Root of the global cache: `<data_dir>/rootfs-cache`.
+const GLOBAL_ROOTFS_CACHE_DIR: &str = "rootfs-cache";
+
+/// Retain at most this many digest entries in the global cache (LRU by mtime).
+/// Bounded so the cache can't fill the worker disk — a past root-fs-full event
+/// caused a full outage, so this cache MUST self-limit. Eviction is safe even
+/// mid-use: the rootfs is opened read-only and Linux keeps an unlinked-but-open
+/// inode alive until the VM exits, so a running guest is unaffected.
+const GLOBAL_ROOTFS_CACHE_KEEP: usize = 6;
+
+/// Global digest-shared rootfs path:
+/// `<data_dir>/rootfs-cache/<digest-sanitized>/rootfs.ext4`. Keyed ONLY by the
+/// immutable digest (NOT the uuid), so the same image content maps to one file.
+#[must_use]
+pub fn global_rootfs_path(data_dir: &Path, digest: &str) -> PathBuf {
+    data_dir
+        .join(GLOBAL_ROOTFS_CACHE_DIR)
+        .join(digest.replace(':', "-"))
+        .join(ROOTFS_NAME)
+}
+
+/// Is the digest's rootfs present in the GLOBAL shared cache?
+#[must_use]
+pub fn global_rootfs_is_cached(data_dir: &Path, digest: &str) -> bool {
+    global_rootfs_path(data_dir, digest).is_file()
+}
+
+/// Resolve a tag (or digest) ref to its immutable manifest digest WITHOUT
+/// pulling layer blobs (`oras resolve`, ~0.2 s). Lets the build consult the
+/// digest-keyed caches BEFORE the (slow) `oras copy` and skip the pull on a hit.
+///
+/// # Errors
+/// The runner reports failure, or stdout is not a `sha256:…` digest line.
+async fn resolve_oci_digest(reff: &str, runner: &FcBuildRunner) -> Result<String> {
+    let mut argv = vec!["oras".to_owned()];
+    argv.extend(crate::oras::oras_resolve_args(reff));
+    let (ok, out) = (runner)(argv).await;
+    let digest = String::from_utf8_lossy(&out).trim().to_owned();
+    if !ok || !digest.starts_with("sha256:") {
+        bail!("oras resolve did not yield a digest for {reff} (ok={ok}, out={digest:?})");
+    }
+    Ok(digest)
+}
+
+/// On a GLOBAL-cache hit, materialize the per-uuid rootfs path as a HARD LINK to
+/// the shared inode (same fs ⇒ instant, zero copy). Read-only rootfs ⇒ sharing
+/// one inode across VMs is safe; a per-session purge that removes the per-uuid
+/// link only decrements the link count, never touching the cache. Returns the
+/// per-uuid path on success, or `None` (no hit / link failed) so the caller
+/// falls back to a normal pull + build — correctness over the optimization.
+async fn link_global_rootfs_to_uuid(data_dir: &Path, uuid: &str, digest: &str) -> Option<PathBuf> {
+    let global = global_rootfs_path(data_dir, digest);
+    if !global.is_file() {
+        return None;
+    }
+    let per_uuid = cached_rootfs_path(data_dir, uuid, digest);
+    if per_uuid.is_file() {
+        return Some(per_uuid); // already materialized for this uuid
+    }
+    let parent = per_uuid.parent()?;
+    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        tracing::warn!(uuid, digest, error = %e, "global rootfs link: mkdir failed; will build");
+        return None;
+    }
+    match tokio::fs::hard_link(&global, &per_uuid).await {
+        Ok(()) => Some(per_uuid),
+        // Lost a race (a concurrent build linked/built it): use what's there.
+        Err(_) if per_uuid.is_file() => Some(per_uuid),
+        Err(e) => {
+            tracing::warn!(uuid, digest, error = %e, "global rootfs link failed; will build");
+            None
+        }
+    }
+}
+
+/// After a per-uuid build, publish the rootfs into the GLOBAL digest cache (hard
+/// link, same inode) so the NEXT uuid needing this digest skips pull + build.
+/// Best-effort: a failure only forfeits a future cache hit, never the current
+/// build. Evicts to the [`GLOBAL_ROOTFS_CACHE_KEEP`] bound afterwards.
+async fn publish_rootfs_to_global(data_dir: &Path, digest: &str, built: &Path) {
+    let global = global_rootfs_path(data_dir, digest);
+    if !global.is_file() {
+        if let Some(parent) = global.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!(digest, error = %e, "global rootfs publish: mkdir failed");
+                return;
+            }
+        }
+        match tokio::fs::hard_link(built, &global).await {
+            Ok(()) => tracing::info!(digest, "rootfs published to global digest cache"),
+            Err(_) if global.is_file() => {} // concurrent publish won the race
+            Err(e) => tracing::warn!(digest, error = %e, "global rootfs publish failed (non-fatal)"),
+        }
+    }
+    evict_global_rootfs_cache(data_dir).await;
+}
+
+/// Keep the global rootfs cache bounded: retain the [`GLOBAL_ROOTFS_CACHE_KEEP`]
+/// most-recently-modified digest dirs, remove the rest. Safe even if a removed
+/// rootfs is in use (read-only + unlink-while-open keeps the running VM alive).
+async fn evict_global_rootfs_cache(data_dir: &Path) {
+    let root = data_dir.join(GLOBAL_ROOTFS_CACHE_DIR);
+    let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let path = e.path();
+        if path.is_dir() {
+            let mtime = e
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            dirs.push((mtime, path));
+        }
+    }
+    if dirs.len() <= GLOBAL_ROOTFS_CACHE_KEEP {
+        return;
+    }
+    dirs.sort_by_key(|(t, _)| *t); // oldest first
+    let remove = dirs.len() - GLOBAL_ROOTFS_CACHE_KEEP;
+    for (_, path) in dirs.into_iter().take(remove) {
+        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            tracing::warn!(path = %path.display(), error = %e, "global rootfs evict failed");
+        } else {
+            tracing::info!(path = %path.display(), "global rootfs cache evicted (LRU bound)");
+        }
+    }
+}
+
+/// Cache lookup for a KNOWN digest: per-uuid first (an app redeploy), then the
+/// GLOBAL digest-shared cache (hard-linked into the per-uuid path on hit). `Some`
+/// ⇒ the rootfs is ready; skip the pull + conversion entirely.
+async fn lookup_cached_rootfs(data_dir: &Path, uuid: &str, digest: &str) -> Option<PathBuf> {
+    if rootfs_is_cached(data_dir, uuid, digest) {
+        return Some(cached_rootfs_path(data_dir, uuid, digest));
+    }
+    link_global_rootfs_to_uuid(data_dir, uuid, digest).await
+}
+
 /// The per-app TAG-ref pull work dir (`<data_dir>/apps/<uuid>/fc/.pull`), CLEARED
 /// before returning so the OCI layout `oras copy --to-oci-layout` writes contains
 /// ONLY the current tag's manifest.
@@ -1216,54 +1368,96 @@ pub async fn run_firecracker_build(
     let reff = crate::oras::lowercase_oci_repo(reff);
     let reff = reff.as_str();
 
+    // FAST PATH (digest-shared cache): resolve the IMMUTABLE digest WITHOUT
+    // pulling layer blobs, so the digest-keyed caches (per-uuid + the GLOBAL
+    // digest-shared cache) can be consulted BEFORE paying a multi-minute pull. A
+    // digest ref already carries it; a tag ref is resolved via `oras resolve`
+    // (~0.2 s, best-effort — a transient failure falls through to the pull path
+    // that derives the digest from the pulled layout). KEY WIN for dev-sessions:
+    // every start gets a FRESH uuid but reuses the SAME dev base image, so from
+    // the second start the cached rootfs is hard-linked and the pull is skipped.
+    let pre_digest: Option<String> = match reff.rsplit_once('@') {
+        Some((_, d)) => Some(d.to_owned()),
+        None => match resolve_oci_digest(reff, runner).await {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(reff, error = %e, "oras resolve failed; pulling to derive digest");
+                None
+            }
+        },
+    };
+    if let Some(digest) = pre_digest.as_deref() {
+        if let Some(rootfs) = lookup_cached_rootfs(data_dir, uuid, digest).await {
+            tracing::info!(
+                uuid,
+                digest,
+                "firecracker rootfs cache hit (pre-pull); skipping pull + conversion"
+            );
+            return launch_firecracker(&rootfs, fetched, fc, uuid, reff, data_dir, is_swap).await;
+        }
+    }
+
+    // MISS: pull, derive the authoritative digest from the pulled layout, convert,
+    // then publish the rootfs to the GLOBAL digest cache for the next uuid.
+    //
     // Two ref shapes, both keyed by the IMMUTABLE digest (fc-3):
-    //
-    //   1. `…@sha256:…` (digest ref) — the digest is known up front, so we take
-    //      the FAST path: a cache hit skips the pull entirely; a miss pulls into
-    //      the digest-keyed work dir (where the rootfs already lives).
-    //
-    //   2. `…:tag` (tag ref) — the immutable digest is UNKNOWN until pulled. The
-    //      automated build pipeline deploys tag refs, so bailing here was the #1
-    //      e2e blocker. Pull into a digest-INDEPENDENT work dir, DERIVE the digest
-    //      from the layout's `index.json` (`manifests[0].digest`), then convert
-    //      keyed by THAT digest — preserving the digest-keyed cache guarantee.
+    //   1. `…@sha256:…` — digest known up front; layout lands in the digest dir.
+    //   2. `…:tag` — immutable digest UNKNOWN until pulled; the automated build
+    //      pipeline deploys tag refs. Pull into a digest-INDEPENDENT work dir,
+    //      DERIVE the digest from the layout's `index.json` (`manifests[0].digest`),
+    //      then convert keyed by THAT digest — preserving the cache guarantee.
     //
     // DOCKER-LESS throughout: pull = `oras copy --to-oci-layout`, config read FROM
     // the layout. No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
     let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
-        if rootfs_is_cached(data_dir, uuid, digest) {
-            cached_rootfs_path(data_dir, uuid, digest)
-        } else {
-            // The layout lands under the digest-keyed work dir (= the rootfs dir).
-            let work = digest_work_dir(data_dir, uuid, digest)?;
-            let layout = pull_oci_layout(reff, &work, runner).await?;
-            let config = read_oci_config_from_layout(&layout)?;
-            resolve_rootfs(
-                uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env,
-            )
-            .await?
-        }
+        let work = digest_work_dir(data_dir, uuid, digest)?;
+        let layout = pull_oci_layout(reff, &work, runner).await?;
+        let config = read_oci_config_from_layout(&layout)?;
+        let built = resolve_rootfs(
+            uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env,
+        )
+        .await?;
+        publish_rootfs_to_global(data_dir, digest, &built).await;
+        built
     } else {
-        // Tag ref: pull into a digest-INDEPENDENT `.pull` work dir (the digest is
-        // not yet known). `oras copy` resolves the tag, so the pull works without
-        // the digest; we then read the digest from the resulting layout and the
-        // digest-keyed `resolve_rootfs` writes the rootfs to its own digest dir.
         let work = fresh_tag_pull_dir(data_dir, uuid).await?;
         let layout = pull_oci_layout(reff, &work, runner).await?;
         let digest = read_manifest_digest_from_layout(&layout)?;
         if rootfs_is_cached(data_dir, uuid, &digest) {
             cached_rootfs_path(data_dir, uuid, &digest)
+        } else if let Some(linked) = link_global_rootfs_to_uuid(data_dir, uuid, &digest).await {
+            // Global hit found only AFTER the pull (the pre-pull resolve failed):
+            // still skip the conversion.
+            tracing::info!(uuid, digest, "rootfs global-cache hit (post-pull); skipping conversion");
+            linked
         } else {
             let config = read_oci_config_from_layout(&layout)?;
-            resolve_rootfs(
+            let built = resolve_rootfs(
                 uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env,
             )
-            .await?
+            .await?;
+            publish_rootfs_to_global(data_dir, &digest, &built).await;
+            built
         }
     };
 
+    launch_firecracker(&rootfs, fetched, fc, uuid, reff, data_dir, is_swap).await
+}
+
+/// Launch the Firecracker microVM from a prepared rootfs and wrap it as an
+/// [`crate::runtime::AppRuntime`]. Shared by the cache-hit fast path and the
+/// pull+build path of [`run_firecracker_build`].
+async fn launch_firecracker(
+    rootfs: &Path,
+    fetched: &crate::fetcher::FetchedApp,
+    fc: &crate::config::FcConfig,
+    uuid: &str,
+    reff: &str,
+    data_dir: &Path,
+    is_swap: bool,
+) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
-        &rootfs,
+        rootfs,
         &fetched.manifest.runtime,
         fc,
         uuid,

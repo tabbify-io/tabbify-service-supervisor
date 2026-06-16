@@ -468,6 +468,103 @@ fn rootfs_is_cached_reflects_presence() {
     assert!(super::rootfs_is_cached(tmp.path(), "app", digest));
 }
 
+// ── GLOBAL digest-shared rootfs cache ───────────────────────────────────────────
+
+/// The GLOBAL cache path is keyed by DIGEST only — NOT the uuid. Same digest ⇒
+/// same shared file regardless of which uuid needs it (the dev-session win: a
+/// fresh uuid every start reuses one rootfs).
+#[test]
+fn global_rootfs_path_is_keyed_by_digest_not_uuid() {
+    let d = Path::new("/data");
+    assert_eq!(
+        super::global_rootfs_path(d, "sha256:abcd"),
+        super::global_rootfs_path(d, "sha256:abcd")
+    );
+    assert!(
+        super::global_rootfs_path(d, "sha256:abcd")
+            .ends_with("rootfs-cache/sha256-abcd/rootfs.ext4")
+    );
+    assert_ne!(
+        super::global_rootfs_path(d, "sha256:abcd"),
+        super::global_rootfs_path(d, "sha256:ef01")
+    );
+}
+
+/// `publish_rootfs_to_global` then `link_global_rootfs_to_uuid` shares ONE inode
+/// across uuids: a build for uuid-A populates the global cache; uuid-B (fresh,
+/// never built) hard-links it — no rebuild, same content, same inode.
+#[tokio::test]
+async fn global_cache_publish_then_link_shares_one_inode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    let digest = "sha256:deadbeef";
+
+    // uuid-A "built" its per-uuid rootfs.
+    let a = cached_rootfs_path(data, "uuid-a", digest);
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::write(&a, b"ROOTFS-CONTENT").unwrap();
+
+    super::publish_rootfs_to_global(data, digest, &a).await;
+    assert!(
+        super::global_rootfs_is_cached(data, digest),
+        "publish must populate the global cache"
+    );
+
+    // uuid-B (fresh) gets it WITHOUT a build, via hard link.
+    assert!(!super::rootfs_is_cached(data, "uuid-b", digest));
+    let linked = super::link_global_rootfs_to_uuid(data, "uuid-b", digest)
+        .await
+        .expect("global hit must materialize B's per-uuid rootfs");
+    assert_eq!(std::fs::read(&linked).unwrap(), b"ROOTFS-CONTENT");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            std::fs::metadata(&a).unwrap().ino(),
+            std::fs::metadata(&linked).unwrap().ino(),
+            "global cache must SHARE an inode (hard link), not copy"
+        );
+    }
+}
+
+/// `link_global_rootfs_to_uuid` returns `None` on a global MISS so the caller
+/// falls back to pull + build (never a wrong/empty rootfs).
+#[tokio::test]
+async fn global_cache_link_misses_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        super::link_global_rootfs_to_uuid(tmp.path(), "uuid-x", "sha256:absent")
+            .await
+            .is_none()
+    );
+}
+
+/// `evict_global_rootfs_cache` bounds the cache to KEEP entries (so it can never
+/// fill the worker disk — a past root-fs-full caused a full outage).
+#[tokio::test]
+async fn global_cache_eviction_bounds_entry_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    let total = super::GLOBAL_ROOTFS_CACHE_KEEP + 3;
+    for i in 0..total {
+        let p = super::global_rootfs_path(data, &format!("sha256:{i:064x}"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"\0").unwrap();
+    }
+    super::evict_global_rootfs_cache(data).await;
+    let remaining = std::fs::read_dir(data.join("rootfs-cache"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .count();
+    assert_eq!(
+        remaining,
+        super::GLOBAL_ROOTFS_CACHE_KEEP,
+        "eviction must bound the cache to KEEP entries"
+    );
+}
+
 use crate::fetcher::FetchedApp;
 use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
 use bytes::Bytes;

@@ -40,6 +40,35 @@ pub fn oras_copy_to_oci_layout_args(reff: &str, layout_dir: &str) -> Vec<String>
     ]
 }
 
+/// Build the `oras resolve --plain-http <ref>` argument list (sans the leading
+/// binary name): resolve a TAG (or digest) ref to its immutable manifest digest
+/// (`sha256:…`) by fetching ONLY the manifest (a few KB), NOT the layer blobs.
+///
+/// This is the key to the digest-shared rootfs cache: a tag ref's immutable
+/// digest is otherwise unknown until the (multi-minute, multi-MB) `oras copy`
+/// pull completes, so the cache could only be consulted AFTER paying the pull.
+/// `oras resolve` returns the digest in ~0.2 s, so the runtime build can check
+/// the digest-keyed cache BEFORE pulling and skip the pull entirely on a hit.
+///
+/// Single-target command ⇒ the plain-HTTP flag is `--plain-http` (NOT the
+/// copy-specific `--from-plain-http`). The digest is printed to stdout as a
+/// single `sha256:<hex>` line.
+///
+/// # Example
+/// ```
+/// # use tabbify_supervisor::oras::oras_resolve_args;
+/// let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag");
+/// assert_eq!(args, vec!["resolve", "--plain-http", "[fd5a::1]:5000/acme/vm:tag"]);
+/// ```
+#[must_use]
+pub fn oras_resolve_args(reff: &str) -> Vec<String> {
+    vec![
+        "resolve".to_owned(),
+        "--plain-http".to_owned(),
+        reff.to_owned(),
+    ]
+}
+
 /// Lowercase the repository portion of an OCI reference, preserving the tag /
 /// digest. The OCI distribution spec requires repository names to be lowercase;
 /// a GitHub owner like `Lsneg` would otherwise make the registry reject the
@@ -118,6 +147,23 @@ mod tests {
                 "--to-oci-layout",
                 "/out/oci",
             ]
+        );
+    }
+
+    // ---- oras_resolve_args ---------------------------------------------------
+
+    /// The resolve args must be `oras resolve --plain-http <ref>` (single-target
+    /// command ⇒ `--plain-http`, NOT the copy-only `--from-plain-http`).
+    #[test]
+    fn resolve_args_exact_shape() {
+        let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag");
+        assert_eq!(
+            args,
+            vec!["resolve", "--plain-http", "[fd5a::1]:5000/acme/vm:tag"]
+        );
+        assert!(
+            !args.contains(&"--from-plain-http".to_owned()),
+            "resolve is single-target; must use --plain-http; got {args:?}"
         );
     }
 
