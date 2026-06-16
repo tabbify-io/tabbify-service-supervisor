@@ -304,8 +304,8 @@ pub struct DevSessionRow {
         content_type = "application/json"
     ),
     responses(
-        (status = 200, description = "Session created, VM healthy", body = DevSessionCreated),
-        (status = 500, description = "Deploy failure", body = crate::api::ErrorResponse),
+        (status = 202, description = "Session accepted; VM provisions asynchronously", body = DevSessionCreated),
+        (status = 500, description = "Spawn setup failure", body = crate::api::ErrorResponse),
     ),
 )]
 #[tracing::instrument(skip(state, body), fields(app_uuid = %body.app_uuid))]
@@ -355,51 +355,60 @@ pub async fn create_dev_session(
         runner_join_token: body.runner_join_token,
     };
 
-    // Spawn the dev-FC (synchronous — returns when healthy or fails).
-    // On failure: revoke the cap and return the orchestrator error.
-    let result = state
-        .orchestrator
-        .deploy_app(
-            &body.app_uuid,
-            &body.image_ref,
-            None,
-            None,
-            net,
-            Some(&extra_env),
-        )
-        .await;
+    // ASYNC spawn (202). Previously this `await`ed `deploy_app` SYNCHRONOUSLY
+    // until the VM was HEALTHY — but a cold image pull takes minutes, exceeding
+    // the node's 300 s HTTP timeout, so the node reported "create failed" while
+    // the DETACHED runner kept provisioning (an orphan VM, plus a duplicate when
+    // the agent retried). Instead: register the session NOW so the node can
+    // list/exec/refresh it immediately, then provision in the BACKGROUND. On
+    // failure, revoke the git cap + drop the session so a later exec/list sees it
+    // gone. The runner is detached, so provisioning survives this handler return.
+    let now = Instant::now();
+    state.dev_sessions.insert(DevSession {
+        session_id: session_id.clone(),
+        app_uuid: body.app_uuid.clone(),
+        cap: cap.clone(),
+        created_at: now,
+        last_activity: now,
+        repo_url: body.repo_url.clone(),
+        branch: body.branch.clone(),
+    });
 
-    match result {
-        Err(e) => {
-            // Revoke the cap so the git proxy rejects future requests.
-            state.git_sessions.revoke(&cap);
-            tracing::warn!(app_uuid = %body.app_uuid, error = %e, "dev-session deploy failed");
-            let tail = state.orchestrator.runner_log_tail(&body.app_uuid, 20).await;
-            crate::api::handlers::anyhow_to_response_with_tail(&e, tail.as_deref())
+    let bg = state.clone();
+    let app_uuid = body.app_uuid.clone();
+    let image_ref = body.image_ref.clone();
+    let sid = session_id.clone();
+    tokio::spawn(async move {
+        match bg
+            .orchestrator
+            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&extra_env))
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(app_uuid = %app_uuid, session_id = %sid, "dev-session provisioned (async)");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    app_uuid = %app_uuid, session_id = %sid, error = %e,
+                    "dev-session deploy failed (async); revoking git cap + dropping session"
+                );
+                bg.git_sessions.revoke(&cap);
+                bg.dev_sessions.remove(&sid);
+            }
         }
-        Ok(_summary) => {
-            // Register the session ONLY after a successful deploy.
-            let now = Instant::now();
-            let session = DevSession {
-                session_id: session_id.clone(),
-                app_uuid: body.app_uuid.clone(),
-                cap,
-                created_at: now,
-                last_activity: now,
-                repo_url: body.repo_url,
-                branch: body.branch,
-            };
-            state.dev_sessions.insert(session);
+    });
 
-            // 200, not 202: the deploy is synchronous — the VM is healthy here.
-            Json(DevSessionCreated {
-                session_id,
-                app_uuid: body.app_uuid,
-                git_remote,
-            })
-            .into_response()
-        }
-    }
+    // 202 Accepted: session is registered + provisioning in the background. The
+    // node observes readiness via exec/list/status — never blocks on the pull.
+    (
+        axum::http::StatusCode::ACCEPTED,
+        Json(DevSessionCreated {
+            session_id,
+            app_uuid: body.app_uuid,
+            git_remote,
+        }),
+    )
+        .into_response()
 }
 
 /// `POST /v1/dev-sessions/:id/git-token` — refresh the git-proxy token for an

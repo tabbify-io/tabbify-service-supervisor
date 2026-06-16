@@ -585,38 +585,34 @@ async fn create_dev_session_deploy_failure_cleans_up() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    // Deploy must fail (no runner binary) → 500 with the runner log tail.
+    // Create is now ASYNC (202): it returns immediately and provisions in the
+    // background, so the node never blocks on a multi-minute cold pull (which
+    // previously blew the node's HTTP timeout and produced a false "create
+    // failed" + an orphan VM). Here the background deploy fails (no runner /
+    // KVM) → it must revoke the git cap + drop the session.
     assert_eq!(
         resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "create_dev_session with failing deploy must return 500"
-    );
-    let body = body_bytes(resp).await;
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let tail = json
-        .get("runner_log_tail")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    assert!(
-        tail.contains("FATAL: dev-FC spawn failed"),
-        "500 body must include runner log tail; got body: {json}"
+        StatusCode::ACCEPTED,
+        "create_dev_session now returns 202 (async provision)"
     );
 
-    // Dev-session registry must be empty (session not registered on failure).
-    assert_eq!(
-        state.dev_sessions.len(),
-        0,
-        "dev_sessions registry must be empty after deploy failure"
-    );
-
-    // The handler-generated cap must be REVOKED. It never leaves the handler on
-    // the error path, so assert via the registry snapshot: no caps remain — and
-    // with an empty registry the proxy 403s every `/git/<cap>` request (route
-    // behavior pinned by git_proxy_unknown_cap_403).
-    let leaked = state.git_sessions.registered_caps();
+    // Poll for the background-failure cleanup: the session is registered up front
+    // (so the node can track it), then dropped + its cap revoked once the deploy
+    // fails. The failure is fast here (no KVM on the test host → bail).
+    let cleaned = {
+        let mut ok = false;
+        for _ in 0..100 {
+            if state.dev_sessions.is_empty() && state.git_sessions.registered_caps().is_empty() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        ok
+    };
     assert!(
-        leaked.is_empty(),
-        "git cap must be revoked after deploy failure; leaked caps: {leaked:?}"
+        cleaned,
+        "background deploy failure must drop the session + revoke the git cap"
     );
 }
 
