@@ -1352,6 +1352,20 @@ pub async fn run_firecracker_build(
     is_swap: bool,
     extra_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
+    // DEV-SESSION snapshot suppression. A dev-FC's guest `/init` clones
+    // `/workspace` ASYNC — it finishes AFTER the readiness port answers, i.e.
+    // after the FC cold boot would snapshot — so a snapshot would freeze a
+    // pre-/mid-clone rootfs and a later warm-restore (e.g. a crash respawn)
+    // would resurrect an EMPTY /workspace. Mark the cache dir `.no-snapshot` so
+    // the cold boot NEVER snapshots a dev-FC → every (re)launch cold-boots and
+    // re-clones (self-healing). The dev marker is the `TABBIFY_GIT_REMOTE` env
+    // the dev-session deploy injects (`api::dev_sessions::create_dev_session`).
+    if extra_env.is_some_and(|m| m.contains_key("TABBIFY_GIT_REMOTE")) {
+        crate::firecracker::snapshot::suppress(&crate::firecracker::snapshot::cache_dir(
+            data_dir, uuid,
+        ));
+    }
+
     let reff = fetched
         .manifest
         .runtime

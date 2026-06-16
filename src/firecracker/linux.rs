@@ -282,8 +282,13 @@ impl FirecrackerRuntime {
         // successful create, record the image_ref the snapshot was taken from so
         // a later warm restore is invalidated when the deployed image changes
         // (snapshot cache is keyed by UUID only — see `snapshot::ref_matches`).
+        // `is_suppressed`: dev-sessions mark their cache dir `.no-snapshot`
+        // because the guest `/init` clones `/workspace` ASYNC — a snapshot here
+        // (right after the app port answers) would freeze a pre-/mid-clone
+        // rootfs, and a later warm-restore would resurrect an EMPTY /workspace.
+        // Suppressed ⇒ never snapshot ⇒ every (re)launch cold-boots + re-clones.
         if let Some(dir) = cache_dir {
-            if !snapshot::files_present(dir) {
+            if !snapshot::files_present(dir) && !snapshot::is_suppressed(dir) {
                 me.try_create_snapshot(dir).await;
                 if let (Some(reff), true) = (image_ref, snapshot::files_present(dir)) {
                     snapshot::write_ref(dir, reff);

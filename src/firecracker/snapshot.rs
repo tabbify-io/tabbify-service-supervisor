@@ -84,6 +84,47 @@ pub fn clear(cache_dir: &Path) {
     let _ = std::fs::remove_file(ref_path(cache_dir));
 }
 
+/// The per-app snapshot/cache directory: `<data_dir>/apps/<uuid>/cache`. Single
+/// source of the convention shared by the firecracker launcher (`launch_with_uuid`)
+/// and the dev-session snapshot-suppression below.
+pub fn cache_dir(data_dir: &Path, uuid: &str) -> PathBuf {
+    data_dir.join("apps").join(uuid).join("cache")
+}
+
+/// Path to the `.no-snapshot` marker in `cache_dir`. Its presence SUPPRESSES
+/// warm-start snapshot creation for this app (see [`is_suppressed`]).
+pub fn suppress_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(".no-snapshot")
+}
+
+/// Mark `cache_dir` so the firecracker cold boot NEVER creates a warm-start
+/// snapshot for this app.
+///
+/// Used for DEV-SESSIONS: the dev guest's `/init` clones `/workspace`
+/// ASYNCHRONOUSLY — it finishes AFTER the host readiness probe (the app port
+/// answers) returns, which is exactly when the cold boot would snapshot. So a
+/// snapshot would freeze a pre-/mid-clone rootfs, and a later warm-restore
+/// (e.g. a crash respawn) would resurrect an EMPTY `/workspace`. Suppressing the
+/// snapshot forces every (re)launch to COLD-boot, which re-runs `/init` and
+/// re-clones `/workspace` correctly (self-healing). Best-effort: a write failure
+/// just means a snapshot MAY still be taken — the pre-existing behaviour, never
+/// worse.
+pub fn suppress(cache_dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        tracing::warn!(path = %cache_dir.display(), error = %e, "snapshot suppress: mkdir failed");
+        return;
+    }
+    if let Err(e) = std::fs::write(suppress_path(cache_dir), b"") {
+        tracing::warn!(path = %suppress_path(cache_dir).display(), error = %e, "snapshot suppress: write failed");
+    }
+}
+
+/// Is snapshot creation suppressed for `cache_dir` (the `.no-snapshot` marker
+/// present)? Checked by the firecracker cold boot before creating a snapshot.
+pub fn is_suppressed(cache_dir: &Path) -> bool {
+    suppress_path(cache_dir).is_file()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -173,6 +214,38 @@ mod tests {
         clear(dir.path());
         assert!(!ref_path(dir.path()).exists(), "clear must drop .snapshot_ref");
         assert!(!files_present(dir.path()));
+    }
+
+    /// No `.no-snapshot` marker ⇒ snapshots are NOT suppressed (regular apps).
+    #[test]
+    fn is_suppressed_false_without_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_suppressed(dir.path()));
+    }
+
+    /// `suppress` writes the marker (creating the dir if absent) ⇒ `is_suppressed`
+    /// then true, and it does NOT create snapshot files (just the marker).
+    #[test]
+    fn suppress_creates_marker_and_is_idempotent() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("apps").join("u").join("cache"); // not yet created
+        assert!(!is_suppressed(&dir));
+        suppress(&dir);
+        assert!(is_suppressed(&dir), "marker must exist after suppress");
+        assert!(!files_present(&dir), "suppress must not create snapshot files");
+        // Idempotent: a second suppress is harmless.
+        suppress(&dir);
+        assert!(is_suppressed(&dir));
+    }
+
+    /// `cache_dir` is the single source of the `<data_dir>/apps/<uuid>/cache`
+    /// convention shared with the firecracker launcher.
+    #[test]
+    fn cache_dir_path_convention() {
+        assert_eq!(
+            cache_dir(Path::new("/data"), "019ed025"),
+            PathBuf::from("/data/apps/019ed025/cache")
+        );
     }
 
     #[test]

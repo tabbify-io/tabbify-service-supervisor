@@ -271,6 +271,20 @@ in {
       # here, and is best-effort (no-op off systemd).
       Type             = "notify";
       NotifyAccess     = "main";
+      # SU-2: app runners are `setsid`-detached so they OUTLIVE a supervisord
+      # restart (OTA self-update) — the crash-survival contract. But `setsid`
+      # escapes the process GROUP, NOT the systemd CGROUP, so the default
+      # `KillMode=control-group` SIGKILLs the WHOLE cgroup (every runner + its
+      # Firecracker child) on each `systemctl restart`. The new supervisord then
+      # sees the runners dead → respawns them → a dev-FC warm-restores its
+      # snapshot (taken mid-/workspace-clone) → /workspace is LOST. `process`
+      # signals ONLY the main supervisord on stop, leaving the detached runners +
+      # FCs alive so startup `readopt()` ADOPTS them untouched (no respawn, no
+      # restore). `Delegate` gives the unit its own cgroup subtree so systemd
+      # does not reap the surviving children. Regular-app on_request fast-wake is
+      # unaffected (warm-restore still works on a genuine cold respawn).
+      KillMode         = "process";
+      Delegate         = true;
       # The probe/start gate ceiling from the spec (§4): a candidate that does
       # not reach READY within 60s is killed by systemd -> rollback territory.
       TimeoutStartSec  = 60;

@@ -24,6 +24,15 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
+# App runners are setsid-detached to OUTLIVE a supervisord restart (OTA), but
+# setsid escapes the process group, NOT the cgroup — the default
+# KillMode=control-group would SIGKILL every detached runner + its Firecracker
+# child on `systemctl restart`, after which the new supervisord respawns them and
+# a dev-FC warm-restores a mid-clone snapshot (losing /workspace). `process`
+# signals only the main supervisord; the detached runners survive and startup
+# readopt() adopts them in place. Delegate gives the unit its own cgroup subtree.
+KillMode=process
+Delegate=yes
 # The supervisor self-detects capabilities + joins the baked-in coordinator.
 # Override via the environment (mesh coordinator, data dir, name, ...):
 #   Environment=TABBIFY_MESH_COORDINATOR=http://3.124.69.92:8888
