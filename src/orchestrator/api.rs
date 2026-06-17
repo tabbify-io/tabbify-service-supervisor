@@ -464,6 +464,18 @@ impl Orchestrator {
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
+        // Serialize concurrent deploys of the SAME app. A single push commonly
+        // fans out into two deploys (commit_repo_edit's redeploy + the GitHub-App
+        // webhook's redeploy of the same commit); without this lock both reach the
+        // runner's control socket at once and race the in-flight Firecracker swap
+        // → one returns "deploy control message failed" (500) + the surviving
+        // artifact is non-deterministic. The second caller queues here until the
+        // first finishes its swap; DIFFERENT apps contend on different locks and
+        // still deploy in parallel. Held across every await below for the whole
+        // deploy (control round-trip and any cold spawn + health wait).
+        let deploy_lock = self.deploy_lock_for(uuid);
+        let _serialize = deploy_lock.lock().await;
+
         // Mark this uuid as deploy-in-flight for the WHOLE deploy. The RAII guard
         // clears it on every exit path (early `?`, error, success). While it is
         // held the monitor's reconcile defers killing + respawning this runner —
@@ -1120,6 +1132,118 @@ mod tests {
             updated.image_ref.as_deref(),
             Some(reff),
             "image_ref must be persisted after a live deploy"
+        );
+    }
+
+    /// Two concurrent `deploy_app` calls for the SAME uuid must be SERIALIZED.
+    ///
+    /// The bug this guards: a single push fans out into two deploys (e.g.
+    /// `commit_repo_edit`'s redeploy + the GitHub-App webhook's redeploy of the
+    /// same commit). Without a per-uuid lock both reach the runner's control
+    /// socket at once and race the in-flight FC swap → one returns
+    /// `Err("deploy control message failed")` (supervisor 500) and the final
+    /// artifact is non-deterministic.
+    ///
+    /// We prove serialization by counting the MAX number of simultaneously-open
+    /// control connections. Each `deploy_app` opens two (a health probe then the
+    /// Deploy), and the fake server holds every connection open for 80ms while
+    /// accepting new ones concurrently. Serialized deploys never overlap on the
+    /// socket → max concurrency 1; a racing implementation reaches 2.
+    #[tokio::test]
+    async fn deploy_app_serializes_concurrent_same_uuid() {
+        use std::{
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::Duration,
+        };
+
+        use tempfile::TempDir;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let sock_path_srv = sock_path.clone();
+        let active_srv = Arc::clone(&active);
+        let max_srv = Arc::clone(&max_seen);
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            // 2 deploys × (health + deploy) = 4 connections; accept a few extra.
+            for _ in 0..8 {
+                match tokio::time::timeout(Duration::from_secs(3), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let active = Arc::clone(&active_srv);
+                        let max_seen = Arc::clone(&max_srv);
+                        // Handle each connection on its own task so the server
+                        // never serializes — overlap must come (or not) from the
+                        // client side under test.
+                        tokio::spawn(async move {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(now, Ordering::SeqCst);
+                            let mut reader = BufReader::new(stream);
+                            let mut line = String::new();
+                            let _ = reader.read_line(&mut line).await;
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: None,
+            extra_env: None,
+            crash_looped: false,
+            stopped: false,
+        };
+        rec.save(dir.path()).unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        let reff = "[fd5a::1]:5000/acme/app:sha256abc";
+
+        // Fire both deploys for the SAME uuid concurrently.
+        let o1 = o.clone();
+        let o2 = o.clone();
+        let h1 = tokio::spawn(async move {
+            o1.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None)
+                .await
+        });
+        let h2 = tokio::spawn(async move {
+            o2.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None)
+                .await
+        });
+        let (r1, r2) = tokio::join!(h1, h2);
+        assert!(r1.unwrap().is_ok(), "first concurrent deploy must succeed");
+        assert!(r2.unwrap().is_ok(), "second concurrent deploy must succeed");
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "control socket saw overlapping deploys for one uuid → not serialized"
         );
     }
 

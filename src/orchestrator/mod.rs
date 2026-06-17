@@ -31,7 +31,7 @@ pub mod restart;
 pub mod spawn;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -176,6 +176,26 @@ pub struct Orchestrator {
     /// it is only ever locked for the duration of a `contains`/`insert`/`remove`,
     /// never across an await.
     deploying: Arc<Mutex<HashSet<String>>>,
+    /// Per-uuid async locks that SERIALIZE concurrent deploys of the SAME app.
+    ///
+    /// A single push commonly fans out into two deploys — `commit_repo_edit`'s
+    /// server-side redeploy AND the GitHub-App webhook's redeploy of the same
+    /// commit both arrive at the node and call [`deploy_app`](Self::deploy_app)
+    /// near-simultaneously. Without this, both reach the runner's control socket
+    /// at once and race the in-flight Firecracker swap: one returns
+    /// `deploy control message failed` (the supervisor answers 500) and the
+    /// surviving artifact is non-deterministic. Holding the per-uuid lock for the
+    /// whole deploy makes same-app deploys QUEUE (the second waits for the first
+    /// to finish its swap) while DIFFERENT apps still deploy fully in parallel.
+    ///
+    /// A `tokio::sync::Mutex` (not `std`) because the guard is held ACROSS awaits
+    /// — the entire `deploy_app`, including the control round-trip and any cold
+    /// spawn + health wait. The OUTER `std::sync::Mutex` only guards the
+    /// map's get-or-insert and is never held across an await. Shared across
+    /// clones via `Arc` (same as `deploying`) so every caller contends on the
+    /// same per-uuid lock. Entries are never removed — an empty mutex per app
+    /// ever deployed is negligible and removal would race a waiting deployer.
+    deploy_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// RAII guard that removes a uuid from the orchestrator's in-flight-deploy set
@@ -204,7 +224,24 @@ impl Orchestrator {
             shared,
             runner_dir,
             deploying: Arc::new(Mutex::new(HashSet::new())),
+            deploy_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The per-uuid async lock that serializes deploys for `uuid`, created on
+    /// first use. The returned `Arc<tokio::sync::Mutex<()>>` is what the caller
+    /// `.lock().await`s to enter the deploy critical section. The outer
+    /// `std::sync::Mutex` is only held for the map lookup/insert here, never
+    /// across the await.
+    pub(crate) fn deploy_lock_for(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .deploy_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            map.entry(uuid.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     /// Mark `uuid` as deploy-in-flight and return an RAII [`DeployGuard`] that
