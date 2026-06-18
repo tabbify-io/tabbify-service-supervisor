@@ -22,13 +22,26 @@ use tokio::time::timeout;
 
 use crate::control_proto::{Cmd, Reply};
 
-/// Connect + read timeout applied to every control-socket round-trip.
-///
-/// Sized to be generous enough for a runner that is still starting up while
-/// being short enough that a crashed/dead runner fails fast. Callers that need
-/// to *poll until ready* (e.g. `wait_health` in the integration test) loop with
-/// their own outer deadline.
+/// Connect + read timeout for the FAST control round-trips (ping / health /
+/// stop / purge / shutdown). Sized to be generous enough for a runner that is
+/// still starting up while being short enough that a crashed/dead runner fails
+/// fast. Callers that need to *poll until ready* (e.g. `wait_health` in the
+/// integration test) loop with their own outer deadline.
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read timeout for the `Deploy` round-trip specifically. Deploy is NOT a fast
+/// command: the runner builds the new runtime SYNCHRONOUSLY before replying —
+/// `build_runtime` (pull image + convert rootfs + boot the FC) then
+/// `perform_swap` (health-gate + flip). A cold pull over the relay-only WAN
+/// (~minutes for a multi-MB image) dwarfs the 5s [`TIMEOUT`], so reusing it made
+/// every running-app warm-swap of an UNCACHED image fail with "deploy control
+/// message failed" while only cache-warm swaps fit — the long-standing
+/// "redeploy a running app 500s, an idle one works" bug (idle goes through the
+/// generous 180s cold-spawn path instead). This deadline must cover a cold build
+/// end-to-end; the connect still fails fast for a dead socket, the per-uuid
+/// deploy lock + monitor-shield already tolerate a long-held deploy, and the
+/// node waits on its side with no timeout.
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Thin client for the runner's Unix-domain control socket.
 ///
@@ -92,22 +105,35 @@ impl ControlClient {
     /// runtime never became healthy it replies [`Reply::Err`] and the OLD
     /// runtime stays in service (no downtime).
     pub async fn deploy(&self, reff: impl Into<String>) -> Result<Reply> {
-        self.round_trip(Cmd::Deploy { reff: reff.into() }).await
+        // Deploy builds the new runtime SYNCHRONOUSLY before replying (pull +
+        // rootfs convert + boot + health-gated swap), which on a cold pull over
+        // the relay-only WAN takes minutes — so it gets the build-length
+        // DEPLOY_TIMEOUT, not the fast TIMEOUT the other commands use.
+        self.round_trip_with_timeout(Cmd::Deploy { reff: reff.into() }, DEPLOY_TIMEOUT)
+            .await
     }
 
     /// Open a fresh connection to `self.sock`, write `cmd` as a JSON line, read
-    /// back one JSON-line [`Reply`], and close.
-    ///
-    /// The entire operation (connect + write + read) is bounded by [`TIMEOUT`].
+    /// back one JSON-line [`Reply`], and close. Bounded by the fast [`TIMEOUT`].
     ///
     /// # Errors
     /// - The socket path does not exist or is not connectable.
     /// - The connect or read exceeds [`TIMEOUT`].
     /// - Serialization / deserialization fails.
     async fn round_trip(&self, cmd: Cmd) -> Result<Reply> {
+        self.round_trip_with_timeout(cmd, TIMEOUT).await
+    }
+
+    /// [`round_trip`](Self::round_trip) with an explicit read deadline. Deploy
+    /// uses the long [`DEPLOY_TIMEOUT`]; everything else uses [`TIMEOUT`]. The
+    /// connect still fails fast for a dead socket regardless of `deadline`.
+    ///
+    /// # Errors
+    /// As [`round_trip`](Self::round_trip), with the bound being `deadline`.
+    async fn round_trip_with_timeout(&self, cmd: Cmd, deadline: Duration) -> Result<Reply> {
         let sock = &self.sock;
 
-        let reply = timeout(TIMEOUT, async {
+        let reply = timeout(deadline, async {
             let mut stream = UnixStream::connect(sock)
                 .await
                 .with_context(|| format!("connect to control socket {:?}", sock))?;
@@ -139,7 +165,7 @@ impl ControlClient {
         .await
         .with_context(|| {
             format!(
-                "control socket round-trip timed out after {TIMEOUT:?} for {:?}",
+                "control socket round-trip timed out after {deadline:?} for {:?}",
                 sock
             )
         })??;
@@ -170,5 +196,68 @@ mod tests {
         let client = ControlClient::new(&dead);
         let result = client.health().await;
         assert!(result.is_err(), "dead socket must return Err");
+    }
+
+    /// `round_trip_with_timeout` honors its `deadline` param: a deadline SHORTER
+    /// than the server's reply delay times out, a generous one tolerates the slow
+    /// reply. This is the mechanism `deploy` rides via the long `DEPLOY_TIMEOUT`
+    /// (so a slow synchronous build no longer 500s) while the fast commands keep
+    /// the short `TIMEOUT`.
+    #[tokio::test]
+    async fn round_trip_honors_its_deadline() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        use crate::control_proto::Cmd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("slow.sock");
+        let sock_srv = sock.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_srv).unwrap();
+            for _ in 0..4 {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line).await;
+                    // Reply ~200ms after the request — slower than a 50ms deadline,
+                    // faster than a 5s one.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = ControlClient::new(&sock);
+        let short = client
+            .round_trip_with_timeout(Cmd::Health, Duration::from_millis(50))
+            .await;
+        assert!(
+            short.is_err(),
+            "a deadline shorter than the reply delay must time out"
+        );
+        let long = client
+            .round_trip_with_timeout(Cmd::Health, Duration::from_secs(5))
+            .await;
+        assert!(
+            long.is_ok(),
+            "a generous deadline tolerates the slow reply: {long:?}"
+        );
+    }
+
+    /// The Deploy round-trip deadline is build-length and far larger than the
+    /// fast `TIMEOUT` — so a cold pull (~minutes) no longer trips the control
+    /// timeout (the long-standing "redeploy a running app 500s" root).
+    #[test]
+    fn deploy_timeout_is_build_length() {
+        assert!(
+            DEPLOY_TIMEOUT > TIMEOUT,
+            "deploy must use a longer deadline than the fast commands"
+        );
+        assert!(
+            DEPLOY_TIMEOUT >= Duration::from_secs(120),
+            "deploy deadline must cover a multi-minute cold build"
+        );
     }
 }
