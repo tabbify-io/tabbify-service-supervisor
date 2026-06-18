@@ -222,6 +222,71 @@ async fn sweep_removes_max_ttl_expired_session() {
     assert!(state.dev_sessions.lookup("old-sess").is_none());
 }
 
+/// The max-ttl reaper also scrubs the on-disk dev-session sidecar (the third
+/// teardown path, alongside delete + async-deploy-failure) so a later restart
+/// cannot resurrect a reaped session.
+#[tokio::test]
+async fn sweep_removes_dev_session_record_sidecar() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let runner_dir = tmp.path().join("runners");
+    std::fs::create_dir_all(&runner_dir).unwrap();
+    let orchestrator = crate::orchestrator::Orchestrator::new(
+        crate::orchestrator::SharedRunnerConfig {
+            runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
+            s3_base_url: "http://s3.invalid".to_owned(),
+            data_dir: tmp.path().to_path_buf(),
+            parent: None,
+            no_mesh: true,
+            relay_url: None,
+            relay_only: false,
+        },
+        runner_dir.clone(),
+    );
+    let fetcher = crate::fetcher::S3Fetcher::new("http://s3.invalid", tmp.path().to_path_buf());
+    let state = Arc::new(crate::api::SupervisorState::new(
+        orchestrator,
+        fetcher,
+        "test-supervisor".to_owned(),
+        "::1".to_owned(),
+    ));
+
+    insert_session_aged(
+        &state,
+        "old-sess",
+        "app-old",
+        "cap-old",
+        Duration::from_secs(120),
+        Duration::from_secs(5),
+    );
+    crate::api::DevSessionRecord {
+        session_id: "old-sess".to_owned(),
+        app_uuid: "app-old".to_owned(),
+        cap: "cap-old".to_owned(),
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
+        created_at_unix: crate::api::now_unix(),
+        last_activity_unix: crate::api::now_unix(),
+    }
+    .save(&runner_dir)
+    .unwrap();
+    assert_eq!(
+        crate::api::DevSessionRecord::list(&runner_dir).unwrap().len(),
+        1
+    );
+
+    // max-ttl 60s < age 120s → reaped.
+    let purged = sweep_expired(&state, Duration::from_secs(3600), Duration::from_secs(60)).await;
+    assert_eq!(purged, vec!["old-sess".to_owned()]);
+    assert!(
+        crate::api::DevSessionRecord::list(&runner_dir)
+            .unwrap()
+            .is_empty(),
+        "reaper must scrub the on-disk sidecar"
+    );
+}
+
 /// Both sessions expired: both purged.
 #[tokio::test]
 async fn sweep_removes_both_expired() {

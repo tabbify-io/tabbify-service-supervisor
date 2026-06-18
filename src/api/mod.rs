@@ -35,11 +35,15 @@ use axum::routing::{get, post};
 use crate::fetcher::S3Fetcher;
 use crate::orchestrator::Orchestrator;
 
+mod dev_session_record;
 mod dev_sessions;
 mod dto;
 mod git_proxy;
 mod handlers;
 
+pub use dev_session_record::{
+    DevSessionRecord, ReadoptDevSummary, now_unix, readopt_dev_sessions,
+};
 pub use dev_sessions::{
     CreateDevSessionBody, DEV_SESSION_IDLE_TTL, DEV_SESSION_MAX_TTL, DevSessionCreated,
     DevSessionPurged, DevSessionRegistry, DevSessionRow, GitTokenRefreshed, RefreshGitTokenBody,

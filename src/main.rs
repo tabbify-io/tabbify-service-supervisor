@@ -199,6 +199,18 @@ async fn main() -> anyhow::Result<()> {
         .with_docker(docker)
         .with_tap_subnet(config.firecracker.tap_subnet.clone());
 
+    // Re-adopt persisted dev-sessions before serving: the dev-VM runners survive
+    // a restart/OTA (KillMode=process) but the in-memory dev_sessions/git_sessions
+    // do not, so without this the running dev-VMs are orphaned (invisible to
+    // `dev_session_*`, git push 403s). Re-insert each from its on-disk sidecar so
+    // it reappears in `GET /v1/dev-sessions`; the node's standing token sweep then
+    // restores the git token. Runs unconditionally on every start (incl. OTA).
+    tabbify_supervisor::api::readopt_dev_sessions(
+        state.orchestrator.runner_dir(),
+        &state.dev_sessions,
+        &state.git_sessions,
+    );
+
     // Spawn the dev-session idle reaper now that `state` (and its Arc) exists.
     // Scans every 60 s for sessions that exceeded idle or max-TTL thresholds.
     // `state.clone()` shares the SAME registries as the router below: the

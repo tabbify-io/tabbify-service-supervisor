@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "tabbify-service-supervisor"
-version = "1.4.60"
+version = "1.4.61"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -28,7 +28,7 @@ use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::api::{GIT_PROXY_IPV4_PORT, GitSessionEntry, SharedState};
+use crate::api::{DevSessionRecord, GIT_PROXY_IPV4_PORT, GitSessionEntry, SharedState, now_unix};
 use crate::orchestrator::api::DeployNetwork;
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
@@ -291,10 +291,13 @@ pub struct DevSessionRow {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// `POST /v1/dev-sessions` — spawn an always-on dev-FC + register a git-proxy
-/// capability. Returns `200` with `{ session_id, app_uuid, git_remote }`.
+/// capability. Returns `202 Accepted` immediately with
+/// `{ session_id, app_uuid, git_remote }`.
 ///
-/// The deploy is SYNCHRONOUS (mirrors `deploy_app`, which also answers 200 only
-/// once the VM is healthy); the node tolerates long mesh-internal calls.
+/// The deploy is ASYNCHRONOUS: the session + git cap are registered up front and
+/// the VM provisions in a background task (a cold image pull can take minutes —
+/// see the inline rationale below). The node observes readiness via
+/// exec/list/status rather than blocking on the create call.
 #[utoipa::path(
     post,
     path = "/v1/dev-sessions",
@@ -374,6 +377,26 @@ pub async fn create_dev_session(
         branch: body.branch.clone(),
     });
 
+    // Persist a durable sidecar so this session survives a supervisor restart/OTA:
+    // the dev-VM runner survives (KillMode=process) but the in-memory registries
+    // do not, so without this the VM is orphaned on restart (see
+    // [`crate::api::readopt_dev_sessions`]). Best-effort — a write failure only
+    // loses restart-survival; the in-memory session still works. The async-failure
+    // path below removes it again.
+    let now_u = now_unix();
+    let record = DevSessionRecord {
+        session_id: session_id.clone(),
+        app_uuid: body.app_uuid.clone(),
+        cap: cap.clone(),
+        repo_url: body.repo_url.clone(),
+        branch: body.branch.clone(),
+        created_at_unix: now_u,
+        last_activity_unix: now_u,
+    };
+    if let Err(e) = record.save(state.orchestrator.runner_dir()) {
+        tracing::warn!(app_uuid = %body.app_uuid, error = %e, "failed to persist dev-session record (session live in-memory only)");
+    }
+
     let bg = state.clone();
     let app_uuid = body.app_uuid.clone();
     let image_ref = body.image_ref.clone();
@@ -394,6 +417,7 @@ pub async fn create_dev_session(
                 );
                 bg.git_sessions.revoke(&cap);
                 bg.dev_sessions.remove(&sid);
+                let _ = DevSessionRecord::remove(bg.orchestrator.runner_dir(), &app_uuid);
             }
         }
     });
@@ -429,7 +453,7 @@ pub async fn refresh_git_token(
     Path(id): Path<String>,
     Json(body): Json<RefreshGitTokenBody>,
 ) -> Response {
-    let Some((_, cap)) = state.dev_sessions.lookup(&id) else {
+    let Some((app_uuid, cap)) = state.dev_sessions.lookup(&id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("dev session {id} not found") })),
@@ -442,6 +466,23 @@ pub async fn refresh_git_token(
         .git_sessions
         .refresh_token(&cap, body.git_token, expires_at);
     state.dev_sessions.bump_activity(&id);
+
+    // Persist the activity bump so `idle_secs` survives a restart (best-effort).
+    // A `None` record is a pre-persistence session (created before this fix) —
+    // nothing to update.
+    let runner_dir = state.orchestrator.runner_dir();
+    match DevSessionRecord::load(runner_dir, &app_uuid) {
+        Ok(Some(mut rec)) => {
+            rec.last_activity_unix = now_unix();
+            if let Err(e) = rec.save(runner_dir) {
+                tracing::warn!(session_id = %id, error = %e, "failed to persist dev-session activity bump");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "failed to load dev-session record for activity bump");
+        }
+    }
 
     Json(GitTokenRefreshed { refreshed: true }).into_response()
 }
@@ -473,6 +514,17 @@ pub async fn delete_dev_session(
 
     // Revoke the git-proxy capability immediately.
     state.git_sessions.revoke(&session.cap);
+
+    // Remove the durable sidecar so a later restart cannot resurrect a phantom
+    // session for the purged VM (best-effort).
+    if let Err(e) = DevSessionRecord::remove(state.orchestrator.runner_dir(), &session.app_uuid) {
+        tracing::warn!(
+            session_id = %id,
+            app_uuid = %session.app_uuid,
+            error = %e,
+            "failed to remove dev-session record on delete"
+        );
+    }
 
     // Purge the VM (purge NOT stop — the monitor must never respawn it).
     if let Err(e) = state.orchestrator.purge_app(&session.app_uuid).await {
@@ -553,6 +605,11 @@ pub async fn sweep_expired(
         state.dev_sessions.remove(&session_id);
         // Revoke the git-proxy capability.
         state.git_sessions.revoke(&cap);
+        // Remove the durable sidecar (third teardown path, alongside delete +
+        // async-deploy-failure) so a restart cannot resurrect a reaped session.
+        if let Err(e) = DevSessionRecord::remove(state.orchestrator.runner_dir(), &app_uuid) {
+            tracing::warn!(session_id, app_uuid, error = %e, "dev-session reap: failed to remove record");
+        }
         // Purge the VM.
         if let Err(e) = state.orchestrator.purge_app(&app_uuid).await {
             tracing::warn!(
