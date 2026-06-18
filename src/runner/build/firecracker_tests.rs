@@ -1822,3 +1822,77 @@ async fn pull_oci_layout_bails_after_max_attempts() {
         "tried exactly PULL_MAX_ATTEMPTS times then gave up"
     );
 }
+
+/// ESCAPE HATCH (#64): an UN-resumable partial (oras keeps erroring on the same
+/// dirty destination) must not doom all attempts. After `PULL_RESUME_ATTEMPTS`
+/// resume tries, `pull_oci_layout` WIPES the layout and re-pulls fresh. We detect
+/// the wipe via a sentinel the mock "oras" leaves each call: once wiped, the next
+/// call sees no sentinel.
+#[tokio::test(start_paused = true)]
+async fn pull_oci_layout_wipes_and_retries_fresh_after_resume_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let saw_sentinel: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let saw = saw_sentinel.clone();
+    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+        let saw = saw.clone();
+        Box::pin(async move {
+            // Last argv element is the layout dir (oras_copy_to_oci_layout_args).
+            let layout = std::path::PathBuf::from(argv.last().cloned().unwrap_or_default());
+            let sentinel = layout.join("partial.blob");
+            saw.lock().unwrap().push(sentinel.exists());
+            // Simulate oras leaving a partial blob, then failing.
+            let _ = std::fs::create_dir_all(&layout);
+            let _ = std::fs::write(&sentinel, b"x");
+            (false, Vec::new())
+        })
+    });
+
+    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+        .await
+        .expect_err("all attempts fail → pull bails");
+
+    let obs = saw_sentinel.lock().unwrap();
+    assert_eq!(obs.len(), super::PULL_MAX_ATTEMPTS, "every attempt ran");
+    assert!(
+        obs[1],
+        "resume phase keeps the partial (attempt 2 sees attempt 1's sentinel — no wipe)"
+    );
+    assert!(
+        !obs[super::PULL_RESUME_ATTEMPTS],
+        "after the resume budget the layout is wiped → the fresh re-pull sees no partial"
+    );
+}
+
+/// The escape hatch RECOVERS: a pull that only succeeds AFTER the resume budget
+/// (i.e. on a fresh post-wipe attempt) still yields Ok.
+#[tokio::test(start_paused = true)]
+async fn pull_oci_layout_recovers_when_fresh_pull_succeeds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls2 = calls.clone();
+    let runner: super::FcBuildRunner = Arc::new(move |_argv: Vec<String>| {
+        let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
+        // Fail through the resume budget; succeed on the first fresh attempt.
+        Box::pin(async move { (n > super::PULL_RESUME_ATTEMPTS, Vec::new()) })
+    });
+    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+        .await
+        .expect("a fresh re-pull after the resume budget must recover");
+}
+
+/// `wipe_oci_layout` is idempotent on a missing dir and removes an existing one.
+#[tokio::test]
+async fn wipe_oci_layout_tolerates_missing_and_removes_existing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = tmp.path().join("oci");
+    // Missing dir → Ok (idempotent).
+    super::wipe_oci_layout(&layout).await.unwrap();
+    // Existing dir with content → removed.
+    std::fs::create_dir_all(layout.join("blobs")).unwrap();
+    std::fs::write(layout.join("index.json"), b"{}").unwrap();
+    super::wipe_oci_layout(&layout).await.unwrap();
+    assert!(!layout.exists(), "wipe removes the layout dir");
+}

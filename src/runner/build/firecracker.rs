@@ -1252,8 +1252,30 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
 /// a multi-MB layer mid-stream converges over a few attempts instead of
 /// failing the whole pull (the home-NAT worker over a wss relay).
 pub(crate) const PULL_MAX_ATTEMPTS: usize = 8;
+/// Resume retries (Phase A) before falling back to wipe-and-retry-fresh. The
+/// first `PULL_RESUME_ATTEMPTS` tries re-`oras copy` into the SAME layout (cheap
+/// blob-level resume for a relay EOF mid-blob); after that the partial is treated
+/// as un-resumable (truncated blob / corrupt index / a dirty dir oras keeps
+/// erroring on) and the layout is wiped for a clean re-pull. Must stay well below
+/// [`PULL_MAX_ATTEMPTS`] so a normal relay EOF still gets several resume tries.
+const PULL_RESUME_ATTEMPTS: usize = 3;
 /// Backoff between pull retries.
 const PULL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Remove an OCI layout dir, tolerating a missing dir (idempotent) but SURFACING
+/// any real error. A silently-swallowed wipe failure (EBUSY / EIO / permissions /
+/// a half-removed tree) leaves a DIRTY layout that makes every subsequent
+/// `oras copy --to-oci-layout` fail identically with "Error from destination
+/// oci-layout" — the #64 doom-loop. Returning the error lets the caller log it
+/// and fall back instead of silently re-failing.
+async fn wipe_oci_layout(layout: &Path) -> Result<()> {
+    match tokio::fs::remove_dir_all(layout).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("wipe oci layout dir {}", layout.display())),
+    }
+}
 
 /// # Errors
 /// A failing `oras copy`.
@@ -1268,8 +1290,11 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
     // (`…@sha256:…`) is immutable and content-addressed, so leave its (possibly
     // already-cached) layout intact — no re-pull churn. `remove_dir_all` is
     // idempotent (a missing dir is fine).
+    // The wipe error is SURFACED (not swallowed): a failed wipe leaves a dirty
+    // dir that would otherwise poison every attempt with "Error from destination
+    // oci-layout" (the #64 doom-loop).
     if !reff.contains("@sha256") {
-        tokio::fs::remove_dir_all(&layout).await.ok();
+        wipe_oci_layout(&layout).await?;
     }
     tokio::fs::create_dir_all(&layout)
         .await
@@ -1279,18 +1304,39 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
         reff,
         &layout.to_string_lossy(),
     ));
-    // RESUMABLE pull: `oras copy` into a content-addressed OCI layout SKIPS
-    // blobs already present, so retrying into the SAME (un-wiped) dir resumes
-    // at blob granularity. A flaky relay that EOFs a multi-MB layer mid-stream
-    // then converges over a few attempts instead of failing the whole pull. The
-    // dir was wiped at most ONCE above (mutable-tag digest resolution); the
-    // retries MUST NOT re-wipe or they would discard the partial pull.
+    // TWO-PHASE retry. Phase A (the first PULL_RESUME_ATTEMPTS tries) re-`oras
+    // copy`s into the SAME content-addressed layout: blobs already present are
+    // SKIPPED, so a flaky relay that EOFs a multi-MB layer mid-stream converges
+    // cheaply at blob granularity. Phase B is the ESCAPE HATCH: once the resume
+    // budget is spent the partial is treated as un-resumable (a truncated blob /
+    // corrupt index / a destination oras keeps erroring on — the #64 flap), so
+    // WIPE the layout ONCE and re-pull from scratch for the remaining attempts
+    // (which themselves resume). The partial is consumed by NOTHING until this fn
+    // returns `Ok`, so discarding it loses no committed work — and frees the bytes
+    // it held, relieving a transient disk-margin.
+    let mut wiped_fresh = false;
     for attempt in 1..=PULL_MAX_ATTEMPTS {
         let (ok, _) = (runner)(argv.clone()).await;
         if ok {
             return Ok(layout);
         }
-        if attempt < PULL_MAX_ATTEMPTS {
+        if attempt >= PULL_MAX_ATTEMPTS {
+            break;
+        }
+        if attempt >= PULL_RESUME_ATTEMPTS && !wiped_fresh {
+            // Cross from blob-resume to wipe-and-retry-fresh, exactly once.
+            wiped_fresh = true;
+            if let Err(e) = wipe_oci_layout(&layout).await {
+                tracing::warn!(reff, attempt, error = %e, "oras pull: wipe-and-retry-fresh wipe failed (continuing)");
+            }
+            tokio::fs::create_dir_all(&layout).await.ok();
+            tracing::warn!(
+                reff,
+                attempt,
+                max = PULL_MAX_ATTEMPTS,
+                "oras copy still failing after resume retries — wiped layout, re-pulling from scratch"
+            );
+        } else {
             tracing::warn!(
                 reff,
                 attempt,
@@ -1298,8 +1344,8 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
                 "oras copy failed (relay may have broken a large blob mid-stream); \
                  retrying — already-pulled blobs are skipped (blob-level resume)"
             );
-            tokio::time::sleep(PULL_RETRY_BACKOFF).await;
         }
+        tokio::time::sleep(PULL_RETRY_BACKOFF).await;
     }
     bail!("oras copy of registry_ref {reff:?} into OCI layout failed after {PULL_MAX_ATTEMPTS} attempts");
 }
