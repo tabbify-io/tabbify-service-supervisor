@@ -51,6 +51,21 @@ use crate::{
 /// genuinely-doomed start in bounded time.
 const START_HEALTHY_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// How many times a live zero-downtime swap re-sends `Cmd::Deploy` when the
+/// control round-trip fails at the TRANSPORT layer (connect/write/read error or
+/// the 5s round-trip timeout — the "deploy control message failed" symptom a
+/// momentarily-wedged or briefly-busy runner socket produces). Each attempt is
+/// itself a full zero-downtime swap (the runner keeps the OLD VM serving on
+/// failure), and the runner's same-ref guard makes a re-send after a lost reply
+/// an idempotent no-op — so retrying never risks the running app. A runner
+/// `Reply::Err` (an opaque build / health-gate verdict; mesh-pull transients are
+/// already exhausted by the runner's own oras retries) is NOT retried here.
+const SWAP_MAX_ATTEMPTS: usize = 3;
+
+/// Backoff between swap retry attempts. Gives a briefly-busy runner a moment to
+/// finish whatever wedged its control socket before the next `Cmd::Deploy`.
+const SWAP_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Externally-visible lifecycle state of an app, mirrored onto the control-API
 /// JSON `state` field. In the orchestrator model an app is `running` iff its
 /// runner answers a control-socket health probe; otherwise it is `stopped`
@@ -432,6 +447,70 @@ impl Orchestrator {
         }))
     }
 
+    /// Send a live runner the `Deploy` control message, retrying transient
+    /// control-transport failures.
+    ///
+    /// Returns `Ok(())` once the runner replies `Reply::Ok` (the swap landed).
+    /// The TRANSPORT-failure class — a connect/write/read error or the 5s
+    /// round-trip timeout, surfaced as `Err(e)` ("deploy control message failed")
+    /// — is retried up to [`SWAP_MAX_ATTEMPTS`] with [`SWAP_RETRY_BACKOFF`]
+    /// between tries: this is the symptom a momentarily-wedged or briefly-busy
+    /// runner socket produces (and the residue of the deploy-race), and re-sending
+    /// is safe because every runner-side deploy is a zero-downtime swap that keeps
+    /// the OLD VM serving on failure, while the runner's same-ref guard makes a
+    /// re-send after a lost reply an idempotent no-op.
+    ///
+    /// A runner `Reply::Err` is a deliberate verdict (the build failed or the new
+    /// VM never became healthy; mesh-pull transients are already exhausted by the
+    /// runner's own oras retries) — it is NOT retried, just surfaced. `Ok(other)`
+    /// is a protocol violation, also not retried.
+    ///
+    /// On any returned `Err` the caller MUST NOT advance `image_ref`, so the app
+    /// stays on its last-known-good build. The error is logged loudly with the
+    /// dropped ref so a re-deploy is obvious.
+    async fn swap_with_retry(&self, uuid: &str, reff: &str) -> Result<()> {
+        for attempt in 1..=SWAP_MAX_ATTEMPTS {
+            match self.client_for(uuid).deploy(reff).await {
+                Ok(Reply::Ok) => return Ok(()),
+                Ok(Reply::Err { message }) => {
+                    tracing::warn!(
+                        uuid,
+                        reff,
+                        %message,
+                        "deploy swap rejected by runner; app stays on its last-known-good build — re-deploy to retry"
+                    );
+                    return Err(anyhow::anyhow!("runner deploy failed: {message}"));
+                }
+                Ok(other) => {
+                    return Err(anyhow::anyhow!("unexpected reply to Deploy: {other:?}"));
+                }
+                Err(e) => {
+                    if attempt >= SWAP_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            uuid,
+                            reff,
+                            attempt,
+                            error = %e,
+                            "deploy swap failed after {SWAP_MAX_ATTEMPTS} attempts (control transport); app stays on its last-known-good build — re-deploy to retry"
+                        );
+                        return Err(e.context("deploy control message failed"));
+                    }
+                    tracing::warn!(
+                        uuid,
+                        reff,
+                        attempt,
+                        error = %e,
+                        "deploy control transport failed; retrying after backoff"
+                    );
+                    tokio::time::sleep(SWAP_RETRY_BACKOFF).await;
+                }
+            }
+        }
+        // Unreachable: every match arm returns, and the final attempt's transport
+        // arm returns rather than looping. Kept for exhaustiveness.
+        unreachable!("swap_with_retry returns inside the loop on the final attempt")
+    }
+
     /// Deploy `reff` to `uuid`: if a runner is live send it a `Deploy` control
     /// message (zero-downtime swap); if there is no live runner, spawn one
     /// pinned to `reff`. The deployed ref is persisted so a future supervisor
@@ -485,17 +564,13 @@ impl Orchestrator {
         let _deploy_guard = self.begin_deploy(uuid);
 
         if self.client_for(uuid).health().await.is_ok() {
-            // Live runner: send the Deploy message.
-            match self.client_for(uuid).deploy(reff).await {
-                Ok(Reply::Ok) => {}
-                Ok(Reply::Err { message }) => {
-                    return Err(anyhow::anyhow!("runner deploy failed: {message}"));
-                }
-                Ok(other) => {
-                    return Err(anyhow::anyhow!("unexpected reply to Deploy: {other:?}"));
-                }
-                Err(e) => return Err(e.context("deploy control message failed")),
-            }
+            // Live runner: send the Deploy message, retrying transient transport
+            // failures. On a persistent failure this returns Err BEFORE the
+            // persist block below — so `image_ref` is left at its current value
+            // and the app stays on its last-known-good build (never stranded on a
+            // half-deployed / broken image; the failed swap kept the OLD VM
+            // serving). The error names the dropped ref so a re-deploy is obvious.
+            self.swap_with_retry(uuid, reff).await?;
 
             // Persist the new ref so a future respawn comes up on this version.
             let mut record = RunnerHandle::load(self.runner_dir(), uuid)
@@ -1244,6 +1319,199 @@ mod tests {
             max_seen.load(Ordering::SeqCst),
             1,
             "control socket saw overlapping deploys for one uuid → not serialized"
+        );
+    }
+
+    /// Helper: a fake control server that replies per a script of per-connection
+    /// behaviors. Each accepted connection consumes the next `Behavior`:
+    /// `Ok` → `{"reply":"ok"}`; `Err` → a runner `Reply::Err`; `DropNoReply` →
+    /// accept then close WITHOUT replying (the client's read hits EOF → a
+    /// deserialize/transport error → the orchestrator's `Err(e)` "deploy control
+    /// message failed" path). Behaviors past the end of the script default to
+    /// `Ok` (so the health probe + tail connections always answer).
+    #[derive(Clone, Copy)]
+    enum Behavior {
+        Ok,
+        Err,
+        DropNoReply,
+    }
+
+    async fn scripted_control_server(sock_path: std::path::PathBuf, script: Vec<Behavior>) {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+            time::Duration,
+        };
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            let mut idx = 0usize;
+            // Accept generously: 1 health probe + up to SWAP_MAX_ATTEMPTS deploys
+            // + a trailing reload, plus slack.
+            for _ in 0..12 {
+                match tokio::time::timeout(Duration::from_secs(3), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let behavior = script.get(idx).copied().unwrap_or(Behavior::Ok);
+                        idx += 1;
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        match behavior {
+                            Behavior::DropNoReply => {
+                                // Close without writing a reply → client sees EOF.
+                                drop(reader);
+                            }
+                            Behavior::Err => {
+                                let _ = reader
+                                    .into_inner()
+                                    .write_all(b"{\"reply\":\"err\",\"message\":\"boom\"}\n")
+                                    .await;
+                            }
+                            Behavior::Ok => {
+                                let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    /// Helper: build + persist a minimal live-runner record pointing at `sock`,
+    /// with a pre-existing `image_ref` so tests can assert it is (not) advanced.
+    fn save_live_record(dir: &std::path::Path, sock: &std::path::Path, old_ref: Option<&str>) {
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock.to_path_buf(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: old_ref.map(str::to_owned),
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: None,
+            extra_env: None,
+            crash_looped: false,
+            stopped: false,
+        };
+        rec.save(dir).unwrap();
+    }
+
+    /// A TRANSIENT control-transport failure on the first swap attempt (the
+    /// runner's socket momentarily wedged — the "deploy control message failed"
+    /// symptom) must be RETRIED, and a subsequent successful swap makes the whole
+    /// deploy succeed + persist the new image_ref. Pre-fix (single send, no retry)
+    /// this returned Err on the first failure.
+    #[tokio::test]
+    async fn deploy_app_retries_transient_transport_failure_then_succeeds() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        // conn 1 = health probe (Ok); conn 2 = first deploy (transport drop);
+        // conn 3 = retried deploy (Ok).
+        scripted_control_server(
+            sock_path.clone(),
+            vec![Behavior::Ok, Behavior::DropNoReply, Behavior::Ok],
+        )
+        .await;
+        save_live_record(dir.path(), &sock_path, Some("[fd5a::1]:5000/acme/app:OLD"));
+
+        let o = orch(dir.path().to_path_buf());
+        let new_ref = "[fd5a::1]:5000/acme/app:NEW";
+        let result = o
+            .deploy_app(APP_UUID, new_ref, None, None, DeployNetwork::default(), None)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "deploy must succeed after retrying the transient transport failure: {result:?}"
+        );
+        let updated = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some(new_ref),
+            "image_ref must advance to the new ref after the retried swap succeeds"
+        );
+    }
+
+    /// A runner `Reply::Err` (build failed / new VM never healthy) is NOT
+    /// retried and must leave `image_ref` at its OLD value — the app stays on its
+    /// last-known-good build and is never stranded on the half-deployed image.
+    #[tokio::test]
+    async fn deploy_app_keeps_old_image_ref_when_swap_fails() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        // conn 1 = health (Ok); conn 2 = deploy → Reply::Err.
+        scripted_control_server(sock_path.clone(), vec![Behavior::Ok, Behavior::Err]).await;
+        let old_ref = "[fd5a::1]:5000/acme/app:OLD";
+        save_live_record(dir.path(), &sock_path, Some(old_ref));
+
+        let o = orch(dir.path().to_path_buf());
+        let result = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:NEW",
+                None,
+                None,
+                DeployNetwork::default(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "a runner Reply::Err must fail the deploy");
+        let updated = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some(old_ref),
+            "image_ref must stay at the OLD build after a failed swap (last-known-good)"
+        );
+    }
+
+    /// A persistently-failing control transport gives up after
+    /// [`SWAP_MAX_ATTEMPTS`] and leaves `image_ref` untouched (last-known-good).
+    #[tokio::test]
+    async fn deploy_app_gives_up_after_max_transport_attempts() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        // conn 1 = health (Ok); then every deploy attempt drops without replying.
+        let mut script = vec![Behavior::Ok];
+        for _ in 0..SWAP_MAX_ATTEMPTS {
+            script.push(Behavior::DropNoReply);
+        }
+        scripted_control_server(sock_path.clone(), script).await;
+        let old_ref = "[fd5a::1]:5000/acme/app:OLD";
+        save_live_record(dir.path(), &sock_path, Some(old_ref));
+
+        let o = orch(dir.path().to_path_buf());
+        let result = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:NEW",
+                None,
+                None,
+                DeployNetwork::default(),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "deploy must fail after exhausting transport retries"
+        );
+        let updated = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some(old_ref),
+            "image_ref must stay at the OLD build after exhausted retries (last-known-good)"
         );
     }
 
