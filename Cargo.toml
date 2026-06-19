@@ -64,6 +64,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # capability salts (OS-CSPRNG randomness via the getrandom v7 already links).
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 blake3 = "1"
+# Frozen workspace wire/boot contract (Phase 0): workspace_uuid identity fn +
+# CODE_SERVICE_PORT/SSH_EXEC_PORT. Path-dep during development (same model as
+# the vendored `Runtime` contract type); pinned to the workspace-root crate.
+tabbify-workspace-contract = { path = "../tabbify-workspace-contract" }
 # Base64 encoding for git proxy Basic auth header (git smart-HTTP dev sessions).
 base64 = "0.22"
 # sha256 verification of fetched release binaries against the `latest` manifest
