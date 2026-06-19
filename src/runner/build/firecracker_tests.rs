@@ -1883,6 +1883,43 @@ async fn pull_oci_layout_recovers_when_fresh_pull_succeeds() {
         .expect("a fresh re-pull after the resume budget must recover");
 }
 
+/// #68: the GLOBAL digest-shared rootfs cache must NOT serve an env-baked rootfs
+/// to a different uuid. A rootfs published globally for digest D (carrying
+/// uuid-A's baked env — its git cap / secrets) must NOT be linked into a
+/// NOT-globally-cacheable uuid (whose own rootfs bakes ITS env) — else that uuid
+/// inherits uuid-A's env (the dev-cap mismatch + secrets leak). An env-FREE
+/// (globally-cacheable) lookup still hits the global cache.
+#[tokio::test]
+async fn global_cache_skipped_for_env_baked_rootfs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    let digest = "sha256:deadbeefcafef00d";
+
+    // uuid-A published an env-baked rootfs to the global cache.
+    let built = tmp.path().join("uuidA.ext4");
+    std::fs::write(&built, b"rootfs-with-uuidA-env").unwrap();
+    super::publish_rootfs_to_global(data, digest, &built).await;
+    assert!(
+        super::global_rootfs_is_cached(data, digest),
+        "global publish must land"
+    );
+
+    // NOT globally cacheable (this uuid bakes its OWN env) → must MISS the global.
+    assert!(
+        super::lookup_cached_rootfs(data, "uuid-B", digest, false)
+            .await
+            .is_none(),
+        "an env-baked rootfs must not be served from the global cache"
+    );
+    // Env-free (globally cacheable) → may use the global cache.
+    assert!(
+        super::lookup_cached_rootfs(data, "uuid-C", digest, true)
+            .await
+            .is_some(),
+        "an env-free rootfs may use the global cache"
+    );
+}
+
 /// `wipe_oci_layout` is idempotent on a missing dir and removes an existing one.
 #[tokio::test]
 async fn wipe_oci_layout_tolerates_missing_and_removes_existing() {

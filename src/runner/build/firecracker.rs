@@ -522,12 +522,29 @@ async fn evict_global_rootfs_cache(data_dir: &Path) {
     }
 }
 
-/// Cache lookup for a KNOWN digest: per-uuid first (an app redeploy), then the
-/// GLOBAL digest-shared cache (hard-linked into the per-uuid path on hit). `Some`
-/// ⇒ the rootfs is ready; skip the pull + conversion entirely.
-async fn lookup_cached_rootfs(data_dir: &Path, uuid: &str, digest: &str) -> Option<PathBuf> {
+/// Cache lookup for a KNOWN digest: per-uuid first (an app redeploy), then —
+/// ONLY when `globally_cacheable` — the GLOBAL digest-shared cache (hard-linked
+/// into the per-uuid path on hit). `Some` ⇒ the rootfs is ready; skip the pull +
+/// conversion entirely.
+///
+/// The global cache is keyed by DIGEST ALONE, so it is SOUND only for a rootfs
+/// that is identical for that digest. A rootfs with deploy-specific `extra_env`
+/// baked into its `/init` (a dev-FC's per-session git cap, or an app's deploy
+/// secrets) is uuid-SPECIFIC — sharing it across uuids by digest would hand a
+/// later uuid an EARLIER uuid's env (the #68 dev-cap mismatch + a secrets leak).
+/// For those the caller passes `globally_cacheable = false`: only the per-uuid
+/// cache is consulted, never the global one.
+async fn lookup_cached_rootfs(
+    data_dir: &Path,
+    uuid: &str,
+    digest: &str,
+    globally_cacheable: bool,
+) -> Option<PathBuf> {
     if rootfs_is_cached(data_dir, uuid, digest) {
         return Some(cached_rootfs_path(data_dir, uuid, digest));
+    }
+    if !globally_cacheable {
+        return None;
     }
     link_global_rootfs_to_uuid(data_dir, uuid, digest).await
 }
@@ -745,12 +762,18 @@ pub fn merge_extra_env(
 /// values win on key collision (POSIX: last `export KEY=…` wins in the init
 /// script). When `None` the guest gets exactly the OCI image's env.
 ///
-/// CACHE CONSTRAINT: the rootfs cache is keyed by `(uuid, digest)` —
+/// CACHE CONSTRAINT: the PER-UUID rootfs cache is keyed by `(uuid, digest)` —
 /// `cached_rootfs_path(data_dir, uuid, digest)`. Because `extra_env` is baked
 /// into the rootfs, changing env on the SAME uuid+digest would NOT rebuild the
 /// cache. In practice this is acceptable: a devbox always gets a fresh uuid on
 /// creation, and a dev-session also creates a fresh uuid, so the uuid+digest
 /// pair is always unique per deploy-time env configuration.
+///
+/// The GLOBAL digest-shared cache (#57), keyed by DIGEST ALONE, is therefore
+/// UNSAFE for an `extra_env`-baked rootfs (it would share one uuid's env with
+/// another uuid of the same digest — the #68 dev-cap mismatch + a secrets leak).
+/// `run_firecracker_build` gates global publish/link on `globally_cacheable`
+/// (true IFF `extra_env` is empty); see [`lookup_cached_rootfs`].
 ///
 /// # Errors
 /// Shell-form entrypoint (D3) or conversion failure.
@@ -1412,6 +1435,18 @@ pub async fn run_firecracker_build(
         ));
     }
 
+    // GLOBAL-cache soundness gate. The global digest-shared rootfs cache (#57) is
+    // keyed by DIGEST ALONE, so it may only carry a rootfs that is identical for
+    // that digest. Deploy-time `extra_env` is baked into the rootfs `/init`
+    // (`render_init` emits `export KEY='value'`) — a dev-FC's per-session git cap
+    // or an app's deploy secrets — making the rootfs uuid-SPECIFIC. Such a rootfs
+    // must NEVER be published to or linked from the global cache, or a later uuid
+    // with the same image digest would inherit THIS uuid's env: a dev-FC would
+    // get the wrong git cap (`git clone` → 403 → no `/workspace`, the #68 bug) and
+    // an app could inherit another app's secrets. The per-uuid cache stays sound
+    // (uuid+digest+env are aligned). So: globally cacheable IFF no deploy env.
+    let globally_cacheable = extra_env.is_none_or(|m| m.is_empty());
+
     let reff = fetched
         .manifest
         .runtime
@@ -1447,7 +1482,7 @@ pub async fn run_firecracker_build(
         },
     };
     if let Some(digest) = pre_digest.as_deref() {
-        if let Some(rootfs) = lookup_cached_rootfs(data_dir, uuid, digest).await {
+        if let Some(rootfs) = lookup_cached_rootfs(data_dir, uuid, digest, globally_cacheable).await {
             tracing::info!(
                 uuid,
                 digest,
@@ -1477,7 +1512,9 @@ pub async fn run_firecracker_build(
             uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env,
         )
         .await?;
-        publish_rootfs_to_global(data_dir, digest, &built).await;
+        if globally_cacheable {
+            publish_rootfs_to_global(data_dir, digest, &built).await;
+        }
         built
     } else {
         let work = fresh_tag_pull_dir(data_dir, uuid).await?;
@@ -1485,19 +1522,28 @@ pub async fn run_firecracker_build(
         let digest = read_manifest_digest_from_layout(&layout)?;
         if rootfs_is_cached(data_dir, uuid, &digest) {
             cached_rootfs_path(data_dir, uuid, &digest)
-        } else if let Some(linked) = link_global_rootfs_to_uuid(data_dir, uuid, &digest).await {
-            // Global hit found only AFTER the pull (the pre-pull resolve failed):
-            // still skip the conversion.
-            tracing::info!(uuid, digest, "rootfs global-cache hit (post-pull); skipping conversion");
-            linked
         } else {
-            let config = read_oci_config_from_layout(&layout)?;
-            let built = resolve_rootfs(
-                uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env,
-            )
-            .await?;
-            publish_rootfs_to_global(data_dir, &digest, &built).await;
-            built
+            // Global hit found only AFTER the pull (the pre-pull resolve failed):
+            // still skip the conversion — but ONLY for a globally-cacheable rootfs.
+            let global_hit = if globally_cacheable {
+                link_global_rootfs_to_uuid(data_dir, uuid, &digest).await
+            } else {
+                None
+            };
+            if let Some(linked) = global_hit {
+                tracing::info!(uuid, digest, "rootfs global-cache hit (post-pull); skipping conversion");
+                linked
+            } else {
+                let config = read_oci_config_from_layout(&layout)?;
+                let built = resolve_rootfs(
+                    uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env,
+                )
+                .await?;
+                if globally_cacheable {
+                    publish_rootfs_to_global(data_dir, &digest, &built).await;
+                }
+                built
+            }
         }
     };
 
