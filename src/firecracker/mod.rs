@@ -49,6 +49,10 @@ pub(crate) mod snapshot;
 // Pure, host-agnostic snapshot DECISION logic — NO cfg gate so it is unit-
 // testable on macOS (the rest of the snapshot path is behind the Linux gate).
 pub mod snapshot_decision;
+// Pure, host-agnostic egress allow-list rule builder + DNS-pin resolver (Track 7
+// network ACL) — NO cfg gate so the rule LOGIC is unit-testable on macOS (the
+// `setup_guest_nat` enforcement that consumes it is behind the Linux gate).
+pub mod egress_filter;
 #[cfg(not(target_os = "linux"))]
 mod stub;
 
