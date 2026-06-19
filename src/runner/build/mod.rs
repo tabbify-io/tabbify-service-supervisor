@@ -51,9 +51,12 @@ pub struct BuildJob {
     pub repo_url: String,
     /// Git ref (branch, tag, or full SHA) to check out.
     ///
-    /// MVP: this value is used verbatim as the image tag component.  The
-    /// control-plane should pass an immutable SHA; resolving HEAD via
-    /// `git rev-parse` (requires a stdout-capturing runner) is a follow-up.
+    /// This value is the ref FETCHED + checked out; it is NO LONGER used as the
+    /// image tag. The builder re-resolves the checked-out HEAD to its immutable
+    /// 40-hex commit SHA (`git rev-parse HEAD`) and tags the image with that SHA,
+    /// so a "deploy now" with a branch ref (e.g. `main`) ships an immutable tag
+    /// instead of a floating one. A push-webhook job whose `git_ref` is already a
+    /// SHA re-resolves to the SAME SHA (zero behaviour change on that path).
     pub git_ref: String,
     /// Tenant namespace used as the registry path prefix.
     pub tenant: String,
@@ -96,6 +99,13 @@ pub struct ArtifactRef {
     /// `None` if the registry did not return a digest.
     #[serde(default)]
     pub digest: Option<String>,
+    /// The IMMUTABLE git commit SHA the image was built from (the resolved
+    /// `git rev-parse HEAD` of the shallow clone). DISTINCT from `digest` (which
+    /// is the OCI manifest content-hash): this is the SOURCE commit, surfaced so
+    /// the control plane can record exactly which commit a deploy shipped. The
+    /// `<...>:<sha>` tag component of `reff` is built from this value.
+    #[serde(default)]
+    pub commit_sha: Option<String>,
 }
 
 /// Run a build job end-to-end with injected dependencies.
@@ -104,22 +114,31 @@ pub struct ArtifactRef {
 /// - [`BuildKind::Docker`] (the only kind): clone → require `Dockerfile` →
 ///   `backend.build` → `docker tag`+`push` to the mesh registry.
 ///
-/// Computes the ref scheme `job.registry_ula/<tenant>/<app_uuid>:<git_ref>` (the
-/// `git_ref` is used verbatim as the tag component; the control-plane must
-/// supply an immutable SHA) and returns an [`ArtifactRef`].
+/// Computes the ref scheme `job.registry_ula/<tenant>/<app_uuid>:<sha>` where
+/// `<sha>` is the IMMUTABLE commit SHA the clone resolved at HEAD (NOT the
+/// possibly-mutable `git_ref`), and returns an [`ArtifactRef`].
 ///
 /// All dependencies are injected so the function is fully unit-testable without
-/// a real git binary, Docker daemon, or `skopeo` binary. The `skopeo_runner` +
-/// `skopeo_bin` drive the registry PUSH (the image is built by `backend`, then
-/// `skopeo` copies it from the local docker daemon to the mesh registry — the
-/// daemon never needs a mesh route).
+/// a real git binary, Docker daemon, or `skopeo` binary. `git` drives the
+/// (side-effecting) clone steps; `git_capture` drives the read-only
+/// `git rev-parse HEAD` that resolves the immutable commit SHA. The
+/// `skopeo_runner` + `skopeo_bin` drive the registry PUSH (the image is built by
+/// `backend`, then `skopeo` copies it from the local docker daemon to the mesh
+/// registry — the daemon never needs a mesh route).
 ///
 /// # Errors
-/// Clone failure; missing `Dockerfile`, build error, or push failure.
+/// Clone failure; an unprovable commit SHA (fail-closed — see
+/// [`crate::git::resolve_cloned_head`]); missing `Dockerfile`, build error, or
+/// push failure.
+// Every dependency is an injected seam (git side-effect + git capture + tool
+// runners + binaries) so the build pipeline is fully unit-testable without real
+// git/docker/skopeo; grouping them into a struct would only obscure the wiring.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_build(
     job: &BuildJob,
     backend: &dyn crate::build_backend::BuildBackend,
     git: &crate::git::GitRun,
+    git_capture: &crate::git::GitCapture,
     tool_runner: &crate::docker::CommandRunner,
     skopeo_bin: &str,
     oras_bin: &str,
@@ -136,6 +155,16 @@ pub async fn run_build(
     )
     .await
     .context("clone")?;
+
+    // Resolve the IMMUTABLE commit SHA the clone left at HEAD. For a "deploy now"
+    // job whose `git_ref` is a branch (e.g. `main`), this turns the floating ref
+    // into the exact commit; for a push-webhook job whose `git_ref` is already a
+    // SHA, re-resolving the checked-out HEAD yields the SAME SHA (no behaviour
+    // change on that path). FAIL-CLOSED: an unprovable SHA aborts the build
+    // rather than shipping a mutable tag.
+    let commit_sha = crate::git::resolve_cloned_head(&src, git_capture)
+        .await
+        .context("resolve clone commit sha")?;
 
     // Inject the Tabbify-MANAGED `tabbify.toml` ONLY when the repo ships none
     // (repo-wins): a repo that carries its own `tabbify.toml` keeps using it,
@@ -154,17 +183,21 @@ pub async fn run_build(
     // defaults: context = `<src>` and Docker's default `<src>/Dockerfile`.
     let build_spec = resolve_build_spec(&src, &toml_path)?;
 
-    // Image ref: <registry_ula>/<tenant>/<app_uuid>:<git_ref>.
+    // Image ref: <registry_ula>/<tenant>/<app_uuid>:<commit_sha>.
+    // The tag component is the IMMUTABLE commit SHA (resolved above), NOT the
+    // possibly-mutable `git_ref` — a branch ref like `main` would otherwise tag a
+    // floating image and "deploy success" could serve a stale commit (TAB-10).
     // OCI distribution requires lowercase repository names; the tenant (GitHub
     // owner, e.g. "Lsneg") is the only mixed-case component, so lowercase it —
     // otherwise `oras`/`skopeo` reject the push with "invalid repository". The
     // runtime PULL lowercases the same way (see firecracker.rs) so refs match.
+    // The SHA is already lowercase hex (validated by `resolve_cloned_head`).
     let reff = format!(
         "{}/{}/{}:{}",
         job.registry_ula,
         job.tenant.to_lowercase(),
         job.app_uuid,
-        job.git_ref
+        commit_sha
     );
 
     match job.build_kind {
@@ -217,7 +250,11 @@ pub async fn run_build(
                 {
                     anyhow::bail!("push to registry failed: {reff}: {e}");
                 }
-                return Ok(ArtifactRef { reff, digest: None });
+                return Ok(ArtifactRef {
+                    reff,
+                    digest: None,
+                    commit_sha: Some(commit_sha),
+                });
             }
             docker::run_docker_build(
                 job,
@@ -227,6 +264,7 @@ pub async fn run_build(
                 oras_bin,
                 &build_spec,
                 reff,
+                commit_sha,
             )
             .await
         }
@@ -328,7 +366,10 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
         .unwrap_or_else(|_| crate::config::DEFAULT_ORAS_BIN.to_owned());
 
     let backend = crate::build_backend::HostDockerBackend::new(docker_bin.clone());
-    let git = crate::git::real_git_run(git_bin);
+    let git = crate::git::real_git_run(git_bin.clone());
+    // Read-only stdout-capturing git seam used to resolve the clone's HEAD commit
+    // SHA (`git rev-parse HEAD`) so the image is tagged with an immutable SHA.
+    let git_capture = crate::git::real_git_capture(git_bin);
     let tool_runner = crate::skopeo::production_tool_runner();
 
     // Work directory: a fresh sub-dir under a tempdir for this build.
@@ -343,6 +384,7 @@ pub async fn run_one_shot_build(spec_path: &Path) -> anyhow::Result<ArtifactRef>
         &job,
         &backend,
         &git,
+        &git_capture,
         &tool_runner,
         &skopeo_bin,
         &oras_bin,

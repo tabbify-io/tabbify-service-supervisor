@@ -377,6 +377,30 @@ impl RunnerServe {
         // guard so a deploy of the already-running ref is a no-op.
         let initial_ref = fetched.manifest.runtime.registry_ref.clone();
 
+        // Best-effort cold-start digest seed: resolve the initial ref to its OCI
+        // manifest digest so the deploy guard's digest comparison has a baseline
+        // from the first cold start. On any error (no initial ref, registry
+        // unreachable) leave `None` — a `None` digest simply means the first
+        // deploy rebuilds rather than short-circuiting, which is always safe.
+        let initial_digest: Option<String> = match &initial_ref {
+            Some(reff) => {
+                let runner = crate::runner::build::firecracker::production_fc_build_runner();
+                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner).await {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        tracing::warn!(
+                            uuid = %cfg.uuid,
+                            reff = %reff,
+                            error = %e,
+                            "cold start: initial ref digest resolve failed — current_digest=None (first deploy rebuilds)"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         let lifecycle = RunnerLifecycle {
             uuid: cfg.uuid.clone(),
             version: fetched.version,
@@ -398,9 +422,15 @@ impl RunnerServe {
             shutdown_tx: Arc::new(Mutex::new(None)),
             // Seed the same-ref guard with the initial build's ref.
             current_ref: Arc::new(Mutex::new(initial_ref)),
+            // Seed the digest guard with the initial ref's resolved digest (or
+            // None — first deploy then rebuilds, which is safe).
+            current_digest: Arc::new(Mutex::new(initial_digest)),
             // Carry the deploy-time extra env into the lifecycle so a
             // zero-downtime swap re-bakes the same vars into the new rootfs.
             extra_env: cfg.extra_env,
+            // Production: resolve digests via the real `oras` runner (no
+            // override). Only tests inject a fake resolver here.
+            digest_resolver: None,
         };
 
         Ok(Self {

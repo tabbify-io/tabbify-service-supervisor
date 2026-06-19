@@ -203,7 +203,7 @@ async fn push_image_surfaces_push_stderr_in_err() {
 #[tokio::test]
 async fn run_docker_build_bails_with_push_stderr() {
     use crate::build_backend::HostDockerBackend;
-    use crate::git::GitRun;
+    use crate::git::{GitCapture, GitRun};
     use crate::runner::build::{BuildJob, BuildKind, run_build};
     use crate::runtime::BoxFut;
     use std::sync::Arc;
@@ -226,6 +226,12 @@ async fn run_docker_build_bails_with_push_stderr() {
             }
             Ok(())
         })
+    });
+
+    // The read-only capture seam resolves the clone HEAD to a valid 40-hex SHA
+    // (the builder tags the image with this immutable SHA, not `job.git_ref`).
+    let git_capture: GitCapture = Arc::new(|_args: Vec<String>| {
+        Box::pin(async { Ok("c64f621abcdef0123456789abcdef0123456789a\n".to_owned()) })
     });
 
     // Build backend succeeds (image built locally).
@@ -262,6 +268,7 @@ async fn run_docker_build_bails_with_push_stderr() {
         &job,
         &backend,
         &git,
+        &git_capture,
         &skopeo_runner,
         "skopeo",
         "oras",

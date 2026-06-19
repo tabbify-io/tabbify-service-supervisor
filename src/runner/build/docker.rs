@@ -21,6 +21,10 @@ use crate::docker::CommandRunner;
 ///
 /// # Errors
 /// Missing `Dockerfile`, build error, or push failure.
+// All args are injected build seams (job + backend + tool runner + binaries +
+// resolved spec + ref + commit sha) threaded from `run_build`; bundling them
+// would not improve clarity over the explicit pipeline wiring.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_docker_build(
     job: &BuildJob,
     backend: &dyn BuildBackend,
@@ -29,6 +33,7 @@ pub(super) async fn run_docker_build(
     oras_bin: &str,
     spec: &BuildSpec,
     reff: String,
+    commit_sha: String,
 ) -> anyhow::Result<ArtifactRef> {
     // Resolve the Dockerfile to require + pass to the build: the
     // `[build].dockerfile` (relative to the clone root) when the toml set one,
@@ -85,5 +90,9 @@ pub(super) async fn run_docker_build(
         anyhow::bail!("push to registry failed: {reff}: {e}");
     }
 
-    Ok(ArtifactRef { reff, digest: None })
+    Ok(ArtifactRef {
+        reff,
+        digest: None,
+        commit_sha: Some(commit_sha),
+    })
 }

@@ -64,6 +64,90 @@ pub fn real_git_run(git_bin: String) -> GitRun {
     })
 }
 
+/// Injectable git command executor that CAPTURES stdout.
+///
+/// Sibling to [`GitRun`]: where `GitRun` discards stdout (it only cares about
+/// success/failure of side-effecting commands like `init`/`fetch`/`checkout`),
+/// this seam runs a read-only git query (`rev-parse HEAD`) and returns its
+/// stdout so the builder can learn the resolved commit SHA. Kept as a separate
+/// type so the existing clone path + its tests are untouched.
+///
+/// # Errors
+/// Spawn failure or a non-zero exit status (the `Result<String>` carries the
+/// captured stdout on success).
+pub type GitCapture = std::sync::Arc<
+    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync,
+>;
+
+/// Build the production [`GitCapture`]: spawns `<git_bin> <args>`, captures
+/// stdout, and returns it as a `String` on exit 0 (bails with git's stderr
+/// otherwise).
+///
+/// # Errors
+/// Spawn failure or a non-zero exit status.
+pub fn real_git_capture(git_bin: String) -> GitCapture {
+    std::sync::Arc::new(move |args| {
+        let git_bin = git_bin.clone();
+        Box::pin(async move {
+            let output = tokio::process::Command::new(&git_bin)
+                .args(&args)
+                .output()
+                .await
+                .context("spawn git")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!(format_git_error(&args, output.status.code(), &stderr));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+    })
+}
+
+/// Resolve the commit SHA that a shallow clone left checked out at HEAD.
+///
+/// After [`clone`] runs `git fetch --depth 1 origin <ref>` + `git checkout
+/// FETCH_HEAD`, the working tree is at a DETACHED HEAD pinned to the fetched
+/// commit. `git -C <dest> rev-parse HEAD` prints that commit's 40-hex SHA.
+///
+/// This is the FAIL-CLOSED seam for tagging the built image with an IMMUTABLE
+/// commit SHA instead of the (possibly mutable) branch/tag ref: when the
+/// requested ref is a branch like `main`, the image must be tagged with the
+/// resolved commit, never the floating branch name. If the SHA cannot be
+/// proven (the command fails, or the output is not a 40-char lowercase hex
+/// string), this returns an `Err` so the build aborts rather than shipping a
+/// mutable tag.
+///
+/// # Errors
+/// The git command failed, or its stdout was not a valid 40-char lowercase hex
+/// commit SHA.
+pub async fn resolve_cloned_head(dest: &Path, capture: &GitCapture) -> Result<String> {
+    let dest_str = dest.to_string_lossy().into_owned();
+    let out = capture(vec![
+        "-C".to_owned(),
+        dest_str,
+        "rev-parse".to_owned(),
+        "HEAD".to_owned(),
+    ])
+    .await
+    .context("git rev-parse HEAD")?;
+    let sha = out.trim();
+    if !is_commit_sha(sha) {
+        bail!(
+            "git rev-parse HEAD did not yield a 40-char lowercase hex commit sha (got {sha:?}); \
+             refusing to tag the image with an unproven commit"
+        );
+    }
+    Ok(sha.to_owned())
+}
+
+/// Is `s` a full 40-character lowercase hexadecimal commit SHA?
+///
+/// We require the canonical full SHA (not an abbreviation, not uppercase) so the
+/// image tag is unambiguous and matches the lowercase-only OCI tag charset.
+fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Maximum number of bytes of git stderr to keep in an error message. We keep
 /// the *tail* because git prints its decisive `fatal:`/`error:` line last.
 const MAX_STDERR_TAIL: usize = 2_000;
@@ -490,6 +574,109 @@ mod tests {
         assert!(
             !chain.contains("Some(\"-C\")"),
             "propagated error must NOT be the opaque `Some(\"-C\")`: {chain}"
+        );
+    }
+
+    // -- resolve_cloned_head ---------------------------------------------------
+
+    /// A clean 40-char lowercase hex SHA on stdout must be returned verbatim
+    /// (trimmed of the trailing newline `git rev-parse` always prints).
+    #[tokio::test]
+    async fn resolve_cloned_head_returns_trimmed_sha() {
+        let sha = "c64f621abcdef0123456789abcdef0123456789a";
+        let capture: GitCapture =
+            std::sync::Arc::new(move |_args| Box::pin(async move { Ok(format!("{sha}\n")) }));
+        let got = resolve_cloned_head(Path::new("/tmp/dest"), &capture)
+            .await
+            .unwrap();
+        assert_eq!(got, sha);
+    }
+
+    /// The rev-parse argv must target the clone dest via `-C` and ask for HEAD —
+    /// the detached-HEAD commit the shallow fetch+checkout left behind.
+    #[tokio::test]
+    async fn resolve_cloned_head_invokes_rev_parse_head_in_dest() {
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = recorded.clone();
+        let capture: GitCapture = std::sync::Arc::new(move |args: Vec<String>| {
+            *r.lock().unwrap() = args;
+            Box::pin(async {
+                Ok("c64f621abcdef0123456789abcdef0123456789a\n".to_owned())
+            })
+        });
+        resolve_cloned_head(Path::new("/tmp/dest"), &capture)
+            .await
+            .unwrap();
+        let args = recorded.lock().unwrap().clone();
+        assert_eq!(
+            args,
+            vec!["-C", "/tmp/dest", "rev-parse", "HEAD"],
+            "must run `git -C <dest> rev-parse HEAD`"
+        );
+    }
+
+    /// FAIL-CLOSED: a non-SHA stdout (e.g. a branch name leaked through, or
+    /// garbage) must produce an Err — a build that cannot prove its commit must
+    /// NOT proceed (it would otherwise ship a mutable tag).
+    #[tokio::test]
+    async fn resolve_cloned_head_rejects_non_sha_output() {
+        let capture: GitCapture =
+            std::sync::Arc::new(|_args| Box::pin(async { Ok("main\n".to_owned()) }));
+        let err = resolve_cloned_head(Path::new("/tmp/dest"), &capture)
+            .await
+            .expect_err("non-sha output must fail closed");
+        assert!(
+            err.to_string().contains("commit sha"),
+            "error must explain the unproven-commit refusal: {err}"
+        );
+    }
+
+    /// FAIL-CLOSED: an ABBREVIATED sha (7 hex chars) is rejected — only the full
+    /// canonical 40-char form is accepted as an immutable tag.
+    #[tokio::test]
+    async fn resolve_cloned_head_rejects_abbreviated_sha() {
+        let capture: GitCapture =
+            std::sync::Arc::new(|_args| Box::pin(async { Ok("c64f621\n".to_owned()) }));
+        assert!(
+            resolve_cloned_head(Path::new("/tmp/dest"), &capture)
+                .await
+                .is_err(),
+            "an abbreviated 7-char sha must be rejected"
+        );
+    }
+
+    /// FAIL-CLOSED: an UPPERCASE-hex sha is rejected — OCI tags are lowercase and
+    /// git emits lowercase, so an uppercase value signals a malformed/forged
+    /// output rather than a real rev-parse result.
+    #[tokio::test]
+    async fn resolve_cloned_head_rejects_uppercase_sha() {
+        let upper = "C64F621ABCDEF0123456789ABCDEF0123456789A";
+        let capture: GitCapture = std::sync::Arc::new(move |_args| {
+            Box::pin(async move { Ok(format!("{upper}\n")) })
+        });
+        assert!(
+            resolve_cloned_head(Path::new("/tmp/dest"), &capture)
+                .await
+                .is_err(),
+            "an uppercase-hex sha must be rejected"
+        );
+    }
+
+    /// FAIL-CLOSED: when the underlying git command itself errors, the failure
+    /// propagates (no SHA, no fabricated tag).
+    #[tokio::test]
+    async fn resolve_cloned_head_propagates_command_error() {
+        let capture: GitCapture = std::sync::Arc::new(|_args| {
+            Box::pin(async { Err(anyhow::anyhow!("git rev-parse failed (128): not a git repo")) })
+        });
+        let err = resolve_cloned_head(Path::new("/tmp/dest"), &capture)
+            .await
+            .expect_err("a failed git command must propagate");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("rev-parse"),
+            "error must reference the rev-parse step: {chain}"
         );
     }
 

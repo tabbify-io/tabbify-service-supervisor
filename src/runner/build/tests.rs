@@ -7,10 +7,22 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::build_backend::BuildBackend;
 use crate::docker::CommandRunner;
-use crate::git::GitRun;
+use crate::git::{GitCapture, GitRun};
 use crate::runtime::BoxFut;
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// The fixed 40-hex commit SHA the test [`GitCapture`] resolves the clone HEAD
+/// to. The builder tags the image with THIS (not `job.git_ref`), so the
+/// expected `reff` tag component is this value, not the input ref.
+const TEST_HEAD_SHA: &str = "c64f621abcdef0123456789abcdef0123456789a";
+
+/// A [`GitCapture`] that resolves the clone HEAD to [`TEST_HEAD_SHA`] — the
+/// production seam runs `git rev-parse HEAD`; the fake just returns a valid
+/// 40-hex SHA so the SHA-tag path is exercised hermetically.
+fn git_capture_head_sha() -> GitCapture {
+    Arc::new(|_args: Vec<String>| Box::pin(async { Ok(format!("{TEST_HEAD_SHA}\n")) }))
+}
 
 /// The `(context_dir, tag, dockerfile)` recorded by [`FakeBackend`] on a build.
 type BuiltCall = (PathBuf, String, Option<PathBuf>);
@@ -185,7 +197,18 @@ async fn run_docker_test(
     skopeo_bin: &str,
     workdir: &Path,
 ) -> anyhow::Result<ArtifactRef> {
-    run_build(job, backend, git, tool_runner, skopeo_bin, "oras", workdir).await
+    let git_capture = git_capture_head_sha();
+    run_build(
+        job,
+        backend,
+        git,
+        &git_capture,
+        tool_runner,
+        skopeo_bin,
+        "oras",
+        workdir,
+    )
+    .await
 }
 
 // ── serde round-trips ─────────────────────────────────────────────────────
@@ -240,9 +263,15 @@ async fn run_build_clones_builds_pushes_and_returns_ref() {
         .await
         .unwrap();
 
-    // ArtifactRef must encode the full registry path.
-    assert_eq!(art.reff, "[fd5a::1]:5000/acme/u:abc123");
+    // ArtifactRef must encode the full registry path, tagged with the resolved
+    // IMMUTABLE commit SHA (NOT the input `git_ref` "abc123").
+    assert_eq!(art.reff, format!("[fd5a::1]:5000/acme/u:{TEST_HEAD_SHA}"));
     assert!(art.digest.is_none());
+    assert_eq!(
+        art.commit_sha.as_deref(),
+        Some(TEST_HEAD_SHA),
+        "the resolved commit sha must be returned in the ArtifactRef"
+    );
 
     // backend.build must have been called with (<workdir>/src, local-tag).
     let b = built.lock().unwrap();
@@ -269,9 +298,9 @@ async fn run_build_clones_builds_pushes_and_returns_ref() {
     assert!(
         cmds.iter().any(|c| {
             c.first() == Some(&"oras".to_string())
-                && c.contains(&"[fd5a::1]:5000/acme/u:abc123".to_string())
+                && c.contains(&format!("[fd5a::1]:5000/acme/u:{TEST_HEAD_SHA}"))
         }),
-        "oras layout->registry step must push the reff; got {cmds:?}"
+        "oras layout->registry step must push the sha-tagged reff; got {cmds:?}"
     );
 }
 
@@ -320,8 +349,8 @@ async fn run_build_errors_when_push_fails() {
         "error must mention push failure; got: {err}"
     );
     assert!(
-        err.contains("[fd5a::1]:5000/acme/u:abc123"),
-        "error must contain the registry ref; got: {err}"
+        err.contains(&format!("[fd5a::1]:5000/acme/u:{TEST_HEAD_SHA}")),
+        "error must contain the sha-tagged registry ref; got: {err}"
     );
 }
 
@@ -379,9 +408,91 @@ async fn run_build_ref_format_is_correct() {
         .await
         .unwrap();
 
+    // The tag component is the resolved IMMUTABLE commit SHA, NOT the input
+    // `git_ref` "deadbeef" (which is a too-short, mutable-looking value).
     assert_eq!(
         art.reff,
-        "[fd5a:1f02:cc::1]:5000/myteam/my-app-uuid:deadbeef"
+        format!("[fd5a:1f02:cc::1]:5000/myteam/my-app-uuid:{TEST_HEAD_SHA}")
+    );
+}
+
+/// A BRANCH-style `git_ref` (e.g. "main") must NOT leak into the image tag:
+/// the builder re-resolves HEAD to the immutable commit SHA and tags with THAT.
+/// This is the core TAB-10 fix — a mutable tag would let "deploy success" serve
+/// a stale commit.
+#[tokio::test]
+async fn run_build_tags_with_resolved_sha_not_branch_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_with_dockerfile(Arc::new(Mutex::new(None)));
+    let backend = FakeBackend {
+        built: Arc::new(Mutex::new(None)),
+    };
+    let skopeo_runner = record_runner(Arc::new(Mutex::new(Vec::new())));
+
+    let mut job = test_job();
+    job.git_ref = "main".into(); // a MUTABLE branch ref
+
+    let art = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+        .await
+        .unwrap();
+
+    assert!(
+        art.reff.ends_with(&format!(":{TEST_HEAD_SHA}")),
+        "image tag must be the resolved SHA, never the branch ref; got {}",
+        art.reff
+    );
+    assert!(
+        !art.reff.contains(":main"),
+        "the mutable branch ref must NOT appear in the tag; got {}",
+        art.reff
+    );
+}
+
+/// FAIL-CLOSED at the build level: when the HEAD cannot be resolved to a valid
+/// SHA (the capture seam yields garbage), `run_build` must abort — it must NOT
+/// fall back to a mutable tag, and must NOT proceed to build/push.
+#[tokio::test]
+async fn run_build_fails_closed_when_head_unresolvable() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_with_dockerfile(Arc::new(Mutex::new(None)));
+    let built = Arc::new(Mutex::new(None));
+    let backend = FakeBackend {
+        built: built.clone(),
+    };
+    let pushed = Arc::new(Mutex::new(Vec::new()));
+    let skopeo_runner = record_runner(pushed.clone());
+
+    // Capture seam returns a non-SHA (e.g. a leaked branch name).
+    let bad_capture: GitCapture =
+        Arc::new(|_args: Vec<String>| Box::pin(async { Ok("main\n".to_owned()) }));
+
+    let job = test_job();
+    let err = run_build(
+        &job,
+        &backend,
+        &git,
+        &bad_capture,
+        &skopeo_runner,
+        "skopeo",
+        "oras",
+        dir.path(),
+    )
+    .await
+    .expect_err("an unprovable commit sha must fail the build closed");
+
+    assert!(
+        err.to_string().contains("resolve clone commit sha")
+            || format!("{err:#}").contains("commit sha"),
+        "error must reference the failed sha resolution; got: {err:#}"
+    );
+    // Fail-closed means the build/push never ran (no mutable tag shipped).
+    assert!(
+        built.lock().unwrap().is_none(),
+        "backend.build must NOT run when the sha is unprovable"
+    );
+    assert!(
+        pushed.lock().unwrap().is_empty(),
+        "no registry push must happen when the sha is unprovable"
     );
 }
 

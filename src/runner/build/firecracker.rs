@@ -423,7 +423,7 @@ pub fn global_rootfs_is_cached(data_dir: &Path, digest: &str) -> bool {
 ///
 /// # Errors
 /// The runner reports failure, or stdout is not a `sha256:…` digest line.
-async fn resolve_oci_digest(reff: &str, runner: &FcBuildRunner) -> Result<String> {
+pub(crate) async fn resolve_oci_digest(reff: &str, runner: &FcBuildRunner) -> Result<String> {
     let mut argv = vec!["oras".to_owned()];
     argv.extend(crate::oras::oras_resolve_args(reff));
     let (ok, out) = (runner)(argv).await;

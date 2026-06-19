@@ -95,15 +95,41 @@ pub struct RunnerLifecycle {
     /// not duplicated. Guards [`RunnerLifecycle::deploy`] against a wasteful
     /// rebuild + tap collision when the requested ref already runs healthily.
     pub(crate) current_ref: Arc<Mutex<Option<String>>>,
+    /// The resolved OCI manifest DIGEST (`sha256:…`) of the currently-active
+    /// runtime's image. The deploy guard compares THIS, not the (possibly-
+    /// floating) string ref in [`Self::current_ref`]: for a connected-repo
+    /// deploy the ref string can stay equal while the digest behind a moving tag
+    /// changes, so a string-equal "no-op" would wrongly skip the new commit
+    /// (TAB-10). `None` ⇒ unknown digest ⇒ the next deploy rebuilds (safe).
+    ///
+    /// Shared via `Arc<Mutex<…>>` for the same per-connection-clone reason as
+    /// [`Self::current_ref`]: the guard reads it and a successful swap writes it.
+    pub(crate) current_digest: Arc<Mutex<Option<String>>>,
     /// Deploy-time extra `KEY=VALUE` env baked into the guest `/init`. Populated
     /// from the runner's `RUNNER_EXTRA_ENV` at startup and passed into
     /// [`build_runtime`] for both cold starts and zero-downtime swaps, so the
     /// guest always gets the same deploy-time env regardless of how the runtime
     /// is (re)built. `None` for a normal (non-devbox, non-dev-session) deploy.
     pub(crate) extra_env: Option<std::collections::HashMap<String, String>>,
+    /// TEST-ONLY override for the OCI digest-resolver runner used by the deploy
+    /// guard. `None` in production ⇒ the guard spawns the real
+    /// [`crate::runner::build::firecracker::production_fc_build_runner`] (real
+    /// `oras resolve`). Tests set `Some(fake)` to exercise the digest
+    /// short-circuit / fail-open logic hermetically without a real registry.
+    pub(crate) digest_resolver:
+        Option<crate::runner::build::firecracker::FcBuildRunner>,
 }
 
 impl RunnerLifecycle {
+    /// The OCI digest-resolver runner: the test override when set, else the real
+    /// production `oras`-spawning runner. Centralised so the deploy guard, the
+    /// post-swap re-resolve, and any future caller share one source.
+    fn digest_runner(&self) -> crate::runner::build::firecracker::FcBuildRunner {
+        self.digest_resolver
+            .clone()
+            .unwrap_or_else(crate::runner::build::firecracker::production_fc_build_runner)
+    }
+
     /// Wire a shutdown notifier into this lifecycle. When `Shutdown` is
     /// dispatched the sender fires, signalling the main task's `select!`.
     pub async fn set_shutdown_tx(&self, tx: oneshot::Sender<()>) {
@@ -177,21 +203,49 @@ impl RunnerLifecycle {
     ///   unhealthy — in both cases the OLD runtime stays in service (no
     ///   downtime).
     async fn deploy(&self, reff: &str) -> Reply {
-        // Same-ref re-deploy guard: if the requested ref is ALREADY the live
-        // ref and the active runtime is healthy, a rebuild is a wasteful no-op —
-        // and worse, the new VM would derive the SAME `uuid:reff` tap as the
-        // still-running old VM and collide on it. Short-circuit with Ok.
-        {
-            let current = self.current_ref.lock().await;
-            if current.as_deref() == Some(reff)
-                && self.active.health().await == RuntimeHealth::Serving
-            {
-                tracing::info!(
-                    uuid = %self.uuid,
-                    reff = %reff,
-                    "deploy: requested ref already live and healthy — skipping rebuild (no-op)"
-                );
-                return Reply::Ok;
+        // Same-DIGEST re-deploy guard: if the requested ref resolves to the SAME
+        // OCI manifest digest as the live runtime AND the active runtime is
+        // healthy, a rebuild is a wasteful no-op — and worse, the new VM would
+        // derive the SAME `uuid:reff` tap as the still-running old VM and collide
+        // on it. Short-circuit with Ok ONLY when the DIGEST matches.
+        //
+        // Why digest, not the string ref (TAB-10): a connected-repo deploy can
+        // carry a stable ref string while the digest behind a moving tag changes;
+        // a string-equal compare would wrongly skip the new commit. We resolve
+        // the requested ref's digest (~0.2s `oras resolve`, no blob pull) and
+        // compare it to the recorded `current_digest`.
+        //
+        // FAIL-OPEN: if the digest cannot be resolved (registry unreachable,
+        // transient flap), we DO NOT short-circuit — we fall through to a
+        // rebuild. A rebuild is always safe; the tap-collision the guard avoids
+        // only matters when the digest is genuinely identical, and we can only
+        // know that on a successful resolve. (This is the opposite stance to the
+        // build-side fail-CLOSED: there an unprovable commit must not ship; here
+        // an unprovable digest must not BLOCK a deploy.)
+        let serving = self.active.health().await == RuntimeHealth::Serving;
+        if serving {
+            let runner = self.digest_runner();
+            match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner).await {
+                Ok(want) => {
+                    if Some(want.as_str()) == self.current_digest.lock().await.as_deref() {
+                        tracing::info!(
+                            uuid = %self.uuid,
+                            reff = %reff,
+                            digest = %want,
+                            "deploy: requested digest already live and healthy — skipping rebuild (no-op)"
+                        );
+                        return Reply::Ok;
+                    }
+                }
+                Err(e) => {
+                    // Fail-open: resolve failed → do NOT short-circuit; rebuild.
+                    tracing::warn!(
+                        uuid = %self.uuid,
+                        reff = %reff,
+                        error = %e,
+                        "deploy: digest resolve failed — proceeding with rebuild (fail-open)"
+                    );
+                }
             }
         }
 
@@ -239,6 +293,23 @@ impl RunnerLifecycle {
                 // The swap flipped the active runtime to the one built from
                 // `reff`; record it so a subsequent same-ref deploy short-circuits.
                 *self.current_ref.lock().await = Some(reff.to_owned());
+                // Re-resolve the digest of the now-live ref so the next deploy's
+                // digest guard has the correct baseline. On a resolve failure
+                // leave `current_digest = None` (the next deploy then rebuilds —
+                // safe) and warn; we never strand a stale digest.
+                let runner = self.digest_runner();
+                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner).await {
+                    Ok(d) => *self.current_digest.lock().await = Some(d),
+                    Err(e) => {
+                        *self.current_digest.lock().await = None;
+                        tracing::warn!(
+                            uuid = %self.uuid,
+                            reff = %reff,
+                            error = %e,
+                            "deploy: post-swap digest re-resolve failed — current_digest=None (next deploy rebuilds)"
+                        );
+                    }
+                }
                 tracing::info!(uuid = %self.uuid, reff = %reff, "deploy: zero-downtime swap complete");
                 Reply::Ok
             }
@@ -444,7 +515,9 @@ mod tests {
             data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             current_ref: Arc::new(Mutex::new(None)),
+            current_digest: Arc::new(Mutex::new(None)),
             extra_env: None,
+            digest_resolver: None,
         }
     }
 
@@ -487,6 +560,30 @@ mod tests {
         }
     }
 
+    // ---- Digest-resolver fakes ----------------------------------------------
+
+    use crate::runner::build::firecracker::FcBuildRunner;
+
+    /// A fake [`FcBuildRunner`] that emulates `oras resolve` by printing a fixed
+    /// `digest` on stdout (exit 0) for ANY argv. Lets the digest guard run
+    /// hermetically without a real registry — the genuine short-circuit path.
+    fn fake_digest_runner(digest: &'static str) -> FcBuildRunner {
+        Arc::new(move |_argv: Vec<String>| {
+            let fut: BoxFut<'static, (bool, Vec<u8>)> =
+                Box::pin(async move { (true, format!("{digest}\n").into_bytes()) });
+            fut
+        })
+    }
+
+    /// A fake [`FcBuildRunner`] that emulates an `oras resolve` FAILURE (exit
+    /// non-zero, empty stdout) — drives the fail-open branch of the guard.
+    fn failing_digest_runner() -> FcBuildRunner {
+        Arc::new(|_argv: Vec<String>| {
+            let fut: BoxFut<'static, (bool, Vec<u8>)> = Box::pin(async { (false, Vec::new()) });
+            fut
+        })
+    }
+
     // ---- Deploy dispatch tests ----------------------------------------------
 
     // NOTE: the happy-path deploy/swap test was removed with the in-process WASM
@@ -500,7 +597,10 @@ mod tests {
     /// runtime stays in service (no downtime).
     #[tokio::test]
     async fn deploy_build_failure_keeps_old_runtime_and_replies_err() {
-        let lc = fake_lifecycle(RuntimeHealth::Serving);
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        // Make the digest guard deterministic + offline: the resolver fails →
+        // fail-open → the guard falls through to the rebuild this test pins.
+        lc.digest_resolver = Some(failing_digest_runner());
         let before = lc.active.load();
 
         let reply = dispatch(
@@ -527,17 +627,62 @@ mod tests {
         );
     }
 
-    /// A deploy of the SAME ref that is already live (and healthy) is a no-op:
-    /// it returns `Ok` WITHOUT rebuilding, so the active runtime allocation is
-    /// untouched (no wasteful build, no `uuid:reff` tap collision with the live
-    /// VM). This is the same-ref re-deploy guard.
+    /// A deploy whose ref resolves to the SAME DIGEST that is already live (and
+    /// healthy) is a no-op: it returns `Ok` WITHOUT rebuilding, so the active
+    /// runtime allocation is untouched (no wasteful build, no `uuid:reff` tap
+    /// collision with the live VM). This is the digest-aware short-circuit — the
+    /// critical tap-collision avoidance. A fake resolver returns a fixed digest
+    /// and `current_digest` is seeded to MATCH it.
     #[tokio::test]
-    async fn deploy_same_ref_when_healthy_is_noop() {
-        let lc = fake_lifecycle(RuntimeHealth::Serving);
-        let live_ref = "[fd5a::1]:5000/acme/app:sha-live";
-        // Seed the current ref to the ref we are about to "re-deploy".
-        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+    async fn deploy_same_digest_when_healthy_is_noop() {
+        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        // The guard resolves ANY ref to LIVE_DIGEST via the fake resolver…
+        lc.digest_resolver = Some(fake_digest_runner(LIVE_DIGEST));
+        // …and the live runtime is already at LIVE_DIGEST → digests match.
+        *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
+        // The ref STRING is irrelevant to the digest guard; set it for realism.
+        *lc.current_ref.lock().await = Some("[fd5a::1]:5000/acme/app:main".to_owned());
         let before = lc.active.load();
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                // A floating-tag ref — the string differs in spirit, but the
+                // resolved digest is identical, which is what must drive the no-op.
+                reff: "[fd5a::1]:5000/acme/app:main".to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        assert!(
+            matches!(reply, Reply::Ok),
+            "same-digest deploy of a healthy runtime must reply Ok (no-op), got {reply:?}"
+        );
+        // No rebuild/swap happened — the active runtime is the SAME allocation.
+        assert!(
+            Arc::ptr_eq(&before, &lc.active.load()),
+            "same-digest deploy must NOT rebuild/swap the active runtime"
+        );
+    }
+
+    /// A deploy whose ref resolves to a DIFFERENT digest than the live runtime
+    /// must NOT short-circuit — even though the ref STRING is unchanged (the
+    /// TAB-10 bug: a floating tag whose digest moved). The guard must fall
+    /// through to a rebuild (here the FC build fails on the unroutable ref,
+    /// proving the short-circuit was bypassed and a real build was attempted).
+    #[tokio::test]
+    async fn deploy_moved_digest_when_healthy_rebuilds() {
+        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const NEW_DIGEST: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        // The requested ref now resolves to NEW_DIGEST…
+        lc.digest_resolver = Some(fake_digest_runner(NEW_DIGEST));
+        // …but the live runtime is still at the OLD digest → MUST rebuild.
+        *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
+        // Same ref string as before — the string-compare bug would wrongly no-op.
+        let live_ref = "[fd5a::1]:5000/acme/app:main";
+        *lc.current_ref.lock().await = Some(live_ref.to_owned());
 
         let reply = dispatch(
             Cmd::Deploy {
@@ -547,15 +692,51 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(reply, Reply::Ok),
-            "same-ref deploy of a healthy runtime must reply Ok, got {reply:?}"
-        );
-        // No rebuild/swap happened — the active runtime is the SAME allocation.
-        assert!(
-            Arc::ptr_eq(&before, &lc.active.load()),
-            "same-ref deploy must NOT rebuild/swap the active runtime"
-        );
+        // The guard did NOT short-circuit (digest moved), so the FC build ran and
+        // failed on the unreachable ref — an Err, NOT the no-op Ok.
+        match reply {
+            Reply::Err { message } => assert!(
+                message.contains("deploy"),
+                "moved-digest deploy must attempt a rebuild (Err), got: {message}"
+            ),
+            other => panic!(
+                "moved-digest deploy must rebuild (not no-op); got {other:?}"
+            ),
+        }
+    }
+
+    /// FAIL-OPEN: when the digest cannot be resolved (registry flap), the guard
+    /// must NOT short-circuit even if `current_digest` is set — it must fall
+    /// through to a rebuild (a rebuild is always safe). Here the resolver fails
+    /// and the FC build then fails on the unroutable ref → Err.
+    #[tokio::test]
+    async fn deploy_resolve_failure_fails_open_and_rebuilds() {
+        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        lc.digest_resolver = Some(failing_digest_runner());
+        *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
+        let live_ref = "[fd5a::1]:5000/acme/app:main";
+        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: live_ref.to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        // Resolve failed → fail-open → rebuild attempted → FC build fails on the
+        // unreachable ref → Err (NOT a no-op Ok).
+        match reply {
+            Reply::Err { message } => assert!(
+                message.contains("deploy"),
+                "fail-open resolve must attempt a rebuild (Err), got: {message}"
+            ),
+            other => panic!(
+                "fail-open (resolve error) must rebuild, never no-op; got {other:?}"
+            ),
+        }
     }
 
     /// The same-ref guard does NOT short-circuit when the active runtime is
