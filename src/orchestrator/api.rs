@@ -45,11 +45,19 @@ use crate::{
 ///
 /// A firecracker cold build is the worst case and drives this value: it pulls a
 /// multi-hundred-MB image by digest, converts the OCI layers to an ext4 rootfs,
-/// boots the microVM, and waits for in-guest readiness — comfortably exceeding
-/// the previous 30s gate, which killed slow-but-healthy firecracker runners
-/// before they came up. 180s covers that worst case while still failing a
-/// genuinely-doomed start in bounded time.
-const START_HEALTHY_TIMEOUT: Duration = Duration::from_secs(180);
+/// boots the microVM, and waits for in-guest readiness.
+///
+/// Sized for a COLD pull over the relay-only WAN mesh (MSI↔Frankfurt ~375 KB/s):
+/// a ~60 MB image alone is ~165s on the wire, plus rootfs convert + boot +
+/// health. The previous 180s was calibrated for a fast/cached pull and TIMED OUT
+/// on a genuine cold WAN pull — which, on the async dev-session create path,
+/// made `deploy_app` Err while the detached runner kept pulling, so the failure
+/// handler REMOVED the session and the VM came up ORPHANED (running but
+/// untracked → `dev_session_exec` could not resolve it). 360s covers the cold
+/// WAN worst case with margin while still failing a genuinely-doomed start in
+/// bounded time. (The real cure for the slowness is direct-UDP p2p; this is the
+/// pragmatic bound until then.)
+const START_HEALTHY_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// How many times a live zero-downtime swap re-sends `Cmd::Deploy` when the
 /// control round-trip fails at the TRANSPORT layer (connect/write/read error or
@@ -843,6 +851,16 @@ mod tests {
             },
             runner_dir,
         )
+    }
+
+    /// The cold-spawn health wait must cover a cold pull over the relay-only WAN
+    /// — otherwise a dev-session create false-fails + orphans the VM (#67).
+    #[test]
+    fn start_healthy_timeout_covers_a_cold_wan_pull() {
+        assert!(
+            START_HEALTHY_TIMEOUT >= std::time::Duration::from_secs(300),
+            "cold-spawn health wait must outlast a cold WAN pull"
+        );
     }
 
     #[test]
