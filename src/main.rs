@@ -211,6 +211,15 @@ async fn main() -> anyhow::Result<()> {
         &state.git_sessions,
     );
 
+    // Re-adopt persisted WORKSPACES on the same principle: the workspace VMs
+    // survive a restart/OTA but the in-memory registries do not. Re-register
+    // every repo cap from each on-disk WorkspaceRecord so `git push` keeps
+    // working; the node's token sweep mints fresh tokens.
+    tabbify_supervisor::api::readopt_workspaces(
+        state.orchestrator.runner_dir(),
+        &state.git_sessions,
+    );
+
     // Spawn the dev-session idle reaper now that `state` (and its Arc) exists.
     // Scans every 60 s for sessions that exceeded idle or max-TTL thresholds.
     // `state.clone()` shares the SAME registries as the router below: the

@@ -14,9 +14,9 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api::{
     AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
-    AppStopResponse, BuildBody, CreateDevSessionBody, DeployBody, DevSessionCreated,
-    DevSessionPurged, DevSessionRow, ErrorResponse, GitTokenRefreshed, HealthResponse,
-    RefreshGitTokenBody, SupervisorState,
+    AppStopResponse, BuildBody, CreateDevSessionBody, CreateWorkspaceBody, DeployBody,
+    DevSessionCreated, DevSessionPurged, DevSessionRow, ErrorResponse, GitTokenRefreshed,
+    HealthResponse, RefreshGitTokenBody, RepoSpec, SupervisorState, WorkspaceCreated,
 };
 use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
 
@@ -45,6 +45,9 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         crate::api::refresh_git_token,
         crate::api::delete_dev_session,
         crate::api::list_dev_sessions,
+        crate::api::create_workspace,
+        crate::api::list_workspaces,
+        crate::api::delete_workspace,
     ),
     components(schemas(
         HealthResponse,
@@ -66,6 +69,9 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         GitTokenRefreshed,
         DevSessionPurged,
         DevSessionRow,
+        CreateWorkspaceBody,
+        RepoSpec,
+        WorkspaceCreated,
     ))
 )]
 pub struct ApiDoc;

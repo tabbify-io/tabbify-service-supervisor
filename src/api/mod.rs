@@ -40,9 +40,19 @@ mod dev_sessions;
 mod dto;
 mod git_proxy;
 mod handlers;
+mod workspace_record;
+mod workspaces;
 
 pub use dev_session_record::{
     DevSessionRecord, ReadoptDevSummary, now_unix, readopt_dev_sessions,
+};
+pub use workspace_record::{
+    ReadoptWorkspaceSummary, WORKSPACE_MARKER_ENV, WorkspaceCap, WorkspaceRecord,
+    readopt_workspaces, workspaces_dir,
+};
+pub use workspaces::{
+    CAP_FILES_ENV, CreateWorkspaceBody, RepoSpec, WORKSPACE_MAX_TTL, Workspace, WorkspaceCreated,
+    WorkspaceRegistry, cap_repo_basename, create_workspace, delete_workspace, list_workspaces,
 };
 pub use dev_sessions::{
     CreateDevSessionBody, DEV_SESSION_IDLE_TTL, DEV_SESSION_MAX_TTL, DevSessionCreated,
@@ -70,6 +80,8 @@ pub use dev_sessions::{
     __path_create_dev_session, __path_delete_dev_session, __path_list_dev_sessions,
     __path_refresh_git_token,
 };
+#[doc(hidden)]
+pub use workspaces::{__path_create_workspace, __path_delete_workspace, __path_list_workspaces};
 #[doc(hidden)]
 pub use handlers::{
     __path_about, __path_build_app, __path_deploy_app, __path_get_app, __path_health,
@@ -106,6 +118,10 @@ pub struct SupervisorState {
     pub git_sessions: std::sync::Arc<GitSessions>,
     /// Dev-session lifecycle registry: session_id → DevSession (app uuid + cap).
     pub dev_sessions: std::sync::Arc<DevSessionRegistry>,
+    /// Per-user workspace lifecycle registry: workspace_uuid → Workspace
+    /// (user_id + N caps). The evolution of `dev_sessions` (stable identity,
+    /// multi-cap, persistent). Shares the SAME `git_sessions` Arc.
+    pub workspaces: std::sync::Arc<WorkspaceRegistry>,
     /// FC tap subnet (CIDR, e.g. `172.31.0.0/16`). Used by `create_dev_session`
     /// to derive the IPv4 `host_ip` for a dev-FC's tap link so the `git_remote`
     /// URL points at the tap gateway the guest will see as its default route.
@@ -134,6 +150,7 @@ impl SupervisorState {
             started_at: std::time::Instant::now(),
             git_sessions: std::sync::Arc::new(GitSessions::default()),
             dev_sessions: std::sync::Arc::new(DevSessionRegistry::default()),
+            workspaces: std::sync::Arc::new(WorkspaceRegistry::default()),
             tap_subnet: crate::config::DEFAULT_FC_TAP_SUBNET.to_owned(),
         }
     }
@@ -200,6 +217,15 @@ pub fn router(state: SupervisorState) -> Router {
         .route(
             "/v1/dev-sessions/:id",
             axum::routing::delete(dev_sessions::delete_dev_session),
+        )
+        // Workspace lifecycle endpoints (per-user persistent workspace).
+        .route(
+            "/v1/workspaces",
+            post(workspaces::create_workspace).get(workspaces::list_workspaces),
+        )
+        .route(
+            "/v1/workspaces/:uuid",
+            axum::routing::delete(workspaces::delete_workspace),
         )
         // Git smart-HTTP proxy — tokenless in-VM remote (dev sessions).
         // Not in OpenAPI (wire protocol, not REST).
