@@ -246,6 +246,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         }

@@ -67,6 +67,7 @@ fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
         runner_join_token: None,
         manifest_toml: None,
         extra_env: None,
+        egress_allow: None,
         crash_looped: false,
         stopped: false,
     }
@@ -222,6 +223,29 @@ fn deploy_body_env_defaults_to_none() {
     );
 }
 
+/// Track 7: a deploy body carrying `egress_allow` (the network ACL allow-list)
+/// deserializes the array into `DeployBody.egress_allow`. Pins the wire shape
+/// the node populates from `GET /v1/egress/resolve`.
+#[test]
+fn deploy_body_accepts_egress_allow() {
+    let body: DeployBody = serde_json::from_str(
+        r#"{"ref":"x","egress_allow":["api.telegram.org","10.0.0.0/24"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        body.egress_allow.as_deref().unwrap(),
+        ["api.telegram.org", "10.0.0.0/24"]
+    );
+}
+
+/// Track 7: a deploy body WITHOUT `egress_allow` deserializes to `None` — a
+/// pre-ACL node / today's deploys keep the supervisor's unrestricted egress.
+#[test]
+fn deploy_body_egress_allow_defaults_none() {
+    let body: DeployBody = serde_json::from_str(r#"{"ref":"x"}"#).unwrap();
+    assert!(body.egress_allow.is_none());
+}
+
 // ── POST /v1/apps/:uuid/deploy — 404 for unknown uuid (no record) ─────────
 
 /// Posting deploy for a uuid that has no on-disk runner record and no live
@@ -297,6 +321,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
         runner_join_token: None,
         manifest_toml: None,
         extra_env: None,
+        egress_allow: None,
         crash_looped: false,
         stopped: false,
     };

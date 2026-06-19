@@ -53,6 +53,7 @@ async fn oci_image_boots_as_firecracker_and_serves_200() {
         &runner,
         false,
         None,
+        None,
     )
     .await
     .expect("convert + boot firecracker microVM");

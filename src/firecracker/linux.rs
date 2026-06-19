@@ -209,7 +209,9 @@ impl FirecrackerRuntime {
         // No per-app uuid context here (the bare entry, used by tests + simple
         // single-VM callers): a fixed identity is fine. The per-uuid production
         // path is `launch_with_uuid`.
-        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default", None).await
+        // The bare entry carries no deploy egress allow-list → `None` keeps the
+        // legacy unrestricted egress.
+        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default", None, None).await
     }
 
     /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
@@ -221,6 +223,7 @@ impl FirecrackerRuntime {
     /// in `<cache_dir>/.snapshot_ref` so a later warm restore can be invalidated
     /// if the deployed image_ref changes (the snapshot cache is keyed by UUID
     /// only — see [`snapshot::ref_matches`]).
+    #[allow(clippy::too_many_arguments)]
     async fn cold_boot(
         rootfs: &Path,
         rt: &Runtime,
@@ -229,6 +232,7 @@ impl FirecrackerRuntime {
         console_log: Option<&Path>,
         vm_key: &str,
         image_ref: Option<&str>,
+        egress_allow: Option<&[String]>,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -269,8 +273,10 @@ impl FirecrackerRuntime {
         tracing::debug!(%tap_name, %host_ip, "fc cold boot: tap up");
 
         // Guest egress (best-effort): forward + SNAT the tap subnet so the
-        // in-VM supervisor can reach the public mesh coordinator/relay.
-        setup_guest_nat(&tap_name, &cfg.tap_subnet).await;
+        // in-VM supervisor can reach the public mesh coordinator/relay. When an
+        // egress allow-list is supplied (Track 7), `setup_guest_nat` installs
+        // deny-by-default + allowed-host rules instead of the blanket-ACCEPT.
+        setup_guest_nat(&tap_name, &cfg.tap_subnet, egress_allow).await;
 
         // Spawn firecracker with its API socket. Clean any stale socket.
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
@@ -349,6 +355,7 @@ impl FirecrackerRuntime {
     ///
     /// # Errors
     /// See [`Self::launch`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn launch_with_uuid(
         rootfs: &Path,
         rt: &Runtime,
@@ -357,6 +364,7 @@ impl FirecrackerRuntime {
         reff: &str,
         data_dir: &Path,
         is_swap: bool,
+        egress_allow: Option<&[String]>,
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
         // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
@@ -387,6 +395,7 @@ impl FirecrackerRuntime {
                 Some(&console_log),
                 &vm_key,
                 Some(reff),
+                egress_allow,
             )
             .await?
         } else {
@@ -427,6 +436,7 @@ impl FirecrackerRuntime {
                             Some(&console_log),
                             &vm_key,
                             Some(reff),
+                            egress_allow,
                         )
                         .await?
                     }
@@ -451,6 +461,7 @@ impl FirecrackerRuntime {
                     Some(&console_log),
                     &vm_key,
                     Some(reff),
+                    egress_allow,
                 )
                 .await?
             }
@@ -1055,15 +1066,29 @@ pub(crate) async fn run_ip(args: &[&str]) -> Result<()> {
 
 /// Give cold-booted guests internet egress so the in-VM tabbify-supervisor can
 /// reach the public mesh coordinator (and the relay / WG peers): enable IPv4
-/// forwarding and SNAT the guest tap subnet out the host's default-route
-/// uplink, plus explicit FORWARD ACCEPTs (a docker-managed FORWARD policy of
-/// DROP would otherwise black-hole guest traffic even with masquerade present).
+/// forwarding and SNAT the guest tap subnet out the host's default-route uplink.
+///
+/// `egress_allow` (Track 7 network ACL) selects the FORWARD policy:
+/// - `None`/empty ⇒ LEGACY unrestricted egress: a blanket `FORWARD -i tap -o
+///   uplink -j ACCEPT` (+ the established-conn return rule). Today's behavior;
+///   no regression for apps without an allow-list.
+/// - `Some(non-empty)` ⇒ ENFORCED: deny-by-default forward out the uplink, with
+///   per-resolved-IP ACCEPTs for the allowed hosts plus an always-allow for the
+///   default-route gateway (so the in-VM supervisor keeps its mesh uplink). The
+///   legacy blanket-ACCEPT for this tap is removed FIRST (open→restricted
+///   transition) so it cannot win the chain over the per-IP+DROP rules.
+///
+/// MASQUERADE is installed in BOTH modes (allowed flows must still be SNAT'd).
 ///
 /// BEST-EFFORT and idempotent: a failure here must not abort a boot — it only
 /// costs the guest its egress (the VM still runs and answers the :8080 probe),
 /// so we log loudly and continue. The host tap link itself (`setup_tap`) is
 /// what the readiness probe needs; this only matters for guest→internet.
-pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
+pub(crate) async fn setup_guest_nat(
+    tap_name: &str,
+    tap_subnet: &str,
+    egress_allow: Option<&[String]>,
+) {
     // Enable forwarding (no-op if already 1; warn but continue on EACCES).
     if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await {
         tracing::warn!(error = %e, "fc nat: could not enable net.ipv4.ip_forward");
@@ -1072,81 +1097,109 @@ pub(crate) async fn setup_guest_nat(tap_name: &str, tap_subnet: &str) {
         tracing::warn!("fc nat: no default-route uplink found; guest egress disabled");
         return;
     };
-    // Idempotent (`-C ... || -A/-I ...`). FORWARD rules are *inserted* at the
-    // head so they precede any docker-installed DROP/jump.
-    let rules: [(Vec<&str>, Vec<&str>); 3] = [
-        (
-            vec![
-                "-t",
-                "nat",
-                "-C",
-                "POSTROUTING",
-                "-s",
-                tap_subnet,
-                "-o",
-                &uplink,
-                "-j",
-                "MASQUERADE",
-            ],
-            vec![
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-s",
-                tap_subnet,
-                "-o",
-                &uplink,
-                "-j",
-                "MASQUERADE",
-            ],
-        ),
-        (
-            vec![
-                "-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
-            ],
-            vec![
-                "-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
-            ],
-        ),
-        (
-            vec![
-                "-C",
-                "FORWARD",
-                "-i",
-                &uplink,
-                "-o",
-                tap_name,
-                "-m",
-                "state",
-                "--state",
-                "RELATED,ESTABLISHED",
-                "-j",
-                "ACCEPT",
-            ],
-            vec![
-                "-I",
-                "FORWARD",
-                "1",
-                "-i",
-                &uplink,
-                "-o",
-                tap_name,
-                "-m",
-                "state",
-                "--state",
-                "RELATED,ESTABLISHED",
-                "-j",
-                "ACCEPT",
-            ],
-        ),
+
+    // MASQUERADE is needed in BOTH modes (allowed flows must still be SNAT'd out
+    // the uplink). Idempotent (`-C ... || -A ...`).
+    let masq_check: Vec<&str> = vec![
+        "-t", "nat", "-C", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE",
     ];
-    for (check, add) in &rules {
-        if let Err(e) = ensure_iptables(check, add).await {
-            tracing::warn!(error = %e, "fc nat: iptables rule add failed; guest egress may be blocked");
+    let masq_add: Vec<&str> = vec![
+        "-t", "nat", "-A", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE",
+    ];
+    if let Err(e) = ensure_iptables(&masq_check, &masq_add).await {
+        tracing::warn!(error = %e, "fc nat: masquerade rule add failed");
+    }
+
+    match egress_allow.filter(|a| !a.is_empty()) {
+        // ── ENFORCED allow-list ────────────────────────────────────────────
+        Some(allow) => {
+            // TRANSITION open→restricted: a previous (re)deploy of this SAME tap
+            // may have installed the legacy BLANKET `-I FORWARD 1 -i tap -o uplink
+            // -j ACCEPT` at the head of the chain. Left in place it WINS over our
+            // per-IP ACCEPT + catch-all DROP (broader + earlier). So FIRST remove
+            // the legacy blanket rules for this tap (idempotent `-D`; a no-op when
+            // absent). `teardown_guest_nat` deletes exactly those.
+            let _ = teardown_guest_nat(tap_name).await;
+
+            // Resolve hosts → IP literals (DNS-pinning at install). Always-allow
+            // the default-route gateway so the in-VM supervisor keeps its mesh
+            // uplink even under the catch-all DROP. The git-proxy needs NO rule
+            // here: it listens on the HOST tap-gateway IP (inside `tap_subnet`),
+            // so guest→git-proxy traffic is delivered locally on the tap and is
+            // NEVER `-o <uplink>` — the FORWARD allow/DROP rules (all `-o uplink`)
+            // never match it.
+            let resolved = crate::firecracker::egress_filter::resolve_hosts(allow).await;
+            let always: Vec<String> = default_route_gateway().await.into_iter().collect();
+            let rules = crate::firecracker::egress_filter::egress_rules(
+                tap_name, &uplink, &resolved, &always,
+            );
+            for (check, add) in &rules {
+                let c: Vec<&str> = check.iter().map(String::as_str).collect();
+                let a: Vec<&str> = add.iter().map(String::as_str).collect();
+                if let Err(e) = ensure_iptables(&c, &a).await {
+                    tracing::warn!(error = %e, "fc nat: egress allow-rule add failed");
+                }
+            }
+            tracing::info!(
+                %tap_name, uplink = %uplink, allowed = resolved.len(), always = always.len(),
+                "fc nat: egress allow-list ENFORCED (deny-by-default + allowed hosts)"
+            );
+        }
+        // ── LEGACY unrestricted (unchanged behavior) ───────────────────────
+        None => {
+            // Idempotent (`-C ... || -I ...`). FORWARD rules are *inserted* at the
+            // head so they precede any docker-installed DROP/jump.
+            let rules: [(Vec<&str>, Vec<&str>); 2] = [
+                (
+                    vec!["-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
+                    vec!["-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
+                ),
+                (
+                    vec![
+                        "-C", "FORWARD", "-i", &uplink, "-o", tap_name, "-m", "state", "--state",
+                        "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                    ],
+                    vec![
+                        "-I", "FORWARD", "1", "-i", &uplink, "-o", tap_name, "-m", "state",
+                        "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                    ],
+                ),
+            ];
+            for (check, add) in &rules {
+                if let Err(e) = ensure_iptables(check, add).await {
+                    tracing::warn!(error = %e, "fc nat: iptables rule add failed; guest egress may be blocked");
+                }
+            }
+            tracing::info!(%tap_name, uplink = %uplink, subnet = %tap_subnet, "fc nat: guest egress enabled (unrestricted)");
         }
     }
-    tracing::info!(%tap_name, uplink = %uplink, subnet = %tap_subnet, "fc nat: guest egress enabled");
+}
+
+/// The default-route GATEWAY IP — always-allowed so the in-VM supervisor keeps
+/// its uplink path even under a strict egress allow-list. VERIFIED: `run_ip`
+/// returns `Result<()>` (no stdout capture), so we cannot reuse it here; we shell
+/// `ip` directly exactly as `default_route_dev` does and parse with the pure
+/// helper below. `None` when there is no default route or `ip` is unavailable.
+async fn default_route_gateway() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_default_gateway(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the `via <gw>` token out of `ip route show default`. Pure + isolated for
+/// unit-testing (mirrors the existing `parse_default_dev`).
+fn parse_default_gateway(route_output: &str) -> Option<String> {
+    let toks: Vec<&str> = route_output.split_whitespace().collect();
+    toks.iter()
+        .position(|t| *t == "via")
+        .and_then(|i| toks.get(i + 1))
+        .map(|g| (*g).to_owned())
 }
 
 /// Install iptables rules so the IPv4 git proxy port (`git_proxy_port`) is

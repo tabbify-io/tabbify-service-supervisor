@@ -144,6 +144,10 @@ impl SharedRunnerConfig {
             // SSH key, dev-session git vars, etc.). `None` for an app with no
             // deploy-time env (normal deploys without extra env).
             extra_env: record.extra_env.clone(),
+            // Reuse the PERSISTED egress allow-list so a RESPAWN-from-record
+            // re-applies the same host-side egress posture (deny-by-default +
+            // allowed hosts). `None` for an app with no allow-list (unrestricted).
+            egress_allow: record.egress_allow.clone(),
             // The runtime is no longer selectable — every app builds as
             // Firecracker, and a by-ref deploy synthesizes a firecracker manifest
             // — so the record's (now inert) `requested_runtime` is NOT read here.
@@ -393,6 +397,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         }

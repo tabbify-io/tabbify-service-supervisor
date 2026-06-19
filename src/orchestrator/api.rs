@@ -191,6 +191,9 @@ impl Orchestrator {
             // A plain start carries no deploy-time extra env; `deploy_app`
             // overrides this on a cold spawn that supplies extra vars.
             extra_env: None,
+            // A plain start carries no egress allow-list; `deploy_app` overrides
+            // this on a network-ACL cold spawn. `None` = unrestricted egress.
+            egress_allow: None,
         }
     }
 
@@ -540,6 +543,7 @@ impl Orchestrator {
     /// - `uuid` is not a valid UUID;
     /// - the control-socket deploy fails (runner returned `Reply::Err`);
     /// - spawning a cold runner fails or it never becomes healthy.
+    #[allow(clippy::too_many_arguments)]
     pub async fn deploy_app(
         &self,
         uuid: &str,
@@ -548,6 +552,7 @@ impl Orchestrator {
         manifest_toml: Option<&str>,
         net: DeployNetwork,
         extra_env: Option<&std::collections::HashMap<String, String>>,
+        egress_allow: Option<&[String]>,
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
@@ -618,6 +623,16 @@ impl Orchestrator {
             if extra_env.is_some() {
                 record.extra_env = extra_env.cloned();
             }
+            // Persist this deploy's egress allow-list so the durable record always
+            // reflects the LATEST deploy's posture. A `Some` replaces the persisted
+            // list; a `None` here means the deploy body carried no allow-list and
+            // we keep the previously-persisted value (a token-less nudge re-deploy
+            // must not silently widen egress back to unrestricted). NB: the LIVE
+            // runner keeps its spawn-time `RUNNER_EGRESS_ALLOW` posture — a rule
+            // change applies on the NEXT COLD (re)deploy, exactly like extra_env.
+            if egress_allow.is_some() {
+                record.egress_allow = egress_allow.map(<[String]>::to_vec);
+            }
             record
                 .save(self.runner_dir())
                 .with_context(|| format!("save runner record for {uuid} after deploy"))?;
@@ -653,6 +668,11 @@ impl Orchestrator {
             // Bake the deploy-time extra env into the guest via the runner.
             // Persisted on the record so a RESPAWN re-bakes the same vars.
             spec.extra_env = extra_env.cloned();
+            // Thread the egress allow-list into the cold spawn so the runner
+            // installs host-side egress-filter rules at boot. Persisted on the
+            // record (via `RunnerHandle::from`) so a RESPAWN re-applies it. `None`
+            // keeps today's unrestricted egress.
+            spec.egress_allow = egress_allow.map(<[String]>::to_vec);
             let (handle, _child) = spawn_runner(&spec, self.runner_dir())
                 .await
                 .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -956,6 +976,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1036,6 +1057,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1107,6 +1129,7 @@ mod tests {
                 None,
                 DeployNetwork::default(),
                 None,
+                None,
             )
             .await
             .is_err(),
@@ -1131,6 +1154,7 @@ mod tests {
                 None,
                 None,
                 DeployNetwork::default(),
+                None,
                 None,
             )
             .await;
@@ -1201,6 +1225,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1209,7 +1234,7 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
         let reff = "[fd5a::1]:5000/acme/app:sha256abc";
         let result = o
-            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None)
+            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None, None)
             .await;
 
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
@@ -1310,6 +1335,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1322,11 +1348,11 @@ mod tests {
         let o1 = o.clone();
         let o2 = o.clone();
         let h1 = tokio::spawn(async move {
-            o1.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None)
+            o1.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None, None)
                 .await
         });
         let h2 = tokio::spawn(async move {
-            o2.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None)
+            o2.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None, None)
                 .await
         });
         let (r1, r2) = tokio::join!(h1, h2);
@@ -1413,6 +1439,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1442,7 +1469,7 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
         let new_ref = "[fd5a::1]:5000/acme/app:NEW";
         let result = o
-            .deploy_app(APP_UUID, new_ref, None, None, DeployNetwork::default(), None)
+            .deploy_app(APP_UUID, new_ref, None, None, DeployNetwork::default(), None, None)
             .await;
 
         assert!(
@@ -1479,6 +1506,7 @@ mod tests {
                 None,
                 None,
                 DeployNetwork::default(),
+                None,
                 None,
             )
             .await;
@@ -1517,6 +1545,7 @@ mod tests {
                 None,
                 None,
                 DeployNetwork::default(),
+                None,
                 None,
             )
             .await;
@@ -1585,6 +1614,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1602,6 +1632,7 @@ mod tests {
                 None,
                 None,
                 net,
+                None,
                 None,
             )
             .await;
@@ -1657,6 +1688,7 @@ mod tests {
             runner_join_token: Some("previously-persisted-jwt".to_owned()),
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1676,6 +1708,7 @@ mod tests {
                 None,
                 None,
                 net,
+                None,
                 None,
             )
             .await;
@@ -1746,6 +1779,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: Some(OLD_TOML.to_owned()),
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         };
@@ -1762,6 +1796,7 @@ mod tests {
                 None,
                 Some(NEW_TOML),
                 DeployNetwork::default(),
+                None,
                 None,
             )
             .await;
@@ -1964,6 +1999,7 @@ mod tests {
                     .into_iter()
                     .collect(),
             ),
+            egress_allow: Some(vec!["api.telegram.org".to_owned()]),
             crash_looped: false,
             stopped: false,
         };
@@ -1996,6 +2032,10 @@ mod tests {
             "manifest_toml must be preserved"
         );
         assert_eq!(after.extra_env, seeded.extra_env, "extra_env must be preserved");
+        assert_eq!(
+            after.egress_allow, seeded.egress_allow,
+            "egress_allow must be preserved so a respawn re-applies the same egress posture"
+        );
         assert_eq!(
             after.runner_join_token, seeded.runner_join_token,
             "runner_join_token must be preserved"

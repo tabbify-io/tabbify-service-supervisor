@@ -213,6 +213,12 @@ pub struct ServeConfig {
     /// AFTER the OCI image's `config.Env` before calling `render_init`. `None`
     /// means the guest gets exactly the OCI image's env (normal deploys).
     pub extra_env: Option<std::collections::HashMap<String, String>>,
+    /// Egress allow-list (Track 7 network ACL). Decoded from `RUNNER_EGRESS_ALLOW`
+    /// (a JSON array) by the binary and threaded HOST-side into
+    /// [`crate::build::build_runtime`] → `setup_guest_nat`, which installs
+    /// deny-by-default + allowed-host iptables rules. Unlike `extra_env` it is NOT
+    /// baked into the rootfs `/init`. `None` ⇒ today's unrestricted egress.
+    pub egress_allow: Option<Vec<String>>,
 }
 
 /// A live per-app runner: holds the [`HostedApp`] (and thus its listener task)
@@ -279,6 +285,7 @@ impl RunnerServe {
             &cfg.data_dir,
             false,
             cfg.extra_env.as_ref(),
+            cfg.egress_allow.as_deref(),
         )
         .await
         .with_context(|| format!("build runtime for {}", cfg.uuid))?;
@@ -470,6 +477,10 @@ impl RunnerServe {
             // Carry the deploy-time extra env into the lifecycle so a
             // zero-downtime swap re-bakes the same vars into the new rootfs.
             extra_env: cfg.extra_env,
+            // Carry the egress allow-list into the lifecycle so a zero-downtime
+            // swap re-applies the SAME host-side egress posture on the new VM
+            // (Track 7) — the cold rebuild's `setup_guest_nat` gets the same list.
+            egress_allow: cfg.egress_allow,
             // Production: resolve digests via the real `oras` runner (no
             // override). Only tests inject a fake resolver here.
             digest_resolver: None,
@@ -709,6 +720,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             extra_env: None,
+            egress_allow: None,
         }
     }
 

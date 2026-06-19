@@ -1621,6 +1621,7 @@ pub(crate) async fn ensure_toolchain_rootfs(
 ///
 /// # Errors
 /// Conversion failure (see [`resolve_rootfs`]) or a VM launch failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_firecracker_build(
     uuid: &str,
     fetched: &crate::fetcher::FetchedApp,
@@ -1629,6 +1630,7 @@ pub async fn run_firecracker_build(
     runner: &FcBuildRunner,
     is_swap: bool,
     extra_env: Option<&std::collections::HashMap<String, String>>,
+    egress_allow: Option<&[String]>,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     // SNAPSHOT SUPPRESS (§12 snapshot-timing). A dev-FC's `/init` async-clones
     // `/workspace`; a WORKSPACE's `cold_boot` readiness probe answers BEFORE
@@ -1745,7 +1747,10 @@ pub async fn run_firecracker_build(
                 digest,
                 "firecracker rootfs cache hit (pre-pull); skipping pull + conversion"
             );
-            return launch_firecracker(&rootfs, fetched, fc, uuid, reff, data_dir, is_swap).await;
+            return launch_firecracker(
+                &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow,
+            )
+            .await;
         }
     }
 
@@ -1781,7 +1786,10 @@ pub async fn run_firecracker_build(
                 if globally_cacheable {
                     publish_rootfs_to_global(data_dir, digest, &built).await;
                 }
-                return launch_firecracker(&built, fetched, fc, uuid, reff, data_dir, is_swap).await;
+                return launch_firecracker(
+                    &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow,
+                )
+                .await;
             }
         }
     }
@@ -1850,12 +1858,13 @@ pub async fn run_firecracker_build(
         }
     };
 
-    launch_firecracker(&rootfs, fetched, fc, uuid, reff, data_dir, is_swap).await
+    launch_firecracker(&rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow).await
 }
 
 /// Launch the Firecracker microVM from a prepared rootfs and wrap it as an
 /// [`crate::runtime::AppRuntime`]. Shared by the cache-hit fast path and the
 /// pull+build path of [`run_firecracker_build`].
+#[allow(clippy::too_many_arguments)]
 async fn launch_firecracker(
     rootfs: &Path,
     fetched: &crate::fetcher::FetchedApp,
@@ -1864,6 +1873,7 @@ async fn launch_firecracker(
     reff: &str,
     data_dir: &Path,
     is_swap: bool,
+    egress_allow: Option<&[String]>,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         rootfs,
@@ -1873,6 +1883,7 @@ async fn launch_firecracker(
         reff,
         data_dir,
         is_swap,
+        egress_allow,
     )
     .await?;
     Ok(std::sync::Arc::new(vm))

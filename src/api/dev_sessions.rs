@@ -404,7 +404,9 @@ pub async fn create_dev_session(
     tokio::spawn(async move {
         match bg
             .orchestrator
-            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&extra_env))
+            // Dev-sessions carry no egress allow-list (no network ACL surface on
+            // the dev-VM path) → `None` keeps unrestricted egress for the dev box.
+            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&extra_env), None)
             .await
         {
             Ok(_) => {

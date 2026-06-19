@@ -32,7 +32,7 @@ impl FirecrackerRuntime {
     ///
     /// # Errors
     /// Always — firecracker is Linux + `/dev/kvm` only.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::too_many_arguments)]
     pub async fn launch_with_uuid(
         _rootfs: &Path,
         _rt: &Runtime,
@@ -41,6 +41,7 @@ impl FirecrackerRuntime {
         _reff: &str,
         _data_dir: &std::path::Path,
         _is_swap: bool,
+        _egress_allow: Option<&[String]>,
     ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }

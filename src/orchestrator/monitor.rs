@@ -905,6 +905,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         }

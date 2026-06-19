@@ -218,6 +218,30 @@ fn parse_default_dev_none_when_no_route_or_dev() {
     assert_eq!(parse_default_dev("default via 10.0.0.1 dev"), None);
 }
 
+/// Track 7: `parse_default_gateway` extracts the `via <gw>` IP — the always-allow
+/// the in-VM supervisor needs to keep its mesh uplink under a strict allow-list.
+#[test]
+fn parses_default_gateway_via() {
+    assert_eq!(
+        parse_default_gateway("default via 10.0.0.1 dev eth0 proto dhcp"),
+        Some("10.0.0.1".to_owned())
+    );
+    assert_eq!(
+        parse_default_gateway("default via 192.168.1.1 dev wlan0\n"),
+        Some("192.168.1.1".to_owned())
+    );
+}
+
+/// A default route with no `via` (link-scope, e.g. a WG/point-to-point default)
+/// yields `None` — there is no gateway IP to always-allow. Must not panic.
+#[test]
+fn parse_default_gateway_none_when_no_via() {
+    assert_eq!(parse_default_gateway("default dev wg0 scope link"), None);
+    assert_eq!(parse_default_gateway(""), None);
+    // "via" with no following token must not panic.
+    assert_eq!(parse_default_gateway("default via"), None);
+}
+
 /// `FirecrackerRuntime::guest_ssh_addr()` must point at the guest's sshd:
 /// the runtime's own `guest_ip` on TCP :2222 (an IPv4 socket). This is what
 /// the runner's L4 forwarder targets so `[app_ula]:2222 → guest_ip:2222` works.

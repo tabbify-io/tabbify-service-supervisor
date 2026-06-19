@@ -145,6 +145,14 @@ pub struct RunnerConfig {
     #[arg(long, env = "RUNNER_EXTRA_ENV")]
     pub extra_env_json: Option<String>,
 
+    /// Egress allow-list (Track 7 network ACL) as a JSON array of hosts/CIDRs/IPs,
+    /// set by the supervisor via the `RUNNER_EGRESS_ALLOW` environment variable
+    /// (never a CLI flag). Decoded in `wire.rs` and threaded HOST-side to
+    /// `setup_guest_nat`, which installs deny-by-default + allowed-host iptables
+    /// rules. `None`/absent ⇒ today's unrestricted egress.
+    #[arg(long, env = "RUNNER_EGRESS_ALLOW")]
+    pub egress_allow_json: Option<String>,
+
     /// Firecracker microVM runtime configuration.
     #[command(flatten)]
     pub firecracker: FcConfig,

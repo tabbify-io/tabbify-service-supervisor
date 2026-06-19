@@ -338,7 +338,12 @@ pub async fn create_workspace(
     tokio::spawn(async move {
         match bg
             .orchestrator
-            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&extra_env))
+            // Workspace-scope egress ACL is a LABELED v2 follow-up (Track 7
+            // self-review): the supervisor enforcement primitive supports the
+            // `workspace` scope, but resolving + threading a workspace-scoped
+            // allow-list at this spawn site lands with the Track-3 lifecycle. Until
+            // then `None` keeps the workspace's egress unrestricted (no regression).
+            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&extra_env), None)
             .await
         {
             Ok(_) => tracing::info!(workspace_uuid = %app_uuid, "workspace provisioned (async)"),

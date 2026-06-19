@@ -47,6 +47,13 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         // build pipeline can merge deploy-time entries into the guest `/init`.
         // A missing/blank/malformed value becomes `None` (safe fallback).
         extra_env: parse_extra_env(cfg.extra_env_json.as_deref()),
+        // Decode the `RUNNER_EGRESS_ALLOW` JSON array (Track 7) into the typed
+        // allow-list threaded host-side to `setup_guest_nat`. A missing/blank/
+        // malformed value becomes `None` (safe fallback = unrestricted egress).
+        egress_allow: cfg
+            .egress_allow_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()),
     }
 }
 
@@ -149,5 +156,44 @@ mod tests {
         let cfg = parse(&[]);
         let serve = serve_config_from(&cfg);
         assert!(serve.extra_env.is_none());
+    }
+
+    /// Track 7: `serve_config_from` decodes the `RUNNER_EGRESS_ALLOW` JSON array
+    /// (here via the equivalent `--egress-allow-json` flag) into the typed
+    /// allow-list threaded host-side to `setup_guest_nat`.
+    #[test]
+    fn serve_config_from_carries_egress_allow() {
+        let cfg = parse(&[
+            "--egress-allow-json",
+            r#"["api.telegram.org","10.0.0.0/24"]"#,
+        ]);
+        let serve = serve_config_from(&cfg);
+        assert_eq!(
+            serve.egress_allow.as_deref(),
+            Some(&["api.telegram.org".to_owned(), "10.0.0.0/24".to_owned()][..]),
+            "serve_config_from must decode RUNNER_EGRESS_ALLOW JSON into egress_allow"
+        );
+    }
+
+    /// Track 7 PINNED CONTRACT: a malformed `RUNNER_EGRESS_ALLOW` decodes to
+    /// `None` (safe fallback = unrestricted egress) — broken JSON must never
+    /// wedge the runner nor silently sever its egress.
+    #[test]
+    fn serve_config_from_malformed_egress_allow_is_none() {
+        let cfg = parse(&["--egress-allow-json", "[not-json"]);
+        let serve = serve_config_from(&cfg);
+        assert!(
+            serve.egress_allow.is_none(),
+            "malformed RUNNER_EGRESS_ALLOW must decode to None, not panic/abort"
+        );
+    }
+
+    /// Absent an allow-list, `serve_config_from` leaves `egress_allow` None (a
+    /// normal deploy: today's unrestricted egress, no regression).
+    #[test]
+    fn serve_config_from_egress_allow_defaults_none() {
+        let cfg = parse(&[]);
+        let serve = serve_config_from(&cfg);
+        assert!(serve.egress_allow.is_none());
     }
 }

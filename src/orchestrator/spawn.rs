@@ -115,6 +115,15 @@ pub struct SpawnSpec {
     /// so a respawn re-bakes the same env. `None` (the default) keeps the guest
     /// env exactly as the OCI image declares it.
     pub extra_env: Option<std::collections::HashMap<String, String>>,
+    /// Egress allow-list (Track 7 network ACL): the hosts/CIDRs/IPs the spawned
+    /// FC may reach outbound. Passed to the runner via the `RUNNER_EGRESS_ALLOW`
+    /// environment variable as a JSON array (same off-the-arg-list pattern as
+    /// `RUNNER_EXTRA_ENV`). Unlike `extra_env` this is a HOST-side NAT parameter
+    /// (NOT baked into the rootfs `/init`) — the runner threads it to
+    /// `setup_guest_nat`, which installs deny-by-default + allowed-host iptables
+    /// rules. PERSISTED on the runner record so a respawn re-applies the same
+    /// posture. `None` (the default) keeps today's unrestricted egress.
+    pub egress_allow: Option<Vec<String>>,
 }
 
 /// Resolve the production `tabbify-runner` path: the binary sitting next to the
@@ -264,6 +273,22 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         }
     }
 
+    // Egress allow-list (Track 7) travels via the `RUNNER_EGRESS_ALLOW` env as a
+    // JSON array (same off-the-arg-list pattern as `RUNNER_EXTRA_ENV`). The runner
+    // decodes it and threads it host-side to `setup_guest_nat`. `None` ⇒ clear the
+    // var so an ambient value never leaks into a deploy that carries no allow-list
+    // (which would silently restrict egress on an unrelated app).
+    match &spec.egress_allow {
+        Some(list) => {
+            let encoded = serde_json::to_string(list)
+                .expect("egress_allow Vec<String> is always JSON-serialisable");
+            cmd.env("RUNNER_EGRESS_ALLOW", encoded);
+        }
+        None => {
+            cmd.env_remove("RUNNER_EGRESS_ALLOW");
+        }
+    }
+
     // Detach: become a new session leader so the runner is not in the
     // supervisor's process group and survives the supervisor's death / signals.
     //
@@ -370,6 +395,10 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // same KEY=VALUE entries into the guest `/init` (devbox SSH key,
         // dev-session git vars, etc.). `None` on a deploy with no extra env.
         extra_env: spec.extra_env.clone(),
+        // Persist the egress allow-list so a RESPAWN-from-record re-applies the
+        // same host-side egress posture (deny-by-default + allowed hosts). `None`
+        // on a deploy with no allow-list = today's unrestricted egress.
+        egress_allow: spec.egress_allow.clone(),
         // A freshly-spawned runner always starts with the circuit breaker clear
         // (not parked). The monitor sets this only after N consecutive failures.
         crash_looped: false,
@@ -441,6 +470,7 @@ mod tests {
             network: None,
             runner_join_token: None,
             extra_env: None,
+            egress_allow: None,
         }
     }
 

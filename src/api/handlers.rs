@@ -298,6 +298,14 @@ pub struct DeployBody {
     /// (non-devbox, non-dev-session) deploys.
     #[serde(default)]
     pub(super) env: Option<std::collections::HashMap<String, String>>,
+    /// Egress allow-list (Track 7 network ACL): the hosts/CIDRs/IPs the spawned
+    /// FC may reach outbound. When `Some(non-empty)`, the runner installs
+    /// host-side egress-filter iptables rules (deny-by-default + these hosts,
+    /// plus the always-allowed mesh uplink + git-proxy). `None`/empty ⇒ today's
+    /// unrestricted egress. Persisted on the runner record so a crash-respawn
+    /// re-applies the same posture. A pre-ACL supervisor ignores the key.
+    #[serde(default)]
+    pub(super) egress_allow: Option<Vec<String>>,
 }
 
 /// Request body for `POST /v1/apps/:uuid/start`. All fields optional so a
@@ -372,6 +380,7 @@ pub async fn deploy_app(
             body.manifest_toml.as_deref(),
             net,
             body.env.as_ref(),
+            body.egress_allow.as_deref(),
         )
         .await
     {

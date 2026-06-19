@@ -103,8 +103,11 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
         .await
         .context("build VM tap setup (need CAP_NET_ADMIN/root)")?;
     // Egress NAT: the guest pulls BASE image layers (FROM …) over the tap.
-    // No mesh access, no clone token — outbound internet only.
-    setup_guest_nat(tap_name, &spec.cfg.tap_subnet).await;
+    // No mesh access, no clone token — outbound internet only. The build VM is
+    // NEVER egress-restricted (it clones + pulls base images from arbitrary
+    // registries), so `None` keeps unrestricted egress (Track 7 ACL is for
+    // RUNTIME app/workspace FCs, not the builder).
+    setup_guest_nat(tap_name, &spec.cfg.tap_subnet, None).await;
 
     // Tear down our tap + NAT rules on EVERY exit (success/boot-error/
     // timeout-kill) so the host accrues nothing across builds.

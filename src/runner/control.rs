@@ -111,6 +111,12 @@ pub struct RunnerLifecycle {
     /// guest always gets the same deploy-time env regardless of how the runtime
     /// is (re)built. `None` for a normal (non-devbox, non-dev-session) deploy.
     pub(crate) extra_env: Option<std::collections::HashMap<String, String>>,
+    /// Egress allow-list (Track 7 network ACL). Populated from the runner's
+    /// `RUNNER_EGRESS_ALLOW` at startup and passed into [`build_runtime`] on a
+    /// zero-downtime swap so the new VM's cold rebuild re-applies the SAME
+    /// host-side egress posture (deny-by-default + allowed hosts). `None` ⇒
+    /// today's unrestricted egress.
+    pub(crate) egress_allow: Option<Vec<String>>,
     /// TEST-ONLY override for the OCI digest-resolver runner used by the deploy
     /// guard. `None` in production ⇒ the guard spawns the real
     /// [`crate::runner::build::firecracker::production_fc_build_runner`] (real
@@ -287,6 +293,7 @@ impl RunnerLifecycle {
             &self.data_dir,
             true,
             self.extra_env.as_ref(),
+            self.egress_allow.as_deref(),
         )
         .await
         {
@@ -539,6 +546,7 @@ mod tests {
             current_ref: Arc::new(Mutex::new(None)),
             current_digest: Arc::new(Mutex::new(None)),
             extra_env: None,
+            egress_allow: None,
             digest_resolver: None,
         }
     }

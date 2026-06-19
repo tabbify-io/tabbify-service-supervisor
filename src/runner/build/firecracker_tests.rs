@@ -1053,6 +1053,7 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
         &runner,
         false,
         None,
+        None,
     )
     .await;
 
@@ -1835,7 +1836,8 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
     // Tag ref must NOT bail; the boot at the end errors (no KVM) — irrelevant to
     // the digest-derivation assertion below.
     let _ =
-        super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner, false, None).await;
+        super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner, false, None, None)
+            .await;
 
     let recorded = calls.lock().unwrap().clone();
     // It pulled the layout (oras) for the tag ref instead of bailing.

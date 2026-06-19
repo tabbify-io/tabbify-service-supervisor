@@ -111,6 +111,12 @@ pub struct RunnerHandle {
     /// existed (serde default).
     #[serde(default)]
     pub extra_env: Option<std::collections::HashMap<String, String>>,
+    /// Egress allow-list (Track 7 network ACL) PERSISTED so a supervisor-driven
+    /// RESPAWN re-applies the same host-side egress posture (deny-by-default +
+    /// allowed hosts). `None` for apps with no allow-list (today's unrestricted
+    /// egress) and for records written before this field existed (serde default).
+    #[serde(default)]
+    pub egress_allow: Option<Vec<String>>,
     /// Crash-loop circuit-breaker flag. Set by the monitor after
     /// `CRASH_LOOP_PARK_THRESHOLD` consecutive failed respawns with no healthy
     /// window between them. A parked runner is NOT respawned until a new deploy
@@ -241,6 +247,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         }
@@ -261,6 +268,7 @@ mod tests {
             runner_join_token: None,
             manifest_toml: None,
             extra_env: None,
+            egress_allow: None,
             crash_looped: false,
             stopped: false,
         }

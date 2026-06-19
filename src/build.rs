@@ -50,6 +50,7 @@ pub async fn build_runtime(
     data_dir: &std::path::Path,
     is_swap: bool,
     extra_env: Option<&std::collections::HashMap<String, String>>,
+    egress_allow: Option<&[String]>,
 ) -> anyhow::Result<Arc<dyn AppRuntime>> {
     // Generic Firecracker (D11): convert the deployed OCI image into a
     // rootfs.ext4 (cached by digest) + a PID-1 init, then boot it via the
@@ -61,7 +62,7 @@ pub async fn build_runtime(
     // new coexist) from a COLD START (false: reconcile + warm-restore).
     let runner = crate::runner::build::firecracker::production_fc_build_runner();
     crate::runner::build::firecracker::run_firecracker_build(
-        uuid, fetched, fc, data_dir, &runner, is_swap, extra_env,
+        uuid, fetched, fc, data_dir, &runner, is_swap, extra_env, egress_allow,
     )
     .await
 }
