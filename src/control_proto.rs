@@ -31,6 +31,16 @@ pub enum Cmd {
         /// OCI image ref to deploy (e.g. `[fd5a:1f02::1]:5000/acme/app:<sha>`).
         reff: String,
     },
+    /// Refresh the warm-LSP snapshot of the CURRENTLY-RUNNING workspace VM
+    /// IN-PLACE: pause → `/snapshot/create` → resume the live VM (it keeps
+    /// serving). Issued by the node AFTER the code-service signals
+    /// `indexed && idle`, so the captured RAM holds a warm LSP index → a later
+    /// warm restore returns the ready index. Unlike [`Cmd::Stop`] the listener
+    /// and the VM stay up; unlike a cold-boot snapshot this is an explicit
+    /// REFRESH (a plain restart never re-snapshots — see the cold_boot gate).
+    /// Returns [`Reply::Ok`] on a successful create (best-effort: a failed
+    /// create still leaves the VM running + replies [`Reply::Err`]).
+    Snapshot,
 }
 
 /// Replies the runner sends back over the control socket.
@@ -84,6 +94,7 @@ mod tests {
             Cmd::Stop,
             Cmd::Purge,
             Cmd::Shutdown,
+            Cmd::Snapshot,
             Cmd::Deploy {
                 reff: "[fd5a:1f02::1]:5000/acme/app:sha256abc".to_owned(),
             },
@@ -107,6 +118,17 @@ mod tests {
             json.contains("[fd5a:1f02::1]:5000/acme/app:sha256abc"),
             "got: {json}"
         );
+        let back: Cmd = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    /// `Snapshot` round-trips and serializes its snake_case tag so the runner-
+    /// side dispatch can route it.
+    #[test]
+    fn snapshot_cmd_round_trips_and_tags() {
+        let cmd = Cmd::Snapshot;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"snapshot\""), "got: {json}");
         let back: Cmd = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
     }

@@ -239,3 +239,19 @@ fn guest_ssh_addr_targets_guest_ip_port_2222() {
     assert!(ssh.is_ipv4(), "guest SSH target must be IPv4 (the /30 tap)");
     assert_eq!(ssh.port(), 2222, "guest sshd listens on :2222");
 }
+
+/// `snapshot()` is a no-op `Ok(())` when the runtime has no cache dir (the bare
+/// `with_probe_for_test` constructor sets `snapshot_cache_dir: None`) — proving
+/// the early-return guard so a test/build VM never tries to snapshot.
+#[tokio::test]
+async fn snapshot_noop_without_cache_dir() {
+    use std::sync::Arc;
+
+    use crate::runtime::AppRuntime;
+
+    let rt = FirecrackerRuntime::with_probe_for_test("http://169.254.0.2:8080", Arc::new(|_| true));
+    assert!(
+        rt.snapshot().await.is_ok(),
+        "snapshot() with no cache dir must be a no-op Ok(())"
+    );
+}

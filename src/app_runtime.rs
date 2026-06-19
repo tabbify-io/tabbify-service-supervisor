@@ -117,6 +117,44 @@ pub trait AppRuntime: Send + Sync {
     fn guest_ssh_addr(&self) -> Option<SocketAddr> {
         None
     }
+
+    /// The IPv4 TCP address of the guest's structured code-service RPC port, if
+    /// any.
+    ///
+    /// For a Firecracker microVM running a WORKSPACE image, returns
+    /// `Some(<guest_ip>:CODE_SERVICE_PORT)` (8731). The runner's L4 forwarder
+    /// binds `[app_ula]:8731` on the mesh interface and proxies to it, so the
+    /// node can call `POST http://[app_ula]:8731/v1/code/<method>` (Seam 1).
+    /// This is a SEPARATE port from the axum runner's :8730 app port and from
+    /// the :2222 ssh exec port.
+    ///
+    /// Default: `None` — non-workspace runtimes (regular apps, docker, stub)
+    /// expose no code-service target, so no :8731 forwarder is started.
+    fn guest_code_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
+    /// Refresh this runtime's warm-restore snapshot IN-PLACE — without
+    /// stopping or swapping the running app.
+    ///
+    /// For a Firecracker microVM running a workspace image this pauses the
+    /// guest, writes a fresh `/snapshot/create` to the per-uuid cache dir, and
+    /// resumes the guest (it keeps serving). It is the explicit POST-INDEX
+    /// refresh path: the node issues it AFTER the code-service reports
+    /// `indexed && idle`, so the captured RAM holds a warm LSP index. A plain
+    /// restart must NOT re-snapshot (cold_boot only snapshots when
+    /// `!files_present`); the only way to refresh a present snapshot is this
+    /// method, driven by `Cmd::Snapshot`.
+    ///
+    /// Default: **no-op `Ok(())`** — a runtime with no snapshottable state
+    /// (docker, stub, test fakes) reports success without doing anything.
+    ///
+    /// # Errors
+    /// Runtime-specific: the snapshot create/pause/resume sequence failed. The
+    /// VM is left RUNNING on any error (the FC impl always `ensure_resumed`s).
+    fn snapshot<'a>(&'a self) -> BoxFut<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +179,22 @@ mod tests {
     #[test]
     fn guest_ssh_addr_default_is_none() {
         assert_eq!(StubRuntime.guest_ssh_addr(), None);
+    }
+
+    /// The `AppRuntime::snapshot` default is a no-op `Ok(())`: a runtime with
+    /// no snapshottable state (docker, stub, test fakes) reports success
+    /// without doing anything, so a workspace `Cmd::Snapshot` against such a
+    /// runtime never errors.
+    #[tokio::test]
+    async fn snapshot_default_is_ok_noop() {
+        let result = StubRuntime.snapshot().await;
+        assert!(result.is_ok(), "default snapshot() must be a no-op Ok(())");
+    }
+
+    /// `guest_code_addr` default is `None`: a non-FC runtime exposes no code-
+    /// service target, so the runner never starts the :8731 forwarder for it.
+    #[test]
+    fn guest_code_addr_default_is_none() {
+        assert_eq!(StubRuntime.guest_code_addr(), None);
     }
 }

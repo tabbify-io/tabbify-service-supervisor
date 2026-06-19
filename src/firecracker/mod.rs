@@ -46,6 +46,9 @@ pub(crate) mod linux;
 pub(crate) mod pidfile;
 mod protocol;
 pub(crate) mod snapshot;
+// Pure, host-agnostic snapshot DECISION logic — NO cfg gate so it is unit-
+// testable on macOS (the rest of the snapshot path is behind the Linux gate).
+pub mod snapshot_decision;
 #[cfg(not(target_os = "linux"))]
 mod stub;
 

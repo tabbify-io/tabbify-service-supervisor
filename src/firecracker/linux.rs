@@ -175,6 +175,17 @@ pub struct FirecrackerRuntime {
     /// (`guest_ssh_addr`) to expose `guest_ip:2222` via `[app_ula]:2222`.
     guest_ip: Ipv4Addr,
     client: reqwest::Client,
+    /// The per-uuid snapshot cache dir (`<data_dir>/apps/<uuid>/cache`) this VM
+    /// writes its snapshot to. `None` for the bare `launch` entry (tests /
+    /// single-VM callers) and the build VM — those never snapshot. `Some` on the
+    /// production `launch_with_uuid` path so `AppRuntime::snapshot()` (the
+    /// `Cmd::Snapshot` refresh) knows where to put `snap.vmstate` / `snap.mem`.
+    snapshot_cache_dir: Option<PathBuf>,
+    /// The OCI image ref this VM booted from, stamped into `.snapshot_ref` after
+    /// a successful `snapshot()` so a later warm restore is invalidated when the
+    /// deployed image changes (cache is keyed by uuid only — see
+    /// `snapshot::ref_matches`). `None` mirrors `snapshot_cache_dir`.
+    image_ref: Option<String>,
     /// Test-only injectable reachability probe. Production leaves this `None`
     /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
     /// closure via [`Self::with_probe_for_test`] so no real microVM is needed.
@@ -281,6 +292,8 @@ impl FirecrackerRuntime {
             guest_base,
             guest_ip,
             client: reqwest::Client::new(),
+            snapshot_cache_dir: cache_dir.map(Path::to_path_buf),
+            image_ref: image_ref.map(str::to_owned),
             #[cfg(test)]
             probe: None,
         };
@@ -302,7 +315,10 @@ impl FirecrackerRuntime {
         // rootfs, and a later warm-restore would resurrect an EMPTY /workspace.
         // Suppressed ⇒ never snapshot ⇒ every (re)launch cold-boots + re-clones.
         if let Some(dir) = cache_dir {
-            if !snapshot::files_present(dir) && !snapshot::is_suppressed(dir) {
+            if super::snapshot_decision::should_snapshot_on_cold_boot(
+                snapshot::files_present(dir),
+                snapshot::is_suppressed(dir),
+            ) {
                 me.try_create_snapshot(dir).await;
                 if let (Some(reff), true) = (image_ref, snapshot::files_present(dir)) {
                     snapshot::write_ref(dir, reff);
@@ -543,6 +559,11 @@ impl FirecrackerRuntime {
             guest_base,
             guest_ip,
             client: reqwest::Client::new(),
+            snapshot_cache_dir: Some(cache_dir.to_path_buf()),
+            // Carry the ref the existing snapshot was stamped with so a later
+            // Cmd::Snapshot re-stamps the same ref (best-effort read; None on
+            // any error → the snapshot() path simply skips the ref write).
+            image_ref: std::fs::read_to_string(snapshot::ref_path(cache_dir)).ok(),
             #[cfg(test)]
             probe: None,
         };
@@ -802,6 +823,8 @@ impl FirecrackerRuntime {
             guest_base: guest_base.to_owned(),
             guest_ip: Ipv4Addr::new(169, 254, 0, 2),
             client: reqwest::Client::new(),
+            snapshot_cache_dir: None,
+            image_ref: None,
             probe: Some(probe),
         }
     }
@@ -910,6 +933,58 @@ impl AppRuntime for FirecrackerRuntime {
             std::net::IpAddr::V4(self.guest_ip),
             crate::tcp_forward::GUEST_SSH_PORT,
         ))
+    }
+
+    fn guest_code_addr(&self) -> Option<std::net::SocketAddr> {
+        // The workspace code-service listens on CODE_SERVICE_PORT (8731) inside
+        // the VM (IPv4 eth0). The host reaches it at guest_ip:8731 via the /30
+        // tap; the runner forwards [app_ula]:8731 → here. Every FC guest exposes
+        // the port; non-workspace images simply have nothing listening, so a dial
+        // refuses — harmless (the forwarder only matters for workspaces).
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(self.guest_ip),
+            tabbify_workspace_contract::CODE_SERVICE_PORT,
+        ))
+    }
+
+    fn snapshot<'a>(&'a self) -> BoxFut<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let Some(cache_dir) = self.snapshot_cache_dir.clone() else {
+                // No cache dir (bare launch / build VM): nothing to refresh.
+                return Ok(());
+            };
+            // §12 snapshot-timing: this is the explicit POST-INDEX refresh. We do
+            // NOT check `snapshot::is_suppressed(&cache_dir)` — a workspace cache
+            // dir CARRIES the `.no-snapshot` marker (Task 9) so cold_boot never
+            // freezes a COLD index; `Cmd::Snapshot` must write the FIRST warm
+            // snapshot OVER that marker. Suppress gates cold_boot only.
+            //
+            // Reuse the v1.4.67 live-VM primitive: pause → PUT /snapshot/create
+            // (SNAPSHOT_CREATE_TIMEOUT, room for the multi-GB RAM write) →
+            // resume. `try_create_snapshot` ALWAYS `ensure_resumed`s afterward,
+            // so the VM is left RUNNING even if the create itself failed — the
+            // workspace never strands paused. We re-check `files_present` to
+            // know whether the create actually landed before stamping the ref.
+            self.try_create_snapshot(&cache_dir).await;
+            if snapshot::files_present(&cache_dir) {
+                if let Some(reff) = self.image_ref.as_deref() {
+                    snapshot::write_ref(&cache_dir, reff);
+                }
+                tracing::info!(
+                    cache_dir = %cache_dir.display(),
+                    "Cmd::Snapshot: live-VM warm snapshot refreshed (post-index)"
+                );
+                Ok(())
+            } else {
+                // create did not land (logged inside try_create_snapshot); the
+                // VM is still serving (ensure_resumed ran) — report the failure
+                // so the node can retry, but the workspace stays up.
+                anyhow::bail!(
+                    "Cmd::Snapshot: snapshot create did not produce files at {}",
+                    cache_dir.display()
+                )
+            }
+        })
     }
 }
 

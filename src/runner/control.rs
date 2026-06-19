@@ -186,6 +186,27 @@ impl RunnerLifecycle {
         }
     }
 
+    /// Refresh the active runtime's warm snapshot IN-PLACE (the `Cmd::Snapshot`
+    /// handler). Delegates to `AppRuntime::snapshot()` on the swappable active
+    /// cell, so the live VM stays serving while its on-disk snapshot is
+    /// rewritten. Returns [`Reply::Ok`] on success, [`Reply::Err`] (with the
+    /// error text) if the snapshot create failed — the VM keeps running either
+    /// way.
+    async fn snapshot(&self) -> Reply {
+        match self.active.snapshot().await {
+            Ok(()) => {
+                tracing::info!(uuid = %self.uuid, "Cmd::Snapshot: warm snapshot refreshed");
+                Reply::Ok
+            }
+            Err(e) => {
+                tracing::warn!(uuid = %self.uuid, error = %e, "Cmd::Snapshot: snapshot refresh failed (VM still serving)");
+                Reply::Err {
+                    message: format!("snapshot: {e}"),
+                }
+            }
+        }
+    }
+
     /// Deploy a new version by OCI image `reff`: build a fresh runtime from the
     /// app's manifest with `registry_ref = Some(reff)` applied, then perform a
     /// zero-downtime swap against the shared [`ActiveRuntime`] cell.
@@ -406,6 +427,7 @@ async fn dispatch(cmd: Cmd, lifecycle: &RunnerLifecycle) -> Reply {
             Reply::Ok
         }
         Cmd::Deploy { reff } => lifecycle.deploy(&reff).await,
+        Cmd::Snapshot => lifecycle.snapshot().await,
         Cmd::Shutdown => {
             lifecycle.stop().await;
             // Signal the main task to exit cleanly, if a shutdown notifier is
@@ -558,6 +580,24 @@ mod tests {
             }
             other => panic!("expected Health reply, got {other:?}"),
         }
+    }
+
+    /// `Cmd::Snapshot` dispatches to the lifecycle's snapshot path and replies
+    /// `Ok` when the runtime's (default no-op) snapshot succeeds. The active
+    /// runtime is unchanged (snapshot is an in-place refresh, never a swap).
+    #[tokio::test]
+    async fn snapshot_cmd_replies_ok_on_success() {
+        let lc = fake_lifecycle(RuntimeHealth::Serving);
+        let before = lc.active.load();
+        let reply = dispatch(Cmd::Snapshot, &lc).await;
+        assert!(
+            matches!(reply, Reply::Ok),
+            "Snapshot of a default-no-op runtime must reply Ok, got {reply:?}"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &lc.active.load()),
+            "Snapshot must NOT swap the active runtime"
+        );
     }
 
     // ---- Digest-resolver fakes ----------------------------------------------

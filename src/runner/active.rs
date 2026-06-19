@@ -221,6 +221,17 @@ impl AppRuntime for ActiveRuntime {
     fn guest_ssh_addr(&self) -> Option<std::net::SocketAddr> {
         self.load().guest_ssh_addr()
     }
+
+    fn guest_code_addr(&self) -> Option<std::net::SocketAddr> {
+        self.load().guest_code_addr()
+    }
+
+    fn snapshot<'a>(&'a self) -> BoxFut<'a, anyhow::Result<()>> {
+        // In-place: snapshot the CURRENTLY-active runtime; do NOT swap. The
+        // workspace keeps serving while its on-disk snapshot is refreshed.
+        let rt = self.load();
+        Box::pin(async move { rt.snapshot().await })
+    }
 }
 
 // ---- Tests ------------------------------------------------------------------
@@ -348,6 +359,47 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(50), active.shutdown())
             .await
             .expect("shutdown must complete immediately");
+    }
+
+    /// A runtime that flips a flag when `snapshot()` is invoked, so the
+    /// delegation through `ActiveRuntime` is observable.
+    struct SnapFake {
+        snapped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AppRuntime for SnapFake {
+        fn handle<'a>(&'a self, _req: Request<Bytes>) -> BoxRespFut<'a> {
+            Box::pin(async { Ok(Response::builder().status(200).body(Bytes::new()).unwrap()) })
+        }
+        fn snapshot<'a>(&'a self) -> BoxFut<'a, anyhow::Result<()>> {
+            let flag = self.snapped.clone();
+            Box::pin(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// `ActiveRuntime::snapshot()` delegates to the CURRENTLY-active runtime
+    /// IN-PLACE (no swap): the live runtime's `snapshot()` runs and the active
+    /// allocation is unchanged afterward.
+    #[tokio::test]
+    async fn active_runtime_snapshot_delegates_in_place() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rt: Arc<dyn AppRuntime> = Arc::new(SnapFake { snapped: flag.clone() });
+        let active = ActiveRuntime::new(rt);
+        let before = active.load();
+
+        active.snapshot().await.expect("snapshot must succeed");
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the live runtime's snapshot() must have been called"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &active.load()),
+            "snapshot must NOT swap the active runtime (in-place refresh)"
+        );
     }
 
     /// swap() fires the swapped notifier.
