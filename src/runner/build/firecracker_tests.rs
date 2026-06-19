@@ -153,7 +153,7 @@ fn render_init_exec_form_mounts_env_workdir_and_execs() {
         env: vec!["RUST_LOG=info".to_owned(), "PORT=8080".to_owned()],
         workdir: "/app".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
 
     assert!(init.starts_with("#!"), "must be a shebang script");
     assert!(init.contains("mount -t proc"), "mounts /proc; got:\n{init}");
@@ -197,7 +197,7 @@ fn render_init_creates_pseudo_fs_mountpoints_and_mounts_best_effort() {
         env: vec![],
         workdir: "/".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
     assert!(
         init.contains("mkdir -p /proc /sys /dev"),
         "must create pseudo-fs mountpoints (minimal images lack them); got:\n{init}"
@@ -240,7 +240,7 @@ fn render_init_single_quotes_argv_and_env_values() {
         ],
         workdir: "/app".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
 
     // Each argv element is wrapped in single quotes verbatim — the shell cannot
     // word-split, glob, or `$`-expand inside single quotes.
@@ -277,7 +277,7 @@ fn render_init_escapes_embedded_single_quote() {
         env: Vec::new(),
         workdir: "/".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
     // it's fine  ->  'it'\''s fine'
     assert!(
         init.contains(r#"exec '/bin/echo' 'it'\''s fine'"#),
@@ -297,7 +297,7 @@ fn render_init_creates_workdir_before_cd() {
         env: Vec::new(),
         workdir: "/var/My App".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
     assert!(
         init.contains("mkdir -p '/var/My App'"),
         "must mkdir -p the workdir (single-quoted) before cd; got:\n{init}"
@@ -317,7 +317,7 @@ fn render_init_creates_workdir_before_cd() {
 /// guess a shell.
 #[test]
 fn render_init_shell_form_returns_clear_error() {
-    let err = render_init(&Entrypoint::ShellForm).unwrap_err();
+    let err = render_init(&Entrypoint::ShellForm, &[]).unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("shell-form") && msg.contains("not") && msg.contains("support"),
@@ -356,7 +356,7 @@ fn extra_env_merged_after_oci_env_and_exported_in_order() {
     // The REAL production merge — the same fn `resolve_rootfs` invokes.
     merge_extra_env(&mut exec.env, &extra);
 
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
 
     // EXACT export sequence: OCI vars first (insertion order), then ALL extras
     // in sorted key order. B appears twice — OCI first, extra last (so the
@@ -394,7 +394,7 @@ fn extra_env_values_are_single_quoted_in_init() {
             .collect();
     merge_extra_env(&mut exec.env, &extra);
 
-    let init = render_init(&Entrypoint::Exec(exec)).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
     assert!(
         init.contains("export KEY='ssh-ed25519 AAAA spaced key'"),
         "extra env value with spaces must be single-quoted in init; got:\n{init}"
@@ -775,6 +775,7 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
         tmp.path(),
         &runner,
         None,
+        &[],
     )
     .await
     .unwrap();
@@ -838,6 +839,7 @@ async fn resolve_rootfs_rejects_arch_mismatch_before_conversion() {
         tmp.path(),
         &runner,
         None,
+        &[],
     )
     .await
     .expect_err("arch mismatch must fail fast");
@@ -921,6 +923,7 @@ async fn resolve_rootfs_allows_matching_host_arch() {
         tmp.path(),
         &runner,
         None,
+        &[],
     )
     .await
     .expect("matching host arch must convert");
@@ -979,6 +982,7 @@ async fn run_fc_build_converts_on_cache_miss() {
         tmp.path(),
         &runner,
         None,
+        &[],
     )
     .await
     .unwrap();
@@ -2053,4 +2057,57 @@ async fn wipe_oci_layout_tolerates_missing_and_removes_existing() {
     std::fs::write(layout.join("index.json"), b"{}").unwrap();
     super::wipe_oci_layout(&layout).await.unwrap();
     assert!(!layout.exists(), "wipe removes the layout dir");
+}
+
+// ---- §12 S1 cap-file writer (Task 9) ----------------------------------------
+
+#[test]
+fn cap_files_init_is_empty_for_regular_apps() {
+    assert_eq!(super::render_cap_files_init(&[]), "");
+}
+
+#[test]
+fn cap_files_init_writes_0600_broker_owned_files() {
+    let files = vec![("app.url".to_owned(), "http://10.0.0.1:9000/git/abc".to_owned())];
+    let rendered = super::render_cap_files_init(&files);
+    assert!(rendered.contains("mkdir -p /run/tabbify/caps"));
+    assert!(rendered.contains("umask 077"));
+    assert!(rendered.contains("/run/tabbify/caps/app.url"));
+    assert!(rendered.contains("chmod 0600 '/run/tabbify/caps/app.url'"));
+    assert!(rendered.contains(&format!("chown -R {}", super::BROKER_UID)));
+    // The cap value is single-quoted, not `export`ed (never an env var).
+    assert!(rendered.contains("'http://10.0.0.1:9000/git/abc'"));
+    assert!(!rendered.contains("export "));
+}
+
+#[test]
+fn safe_cap_name_rejects_traversal() {
+    assert!(super::safe_cap_name("app.url"));
+    assert!(super::safe_cap_name("forge-admin.token"));
+    assert!(!super::safe_cap_name("../escape"));
+    assert!(!super::safe_cap_name("a/b"));
+    assert!(!super::safe_cap_name(""));
+    assert!(!super::safe_cap_name(".."));
+}
+
+/// `render_init` with cap-files emits the 0600 broker-owned writer lines AFTER
+/// the env exports and BEFORE the workdir/exec — proving the §12 S1 channel is
+/// wired into the actual PID-1 init (not just the standalone renderer).
+#[test]
+fn render_init_includes_cap_files_before_exec() {
+    let exec = OciExec {
+        entrypoint: vec!["/app".to_owned()],
+        cmd: vec![],
+        env: vec!["PATH=/usr/bin".to_owned()],
+        workdir: "/srv".to_owned(),
+    };
+    let caps = vec![("app.url".to_owned(), "http://h/git/cap".to_owned())];
+    let init = render_init(&Entrypoint::Exec(exec), &caps).unwrap();
+    let cap_pos = init
+        .find("/run/tabbify/caps/app.url")
+        .expect("cap-file line must be present");
+    let exec_pos = init.find("exec '/app'").expect("exec line must be present");
+    assert!(cap_pos < exec_pos, "cap-files must be written BEFORE exec");
+    // The cap content is NOT an env export.
+    assert!(!init.contains("export TABBIFY_CAP_FILES"));
 }

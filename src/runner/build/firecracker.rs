@@ -792,6 +792,66 @@ fn sh_single_quote(s: &str) -> String {
     out
 }
 
+/// The broker uid the workspace cap-files are `chown`ed to (matches the
+/// workspace image's broker user; the agent uid has no read access). Kept here
+/// as the single source so the writer + the image agree.
+pub const BROKER_UID: &str = "9000";
+
+/// Render the POSIX-sh lines that materialize the §12 S1 cap-files inside the
+/// guest BEFORE `exec`: create `/run/tabbify/caps` (0700), write each
+/// `<name>` → `<value>` as a 0600 file (umask 077 so the create is private), and
+/// `chown` the dir+files to the broker uid so ONLY the broker (not the agent)
+/// can read them. Returns "" when there are no cap-files (regular apps), so the
+/// generic init is byte-identical to today for non-workspace images.
+///
+/// `cap_files` is `(name, value)` pairs already validated by [`safe_cap_name`]
+/// (no `/`, no `..`); the value is single-quoted so a `$`/space/glob in a URL is
+/// not re-interpreted by the shell.
+#[must_use]
+pub fn render_cap_files_init(cap_files: &[(String, String)]) -> String {
+    if cap_files.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "mkdir -p /run/tabbify/caps\n\
+         chmod 0700 /run/tabbify/caps\n",
+    );
+    for (name, value) in cap_files {
+        // safe_cap_name guarantees `name` is a bare filename; quote defensively.
+        let qname = sh_single_quote(&format!("/run/tabbify/caps/{name}"));
+        let qval = sh_single_quote(value);
+        out.push_str(&format!(
+            "(umask 077; printf %s {qval} > {qname})\n\
+             chmod 0600 {qname}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "chown -R {BROKER_UID}:{BROKER_UID} /run/tabbify/caps 2>/dev/null || true\n"
+    ));
+    out
+}
+
+/// The workspace marker env key (`TABBIFY_WORKSPACE_UUID`). Kept as a fn so the
+/// `crate::api` re-export is referenced from exactly one spot in this module.
+fn tabbify_workspace_contract_marker() -> &'static str {
+    crate::api::WORKSPACE_MARKER_ENV
+}
+
+/// Reject a cap-file name that is not a bare, traversal-safe filename. Mirrors
+/// the API-side `cap_repo_basename` invariant at the consuming end so a corrupt
+/// `CAP_FILES_ENV` payload can never write outside `/run/tabbify/caps`.
+#[must_use]
+pub fn safe_cap_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// Render the guest PID-1 init script from an [`Entrypoint`].
 ///
 /// The script (run as PID 1 by the kernel `init=/init` arg) mounts the pseudo
@@ -808,7 +868,7 @@ fn sh_single_quote(s: &str) -> String {
 /// # Errors
 /// [`Entrypoint::ShellForm`] — shell-form entrypoints are not yet supported
 /// (D3); the error message says so clearly.
-pub fn render_init(entry: &Entrypoint) -> Result<String> {
+pub fn render_init(entry: &Entrypoint, cap_files: &[(String, String)]) -> Result<String> {
     let exec = match entry {
         Entrypoint::Exec(e) => e,
         Entrypoint::ShellForm => {
@@ -852,6 +912,11 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
     // OCI/Docker auto-create a missing WorkingDir; with `set -e` a bare `cd` into
     // an unmaterialized workdir would kill PID 1, so `mkdir -p` it first (FIX 3).
     let workdir = sh_single_quote(&exec.workdir);
+    // §12 S1 cap-files: write each per-repo cap-URL (+ forge-admin token) to a
+    // 0600 broker-owned file under /run/tabbify/caps BEFORE exec — NOT as env,
+    // NOT `export`ed (so the agent never reads them + they never freeze into a
+    // Full snapshot). Empty for non-workspace images → byte-identical init.
+    let cap_lines = render_cap_files_init(cap_files);
     Ok(format!(
         "#!/bin/sh\n\
          set -e\n\
@@ -865,6 +930,7 @@ pub fn render_init(entry: &Entrypoint) -> Result<String> {
          fi\n\
          ip link show eth0 >/dev/null 2>&1 || true\n\
          {env_lines}\
+         {cap_lines}\
          mkdir -p {workdir} 2>/dev/null; cd {workdir}\n\
          exec {exec_line}\n",
     ))
@@ -928,6 +994,7 @@ pub async fn resolve_rootfs(
     data_dir: &Path,
     runner: &FcBuildRunner,
     extra_env: Option<&std::collections::HashMap<String, String>>,
+    cap_files: &[(String, String)],
 ) -> Result<PathBuf> {
     let cached = cached_rootfs_path(data_dir, uuid, digest);
     if rootfs_is_cached(data_dir, uuid, digest) {
@@ -969,7 +1036,7 @@ pub async fn resolve_rootfs(
     if let (Some(map), Entrypoint::Exec(exec)) = (extra_env, &mut entry) {
         merge_extra_env(&mut exec.env, map);
     }
-    let init = render_init(&entry)?; // shell-form → clear error (D3)
+    let init = render_init(&entry, cap_files)?; // shell-form → clear error (D3)
 
     build_rootfs_ext4_inner(
         layout,
@@ -1542,7 +1609,8 @@ pub(crate) async fn ensure_toolchain_rootfs(
     let config = read_oci_config_from_layout(&layout)?;
     guard_arch_matches_host(&config)?;
     let entry = Entrypoint::from_oci(&config);
-    let init = render_init(&entry)?;
+    // Toolchain rootfs is NEVER a workspace → no cap-files to materialize.
+    let init = render_init(&entry, &[])?;
     build_rootfs_ext4_inner(&layout, &config, &dir, 1024, Some(&init), runner).await
 }
 
@@ -1562,19 +1630,67 @@ pub async fn run_firecracker_build(
     is_swap: bool,
     extra_env: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
-    // DEV-SESSION snapshot suppression. A dev-FC's guest `/init` clones
-    // `/workspace` ASYNC — it finishes AFTER the readiness port answers, i.e.
-    // after the FC cold boot would snapshot — so a snapshot would freeze a
-    // pre-/mid-clone rootfs and a later warm-restore (e.g. a crash respawn)
-    // would resurrect an EMPTY /workspace. Mark the cache dir `.no-snapshot` so
-    // the cold boot NEVER snapshots a dev-FC → every (re)launch cold-boots and
-    // re-clones (self-healing). The dev marker is the `TABBIFY_GIT_REMOTE` env
-    // the dev-session deploy injects (`api::dev_sessions::create_dev_session`).
-    if extra_env.is_some_and(|m| m.contains_key("TABBIFY_GIT_REMOTE")) {
+    // SNAPSHOT SUPPRESS (§12 snapshot-timing). A dev-FC's `/init` async-clones
+    // `/workspace`; a WORKSPACE's `cold_boot` readiness probe answers BEFORE
+    // rust-analyzer finishes indexing. In BOTH cases a cold-boot snapshot would
+    // freeze a wrong/cold rootfs+RAM, and a later warm-restore would resurrect
+    // it. Mark the cache dir `.no-snapshot` so cold_boot NEVER snapshots → every
+    // (re)launch cold-boots; the workspace's WARM snapshot is taken only later by
+    // `Cmd::Snapshot` (post-index), which bypasses this marker.
+    let is_dev = extra_env.is_some_and(|m| m.contains_key("TABBIFY_GIT_REMOTE"));
+    let is_workspace =
+        extra_env.is_some_and(|m| m.contains_key(tabbify_workspace_contract_marker()));
+    if is_dev || is_workspace {
         crate::firecracker::snapshot::suppress(&crate::firecracker::snapshot::cache_dir(
             data_dir, uuid,
         ));
     }
+
+    // §12 S1 cap-file channel + §4 env-safety guard (RUNNER process — this is the
+    // point where RUNNER_EXTRA_ENV is re-baked into the rootfs /init, i.e. where a
+    // leak would actually freeze). Build the EFFECTIVE env: pop the reserved
+    // CAP_FILES_ENV key so its cap content is NEVER `export`ed nor snapshot-frozen,
+    // decode it into cap-files, then assert NO forbidden key remains.
+    let mut effective_env = extra_env.cloned().unwrap_or_default();
+    let cap_files: Vec<(String, String)> = match effective_env.remove(crate::api::CAP_FILES_ENV) {
+        Some(json) => match serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
+        {
+            Ok(map) => map
+                .into_iter()
+                .filter(|(name, _)| {
+                    let ok = safe_cap_name(name);
+                    if !ok {
+                        tracing::warn!(name = %name, "dropping unsafe cap-file name (would escape /run/tabbify/caps)");
+                    }
+                    ok
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "malformed CAP_FILES_ENV; no cap-files written");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    // §4: with the cap-file key removed, the remaining env must carry NO
+    // snapshot-forbidden key. A workspace bakes a Full snapshot, so a leaked
+    // cap/token here would survive into every warm restore. FAIL the build loudly
+    // (the spawn aborts; the API's async deploy handler then revokes caps).
+    if is_workspace {
+        if let Err(key) = crate::firecracker::snapshot_decision::extra_env_is_snapshot_safe(
+            effective_env.keys(),
+        ) {
+            anyhow::bail!(
+                "workspace boot env carries a snapshot-forbidden key {key:?}; \
+                 refusing to bake it into a Full snapshot (§4)"
+            );
+        }
+    }
+    let extra_env = if effective_env.is_empty() {
+        None
+    } else {
+        Some(&effective_env)
+    };
 
     // GLOBAL-cache soundness gate. The global digest-shared rootfs cache (#57) is
     // keyed by DIGEST ALONE, so it may only carry a rootfs that is identical for
@@ -1659,7 +1775,7 @@ pub async fn run_firecracker_build(
                 tracing::info!(uuid, digest, "oci layout cache hit; skipping pull");
                 let config = read_oci_config_from_layout(&local)?;
                 let built = resolve_rootfs(
-                    uuid, fetched, &local, &config, digest, data_dir, runner, extra_env,
+                    uuid, fetched, &local, &config, digest, data_dir, runner, extra_env, &cap_files,
                 )
                 .await?;
                 if globally_cacheable {
@@ -1690,7 +1806,7 @@ pub async fn run_firecracker_build(
         publish_layout_to_global(data_dir, digest, uuid, &layout).await;
         let config = read_oci_config_from_layout(&layout)?;
         let built = resolve_rootfs(
-            uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env,
+            uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env, &cap_files,
         )
         .await?;
         if globally_cacheable {
@@ -1723,7 +1839,7 @@ pub async fn run_firecracker_build(
             } else {
                 let config = read_oci_config_from_layout(&layout)?;
                 let built = resolve_rootfs(
-                    uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env,
+                    uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env, &cap_files,
                 )
                 .await?;
                 if globally_cacheable {
