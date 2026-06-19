@@ -241,6 +241,11 @@ pub struct RunnerServe {
     /// Held so the forwarder task lives exactly as long as the runner; dropping
     /// it aborts the accept loop and stops forwarding new SSH connections.
     _ssh_fwd: Option<TcpForwarder>,
+    /// L4 code-service forwarder: bridges `[app_ula]:8731` → `{guest_ip}:8731`
+    /// so the node can reach the workspace code-service RPC over the mesh.
+    /// `None` when the runtime reports no code target (non-FC / `--no-mesh`).
+    /// Held so the forwarder task lives exactly as long as the runner.
+    _code_fwd: Option<TcpForwarder>,
 }
 
 impl RunnerServe {
@@ -371,6 +376,43 @@ impl RunnerServe {
             None
         };
 
+        // FIX (workspace Seam 1): a SECOND L4 forwarder beside the :2222 one —
+        // bind [app_ula]:CODE_SERVICE_PORT → guest_ip:CODE_SERVICE_PORT so the
+        // node can POST http://[app_ula]:8731/v1/code/<method> into the workspace
+        // code-service. Same SO_REUSEPORT semantics as the ssh forwarder (a
+        // deploy/swap's new runner binds while the old still holds it). Only in
+        // mesh mode AND when the runtime exposes a code target (FC workspace
+        // image); bind errors are logged + tolerated (never crash the runner).
+        let code_fwd = if cfg.no_mesh {
+            None
+        } else if let Some(code_target) = active.guest_code_addr() {
+            let code_bind = std::net::SocketAddr::new(
+                std::net::IpAddr::V6(app_ula),
+                tabbify_workspace_contract::CODE_SERVICE_PORT,
+            );
+            match crate::tcp_forward::spawn_forwarder(code_bind, code_target).await {
+                Ok(fwd) => {
+                    tracing::info!(
+                        bind = %code_bind,
+                        target = %code_target,
+                        "runner: code-service forwarder bound (app_ula:8731 → guest_ip:8731)"
+                    );
+                    Some(fwd)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bind = %code_bind,
+                        target = %code_target,
+                        error = %e,
+                        "runner: code-service forwarder bind failed — code RPC unavailable until rebind (next respawn re-attempts)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // The ref the INITIAL runtime was built from: the resolved manifest's
         // `runtime.registry_ref` (a deployed version applied via `--image-ref`,
         // or `None` for a plain source/S3 build). Seeds the same-ref re-deploy
@@ -439,6 +481,7 @@ impl RunnerServe {
             lifecycle,
             _membership: membership,
             _ssh_fwd: ssh_fwd,
+            _code_fwd: code_fwd,
         })
     }
 
@@ -885,6 +928,26 @@ mod tests {
         // Sanity: it really is the app-ULA prefix, distinct from loopback.
         assert_ne!(my_ula, Ipv6Addr::LOCALHOST);
         assert!(matches!(host.bind(), HostBind::OwnUla(8730)));
+    }
+
+    /// The code-service forwarder must bind the app-ULA on CODE_SERVICE_PORT
+    /// (8731) — distinct from the :2222 ssh port and the :8730 app port — so the
+    /// node's `[app_ula]:8731` code RPC reaches the guest. Pins the port
+    /// contract without a live mesh join.
+    #[test]
+    fn code_forwarder_binds_app_ula_on_code_service_port() {
+        let app_ula = derive_app_ula(Uuid::parse_str(APP_UUID).unwrap());
+        let code_bind = SocketAddr::new(
+            IpAddr::V6(app_ula),
+            tabbify_workspace_contract::CODE_SERVICE_PORT,
+        );
+        assert_eq!(code_bind.port(), 8731, "code forwarder must bind :8731");
+        assert_ne!(
+            code_bind.port(),
+            crate::tcp_forward::GUEST_SSH_PORT,
+            "code port must differ from the ssh exec port"
+        );
+        assert_ne!(code_bind.port(), 8730, "code port must differ from the app port");
     }
 
     // ---- decide_exit / run_until_exit tests --------------------------------
