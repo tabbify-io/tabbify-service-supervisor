@@ -40,6 +40,20 @@ const READY_BACKOFF_START: Duration = Duration::from_millis(50);
 const READY_BACKOFF_CAP: Duration = Duration::from_secs(2);
 /// How long to wait for one firecracker API call over the unix socket.
 const API_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to allow `PUT /snapshot/create` — the guest's ENTIRE RAM is copied
+/// to disk, which on a busy worker far exceeds the 5s [`API_TIMEOUT`]. With the
+/// old 5s budget the create timed out, left the VM PAUSED, and the recovery
+/// resume then also timed out (FC still flushing) → the new runtime never became
+/// healthy → the deploy swap aborted (TAB-10). Give the memory write room.
+const SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Total budget for [`FirecrackerRuntime::ensure_resumed`] to confirm the VM is
+/// running after a snapshot attempt. The snapshot PAUSES the VM; cold_boot MUST
+/// NOT return it paused (a paused VM fails the swap health-gate). Retry the
+/// resume on this budget so a momentarily-busy FC (still flushing the snapshot)
+/// is waited out rather than stranding the deploy.
+const RESUME_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Delay between resume attempts in [`FirecrackerRuntime::ensure_resumed`].
+const RESUME_ENSURE_POLL: Duration = Duration::from_secs(2);
 
 /// Env flag enabling live-boot debugging: when truthy, the firecracker child's
 /// stdout+stderr (including the guest serial console, `console=ttyS0`) are
@@ -635,9 +649,38 @@ impl FirecrackerRuntime {
                 error = %e,
                 "snapshot create failed (best-effort; VM continues serving cold)"
             );
-            // Attempt to resume in case we paused but failed after that.
-            if let Err(re) = self.api_patch("/vm", &resume_body()).await {
-                tracing::warn!(error = %re, "PATCH /vm Resumed failed during snapshot error recovery");
+        }
+        // ALWAYS confirm the VM is running afterward. `create_snapshot_inner`
+        // PAUSES the VM; on ANY failure (or a memory write that outran the inner
+        // resume) it can be left paused — which fails the deploy swap
+        // health-gate (TAB-10 strand). Guarantee it is resumed so cold_boot NEVER
+        // returns a paused VM due to a snapshot hiccup.
+        self.ensure_resumed().await;
+    }
+
+    /// Best-effort GUARANTEE that the VM is running (not paused). Resuming an
+    /// already-running VM is treated as success (FC answers 4xx "not paused" —
+    /// it IS running). Retries a momentarily-busy FC (still flushing a snapshot)
+    /// up to [`RESUME_ENSURE_TIMEOUT`]; a persistently-unresponsive FC is logged
+    /// and left to the swap health-gate to reject.
+    async fn ensure_resumed(&self) {
+        let deadline = tokio::time::Instant::now() + RESUME_ENSURE_TIMEOUT;
+        loop {
+            match self.api_patch("/vm", &resume_body()).await {
+                Ok(()) => return,
+                // A 4xx means the VM is not in a resumable (paused) state — i.e.
+                // it is already running. Done.
+                Err(e) if e.to_string().contains("returned HTTP 4") => return,
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            error = %e,
+                            "ensure_resumed: VM may be stranded paused (FC unresponsive)"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(RESUME_ENSURE_POLL).await;
+                }
             }
         }
     }
@@ -660,9 +703,13 @@ impl FirecrackerRuntime {
         self.api_patch("/vm", &pause_body())
             .await
             .context("PATCH /vm Paused before snapshot")?;
-        self.api_put(
+        // The memory write can far exceed the 5s API_TIMEOUT — use the snapshot
+        // budget so it is not killed mid-write (which would strand the paused VM).
+        api_put_sock_with_timeout(
+            &self.api_sock,
             "/snapshot/create",
             &snapshot_create_body(vmstate_str, mem_str),
+            SNAPSHOT_CREATE_TIMEOUT,
         )
         .await
         .context("PUT /snapshot/create")?;
@@ -1225,8 +1272,20 @@ pub(crate) async fn api_put_sock(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<()> {
+    api_put_sock_with_timeout(api_sock, path, body, API_TIMEOUT).await
+}
+
+/// Like [`api_put_sock`] but with a caller-chosen timeout. `PUT /snapshot/create`
+/// copies the guest RAM to disk and needs [`SNAPSHOT_CREATE_TIMEOUT`], not the
+/// 5s [`API_TIMEOUT`] (TAB-10).
+pub(crate) async fn api_put_sock_with_timeout(
+    api_sock: &Path,
+    path: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+) -> Result<()> {
     let payload = serde_json::to_vec(body)?;
-    let status = tokio::time::timeout(API_TIMEOUT, unix_http_put(api_sock, path, &payload))
+    let status = tokio::time::timeout(timeout, unix_http_put(api_sock, path, &payload))
         .await
         .map_err(|_| anyhow!("firecracker API timed out on PUT {path}"))??;
     tracing::debug!(verb = "PUT", path, status, "fc API call");
