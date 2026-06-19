@@ -567,6 +567,147 @@ async fn fresh_tag_pull_dir(data_dir: &Path, uuid: &str) -> Result<PathBuf> {
     Ok(work)
 }
 
+// ── Global OCI-layout cache (digest-keyed, env-FREE → ALWAYS shareable) ───────
+//
+// The PULLED OCI layout (manifest + config + layer blobs) is PURE image content
+// addressed by digest — it carries NO deploy env (env is baked LATER, into the
+// rootfs `/init` by `resolve_rootfs`). So unlike the rootfs cache — which #68
+// must NOT share across uuids for an env-baked build (a dev-FC's per-session git
+// cap or an app's deploy secrets) — the layout is ALWAYS safe to share by
+// digest. Caching it lets a dev-FC (a FRESH uuid every start, but the SAME base
+// image) skip the multi-minute WAN `oras copy` from the 2nd start on, WITHOUT
+// re-introducing the #68 leak. This RESTORES the pull-skip that #68 removed when
+// it gated the global ROOTFS cache off for env-baked builds (#57).
+
+const GLOBAL_LAYOUT_CACHE_DIR: &str = "oci-layout-cache";
+const GLOBAL_LAYOUT_CACHE_KEEP: usize = 6;
+
+/// `<data_dir>/oci-layout-cache/<digest-sanitized>` — the per-digest cache entry
+/// dir. The OCI layout itself lives in its `oci/` subdir (matching
+/// [`pull_oci_layout`], which writes the layout to `<out_dir>/oci`).
+fn global_oci_layout_entry(data_dir: &Path, digest: &str) -> PathBuf {
+    data_dir
+        .join(GLOBAL_LAYOUT_CACHE_DIR)
+        .join(digest.replace(':', "-"))
+}
+
+/// The shareable OCI layout root for `digest`, or `None` on a MISS. A hit is an
+/// `oci/` dir with a readable `index.json` — a half-published entry without it
+/// is treated as a miss (the caller pulls), never a corrupt build.
+async fn lookup_global_layout(data_dir: &Path, digest: &str) -> Option<PathBuf> {
+    let layout = global_oci_layout_entry(data_dir, digest).join("oci");
+    if tokio::fs::metadata(layout.join("index.json")).await.is_ok() {
+        Some(layout)
+    } else {
+        None
+    }
+}
+
+/// Recursively HARD-LINK every file under `src` into `dst` (same inode, no data
+/// copy — `data_dir` is one filesystem), recreating the dir tree. Falls back to
+/// a byte copy for a file whose hard link fails (e.g. cross-device). Best-effort
+/// at the call site.
+async fn hardlink_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        tokio::fs::create_dir_all(&d).await?;
+        let mut rd = tokio::fs::read_dir(&s).await?;
+        while let Some(ent) = rd.next_entry().await? {
+            let ft = ent.file_type().await?;
+            let sp = ent.path();
+            let dp = d.join(ent.file_name());
+            if ft.is_dir() {
+                stack.push((sp, dp));
+            } else if tokio::fs::hard_link(&sp, &dp).await.is_err()
+                && tokio::fs::metadata(&dp).await.is_err()
+            {
+                // cross-device (no hard link) and not already present → copy.
+                tokio::fs::copy(&sp, &dp).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Publish a freshly-pulled `layout` (the `<work>/oci` dir) into the GLOBAL
+/// layout cache keyed by `digest`, so the NEXT uuid with this digest skips the
+/// pull. Atomic: build a uuid-scoped temp entry (so concurrent builders never
+/// collide) then `rename` it into place; a lost race (entry already present) is
+/// success. Best-effort — a failure only forfeits a future cache hit, never the
+/// current build. Evicts to [`GLOBAL_LAYOUT_CACHE_KEEP`] afterwards.
+async fn publish_layout_to_global(data_dir: &Path, digest: &str, uuid: &str, layout: &Path) {
+    let entry = global_oci_layout_entry(data_dir, digest);
+    if lookup_global_layout(data_dir, digest).await.is_some() {
+        evict_global_layout_cache(data_dir).await;
+        return; // already cached
+    }
+    let Some(parent) = entry.parent() else {
+        return;
+    };
+    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        tracing::warn!(digest, error = %e, "global layout publish: mkdir failed (non-fatal)");
+        return;
+    }
+    let tmp = parent.join(format!(".tmp.{}.{uuid}", digest.replace(':', "-")));
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    if let Err(e) = hardlink_tree(layout, &tmp.join("oci")).await {
+        tracing::warn!(digest, error = %e, "global layout publish: link tree failed (non-fatal)");
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        return;
+    }
+    match tokio::fs::rename(&tmp, &entry).await {
+        Ok(()) => tracing::info!(digest, "oci layout published to global cache"),
+        // Lost a race (a concurrent build published it first) — fine.
+        Err(_) if lookup_global_layout(data_dir, digest).await.is_some() => {
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
+        }
+        Err(e) => {
+            tracing::warn!(digest, error = %e, "global layout publish: rename failed (non-fatal)");
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
+        }
+    }
+    evict_global_layout_cache(data_dir).await;
+}
+
+/// Bound the global layout cache to [`GLOBAL_LAYOUT_CACHE_KEEP`] entries (LRU by
+/// mtime). Safe even if a removed layout is mid-read by another build: the
+/// reader holds open fds (unlink-while-open) and the per-uuid rootfs is already
+/// built from it. In-flight `.tmp.*` entries are skipped.
+async fn evict_global_layout_cache(data_dir: &Path) {
+    let root = data_dir.join(GLOBAL_LAYOUT_CACHE_DIR);
+    let Ok(mut rd) = tokio::fs::read_dir(&root).await else {
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let path = e.path();
+        let is_tmp = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(".tmp."));
+        if path.is_dir() && !is_tmp {
+            let mtime = e
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            dirs.push((mtime, path));
+        }
+    }
+    if dirs.len() <= GLOBAL_LAYOUT_CACHE_KEEP {
+        return;
+    }
+    dirs.sort_by_key(|(t, _)| *t); // oldest first
+    let remove = dirs.len() - GLOBAL_LAYOUT_CACHE_KEEP;
+    for (_, path) in dirs.into_iter().take(remove) {
+        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            tracing::warn!(path = %path.display(), error = %e, "global layout evict failed");
+        } else {
+            tracing::info!(path = %path.display(), "global layout cache evicted (LRU bound)");
+        }
+    }
+}
+
 /// The digest-keyed work dir for a digest `registry_ref` — the parent of
 /// [`cached_rootfs_path`], i.e. where the OCI layout is pulled and the converted
 /// `rootfs.ext4` lands. Only valid once the digest is known (digest refs); a TAG
@@ -1492,6 +1633,43 @@ pub async fn run_firecracker_build(
         }
     }
 
+    // GLOBAL OCI-LAYOUT fast-path: the rootfs cache missed (a fresh dev-FC uuid,
+    // or an env-baked build the global ROOTFS cache excludes — #68), but we may
+    // already hold this digest's PULLED LAYOUT from an earlier uuid. The layout
+    // is env-FREE image content, so sharing it is ALWAYS sound (unlike the
+    // rootfs). Reuse it to skip the multi-minute WAN `oras copy` and build the
+    // (per-uuid, env-baked) rootfs locally. KEY WIN for dev-sessions: the pull is
+    // paid ONCE per base image, then every later dev-FC builds from the cache
+    // with NO pull (restores what #68 removed; #57).
+    if let Some(digest) = pre_digest.as_deref() {
+        if let Some(global_layout) = lookup_global_layout(data_dir, digest).await {
+            // Snapshot the SHARED layout into a per-uuid dir (hard links — no data
+            // copy) BEFORE reading it. The global entry is LRU-evictable and the
+            // unpack opens layer blobs LAZILY (one per layer, in turn), so a
+            // concurrent eviction could unlink a not-yet-opened blob mid-build →
+            // ENOENT. Reading from a copy the build OWNS removes that race. A link
+            // failure (e.g. the entry was evicted mid-snapshot) leaves the hit and
+            // falls through to a normal pull — correctness over the optimization.
+            let layout_work = data_dir.join("apps").join(uuid).join("fc").join(".layout");
+            tokio::fs::remove_dir_all(&layout_work).await.ok();
+            let local = layout_work.join("oci");
+            if hardlink_tree(&global_layout, &local).await.is_ok()
+                && tokio::fs::metadata(local.join("index.json")).await.is_ok()
+            {
+                tracing::info!(uuid, digest, "oci layout cache hit; skipping pull");
+                let config = read_oci_config_from_layout(&local)?;
+                let built = resolve_rootfs(
+                    uuid, fetched, &local, &config, digest, data_dir, runner, extra_env,
+                )
+                .await?;
+                if globally_cacheable {
+                    publish_rootfs_to_global(data_dir, digest, &built).await;
+                }
+                return launch_firecracker(&built, fetched, fc, uuid, reff, data_dir, is_swap).await;
+            }
+        }
+    }
+
     // MISS: pull, derive the authoritative digest from the pulled layout, convert,
     // then publish the rootfs to the GLOBAL digest cache for the next uuid.
     //
@@ -1507,6 +1685,9 @@ pub async fn run_firecracker_build(
     let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
         let work = digest_work_dir(data_dir, uuid, digest)?;
         let layout = pull_oci_layout(reff, &work, runner).await?;
+        // Seed the global layout cache so the NEXT uuid with this digest skips
+        // the pull (env-free → always safe; keyed by the immutable ref digest).
+        publish_layout_to_global(data_dir, digest, uuid, &layout).await;
         let config = read_oci_config_from_layout(&layout)?;
         let built = resolve_rootfs(
             uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env,
@@ -1520,6 +1701,12 @@ pub async fn run_firecracker_build(
         let work = fresh_tag_pull_dir(data_dir, uuid).await?;
         let layout = pull_oci_layout(reff, &work, runner).await?;
         let digest = read_manifest_digest_from_layout(&layout)?;
+        // Seed the global layout cache keyed by the AUTHORITATIVE manifest digest
+        // derived FROM the pulled layout — NOT the pre-pull `oras resolve` guess,
+        // which can diverge from a mutable tag's actual content. Key == content
+        // makes a future hit always serve the right image; a stale `pre_digest`
+        // then yields a harmless lookup MISS + re-pull, never wrong bytes.
+        publish_layout_to_global(data_dir, &digest, uuid, &layout).await;
         if rootfs_is_cached(data_dir, uuid, &digest) {
             cached_rootfs_path(data_dir, uuid, &digest)
         } else {

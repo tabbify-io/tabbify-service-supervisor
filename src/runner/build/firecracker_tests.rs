@@ -565,6 +565,127 @@ async fn global_cache_eviction_bounds_entry_count() {
     );
 }
 
+// ── Global OCI-layout cache (#57) ─────────────────────────────────────────────
+
+/// Stage a minimal but valid OCI layout dir (the `<work>/oci` shape that
+/// `pull_oci_layout` produces): `index.json` (the hit marker) + a blob.
+fn stage_fake_layout(oci_root: &Path) {
+    std::fs::create_dir_all(oci_root.join("blobs").join("sha256")).unwrap();
+    std::fs::write(oci_root.join("index.json"), br#"{"manifests":[]}"#).unwrap();
+    std::fs::write(
+        oci_root.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(oci_root.join("blobs").join("sha256").join("abc"), b"BLOB").unwrap();
+}
+
+/// `lookup_global_layout` MISSES cleanly when nothing is cached (the caller then
+/// pulls) — never a half-built layout.
+#[tokio::test]
+async fn layout_cache_lookup_misses_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        super::lookup_global_layout(tmp.path(), "sha256:absent")
+            .await
+            .is_none()
+    );
+}
+
+/// An entry dir that exists but lacks `oci/index.json` (a torn/partial publish)
+/// is treated as a MISS, so a corrupt layout never feeds a build.
+#[tokio::test]
+async fn layout_cache_entry_without_index_is_a_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    std::fs::create_dir_all(super::global_oci_layout_entry(data, "sha256:half").join("oci")).unwrap();
+    assert!(
+        super::lookup_global_layout(data, "sha256:half")
+            .await
+            .is_none()
+    );
+}
+
+/// Publish-then-lookup: a build for uuid-A seeds the global LAYOUT cache; a fresh
+/// uuid-B finds the SAME layout (no pull), sharing inodes (hard link, not copy)
+/// — the dev-FC pull-skip that #57 restores.
+#[tokio::test]
+async fn layout_cache_publish_then_lookup_shares_inode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    let digest = "sha256:layoutbeef";
+
+    // uuid-A's freshly-pulled layout (per-uuid work dir).
+    let src = data.join("apps").join("uuid-a").join("fc").join(".pull").join("oci");
+    stage_fake_layout(&src);
+
+    super::publish_layout_to_global(data, digest, "uuid-a", &src).await;
+
+    let hit = super::lookup_global_layout(data, digest)
+        .await
+        .expect("publish must populate the global layout cache");
+    assert!(hit.join("index.json").is_file());
+    assert_eq!(
+        std::fs::read(hit.join("blobs").join("sha256").join("abc")).unwrap(),
+        b"BLOB"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            std::fs::metadata(src.join("blobs").join("sha256").join("abc"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(hit.join("blobs").join("sha256").join("abc"))
+                .unwrap()
+                .ino(),
+            "layout publish must HARD-LINK blobs (share inode), not duplicate the image"
+        );
+    }
+}
+
+/// A second publish for the same digest (a later/concurrent build) is a no-op,
+/// not an error or a corruption — the cache stays valid.
+#[tokio::test]
+async fn layout_cache_publish_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    let digest = "sha256:dup";
+    let src = data.join("apps").join("uuid-a").join("fc").join(".pull").join("oci");
+    stage_fake_layout(&src);
+
+    super::publish_layout_to_global(data, digest, "uuid-a", &src).await;
+    super::publish_layout_to_global(data, digest, "uuid-b", &src).await;
+
+    assert!(super::lookup_global_layout(data, digest).await.is_some());
+}
+
+/// Eviction bounds the layout cache to KEEP entries — the layout cache must never
+/// fill the worker disk (a past rootfs-full caused a full outage).
+#[tokio::test]
+async fn layout_cache_eviction_bounds_entry_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path();
+    let total = super::GLOBAL_LAYOUT_CACHE_KEEP + 3;
+    for i in 0..total {
+        let oci = super::global_oci_layout_entry(data, &format!("sha256:{i:064x}")).join("oci");
+        std::fs::create_dir_all(&oci).unwrap();
+        std::fs::write(oci.join("index.json"), b"{}").unwrap();
+    }
+    super::evict_global_layout_cache(data).await;
+    let remaining = std::fs::read_dir(data.join("oci-layout-cache"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .count();
+    assert_eq!(
+        remaining,
+        super::GLOBAL_LAYOUT_CACHE_KEEP,
+        "eviction must bound the layout cache to KEEP entries"
+    );
+}
+
 use crate::fetcher::FetchedApp;
 use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
 use bytes::Bytes;
