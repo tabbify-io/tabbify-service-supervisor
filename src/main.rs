@@ -322,7 +322,13 @@ async fn main() -> anyhow::Result<()> {
     // (the bind addr is not self-connectable; self-update is a meshed-node
     // concern). Best-effort: a watchdog spawn must never block serving.
     if !config.no_mesh {
-        spawn_post_restart_watchdog(bind_addr);
+        // Capture the data-plane probe from the live membership (held for the
+        // process lifetime in `_membership`). The previous-good (rollback
+        // target) is the last CONFIRMED build, which passed its OWN data-plane
+        // watchdog, so it demonstrably had the tunnel — `data_plane_probe`
+        // present ⇒ the revert clause is armed (D6).
+        let data_plane = _membership.as_ref().map(MeshMembership::data_plane_probe);
+        spawn_post_restart_watchdog(bind_addr, data_plane);
     }
 
     axum::serve(listener, app).await.context("server error")?;
@@ -367,7 +373,11 @@ async fn run_self_update(to: &str) -> i32 {
 /// stability window; on confirm it clears the marker, on failure it rolls back
 /// to previous-good + restarts. No-op (returns immediately) when there is no
 /// pending swap — the steady-state boot path.
-fn spawn_post_restart_watchdog(bind_addr: SocketAddr) {
+fn spawn_post_restart_watchdog(
+    bind_addr: SocketAddr,
+    data_plane: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+) {
+    use tabbify_supervisor::selfupdate::DEFAULT_DATA_PLANE_WINDOW;
     use tabbify_supervisor::selfupdate::SelfUpdateConfig;
     use tabbify_supervisor::selfupdate::confirm::{
         confirm_or_revert, live_local_observe, pending_swap,
@@ -380,20 +390,23 @@ fn spawn_post_restart_watchdog(bind_addr: SocketAddr) {
     };
     tracing::info!(version = %pending, "post-restart self-watchdog: confirming pending swap");
 
+    // The previous-good (rollback target) is the last CONFIRMED build, which
+    // passed its OWN data-plane watchdog, so it demonstrably had the tunnel.
+    // No data-plane handle (e.g. a transient join failure) ⇒ treat the data
+    // plane as live (fail-open: the control-plane gate still guards us).
+    let prev_good_had_tunnel = data_plane.is_some();
+    let data_plane = data_plane.unwrap_or_else(|| std::sync::Arc::new(|| true));
+
     tokio::spawn(async move {
         let restart = production_restart_runner();
-        // D3 placeholder seam: a fail-open data plane (always live). D6 wires the
-        // real membership data-plane probe + DEFAULT_DATA_PLANE_WINDOW here.
-        let data_plane: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
-            std::sync::Arc::new(|| true);
-        let observe = live_local_observe(bind_addr, data_plane, true);
-        // Poll every 2s through the stability window (default 45s < heartbeat).
+        let observe = live_local_observe(bind_addr, data_plane, prev_good_had_tunnel);
+        // Poll every 2s; control window 45s, data-plane soak 120s (separate).
         let poll = std::time::Duration::from_secs(2);
         match confirm_or_revert(
             &cfg.install_dir,
             &cfg.releases_dir,
             cfg.stability_window,
-            std::time::Duration::from_secs(120),
+            DEFAULT_DATA_PLANE_WINDOW,
             poll,
             observe,
             &restart,

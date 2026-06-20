@@ -251,6 +251,23 @@ impl MeshMembership {
             .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
         self.joiner.dataplane_healthy(now_micros)
     }
+
+    /// A cheap, `Send + Sync` data-plane probe closure for the OTA watchdog
+    /// (Track D, D6): captures a clone of the joiner handle and evaluates
+    /// [`Joiner::dataplane_healthy`] against the current clock on each call
+    /// (self-clocked exactly like [`Self::dataplane_healthy`]). Used by `main`'s
+    /// post-restart watchdog wiring to feed `live_local_observe`'s data-plane
+    /// seam without coupling `main` to the joiner directly.
+    #[must_use]
+    pub fn data_plane_probe(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let joiner = Arc::clone(&self.joiner);
+        Arc::new(move || {
+            let now_micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+            joiner.dataplane_healthy(now_micros)
+        })
+    }
 }
 
 /// Advertise `my_ula` as a hosted app-ULA on the given mesh handle (FIX #9).

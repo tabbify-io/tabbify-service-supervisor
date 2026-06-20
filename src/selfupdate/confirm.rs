@@ -344,11 +344,40 @@ mod tests {
         );
     }
 
+    /// D6: the production-shaped observer (live_local_observe with a data-plane
+    /// closure) surfaces a dead data plane into the WatchdogObservations the
+    /// watchdog consumes. We can't bind a real local HTTP server here, so we
+    /// assert the field plumbing: a `false` data-plane closure ⇒ a snapshot with
+    /// data_plane_live=false (health/pong come back false against a dead addr,
+    /// which is fine — this test pins the data-plane field wiring specifically).
+    #[tokio::test]
+    async fn live_observe_surfaces_data_plane_verdict() {
+        // An unroutable addr ⇒ health/pong false; the data-plane closure is the
+        // field under test.
+        let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let dp = std::sync::Arc::new(|| false);
+        let mut observe = live_local_observe(dead_addr, dp, true);
+        let snap = observe().await;
+        assert!(
+            !snap.data_plane_live,
+            "data-plane closure verdict must ride onto the snapshot"
+        );
+        assert!(
+            snap.previous_good_had_tunnel,
+            "prev-good-had-tunnel flag must ride onto the snapshot"
+        );
+    }
+
     /// D4: every auto-revert emits a structured ALARM event at the stable
     /// `selfupdate.revert.alarm` target with the rolled-back version + reason,
     /// so Loki/promtail can fire on it (a silent revert is invisible today).
-    #[tokio::test]
-    async fn revert_emits_alarm_event() {
+    ///
+    /// Driven on a DEDICATED current-thread runtime inside `with_default` so the
+    /// thread-local capturing subscriber stays installed across every `.await`
+    /// (a multi-thread runtime could migrate the task off the subscriber thread
+    /// and silently drop the alarm event — flaky under the parallel test load).
+    #[test]
+    fn revert_emits_alarm_event() {
         use tracing::field::{Field, Visit};
         use tracing::{Event, Subscriber};
 
@@ -417,19 +446,28 @@ mod tests {
         .unwrap();
 
         let (restart, _calls) = recording_restart();
-        let guard = tracing::subscriber::set_default(cap);
-        confirm_or_revert(
-            install,
-            &releases,
-            Duration::from_secs(90),
-            Duration::from_secs(120),
-            Duration::from_millis(1),
-            unhealthy_observe(),
-            &restart,
-        )
-        .await
-        .unwrap();
-        drop(guard);
+        // Single-threaded executor + thread-local subscriber, both pinned to THIS
+        // thread, so the alarm event (emitted after the watchdog's awaits) is
+        // always captured.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(cap, || {
+            rt.block_on(async {
+                confirm_or_revert(
+                    install,
+                    &releases,
+                    Duration::from_secs(90),
+                    Duration::from_secs(120),
+                    Duration::from_millis(1),
+                    unhealthy_observe(),
+                    &restart,
+                )
+                .await
+                .unwrap();
+            });
+        });
 
         let events = sink.lock().unwrap();
         assert!(
