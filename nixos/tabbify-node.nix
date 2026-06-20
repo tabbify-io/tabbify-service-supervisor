@@ -26,6 +26,15 @@ let
   kernelUrl   = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128";
   dataDir     = "/opt/tabbify";
 
+  # Track C signed remote-restart: the super-admin Ed25519 PUBLIC key (64-char
+  # hex) this node verifies every remote command against, end-to-end. Empty (the
+  # default) DISABLES remote commands — the supervisor's gate is fail-closed, so
+  # an unset / malformed key means every signed command is rejected. It is a
+  # PUBLIC key (safe in git / the Nix store), but for rotation without a rebuild
+  # it can also be supplied via the `${dataDir}/supervisor.env` EnvironmentFile
+  # drop-in (TABBIFY_MESH_SUPER_ADMIN_PUBKEY=<hex>), which overrides this default.
+  meshSuperAdminPubkey = "";
+
   # On-host versioned layout (persistent, OUTSIDE the Nix store — this module
   # manages the systemd UNIT, never the binaries as derivations). The binaries
   # live under releases/v<VER>/{supervisord,tabbify-runner}; the top-level
@@ -253,6 +262,13 @@ in {
       # forwards `--mesh-relay-only` to every runner it spawns (which share this
       # host's NAT/firewall), so the whole node converges over the relay.
       TABBIFY_MESH_RELAY_ONLY = "true";
+      # Track C signed remote-restart: the super-admin Ed25519 PUBLIC key (hex)
+      # this node verifies remote commands against end-to-end. Empty default →
+      # remote commands DISABLED (fail-closed gate). The EnvironmentFile drop-in
+      # (supervisor.env) overrides this when set, so the key can be rotated
+      # without a Nix rebuild. A compromised coordinator can relay but never
+      # forge a command (the node verifies this key, not the transport).
+      TABBIFY_MESH_SUPER_ADMIN_PUBKEY = meshSuperAdminPubkey;
       # Always capture the Firecracker serial console: runners inherit this env
       # and append guest console output to <data_dir>/fc/<uuid>.console.log
       # (src/firecracker/linux.rs::console_stdio) — without it a spawn failure
@@ -297,10 +313,12 @@ in {
       # this node to present a join token on register; the coordinator then stamps
       # the node's network + tags from the token CLAIMS. Kept OUT of the Nix store
       # (no secret in git / world-readable store): drop it out-of-band into
-      #   /etc/tabbify/supervisor.env   ->   TABBIFY_JOIN_TOKEN=<jwt>   (chmod 600)
-      # before `nixos-rebuild switch`. The leading '-' makes a missing file
+      #   ${dataDir}/supervisor.env   ->   TABBIFY_JOIN_TOKEN=<jwt>   (chmod 600)
+      # before `nixos-rebuild switch`. This is the SAME path the curl|sh
+      # installer writes (scripts/install.sh), so both install paths share one
+      # canonical token location. The leading '-' makes a missing file
       # non-fatal, so a dev / no-mesh node still starts.
-      EnvironmentFile  = "-/etc/tabbify/supervisor.env";
+      EnvironmentFile  = "-${dataDir}/supervisor.env";
       # on-failure (NOT always): a clean exit during a watchdog rollback must
       # NOT auto-respawn the just-swapped-out binary. Exponential-ish backoff
       # (RestartSec grows over RestartSteps up to RestartMaxDelaySec) avoids a

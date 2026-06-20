@@ -5,12 +5,32 @@
 //! the CONTROL listener, and hands out an [`Arc<dyn MeshHost>`] the per-app-ULA
 //! hosting layer ([`crate::host::AppHost`]) uses to route app-ULAs.
 
-use std::{net::Ipv6Addr, sync::Arc};
+use std::{net::Ipv6Addr, path::Path, sync::Arc};
 
 use anyhow::Context;
 use mesh_joiner::{JoinConfig, Joiner};
 
 use crate::host::MeshHost;
+use crate::mesh_command::sink::SupervisorCommandSink;
+
+/// Env var carrying the super-admin Ed25519 pubkey as 64-char hex (Track C).
+/// Unset / malformed → remote commands disabled (fail-closed).
+pub const SUPER_ADMIN_PUBKEY_ENV: &str = "TABBIFY_MESH_SUPER_ADMIN_PUBKEY";
+
+/// The systemd unit a `RestartJoiner` verb restarts (the supervisor's own unit).
+pub const SUPERVISOR_UNIT: &str = "tabbify-supervisor";
+
+/// Filename of the Track-C executed-nonce replay-guard sidecar under `data_dir`.
+pub const COMMAND_NONCE_FILENAME: &str = "mesh-command-nonces.json";
+
+/// Parse a 32-byte Ed25519 pubkey from optional 64-char hex (Track C). `None` on
+/// absent / malformed / wrong-length input — the caller then disables remote
+/// commands (fail-closed: a wedged pubkey can never become an open door).
+#[must_use]
+pub fn parse_super_admin_pubkey(hex_opt: Option<&str>) -> Option<[u8; 32]> {
+    let raw = hex::decode(hex_opt?.trim()).ok()?;
+    raw.as_slice().try_into().ok()
+}
 
 /// A joined mesh membership: holds the [`Joiner`] (kept alive for the process
 /// so the TUN device + WG background tasks stay up) and the addressing info the
@@ -103,6 +123,7 @@ impl MeshMembership {
     /// Propagates the broad `Joiner::join` failure surface (HTTP, TUN setup,
     /// UDP bind, sudo). On a host without root / TUN this fails — callers that
     /// want to run without the mesh should use `--no-mesh` and skip this.
+    #[allow(clippy::too_many_arguments)]
     pub async fn join(
         coordinator_url: &str,
         display_name: &str,
@@ -111,6 +132,7 @@ impl MeshMembership {
         relay_url: Option<String>,
         relay_only: bool,
         advertise_endpoint: Option<String>,
+        data_dir: &Path,
     ) -> anyhow::Result<Self> {
         let config = build_supervisor_join_config(
             coordinator_url,
@@ -121,7 +143,27 @@ impl MeshMembership {
             relay_only,
             advertise_endpoint,
         );
-        Self::from_config(config, "join mesh as supervisor").await
+        // Track C: resolve the super-admin pubkey (fail-closed when unset /
+        // malformed) + build the production restart/reboot sink. A node without
+        // `TABBIFY_MESH_SUPER_ADMIN_PUBKEY` set gets a fail-closed gate (every
+        // signed command rejected), so remote restart is OFF by default.
+        let super_admin_pubkey =
+            parse_super_admin_pubkey(std::env::var(SUPER_ADMIN_PUBKEY_ENV).ok().as_deref());
+        if super_admin_pubkey.is_some() {
+            tracing::info!("Track C: super-admin pubkey configured — signed remote commands ENABLED");
+        }
+        let nonce_path = data_dir.join(COMMAND_NONCE_FILENAME);
+        let sink: Arc<dyn mesh_joiner::coordinator::command_exec::CommandSink> =
+            Arc::new(SupervisorCommandSink::new(data_dir, SUPERVISOR_UNIT));
+        let joiner = Joiner::join_with_commands(
+            config,
+            super_admin_pubkey,
+            Some(nonce_path),
+            Some(sink),
+        )
+        .await
+        .context("join mesh as supervisor")?;
+        Ok(Self::from_joiner(joiner))
     }
 
     /// Join the mesh from a fully-built [`JoinConfig`] — used by the per-app
@@ -136,15 +178,22 @@ impl MeshMembership {
     }
 
     /// Shared core: drive [`Joiner::join`] and capture the assigned addressing.
+    /// Used by the runner path (which does NOT wire Track-C remote commands —
+    /// only the long-lived supervisor is a restart target).
     async fn from_config(config: JoinConfig, ctx: &'static str) -> anyhow::Result<Self> {
         let joiner = Joiner::join(config).await.context(ctx)?;
+        Ok(Self::from_joiner(joiner))
+    }
+
+    /// Capture the assigned addressing from a freshly-joined [`Joiner`].
+    fn from_joiner(joiner: Joiner) -> Self {
         let my_ula = joiner.my_ula();
         let peer_id = joiner.my_peer_id().to_string();
-        Ok(Self {
+        Self {
             joiner: Arc::new(joiner),
             my_ula,
             peer_id,
-        })
+        }
     }
 
     /// Our assigned peer-ULA (bind the CONTROL listener on `[my_ula]:port`).
@@ -349,6 +398,24 @@ mod tests {
         assert_eq!(md.software_version.as_deref(), Some("1.4.0"));
         // Default omits it (None = unknown, never a downgrade trigger).
         assert!(JoinMetadata::default().software_version.is_none());
+    }
+
+    /// Track C: the super-admin pubkey resolves from 64-char hex; wrong length
+    /// or absence → `None` (fail-closed: remote commands disabled).
+    #[test]
+    fn resolve_super_admin_pubkey_from_hex_env() {
+        // 32 bytes of 0xAB, hex-encoded.
+        let hex = "ab".repeat(32);
+        let pk = super::parse_super_admin_pubkey(Some(&hex));
+        assert!(pk.is_some(), "valid 32-byte hex must resolve");
+        assert_eq!(pk.unwrap(), [0xAB; 32]);
+
+        // Wrong length → None (fail-closed: no remote commands).
+        assert!(super::parse_super_admin_pubkey(Some("abcd")).is_none());
+        // Absent → None.
+        assert!(super::parse_super_admin_pubkey(None).is_none());
+        // Non-hex → None.
+        assert!(super::parse_super_admin_pubkey(Some(&"zz".repeat(32))).is_none());
     }
 
     /// The supervisor's software_version is wired onto `JoinConfig` so it rides
