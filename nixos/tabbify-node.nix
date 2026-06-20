@@ -304,6 +304,26 @@ in {
       # The probe/start gate ceiling from the spec (§4): a candidate that does
       # not reach READY within 60s is killed by systemd -> rollback territory.
       TimeoutStartSec  = 60;
+      # Track B tier-1 (self-heal watchdog). systemd arms a hardware-style
+      # watchdog on this unit: supervisord must send sd_notify(WATCHDOG=1) at
+      # least every WatchdogSec or systemd SIGKILLs + restarts it. The
+      # independent watchdog-pet task in supervisord pets every WatchdogSec/2
+      # ONLY while the mesh data plane is healthy (Track-K dataplane_healthy);
+      # on a sustained black hole (control-plane alive, WG decap-RX zero — the
+      # MSI incident) the pet stops, systemd restarts the unit, and the fresh
+      # register + fresh boringtun Tunns + fresh relay-WS re-handshake the
+      # tunnel. 120s > ~20s heartbeat + a realistic WAN stall AND > the ~90s
+      # Track-K RX-silence threshold, so dataplane_healthy() has already flipped
+      # false (and stayed false across a W/2 skip) before systemd fires — a
+      # healthy but momentarily-laggy node is never killed (spec §8 tuning).
+      #
+      # KillMode=process (above, SU-2) means this watchdog restart signals ONLY
+      # supervisord — the setsid-detached app/dev runners + their Firecrackers
+      # survive and are re-adopted by readopt() on the fresh boot, so a self-heal
+      # never loses a /workspace. relay_only rides TABBIFY_MESH_RELAY_ONLY in the
+      # env (above), so the post-restart re-join preserves it automatically.
+      WatchdogSec      = 120;
+      WatchdogSignal   = "SIGKILL";  # default, made explicit: hard-kill a wedged proc
       # Fail-safe on-host joiner self-update at boot (NX-4): a broken joiner
       # makes this exit non-zero -> the unit fails to start -> host left as-is.
       ExecStartPre     = "${supervisorFetchJoiner}";
