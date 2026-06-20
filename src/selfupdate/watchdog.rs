@@ -36,6 +36,17 @@ pub struct WatchdogObservations {
     pub window_elapsed: bool,
     /// Restart/backoff state of the freshly-swapped supervisor (restart.rs).
     pub restart: RestartState,
+    /// The live WG data plane has an inbound decap frame within the staleness
+    /// threshold (Track-K `dataplane_healthy`). The post-restart watchdog runs
+    /// as the REAL rooted production process (unlike the `--no-mesh` candidate
+    /// probe), so it CAN observe the live tunnel. `true` for an idle/quiet node.
+    pub data_plane_live: bool,
+    /// The previous-good version (the rollback target) demonstrably had a live
+    /// tunnel before this swap. Gate for the data-plane revert: we only roll
+    /// back a build for breaking WG if rolling back would actually restore it.
+    /// `false` means the environment itself is down — rolling back is futile,
+    /// so we DON'T (fail-open for availability, spec §7).
+    pub previous_good_had_tunnel: bool,
 }
 
 /// What the watchdog should do given the latest observation.
@@ -61,6 +72,13 @@ pub fn decide_revert(o: WatchdogObservations) -> RevertDecision {
     }
     if !o.pong {
         return RevertDecision::Revert("post-swap control Ping had no Pong".into());
+    }
+    // D1: data-plane-aware revert. The control plane (HTTP /health + /v1/about,
+    // the relay-WS + HTTPS heartbeat transports) can stay green while the WG
+    // tunnel is a black hole (the MSI incident). Revert ONLY when the tunnel is
+    // dead AND the rollback target had it — never thrash when the env is down.
+    if !o.data_plane_live && o.previous_good_had_tunnel {
+        return RevertDecision::Revert("post-swap WG data plane dead (tunnel black-holed)".into());
     }
     if o.window_elapsed {
         RevertDecision::KeepNewVersion
@@ -211,12 +229,63 @@ mod tests {
             pong: true,
             window_elapsed: true,
             restart: RestartState::default(),
+            // D1: a healthy baseline has a live tunnel and a previous-good that
+            // also had one (so the data-plane revert clause is armed but unmet).
+            data_plane_live: true,
+            previous_good_had_tunnel: true,
         }
     }
 
     #[test]
     fn stays_when_healthy_through_window() {
         assert_eq!(decide_revert(healthy()), RevertDecision::KeepNewVersion);
+    }
+
+    /// D1: a dead data plane AFTER a swap, when the previous-good build
+    /// demonstrably HAD the tunnel, reverts — the build broke WG even though
+    /// /health + /v1/about (control-plane transports) stay green.
+    #[test]
+    fn reverts_on_dead_data_plane_when_previous_good_had_tunnel() {
+        let o = WatchdogObservations {
+            data_plane_live: false,
+            previous_good_had_tunnel: true,
+            ..healthy()
+        };
+        match decide_revert(o) {
+            RevertDecision::Revert(why) => assert!(
+                why.contains("data plane"),
+                "revert reason must name the data plane, got: {why}"
+            ),
+            other => panic!("expected Revert, got {other:?}"),
+        }
+    }
+
+    /// D1 fail-open: a dead data plane is NOT a revert trigger when the
+    /// previous-good build ALSO lacked the tunnel — that means the ENVIRONMENT
+    /// (relay/coordinator/host network) is down, not this build. Rolling back
+    /// would thrash without fixing anything (§7 fail-open for availability).
+    #[test]
+    fn does_not_revert_dead_data_plane_when_env_itself_is_down() {
+        let o = WatchdogObservations {
+            data_plane_live: false,
+            previous_good_had_tunnel: false, // env down, not the new build
+            window_elapsed: true,
+            ..healthy()
+        };
+        // Healthy control plane + window elapsed ⇒ keep (do not thrash).
+        assert_eq!(decide_revert(o), RevertDecision::KeepNewVersion);
+    }
+
+    /// D1: a LIVE data plane keeps the new version through the window exactly
+    /// as before (no behavioural regression to the existing control-plane gate).
+    #[test]
+    fn keeps_new_version_when_data_plane_live() {
+        let o = WatchdogObservations {
+            data_plane_live: true,
+            previous_good_had_tunnel: true,
+            ..healthy()
+        };
+        assert_eq!(decide_revert(o), RevertDecision::KeepNewVersion);
     }
 
     #[test]
@@ -388,6 +457,8 @@ mod tests {
                     pong: true,
                     window_elapsed: false, // overwritten by run_watchdog
                     restart: RestartState::default(),
+                    data_plane_live: true,
+                    previous_good_had_tunnel: true,
                 }
             })
         });
@@ -443,6 +514,8 @@ mod tests {
                     pong: true,
                     window_elapsed: false,
                     restart: RestartState::default(),
+                    data_plane_live: true,
+                    previous_good_had_tunnel: true,
                 }
             })
         });
@@ -505,6 +578,8 @@ mod tests {
                     pong: true,
                     window_elapsed: false, // overwritten; window is NOT yet elapsed
                     restart: RestartState::default(),
+                    data_plane_live: true,
+                    previous_good_had_tunnel: true,
                 }
             })
         });
@@ -574,6 +649,8 @@ mod tests {
                         consecutive_failures: 5, // >= crashloop threshold
                         ..Default::default()
                     },
+                    data_plane_live: true,
+                    previous_good_had_tunnel: true,
                 }
             })
         });

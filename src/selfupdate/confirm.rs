@@ -116,6 +116,10 @@ pub fn live_local_observe(local: SocketAddr) -> ObserveFn<'static> {
                 // Overwritten by run_watchdog from the elapsed window.
                 window_elapsed: false,
                 restart: RestartState::default(),
+                // D1 placeholder: a live data plane (fail-open). D3 rewires this
+                // to the injected Track-K data-plane closure.
+                data_plane_live: true,
+                previous_good_had_tunnel: true,
             }
         })
     })
@@ -168,6 +172,8 @@ mod tests {
                     pong: true,
                     window_elapsed: false,
                     restart: RestartState::default(),
+                    data_plane_live: true,
+                    previous_good_had_tunnel: true,
                 }
             })
         })
@@ -181,6 +187,8 @@ mod tests {
                     pong: true,
                     window_elapsed: false,
                     restart: RestartState::default(),
+                    data_plane_live: true,
+                    previous_good_had_tunnel: true,
                 }
             })
         })
