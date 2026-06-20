@@ -2311,6 +2311,7 @@ dependencies = [
 [[package]]
 name = "tabbify-workspace-contract"
 version = "0.1.0"
+source = "git+https://github.com/tabbify-io/tabbify-workspace-contract.git?rev=35330cac6925d89928d916d0b6ce0d9839099f00#35330cac6925d89928d916d0b6ce0d9839099f00"
 dependencies = [
  "serde",
  "serde_json",
