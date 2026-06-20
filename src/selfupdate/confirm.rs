@@ -65,6 +65,7 @@ pub async fn confirm_or_revert(
     install_dir: &Path,
     releases_dir: &Path,
     stability_window: Duration,
+    data_plane_window: Duration,
     poll_interval: Duration,
     observe: ObserveFn<'_>,
     restart: &RestartRunner,
@@ -73,6 +74,7 @@ pub async fn confirm_or_revert(
         install_dir,
         releases_dir,
         stability_window,
+        data_plane_window,
         poll_interval,
         observe,
         restart,
@@ -96,30 +98,43 @@ pub async fn confirm_or_revert(
 
 /// Build the production [`ObserveFn`] that samples the LIVE local supervisor:
 /// `GET http://<local>/health` (gate part 2) + `GET http://<local>/v1/about`
-/// (gate part 3, the distinct liveness route the candidate probe also uses).
-/// Both must return 2xx for the observation to be healthy. The restart state is
-/// not tracked in-process here (systemd owns restarts), so it is reported as
-/// the default (no consecutive failures): a hard crash is caught by systemd's
-/// own restart policy + the heartbeat-timeout, while THIS watchdog catches a
-/// process that came up but cannot serve.
+/// (gate part 3, the distinct liveness route the candidate probe also uses),
+/// PLUS the live WG data-plane verdict via the injected `data_plane`/
+/// `prev_good_had_tunnel` seams (Track D). The control checks must return 2xx
+/// for the observation to be healthy; the data-plane closure is a cheap,
+/// synchronous joiner read.
+///
+/// The data-plane closures are seams so this stays unit-testable without a live
+/// joiner: production wires `data_plane` to
+/// [`crate::mesh::MeshMembership::dataplane_healthy`] (D6).
+///
+/// The restart state is not tracked in-process here (systemd owns restarts), so
+/// it is reported as the default (no consecutive failures): a hard crash is
+/// caught by systemd's own restart policy + the heartbeat-timeout, while THIS
+/// watchdog catches a process that came up but cannot serve.
 #[must_use]
-pub fn live_local_observe(local: SocketAddr) -> ObserveFn<'static> {
+pub fn live_local_observe(
+    local: SocketAddr,
+    data_plane: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    prev_good_had_tunnel: bool,
+) -> ObserveFn<'static> {
     let client = reqwest::Client::new();
     Box::new(move || {
         let client = client.clone();
+        let data_plane = std::sync::Arc::clone(&data_plane);
         Box::pin(async move {
             let health_200 = probe_2xx(&client, &format!("http://{local}/health")).await;
             let pong = probe_2xx(&client, &format!("http://{local}/v1/about")).await;
+            // The data-plane verdict is a cheap, synchronous joiner read.
+            let data_plane_live = data_plane();
             WatchdogObservations {
                 health_200,
                 pong,
                 // Overwritten by run_watchdog from the elapsed window.
                 window_elapsed: false,
                 restart: RestartState::default(),
-                // D1 placeholder: a live data plane (fail-open). D3 rewires this
-                // to the injected Track-K data-plane closure.
-                data_plane_live: true,
-                previous_good_had_tunnel: true,
+                data_plane_live,
+                previous_good_had_tunnel: prev_good_had_tunnel,
             }
         })
     })
@@ -248,6 +263,7 @@ mod tests {
             install,
             &install.join("releases"),
             Duration::ZERO, // first poll already sees window_elapsed
+            Duration::from_secs(120),
             Duration::from_millis(1),
             healthy_observe(),
             &restart,
@@ -291,6 +307,7 @@ mod tests {
             install,
             &releases,
             Duration::from_secs(90),
+            Duration::from_secs(120),
             Duration::from_millis(1),
             unhealthy_observe(),
             &restart,

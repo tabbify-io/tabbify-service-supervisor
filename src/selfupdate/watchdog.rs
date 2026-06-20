@@ -188,19 +188,35 @@ pub async fn run_watchdog(
     install_dir: &Path,
     releases_dir: &Path,
     stability_window: Duration,
+    data_plane_window: Duration,
     poll_interval: Duration,
     mut observe: ObserveFn<'_>,
     restart: &RestartRunner,
 ) -> Result<Option<String>> {
+    use super::dataplane::DataPlaneDebounce;
+
     // Floor the poll cadence so a misconfigured `poll_interval == 0` cannot turn
     // the watch loop into a CPU-spinning busy-loop while still inside the
     // window. The window is the safety bound for total wait time; this only
     // bounds the per-tick wait.
     let poll_interval = poll_interval.max(MIN_POLL_INTERVAL);
     let started = Instant::now();
+    let mut debounce = DataPlaneDebounce::default();
     loop {
         let mut snapshot = observe().await;
         snapshot.window_elapsed = started.elapsed() >= stability_window;
+
+        // D2/D3: the data-plane verdict only counts once DEBOUNCED. A live poll
+        // resets the streak; a dead poll extends it. We hand `decide_revert` a
+        // data_plane_live that is "still live as far as the revert clause is
+        // concerned" UNLESS the streak is armed — so a single flap never trips
+        // the revert. After the data-plane window elapses we stop arming new
+        // streaks (fail-open: keep the build, keep polling for control health).
+        let armed = debounce.observe(snapshot.data_plane_live);
+        let within_dp_window = started.elapsed() < data_plane_window;
+        // Only let a dead data plane reach decide_revert when armed AND we are
+        // still inside the (longer) data-plane soak window.
+        snapshot.data_plane_live = snapshot.data_plane_live || !(armed && within_dp_window);
 
         match decide_revert(snapshot) {
             RevertDecision::KeepNewVersion => return Ok(None),
@@ -468,6 +484,7 @@ mod tests {
             install,
             &install.join("releases"),
             Duration::ZERO,
+            Duration::from_secs(120),
             Duration::from_millis(1),
             observe,
             &restart,
@@ -524,6 +541,7 @@ mod tests {
             install,
             &releases,
             Duration::from_secs(90),
+            Duration::from_secs(120),
             Duration::from_millis(1),
             observe,
             &restart,
@@ -591,6 +609,7 @@ mod tests {
             // A window far larger than any test wall-clock: if the revert were
             // gated on window-elapse, it could never fire here.
             Duration::from_secs(90),
+            Duration::from_secs(120),
             Duration::from_millis(1),
             observe,
             &restart,
@@ -660,6 +679,7 @@ mod tests {
             install,
             &releases,
             Duration::from_secs(90),
+            Duration::from_secs(120),
             Duration::from_millis(1),
             observe,
             &restart,
@@ -811,5 +831,116 @@ mod tests {
             1,
             "exactly one restart on success"
         );
+    }
+
+    /// D3: a single dead-data-plane poll does NOT revert; the watchdog keeps
+    /// watching until K=3 consecutive dead polls arm the debounce, THEN reverts.
+    /// Control plane stays green the whole time (the black-hole signature).
+    #[tokio::test]
+    async fn run_watchdog_debounces_data_plane_then_reverts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage_release(&releases, ver);
+        }
+        for bin in SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+            },
+        )
+        .unwrap();
+
+        // Every poll: control plane healthy, data plane DEAD, previous-good HAD
+        // the tunnel. Count polls to prove the debounce held for K-1 ticks.
+        let polls = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&polls);
+        let observe: ObserveFn<'_> = Box::new(move || {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                *counter.lock().unwrap() += 1;
+                WatchdogObservations {
+                    health_200: true,
+                    pong: true,
+                    window_elapsed: false,
+                    restart: RestartState::default(),
+                    data_plane_live: false,
+                    previous_good_had_tunnel: true,
+                }
+            })
+        });
+
+        let (restart, calls) = recording_restart();
+        let rolled_back = run_watchdog(
+            install,
+            &releases,
+            Duration::from_secs(45),  // control window
+            Duration::from_secs(120), // data-plane window
+            Duration::from_millis(1),
+            observe,
+            &restart,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rolled_back, Some("v1.0.0".to_owned()));
+        assert!(
+            *polls.lock().unwrap() >= 3,
+            "must debounce >= 3 dead polls before reverting, got {}",
+            *polls.lock().unwrap()
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "one rollback restart");
+    }
+
+    /// D3: a SINGLE dead data-plane flap inside an otherwise-healthy window does
+    /// NOT revert — the streak resets on the next live poll, and the new version
+    /// is kept once the control window elapses.
+    #[tokio::test]
+    async fn run_watchdog_keeps_through_single_data_plane_flap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        // Alternate dead/live so the streak never reaches 3; control healthy.
+        let n = Arc::new(Mutex::new(0u32));
+        let cnt = Arc::clone(&n);
+        let observe: ObserveFn<'_> = Box::new(move || {
+            let cnt = Arc::clone(&cnt);
+            Box::pin(async move {
+                let mut g = cnt.lock().unwrap();
+                *g += 1;
+                let live = *g % 2 == 0; // dead, live, dead, live...
+                WatchdogObservations {
+                    health_200: true,
+                    pong: true,
+                    window_elapsed: false,
+                    restart: RestartState::default(),
+                    data_plane_live: live,
+                    previous_good_had_tunnel: true,
+                }
+            })
+        });
+
+        let (restart, calls) = recording_restart();
+        // Zero control window ⇒ first all-control-healthy tick that is NOT
+        // debounce-armed returns KeepNewVersion.
+        let kept = run_watchdog(
+            install,
+            &install.join("releases"),
+            Duration::ZERO,
+            Duration::from_secs(120),
+            Duration::from_millis(1),
+            observe,
+            &restart,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(kept, None, "a single flap must not revert");
+        assert!(calls.lock().unwrap().is_empty(), "no rollback on a flap");
     }
 }

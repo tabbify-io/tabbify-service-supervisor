@@ -382,13 +382,18 @@ fn spawn_post_restart_watchdog(bind_addr: SocketAddr) {
 
     tokio::spawn(async move {
         let restart = production_restart_runner();
-        let observe = live_local_observe(bind_addr);
+        // D3 placeholder seam: a fail-open data plane (always live). D6 wires the
+        // real membership data-plane probe + DEFAULT_DATA_PLANE_WINDOW here.
+        let data_plane: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+            std::sync::Arc::new(|| true);
+        let observe = live_local_observe(bind_addr, data_plane, true);
         // Poll every 2s through the stability window (default 45s < heartbeat).
         let poll = std::time::Duration::from_secs(2);
         match confirm_or_revert(
             &cfg.install_dir,
             &cfg.releases_dir,
             cfg.stability_window,
+            std::time::Duration::from_secs(120),
             poll,
             observe,
             &restart,
