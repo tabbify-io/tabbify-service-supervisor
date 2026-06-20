@@ -63,6 +63,7 @@ pub mod tcp_forward;
 pub mod tool_exec;
 pub mod unified_manifest;
 pub mod version;
+pub mod watchdog_pet;
 
 pub use config::Config;
 pub use runner::RunnerConfig;
