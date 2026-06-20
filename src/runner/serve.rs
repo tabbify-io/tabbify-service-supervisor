@@ -252,6 +252,12 @@ pub struct RunnerServe {
     /// `None` when the runtime reports no code target (non-FC / `--no-mesh`).
     /// Held so the forwarder task lives exactly as long as the runner.
     _code_fwd: Option<TcpForwarder>,
+    /// L4 broker add-key forwarder: bridges `[app_ula]:8732` → `{guest_ip}:8732`
+    /// so node can POST a laptop pubkey (with its bearer cap) to the workspace
+    /// broker's token-gated add-key endpoint over the mesh (§12 S6). `None` when
+    /// the runtime reports no broker control target (non-FC / `--no-mesh`). Held
+    /// so the forwarder task lives exactly as long as the runner.
+    _authkeys_fwd: Option<TcpForwarder>,
 }
 
 impl RunnerServe {
@@ -420,6 +426,42 @@ impl RunnerServe {
             None
         };
 
+        // §12 S6: a THIRD L4 forwarder beside the :2222 and :8731 ones — bind
+        // [app_ula]:8732 → guest_ip:8732 so node can POST a laptop pubkey (with
+        // its bearer cap) to the workspace broker's token-gated add-key endpoint
+        // over the mesh (T4 IDE-remote dynamic add-key). Same SO_REUSEPORT
+        // semantics; only in mesh mode AND when the runtime exposes a broker
+        // control target (FC workspace image); bind errors are logged + tolerated.
+        let authkeys_fwd = if cfg.no_mesh {
+            None
+        } else if let Some(ctrl_target) = active.guest_broker_ctrl_addr() {
+            let ctrl_bind = std::net::SocketAddr::new(
+                std::net::IpAddr::V6(app_ula),
+                crate::tcp_forward::GUEST_BROKER_CTRL_PORT,
+            );
+            match crate::tcp_forward::spawn_forwarder(ctrl_bind, ctrl_target).await {
+                Ok(fwd) => {
+                    tracing::info!(
+                        bind = %ctrl_bind,
+                        target = %ctrl_target,
+                        "runner: broker add-key forwarder bound (app_ula:8732 → guest_ip:8732)"
+                    );
+                    Some(fwd)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bind = %ctrl_bind,
+                        target = %ctrl_target,
+                        error = %e,
+                        "runner: broker add-key forwarder bind failed — dynamic add-key unavailable until rebind (next respawn re-attempts)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // The ref the INITIAL runtime was built from: the resolved manifest's
         // `runtime.registry_ref` (a deployed version applied via `--image-ref`,
         // or `None` for a plain source/S3 build). Seeds the same-ref re-deploy
@@ -493,6 +535,7 @@ impl RunnerServe {
             _membership: membership,
             _ssh_fwd: ssh_fwd,
             _code_fwd: code_fwd,
+            _authkeys_fwd: authkeys_fwd,
         })
     }
 
@@ -960,6 +1003,27 @@ mod tests {
             "code port must differ from the ssh exec port"
         );
         assert_ne!(code_bind.port(), 8730, "code port must differ from the app port");
+    }
+
+    /// §12 S6: the broker add-key forwarder must bind the app-ULA on
+    /// GUEST_BROKER_CTRL_PORT (8732) — distinct from the :2222 ssh, :8730 app,
+    /// and :8731 code ports — so node's `[app_ula]:8732` add-key POST reaches the
+    /// guest broker. Pins the port contract without a live mesh join.
+    #[test]
+    fn broker_ctrl_forwarder_binds_app_ula_on_8732() {
+        let app_ula = derive_app_ula(Uuid::parse_str(APP_UUID).unwrap());
+        let ctrl_bind = SocketAddr::new(
+            IpAddr::V6(app_ula),
+            crate::tcp_forward::GUEST_BROKER_CTRL_PORT,
+        );
+        assert_eq!(ctrl_bind.port(), 8732, "add-key forwarder must bind :8732");
+        assert_ne!(ctrl_bind.port(), crate::tcp_forward::GUEST_SSH_PORT);
+        assert_ne!(ctrl_bind.port(), 8730);
+        assert_ne!(
+            ctrl_bind.port(),
+            tabbify_workspace_contract::CODE_SERVICE_PORT,
+            "add-key port must differ from the code-service port"
+        );
     }
 
     // ---- decide_exit / run_until_exit tests --------------------------------

@@ -134,6 +134,22 @@ pub trait AppRuntime: Send + Sync {
         None
     }
 
+    /// The IPv4 TCP address of the guest's BROKER control port (`:8732`), if any
+    /// (§12 S6, T4 IDE-remote dynamic add-key).
+    ///
+    /// For a Firecracker microVM running a WORKSPACE image, returns
+    /// `Some(<guest_ip>:8732)` — the token-gated `POST /v1/authorized-keys`
+    /// listener the broker runs. The runner's L4 forwarder binds `[app_ula]:8732`
+    /// on the mesh interface and proxies to it, so node can POST the laptop
+    /// pubkey (with its bearer cap) over the mesh. SEPARATE from :2222 (ssh) and
+    /// :8731 (code RPC).
+    ///
+    /// Default: `None` — non-FC runtimes expose no broker control target, so no
+    /// :8732 forwarder is started.
+    fn guest_broker_ctrl_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+
     /// Refresh this runtime's warm-restore snapshot IN-PLACE — without
     /// stopping or swapping the running app.
     ///
@@ -196,5 +212,13 @@ mod tests {
     #[test]
     fn guest_code_addr_default_is_none() {
         assert_eq!(StubRuntime.guest_code_addr(), None);
+    }
+
+    /// `guest_broker_ctrl_addr` default is `None`: a non-FC runtime exposes no
+    /// broker control target, so the runner never starts the :8732 add-key
+    /// forwarder for it (§12 S6).
+    #[test]
+    fn guest_broker_ctrl_addr_default_is_none() {
+        assert_eq!(StubRuntime.guest_broker_ctrl_addr(), None);
     }
 }

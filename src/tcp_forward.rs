@@ -22,6 +22,15 @@ use tokio::sync::Semaphore;
 /// the runtime's `guest_ssh_addr()` so the two never drift.
 pub const GUEST_SSH_PORT: u16 = 2222;
 
+/// TCP port the FC workspace BROKER serves its token-gated add-key control
+/// endpoint on (§12 S6, T4 IDE-remote). The runner binds `[app_ula]:8732` and
+/// forwards to `{guest_ip}:8732`; node POSTs the laptop pubkey here with its
+/// bearer cap. NOT a frozen-contract value — an admin/control seam reconciled
+/// with the broker (`tabbify-broker` `http_ctrl::BROKER_CTRL_PORT`) and node
+/// (`ssh_tunnel::WORKSPACE_BROKER_CTRL_PORT`). Shared by the serve-side bind and
+/// `guest_broker_ctrl_addr()` so the two never drift.
+pub const GUEST_BROKER_CTRL_PORT: u16 = 8732;
+
 /// Max concurrently-forwarded connections per forwarder. Acquiring a permit
 /// before spawning a `forward_conn` task bounds the fds/tasks a stuck or
 /// still-booting guest can leak: with the guest's sshd unreachable, each dial

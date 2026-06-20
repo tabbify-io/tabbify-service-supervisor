@@ -2086,10 +2086,27 @@ fn cap_files_init_writes_0600_broker_owned_files() {
 fn safe_cap_name_rejects_traversal() {
     assert!(super::safe_cap_name("app.url"));
     assert!(super::safe_cap_name("forge-admin.token"));
+    // §12 S6: the authorized-keys cap rides the same off-env cap-file channel.
+    assert!(super::safe_cap_name("authkeys.cap"));
     assert!(!super::safe_cap_name("../escape"));
     assert!(!super::safe_cap_name("a/b"));
     assert!(!super::safe_cap_name(""));
     assert!(!super::safe_cap_name(".."));
+}
+
+/// §12 S6: the authkeys cap (the :8732 bearer token) is materialized via the
+/// SAME 0600 broker-owned cap-file writer — so the AGENT uid cannot read it
+/// (only the broker, which validates incoming :8732 requests, can). The token
+/// is single-quoted and NEVER `export`ed into agent env.
+#[test]
+fn cap_files_init_writes_authkeys_cap_0600_broker_owned() {
+    let files = vec![("authkeys.cap".to_owned(), "deadbeefCAPTOKEN".to_owned())];
+    let rendered = super::render_cap_files_init(&files);
+    assert!(rendered.contains("/run/tabbify/caps/authkeys.cap"));
+    assert!(rendered.contains("chmod 0600 '/run/tabbify/caps/authkeys.cap'"));
+    assert!(rendered.contains(&format!("chown -R {}", super::BROKER_UID)));
+    assert!(rendered.contains("'deadbeefCAPTOKEN'"));
+    assert!(!rendered.contains("export "));
 }
 
 /// `render_init` with cap-files emits the 0600 broker-owned writer lines AFTER

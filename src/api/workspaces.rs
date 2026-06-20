@@ -76,6 +76,30 @@ pub fn cap_repo_basename(repo_url: &str) -> String {
     if cleaned.is_empty() { "repo".to_owned() } else { cleaned }
 }
 
+/// The reserved cap-file name for the §12-S6 authorized-keys cap (the `:8732`
+/// add-key bearer token). Written by the runner as a 0600 broker-uid file under
+/// `/run/tabbify/caps/` (same off-env channel as the git caps / forge-admin
+/// token), so the AGENT uid can never read it. One constant, one source.
+pub const AUTHKEYS_CAP_FILE: &str = "authkeys.cap";
+
+/// Generate the §12-S6 authorized-keys cap for `ws_uuid` and insert it into the
+/// `cap_files` map under [`AUTHKEYS_CAP_FILE`], returning the token so the
+/// handler can ALSO return it to node. The token is an unguessable
+/// blake3-over-CSPRNG-salts value (the same generator the git caps use); the
+/// broker validates incoming `:8732` add-key requests against this exact value,
+/// and the runner writes it 0600 broker-uid so the agent cannot read it.
+fn insert_authkeys_cap(
+    ws_uuid: &str,
+    cap_files: &mut serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let token = generate_cap(ws_uuid, "authkeys");
+    cap_files.insert(
+        AUTHKEYS_CAP_FILE.to_owned(),
+        serde_json::Value::String(token.clone()),
+    );
+    token
+}
+
 /// One repo inside the workspace request: clone URL (no creds) + branch +
 /// short-lived provider token the git proxy injects.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -130,6 +154,15 @@ pub struct WorkspaceCreated {
     pub workspace_uuid: String,
     /// Tokenless git remote per repo (index-parallel to the request `repos`).
     pub git_remotes: Vec<String>,
+    /// The authorized-keys cap (§12 S6): the bearer token node MUST present on
+    /// its `POST [ula]:8732/v1/authorized-keys` add-key calls (T4 IDE-remote
+    /// dynamic add-key). The SAME token is written into the FC as the off-env
+    /// cap-file `/run/tabbify/caps/authkeys.cap` (0600, broker-uid), which the
+    /// broker reads to validate. The AGENT uid cannot read that cap-file, so only
+    /// node (which receives this token over the trusted node→supervisor channel)
+    /// can authorize an add-key. NOT a git credential — but it IS an authz
+    /// secret, so node MUST hold it off agent reach and not log it.
+    pub authkeys_cap: String,
 }
 
 /// One live workspace in the in-memory registry.
@@ -275,6 +308,15 @@ pub async fn create_workspace(
         );
     }
 
+    // §12 S6: the authorized-keys cap. Generate a fresh unguessable token, write
+    // it into the FC as the off-env cap-file `authkeys.cap` (the runner writes it
+    // 0600, broker-uid — so the AGENT uid cannot read it), and ALSO return it to
+    // node so node can authorize its `[ula]:8732/v1/authorized-keys` add-key
+    // POSTs. The broker validates incoming :8732 requests against this exact
+    // token; an unauthenticated (agent) request 401s. Cap-file channel ONLY —
+    // never an env var, never the agent's reach.
+    let authkeys_cap = insert_authkeys_cap(&ws_uuid, &mut cap_files);
+
     // RE-KEY #3 (persistence): the workspace marker env + a durable record. The
     // marker (a) makes a respawn re-bake the same identity, (b) drives the runner
     // to SUPPRESS the cold-boot snapshot (Task 9), and (c) lets readopt re-register
@@ -363,6 +405,7 @@ pub async fn create_workspace(
         Json(WorkspaceCreated {
             workspace_uuid: ws_uuid,
             git_remotes,
+            authkeys_cap,
         }),
     )
         .into_response()

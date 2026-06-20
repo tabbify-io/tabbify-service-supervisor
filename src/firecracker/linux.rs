@@ -958,6 +958,19 @@ impl AppRuntime for FirecrackerRuntime {
         ))
     }
 
+    fn guest_broker_ctrl_addr(&self) -> Option<std::net::SocketAddr> {
+        // The workspace broker serves its token-gated add-key endpoint on
+        // GUEST_BROKER_CTRL_PORT (8732) inside the VM (IPv4 eth0). The host
+        // reaches it at guest_ip:8732 via the /30 tap; the runner forwards
+        // [app_ula]:8732 → here so node can POST the laptop pubkey with its
+        // bearer cap (§12 S6). Non-workspace images have nothing listening → a
+        // dial refuses (harmless; the forwarder only matters for workspaces).
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(self.guest_ip),
+            crate::tcp_forward::GUEST_BROKER_CTRL_PORT,
+        ))
+    }
+
     fn snapshot<'a>(&'a self) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let Some(cache_dir) = self.snapshot_cache_dir.clone() else {

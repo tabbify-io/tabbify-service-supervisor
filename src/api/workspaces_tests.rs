@@ -64,3 +64,28 @@
         // Trailing slash + empty segment still yields a usable, non-empty stem.
         assert!(!cap_repo_basename("https://x/").is_empty());
     }
+
+    /// §12 S6: `insert_authkeys_cap` writes the cap into the cap-file map under
+    /// the reserved `authkeys.cap` name AND returns the SAME token, so the
+    /// handler's `WorkspaceCreated.authkeys_cap` matches the value the runner
+    /// writes 0600 broker-uid into the FC. The token must be unguessable (64 hex
+    /// chars) and fresh on each create (no static secret).
+    #[test]
+    fn insert_authkeys_cap_writes_and_returns_matching_token() {
+        let mut cap_files = serde_json::Map::new();
+        let token = insert_authkeys_cap("ws-uuid-1", &mut cap_files);
+        // Returned token == the value written into the cap-file map (so node's
+        // bearer token matches the broker's cap-file).
+        assert_eq!(
+            cap_files.get(AUTHKEYS_CAP_FILE).and_then(|v| v.as_str()),
+            Some(token.as_str()),
+            "returned cap must equal the cap-file value the broker validates against"
+        );
+        // 64-hex blake3 token (unguessable, not a static/derivable secret).
+        assert_eq!(token.len(), 64, "authkeys cap must be a 64-hex token");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        // Fresh per create — a second call yields a DIFFERENT token (CSPRNG salt).
+        let mut cap_files2 = serde_json::Map::new();
+        let token2 = insert_authkeys_cap("ws-uuid-1", &mut cap_files2);
+        assert_ne!(token, token2, "each workspace-create mints a fresh cap");
+    }
