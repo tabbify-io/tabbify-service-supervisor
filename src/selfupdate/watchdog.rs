@@ -947,4 +947,43 @@ mod tests {
         assert_eq!(kept, None, "a single flap must not revert");
         assert!(calls.lock().unwrap().is_empty(), "no rollback on a flap");
     }
+
+    /// §7 invariant lock (D7): the revert path is symlink-repoint + a PLAIN unit
+    /// restart — it NEVER re-joins the mesh in-process with a mutated config, so
+    /// `relay_only` (read from TABBIFY_MESH_RELAY_ONLY in the unit env on the
+    /// fresh boot) is preserved BY CONSTRUCTION. We assert the exact restart
+    /// argv is the bare unit restart and nothing more (no `--relay-only`-style
+    /// override could be smuggled in here).
+    #[tokio::test]
+    async fn revert_restart_is_plain_unit_restart_preserving_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage_release(&releases, ver);
+        }
+        for bin in SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+            },
+        )
+        .unwrap();
+
+        let (restart, calls) = recording_restart();
+        revert_to_previous(install, &releases, &restart).await.unwrap();
+
+        // EXACTLY the bare unit restart — no extra args that could carry a
+        // relay/direct override. The fresh boot re-reads relay_only from env.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]],
+            "revert must trigger ONLY a plain unit restart (relay_only preserved via env)",
+        );
+    }
 }
