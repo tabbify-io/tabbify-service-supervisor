@@ -48,6 +48,7 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         crate::api::create_workspace,
         crate::api::list_workspaces,
         crate::api::delete_workspace,
+        crate::api::snapshot_workspace,
     ),
     components(schemas(
         HealthResponse,

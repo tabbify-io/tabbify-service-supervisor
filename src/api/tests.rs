@@ -970,3 +970,56 @@ fn supervisor_state_has_empty_dev_sessions_on_new() {
         "dev_sessions must be empty on a fresh SupervisorState"
     );
 }
+
+// ── POST /v1/workspaces/:uuid/snapshot — 404 for unknown workspace ──────────
+
+/// Snapshotting a workspace this supervisor does not host returns 404 BEFORE any
+/// control dispatch — the endpoint is gated on the registry (Seam B). Proves the
+/// route is wired and the not-found gate fires.
+#[tokio::test]
+async fn snapshot_unknown_workspace_returns_404() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workspaces/{APP_UUID}/snapshot"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A KNOWN workspace whose runner socket is dead returns 500 (the snapshot
+/// dispatch fails) — NOT 404. This proves the registry gate passes through to
+/// the orchestrator dispatch for a hosted workspace (the VM-still-serving error
+/// path; no live runner is wired in the unit test).
+#[tokio::test]
+async fn snapshot_known_workspace_dispatches_and_500s_without_runner() {
+    use crate::api::Workspace;
+    use std::time::Instant;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    // Register the workspace so the registry gate passes; no runner socket
+    // exists, so the Cmd::Snapshot round-trip fails → 500 (not 404).
+    state.workspaces.insert(Workspace {
+        workspace_uuid: APP_UUID.to_owned(),
+        user_id: "acct_a".to_owned(),
+        caps: vec!["cap".to_owned()],
+        created_at: Instant::now(),
+        last_activity: Instant::now(),
+    });
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workspaces/{APP_UUID}/snapshot"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}

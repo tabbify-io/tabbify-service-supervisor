@@ -113,6 +113,19 @@ impl ControlClient {
             .await
     }
 
+    /// Send [`Cmd::Snapshot`], expect [`Reply::Ok`].
+    ///
+    /// Refreshes the warm-LSP snapshot of the STILL-RUNNING workspace VM in
+    /// place (pause → `/snapshot/create` → resume the live VM). On success it
+    /// replies [`Reply::Ok`]; if the create failed it replies [`Reply::Err`] and
+    /// the VM keeps serving (no downtime). The create writes the multi-GB guest
+    /// RAM, so it rides the build-length [`DEPLOY_TIMEOUT`], not the fast
+    /// [`TIMEOUT`].
+    pub async fn snapshot(&self) -> Result<Reply> {
+        self.round_trip_with_timeout(Cmd::Snapshot, DEPLOY_TIMEOUT)
+            .await
+    }
+
     /// Open a fresh connection to `self.sock`, write `cmd` as a JSON line, read
     /// back one JSON-line [`Reply`], and close. Bounded by the fast [`TIMEOUT`].
     ///
@@ -243,6 +256,42 @@ mod tests {
         assert!(
             long.is_ok(),
             "a generous deadline tolerates the slow reply: {long:?}"
+        );
+    }
+
+    /// `snapshot()` sends `Cmd::Snapshot` and parses the runner's `Reply::Ok`.
+    /// A mock control socket reads the request line and replies `ok`, proving the
+    /// new client method round-trips the snapshot command.
+    #[tokio::test]
+    async fn snapshot_round_trips_ok() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("snap.sock");
+        let sock_srv = sock.clone();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let captured_srv = captured.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_srv).unwrap();
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                *captured_srv.lock().await = line;
+                let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = ControlClient::new(&sock);
+        let reply = client.snapshot().await.expect("snapshot round-trip");
+        assert!(matches!(reply, Reply::Ok), "got {reply:?}");
+        // The wire carried the snapshot command, not some other Cmd.
+        assert!(
+            captured.lock().await.contains("\"cmd\":\"snapshot\""),
+            "client must send Cmd::Snapshot, got: {}",
+            captured.lock().await
         );
     }
 

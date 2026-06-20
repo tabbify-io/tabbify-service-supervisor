@@ -387,6 +387,36 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Refresh `uuid`'s warm-LSP snapshot IN-PLACE (the `Cmd::Snapshot` path).
+    ///
+    /// Sends `Cmd::Snapshot` to the runner, which pauses the live workspace VM,
+    /// writes a fresh `/snapshot/create` to the per-uuid cache dir, and resumes
+    /// the guest (it keeps serving). This is the §12 POST-INDEX refresh: the node
+    /// calls it AFTER the code-service reports `index_status == Ready`, so the
+    /// captured RAM holds a WARM LSP index. The VM is left RUNNING on any error
+    /// (the runner always `ensure_resumed`s).
+    ///
+    /// # Errors
+    /// - `uuid` is malformed (caller can 400).
+    /// - The control round-trip failed, OR the runner replied [`Reply::Err`]
+    ///   (the snapshot create did not land). Either way the VM stays up; the
+    ///   caller may retry. A successful snapshot returns `Ok(())`.
+    pub async fn snapshot_app(&self, uuid: &str) -> Result<()> {
+        let _ = self.app_ula_for(uuid)?;
+        match self.client_for(uuid).snapshot().await? {
+            Reply::Ok => {
+                tracing::info!(uuid, "Cmd::Snapshot: warm snapshot refreshed");
+                Ok(())
+            }
+            Reply::Err { message } => {
+                // The runner ran the create but it failed (VM still serving).
+                // Surface it so the node can retry; do NOT treat as fatal.
+                anyhow::bail!("snapshot for {uuid} failed: {message}")
+            }
+            other => anyhow::bail!("unexpected reply to Snapshot for {uuid}: {other:?}"),
+        }
+    }
+
     /// Snapshot every app the orchestrator has a runner record for, with each
     /// one's live state from a control-socket health probe.
     ///
@@ -1251,6 +1281,98 @@ mod tests {
             Some(reff),
             "image_ref must be persisted after a live deploy"
         );
+    }
+
+    /// `snapshot_app` round-trips `Cmd::Snapshot` to the runner and maps a
+    /// `Reply::Ok` to `Ok(())` (the §12 post-index warm-snapshot path). A fake
+    /// control server captures the request line to prove the right command went
+    /// out and answers `ok`.
+    #[tokio::test]
+    async fn snapshot_app_round_trips_ok_and_sends_snapshot_cmd() {
+        use std::{sync::Arc, time::Duration};
+
+        use tempfile::TempDir;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+            sync::Mutex,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_srv = captured.clone();
+        let sock_path_srv = sock_path.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+            {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                *captured_srv.lock().await = line;
+                let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let o = orch(dir.path().to_path_buf());
+        o.snapshot_app(APP_UUID).await.expect("snapshot must succeed");
+        assert!(
+            captured.lock().await.contains("\"cmd\":\"snapshot\""),
+            "snapshot_app must send Cmd::Snapshot, got: {}",
+            captured.lock().await
+        );
+    }
+
+    /// A runner `Reply::Err` (the snapshot create did not land — VM still
+    /// serving) surfaces as an `Err` so the node can retry, carrying the runner's
+    /// message.
+    #[tokio::test]
+    async fn snapshot_app_surfaces_runner_err() {
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        let sock_path_srv = sock_path.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path_srv).unwrap();
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+            {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let _ = reader
+                    .into_inner()
+                    .write_all(b"{\"reply\":\"err\",\"message\":\"create did not produce files\"}\n")
+                    .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let o = orch(dir.path().to_path_buf());
+        let err = o.snapshot_app(APP_UUID).await.unwrap_err();
+        assert!(
+            err.to_string().contains("create did not produce files"),
+            "the runner's snapshot error must surface: {err}"
+        );
+    }
+
+    /// A malformed uuid is rejected before any control I/O (so the API layer can
+    /// 400 it) — mirrors `stop_app`/`purge_app`'s up-front uuid validation.
+    #[tokio::test]
+    async fn snapshot_app_rejects_bad_uuid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch(dir.path().to_path_buf());
+        assert!(o.snapshot_app("not-a-uuid").await.is_err());
     }
 
     /// Two concurrent `deploy_app` calls for the SAME uuid must be SERIALIZED.

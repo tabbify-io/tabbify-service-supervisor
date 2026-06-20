@@ -426,69 +426,54 @@ pub async fn delete_workspace(
     Json(json!({ "purged": true })).into_response()
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// The stable workspace_uuid is a pure fn of user_id (frozen contract): same
-    /// user → same uuid, distinct users → distinct. This is the re-key keystone.
-    #[test]
-    fn workspace_uuid_is_stable_per_user() {
-        assert_eq!(
-            workspace_uuid("acct_A").to_string(),
-            workspace_uuid("acct_A").to_string(),
-            "same user must re-key to the same workspace"
-        );
-        assert_ne!(
-            workspace_uuid("acct_A").to_string(),
-            workspace_uuid("acct_B").to_string(),
-        );
+/// `POST /v1/workspaces/{uuid}/snapshot` — refresh the workspace VM's warm-LSP
+/// snapshot IN-PLACE (§12 post-index, Seam B).
+///
+/// The node calls this AFTER the code-service reports the dogfood repo's
+/// `index_status == Ready`, so the snapshot captures a WARM LSP index (the
+/// cold-boot snapshot is suppressed for a workspace — see the module docs). The
+/// handler dispatches `Cmd::Snapshot` to the runner via the orchestrator; the VM
+/// is left RUNNING on any failure (best-effort refresh). A snapshot of a
+/// workspace this supervisor does not know returns `404`.
+#[utoipa::path(
+    post,
+    path = "/v1/workspaces/{uuid}/snapshot",
+    params(("uuid" = String, Path, description = "Workspace uuid")),
+    responses(
+        (status = 200, description = "Warm snapshot refreshed"),
+        (status = 404, description = "Workspace not found", body = crate::api::ErrorResponse),
+        (status = 500, description = "Snapshot create failed (VM still serving)", body = crate::api::ErrorResponse),
+    ),
+)]
+#[tracing::instrument(skip(state), fields(workspace_uuid = %uuid))]
+pub async fn snapshot_workspace(
+    State(state): State<SharedState>,
+    Path(uuid): Path<String>,
+) -> Response {
+    // Only snapshot a workspace this supervisor actually hosts — a stray uuid
+    // (or one whose VM was already torn down) is a 404, never a blind dispatch.
+    if state.workspaces.caps_of(&uuid).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("workspace {uuid} not found") })),
+        )
+            .into_response();
     }
-
-    /// The registry stores N caps for one workspace and returns them all.
-    #[test]
-    fn registry_holds_n_caps() {
-        let reg = WorkspaceRegistry::default();
-        reg.insert(Workspace {
-            workspace_uuid: "ws-1".to_owned(),
-            user_id: "u".to_owned(),
-            caps: vec!["capA".to_owned(), "capB".to_owned()],
-            created_at: Instant::now(),
-            last_activity: Instant::now(),
-        });
-        let caps = reg.caps_of("ws-1").unwrap();
-        assert_eq!(caps.len(), 2);
-        assert!(caps.contains(&"capB".to_owned()));
-        // remove returns the workspace; a second remove is None.
-        assert!(reg.remove("ws-1").is_some());
-        assert!(reg.remove("ws-1").is_none());
-        assert_eq!(reg.len(), 0);
-    }
-
-    /// WORKSPACE_MAX_TTL is effectively infinite (spec §3 re-key #3): far beyond
-    /// the dev-session 7d, so the safety reaper never reclaims a workspace.
-    #[test]
-    fn workspace_max_ttl_is_effectively_infinite() {
-        assert!(
-            WORKSPACE_MAX_TTL > Duration::from_secs(7 * 24 * 60 * 60),
-            "workspace TTL must exceed the dev-session 7d ceiling"
-        );
-        assert!(
-            WORKSPACE_MAX_TTL >= Duration::from_secs(10 * 365 * 24 * 60 * 60),
-            "workspace TTL must be effectively infinite (≥10y)"
-        );
-    }
-
-    /// The cap-file stem is sanitized + traversal-safe: it strips `.git`, keeps
-    /// only safe chars, and never escapes the caps dir or empties (§12 S1).
-    #[test]
-    fn cap_repo_basename_is_safe_and_strips_git() {
-        assert_eq!(cap_repo_basename("https://github.com/acme/app.git"), "app");
-        assert_eq!(cap_repo_basename("https://github.com/acme/My-Repo"), "My-Repo");
-        // A traversal attempt can never produce a path separator.
-        assert!(!cap_repo_basename("../../etc/passwd").contains('/'));
-        // Trailing slash + empty segment still yields a usable, non-empty stem.
-        assert!(!cap_repo_basename("https://x/").is_empty());
+    match state.orchestrator.snapshot_app(&uuid).await {
+        Ok(()) => Json(json!({ "snapshotted": true })).into_response(),
+        Err(e) => {
+            // The VM keeps serving (the runner always resumes); report the
+            // failure so the node can retry the post-index snapshot.
+            tracing::warn!(workspace_uuid = %uuid, error = %e, "workspace snapshot failed (VM still serving)");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("snapshot failed: {e}") })),
+            )
+                .into_response()
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "workspaces_tests.rs"]
+mod tests;
