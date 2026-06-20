@@ -1,9 +1,22 @@
-//! Track B tier-1: the watchdog-pet decision core (pure) + the live pet task.
+//! Track B self-heal watchdog. Tier-1: the watchdog-pet decision core (pure) +
+//! the live pet task that pets systemd (`WATCHDOG=1`) every `W/2` ONLY while the
+//! mesh data plane is healthy (Track-K `dataplane_healthy`). Tier-2 (in
+//! [`tier2`]): reboot-on-persistent-failure, behind the SHARED Track-C reboot
+//! loop-guard ([`crate::mesh_command::reboot_guard::RebootGuard`], ≤3/hr).
 
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use sd_notify::NotifyState;
+
+pub mod tier2;
+
+pub use tier2::{
+    DeadStreak, REBOOT_AFTER_CONSECUTIVE_DEAD, RebootRunner, SystemctlReboot, TIER2_GRACE,
+    Tier2Action, apply_tier2, dead_streak_path, escalate_decision, fold_observation,
+    load_dead_streak, run_tier2_boot_check, save_dead_streak,
+};
 
 /// What the pet loop should do this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,17 +136,21 @@ pub fn run_once<Pe: Petter + ?Sized>(
     apply_decision(action, petter)
 }
 
-/// Spawn the independent watchdog-pet task (tier-1). No-op (returns `None`) when
-/// `watchdog_enabled()` is `None`: dev / `--no-mesh` / not under systemd / no
-/// `WatchdogSec=` — those runs are NEVER watchdog-killed (fail-open). Otherwise
-/// loops forever, petting every `W/2` while the data plane is healthy. The
-/// `probe` closure (`MeshMembership::data_plane_probe`) holds a clone of the
-/// joiner handle so the data plane stays observable for the process lifetime;
-/// `relay_only` is the static node policy (env-derived) so the §3 assertion needs
-/// no extra plumbing.
+/// Spawn the independent watchdog-pet task (tier-1) + the tier-2 boot-check.
+/// No-op (returns `None`) when `watchdog_enabled()` is `None`: dev / `--no-mesh`
+/// / not under systemd / no `WatchdogSec=` — those runs are NEVER watchdog-killed
+/// (fail-open). Otherwise loops forever, petting every `W/2` while the data plane
+/// is healthy, and ONCE per boot (after a grace window) folds a data-plane
+/// observation into the persisted consecutive-dead streak, escalating to a host
+/// reboot (tier-2) past [`REBOOT_AFTER_CONSECUTIVE_DEAD`] — behind the shared
+/// ≤3/hr `RebootGuard`. The `probe` closure (`MeshMembership::data_plane_probe`)
+/// holds a clone of the joiner handle so the data plane stays observable for the
+/// process lifetime; `relay_only` is the static node policy (env-derived) so the
+/// §3 assertion needs no extra plumbing. `data_dir` backs the persisted sidecars.
 pub fn spawn_watchdog_pet(
     probe: DataPlaneProbe,
     relay_only: bool,
+    data_dir: &Path,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let Some(window) = sd_notify::watchdog_enabled() else {
         tracing::debug!("no systemd WatchdogSec (WATCHDOG_USEC unset) — watchdog-pet disabled");
@@ -145,6 +162,24 @@ pub fn spawn_watchdog_pet(
         pet_interval_secs = interval.as_secs(),
         "watchdog-pet armed: petting every W/2 while data-plane healthy"
     );
+
+    // Tier-2 boot-check: one-shot, after a grace window long enough for a fresh
+    // post-restart handshake to converge. Spawned independently so a slow grace
+    // never delays the pet.
+    let tier2_probe = std::sync::Arc::clone(&probe);
+    let data_dir = data_dir.to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(TIER2_GRACE).await;
+        run_tier2_boot_check(
+            tier2_probe.as_ref(),
+            &dead_streak_path(&data_dir),
+            &crate::mesh_command::reboot_guard::RebootGuard::new(
+                crate::mesh_command::sink::reboot_history_path(&data_dir),
+            ),
+            &SystemctlReboot,
+        );
+    });
+
     let petter = SdPetter;
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);

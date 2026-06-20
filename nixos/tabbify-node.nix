@@ -227,6 +227,18 @@ in {
   systemd.services.tabbify-supervisor = {
     description = "Tabbify supervisor node";
     wantedBy = [ "multi-user.target" ];
+    # Track B tier-2 loop-guard (systemd backstop). If the unit restart-loops
+    # (watchdog kill → restart → still data-plane-dead → kill …) more than 5
+    # times in 10 minutes, systemd stops restarting it and parks it `failed` for
+    # a human. This is the LAST line of defence behind the Rust reboot loop-guard
+    # (the SHARED RebootGuard, ≤3 reboots/hr): a wedged node never becomes an
+    # infinite restart/reboot storm on a box with no remote console (MSI). A
+    # human clears it with `systemctl reset-failed tabbify-supervisor`. These
+    # emit StartLimitIntervalSec=/StartLimitBurst= into the unit's [Unit] section;
+    # Restart=on-failure + the existing RestartSec/Steps/MaxDelaySec backoff
+    # (serviceConfig below) handle the spacing.
+    startLimitIntervalSec = 600;
+    startLimitBurst       = 5;
     after    = [ "tabbify-fetch.service" "network-online.target" ];
     wants    = [ "network-online.target" ];
     requires = [ "tabbify-fetch.service" ];

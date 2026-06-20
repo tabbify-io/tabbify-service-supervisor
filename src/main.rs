@@ -325,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
         tabbify_supervisor::watchdog_pet::spawn_watchdog_pet(
             membership.data_plane_probe(),
             config.relay_only,
+            &config.data_dir,
         );
     }
 
