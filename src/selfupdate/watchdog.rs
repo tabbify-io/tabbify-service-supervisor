@@ -1,9 +1,13 @@
-//! Post-swap watchdog (spec §7): a stability window held UNDER the coordinator
-//! heartbeat-timeout (default 45s < 60s — see
+//! Post-swap watchdog (spec §7): a CONTROL stability window held UNDER the
+//! coordinator heartbeat-timeout (default 45s < 60s — see
 //! [`super::DEFAULT_STABILITY_WINDOW`]) polling /health + control Ping,
-//! crash-loop aware via restart.rs. The window must close before the
-//! coordinator GC's a bad node from the roster, so it can never outrun the
-//! heartbeat-timeout.
+//! crash-loop aware via restart.rs. The CONTROL window must close before the
+//! coordinator GC's a control-plane-broken node from the roster. NOTE (Track D):
+//! the DATA-PLANE verdict is NOT covered by coordinator GC (the control
+//! heartbeat stays green during a WG black hole); the `data_plane_live` clause
+//! plus the separate [`super::DEFAULT_DATA_PLANE_WINDOW`] debounce are the
+//! backstop there. So this window can NEVER outrun the heartbeat-timeout for the
+//! control signal, but the data-plane soak deliberately may.
 //!
 //! Revert is PROMPT: a crash / health-fail / no-pong observation on ANY poll
 //! tick reverts immediately ([`decide_revert`] checks failures before the

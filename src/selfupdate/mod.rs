@@ -11,11 +11,15 @@
 //!    restart (`Tunn` / `SessionTable` are not serialisable).
 //! 2. Rollback touches ONLY the binary symlink — never `data_dir` /
 //!    `runner_dir` / `mesh-identity.json`.
-//! 3. The gate is held under the coordinator heartbeat-timeout (60s); the
-//!    post-swap stability window is ALSO held under it (see
-//!    [`COORDINATOR_HEARTBEAT_TIMEOUT`] / [`DEFAULT_STABILITY_WINDOW`]). A
-//!    window that outran the heartbeat would let the coordinator GC a bad node
-//!    from the roster before the watchdog ever decided to revert it.
+//! 3. The CONTROL gate + post-swap CONTROL stability window are held under the
+//!    coordinator heartbeat-timeout (60s) so a control-plane-broken node is
+//!    reverted before the coordinator GC's it (see [`COORDINATOR_HEARTBEAT_TIMEOUT`]
+//!    / [`DEFAULT_STABILITY_WINDOW`]). NOTE (Track D): coordinator GC is NOT a
+//!    backstop for DATA-PLANE breakage — the control heartbeat (HTTPS) stays
+//!    green while the WG tunnel is a black hole, so the peer is never GC'd. The
+//!    data-plane watchdog ([`watchdog::decide_revert`]'s `data_plane_live`
+//!    clause + the [`DEFAULT_DATA_PLANE_WINDOW`] debounce) is the backstop
+//!    there, and its window is DELIBERATELY decoupled from the heartbeat-timeout.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,22 +56,29 @@ const ENV_INSTALL_DIR: &str = "TABBIFY_INSTALL_DIR";
 const ENV_RELEASES_DIR: &str = "TABBIFY_RELEASES_DIR";
 
 /// Coordinator heartbeat-timeout: how long the coordinator waits before it
-/// garbage-collects a silent node from the mesh roster. Every self-update
-/// timer MUST stay comfortably under this so that a bad node is reverted by the
-/// watchdog BEFORE the coordinator drops it (a GC'd node can no longer be
-/// reasoned about, so the revert window must close first).
+/// garbage-collects a silent node from the mesh roster. Every CONTROL-plane
+/// self-update timer MUST stay comfortably under this so that a
+/// control-plane-broken node is reverted by the watchdog BEFORE the coordinator
+/// drops it (a GC'd node can no longer be reasoned about, so the revert window
+/// must close first). This does NOT cover DATA-PLANE breakage: the control
+/// heartbeat keeps a black-holed peer un-GC'd, so the data-plane watchdog
+/// ([`DEFAULT_DATA_PLANE_WINDOW`]) is the backstop there, not GC.
 pub(crate) const COORDINATOR_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 3-part health gate timeout — kept under the coordinator heartbeat-timeout.
 const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Post-swap stability window — long enough to catch a bad swap, short enough
-/// to stay comfortably UNDER [`COORDINATOR_HEARTBEAT_TIMEOUT`].
+/// Post-swap CONTROL stability window — long enough to catch a bad swap, short
+/// enough to stay comfortably UNDER [`COORDINATOR_HEARTBEAT_TIMEOUT`].
 ///
 /// INVARIANT: `DEFAULT_STABILITY_WINDOW < COORDINATOR_HEARTBEAT_TIMEOUT`. This
-/// is the whole point of I3: the window must close (so the watchdog can decide
-/// `KeepNewVersion` vs `Revert`) before the coordinator GC's a bad node from
-/// the roster at the heartbeat-timeout. A failed swap is reverted PROMPTLY on
+/// is the whole point of I3 FOR THE CONTROL PLANE: the window must close (so the
+/// watchdog can decide `KeepNewVersion` vs `Revert`) before the coordinator GC's
+/// a control-plane-broken node from the roster at the heartbeat-timeout. The
+/// SEPARATE [`DEFAULT_DATA_PLANE_WINDOW`] is intentionally NOT bound by this
+/// rule — coordinator GC keys off the control heartbeat, which stays green
+/// during a data-plane black hole, so GC is no backstop there (see that const).
+/// A failed swap is reverted PROMPTLY on
 /// the first failing poll regardless of this window (see
 /// [`watchdog::decide_revert`]); the window only bounds the time we wait to
 /// CONFIRM a healthy swap. Enforced by a unit test.
@@ -81,7 +92,7 @@ pub(crate) const DEFAULT_STABILITY_WINDOW: Duration = Duration::from_secs(45);
 /// stays green during a data-plane black hole, so GC is NOT a backstop here —
 /// THIS watchdog is (see the corrected I3 note in [`watchdog`]). Tunable
 /// (90–180s); 120s is the default proposal. Public so the binary's
-/// post-restart watchdog wiring ([`main`]) can pass it to `confirm_or_revert`.
+/// post-restart watchdog wiring (`main`) can pass it to `confirm_or_revert`.
 pub const DEFAULT_DATA_PLANE_WINDOW: Duration = Duration::from_secs(120);
 
 /// Compile-time enforcement of the I3 invariant: the default stability window
@@ -245,6 +256,24 @@ mod tests {
             cfg.candidate_identity_path,
             PathBuf::from("/srv/tabbify/candidate-identity.json"),
         );
+    }
+
+    /// D5: the DATA-PLANE confirm window is DELIBERATELY decoupled from the
+    /// coordinator heartbeat-timeout — it MAY exceed it, because the coordinator
+    /// GCs on the CONTROL heartbeat, which stays green during a data-plane black
+    /// hole. The data-plane watchdog (NOT coordinator GC) is the backstop here.
+    /// This guards against someone "fixing" the window back under the timeout
+    /// and silently re-breaking the debounce soak.
+    #[test]
+    fn data_plane_window_is_decoupled_from_heartbeat_timeout() {
+        assert!(
+            DEFAULT_DATA_PLANE_WINDOW >= COORDINATOR_HEARTBEAT_TIMEOUT,
+            "data-plane window {DEFAULT_DATA_PLANE_WINDOW:?} is intentionally NOT \
+             bound by the heartbeat-timeout {COORDINATOR_HEARTBEAT_TIMEOUT:?}: \
+             coordinator GC is not a data-plane backstop",
+        );
+        // The CONTROL window invariant is unchanged and still holds.
+        assert!(DEFAULT_STABILITY_WINDOW < COORDINATOR_HEARTBEAT_TIMEOUT);
     }
 
     /// The default config must carry the I3-safe window, not some larger value.
