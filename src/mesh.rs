@@ -190,6 +190,18 @@ impl MeshMembership {
         let mesh = self.mesh_host();
         advertise_own_ula(&mesh, self.my_ula).await
     }
+
+    /// Track K keystone: is this supervisor's WG data plane alive right now?
+    /// Delegates to the joiner's `dataplane_healthy`. `false` ⇒ this node is a
+    /// black hole (heartbeat alive, WG decap-RX dead). Read by the self-heal
+    /// watchdog (Track B) and the OTA data-plane gate (Track D).
+    #[must_use]
+    pub fn dataplane_healthy(&self) -> bool {
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+        self.joiner.dataplane_healthy(now_micros)
+    }
 }
 
 /// Advertise `my_ula` as a hosted app-ULA on the given mesh handle (FIX #9).

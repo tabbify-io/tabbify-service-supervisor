@@ -56,6 +56,13 @@ pub trait MeshHost: Send + Sync {
     fn mesh_host_ula(&self, app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>>;
     /// Stop routing `app_ula` to this node (joiner `unhost_app_ula`).
     fn mesh_unhost_ula(&self, app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>>;
+    /// Track K keystone read: is this host's WG data plane alive right now?
+    /// `false` only on a demonstrable black hole (peers + sending + RX-silent
+    /// past threshold). Default `true` (fail-open) for impls that don't wire a
+    /// live joiner. Tracks B (watchdog) and D (OTA confirm) consume this.
+    fn mesh_dataplane_healthy(&self, _now_micros: i64) -> bool {
+        true
+    }
 }
 
 impl MeshHost for mesh_joiner::Joiner {
@@ -67,6 +74,9 @@ impl MeshHost for mesh_joiner::Joiner {
     }
     fn mesh_unhost_ula(&self, app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>> {
         Box::pin(async move { self.unhost_app_ula(app_ula).await })
+    }
+    fn mesh_dataplane_healthy(&self, now_micros: i64) -> bool {
+        self.dataplane_healthy(now_micros)
     }
 }
 
@@ -355,6 +365,39 @@ mod tests {
             self.unhosted.insert(app_ula, ());
             Box::pin(async { Ok(()) })
         }
+    }
+
+    /// Track K: the supervisor surfaces a host's data-plane health through
+    /// `MeshHost::mesh_dataplane_healthy`. The default fake reports healthy
+    /// (the trait's fail-open default impl); a black-hole fake reports dead.
+    #[test]
+    fn mesh_dataplane_healthy_surfaces_the_host_value() {
+        let healthy: Arc<dyn MeshHost> = Arc::new(FakeMeshHost::default());
+        assert!(
+            healthy.mesh_dataplane_healthy(1_000_000),
+            "default fake reports healthy (fail-open)"
+        );
+
+        struct BlackHoleHost;
+        impl MeshHost for BlackHoleHost {
+            fn tun_iface(&self) -> Option<String> {
+                None
+            }
+            fn mesh_host_ula(&self, _app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mesh_unhost_ula(&self, _app_ula: Ipv6Addr) -> BoxFut<'_, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mesh_dataplane_healthy(&self, _now_micros: i64) -> bool {
+                false
+            }
+        }
+        let dead: Arc<dyn MeshHost> = Arc::new(BlackHoleHost);
+        assert!(
+            !dead.mesh_dataplane_healthy(1_000_000),
+            "a black-hole host reports unhealthy"
+        );
     }
 
     /// A minimal [`AppRuntime`] stub: answers every request `200 "Hello,
