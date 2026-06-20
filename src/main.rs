@@ -312,6 +312,22 @@ async fn main() -> anyhow::Result<()> {
     // above and never reaches here, so readiness is emitted only on real boot.
     tabbify_supervisor::readiness::notify_ready();
 
+    // ── Track B tier-1: arm the independent watchdog-pet ─────────────────────
+    // It pets systemd (WATCHDOG=1) every WatchdogSec/2 ONLY while the data plane
+    // is healthy (Track-K `dataplane_healthy`, self-clocking). On a sustained
+    // black hole it withholds the pet → systemd SIGKILL+restart → fresh register
+    // + fresh boringtun Tunns + fresh relay-WS = fresh handshake. `KillMode=process`
+    // keeps detached runners alive across the restart. No-op off systemd (no
+    // WATCHDOG_USEC ⇒ dev / --no-mesh / non-systemd) and on `--no-mesh` (no
+    // membership ⇒ no probe). relay_only is preserved across the restart by the
+    // unit env (TABBIFY_MESH_RELAY_ONLY re-read on the fresh process).
+    if let Some(membership) = _membership.as_ref() {
+        tabbify_supervisor::watchdog_pet::spawn_watchdog_pet(
+            membership.data_plane_probe(),
+            config.relay_only,
+        );
+    }
+
     // ── Post-restart self-watchdog (spec §7) ────────────────────────────────
     // If a prior `self-update` swap stamped a pending-confirm marker in VERSION,
     // THIS boot is running an UNCONFIRMED binary. Spawn the audited watchdog

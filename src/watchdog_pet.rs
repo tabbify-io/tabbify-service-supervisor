@@ -93,6 +93,70 @@ pub const fn guard_black_hole(data_plane_healthy: bool, relay_only: bool) -> Pet
     }
 }
 
+/// A data-plane liveness probe the live loop polls each tick. The supervisor
+/// supplies [`crate::mesh::MeshMembership::data_plane_probe`] (a self-clocking
+/// closure over the Track-K accessor); tests inject a fake. `Send + Sync` so the
+/// closure can move into the spawned task.
+pub type DataPlaneProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// One pet tick: sample the data plane, gate on `relay_only` (§3), and apply the
+/// decision through the petter. Pure given its injected collaborators — the live
+/// loop is just this on a `W/2` timer. The probe self-clocks (Track K reads the
+/// current monotonic clock internally), so no `now` is plumbed here.
+#[must_use]
+pub fn run_once<Pe: Petter + ?Sized>(
+    probe: &dyn Fn() -> bool,
+    petter: &Pe,
+    relay_only: bool,
+) -> PetOutcome {
+    let healthy = probe();
+    let action = guard_black_hole(healthy, relay_only);
+    if action == PetAction::Skip {
+        // About to let systemd SIGKILL+restart us — make the cause forensically
+        // obvious in the journal (the restart itself otherwise looks unexplained).
+        tracing::error!(
+            relay_only,
+            "watchdog-pet: sustained data-plane black hole — WITHHOLDING WATCHDOG=1; \
+             systemd will restart the unit for a fresh handshake (relay_only preserved)"
+        );
+    }
+    apply_decision(action, petter)
+}
+
+/// Spawn the independent watchdog-pet task (tier-1). No-op (returns `None`) when
+/// `watchdog_enabled()` is `None`: dev / `--no-mesh` / not under systemd / no
+/// `WatchdogSec=` — those runs are NEVER watchdog-killed (fail-open). Otherwise
+/// loops forever, petting every `W/2` while the data plane is healthy. The
+/// `probe` closure (`MeshMembership::data_plane_probe`) holds a clone of the
+/// joiner handle so the data plane stays observable for the process lifetime;
+/// `relay_only` is the static node policy (env-derived) so the §3 assertion needs
+/// no extra plumbing.
+pub fn spawn_watchdog_pet(
+    probe: DataPlaneProbe,
+    relay_only: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(window) = sd_notify::watchdog_enabled() else {
+        tracing::debug!("no systemd WatchdogSec (WATCHDOG_USEC unset) — watchdog-pet disabled");
+        return None;
+    };
+    let interval = pet_interval(window);
+    tracing::info!(
+        watchdog_window_secs = window.as_secs(),
+        pet_interval_secs = interval.as_secs(),
+        "watchdog-pet armed: petting every W/2 while data-plane healthy"
+    );
+    let petter = SdPetter;
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // First tick fires immediately: pet right away so the unit is fed before
+        // the very first W elapses (we just reached READY).
+        loop {
+            tick.tick().await;
+            let _ = run_once(probe.as_ref(), &petter, relay_only);
+        }
+    }))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -188,5 +252,32 @@ mod tests {
         // A healthy node always pets regardless of relay_only.
         assert_eq!(guard_black_hole(true, true), PetAction::Pet);
         assert_eq!(guard_black_hole(true, false), PetAction::Pet);
+    }
+
+    #[test]
+    fn run_once_pets_then_withholds_on_black_hole() {
+        // A probe that flips healthy→dead after the first sample, so two ticks
+        // exercise both branches.
+        let calls = Cell::new(0u32);
+        let probe = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            n == 0 // healthy on the first call, dead thereafter
+        };
+        let spy = SpyPetter::new(|| Ok(()));
+        // First tick: healthy + relay_only ⇒ Petted.
+        assert_eq!(run_once(&probe, &spy, true), PetOutcome::Petted);
+        // Second tick: dead + relay_only ⇒ Withheld (systemd will restart).
+        assert_eq!(run_once(&probe, &spy, true), PetOutcome::Withheld);
+        assert_eq!(spy.pets.get(), 1, "exactly one pet across the two ticks");
+    }
+
+    #[test]
+    fn run_once_fails_open_when_dead_but_not_relay_only() {
+        let probe = || false; // dead data plane
+        let spy = SpyPetter::new(|| Ok(()));
+        // Dead data plane but relay_only=false ⇒ fail-open ⇒ Petted (never kill).
+        assert_eq!(run_once(&probe, &spy, false), PetOutcome::Petted);
+        assert_eq!(spy.pets.get(), 1);
     }
 }
