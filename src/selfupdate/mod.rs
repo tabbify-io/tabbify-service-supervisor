@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub mod confirm;
+pub mod dataplane;
 pub mod fetch;
 pub mod manifest;
 pub mod probe;
@@ -71,6 +72,17 @@ const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(45);
 /// [`watchdog::decide_revert`]); the window only bounds the time we wait to
 /// CONFIRM a healthy swap. Enforced by a unit test.
 pub(crate) const DEFAULT_STABILITY_WINDOW: Duration = Duration::from_secs(45);
+
+/// Post-swap DATA-PLANE confirm window (Track D, D2) — SEPARATE from and LONGER
+/// than [`DEFAULT_STABILITY_WINDOW`]. MSI is WAN-limited and its tunnel flaps,
+/// so the data-plane verdict needs more soak than the 45s control window. This
+/// window is DELIBERATELY allowed to exceed [`COORDINATOR_HEARTBEAT_TIMEOUT`]:
+/// the coordinator's heartbeat-timeout GC keys off the CONTROL heartbeat, which
+/// stays green during a data-plane black hole, so GC is NOT a backstop here —
+/// THIS watchdog is (see the corrected I3 note in [`watchdog`]). Tunable
+/// (90–180s); 120s is the default proposal. Public so the binary's
+/// post-restart watchdog wiring ([`main`]) can pass it to `confirm_or_revert`.
+pub const DEFAULT_DATA_PLANE_WINDOW: Duration = Duration::from_secs(120);
 
 /// Compile-time enforcement of the I3 invariant: the default stability window
 /// (and the gate) must be strictly under the coordinator heartbeat-timeout, so
