@@ -88,8 +88,19 @@ pub async fn confirm_or_revert(
             Ok(None)
         }
         // Rolled back: revert_to_previous already restored the ledger (marker
-        // cleared) + restarted; nothing more to do here.
+        // cleared) + restarted; emit the D4 alarm so a revert is not silent.
         Some(rolled_back) => {
+            // D4: structured alarm at a STABLE target so Loki/promtail (shipping
+            // journald) can fire on `target="selfupdate.revert.alarm"`. Carries
+            // the rolled-back (previous-good) version + the running — i.e. the
+            // BAD — version that just reverted. Both control-plane and
+            // data-plane reverts funnel here, so they alarm identically.
+            tracing::warn!(
+                target: "selfupdate.revert.alarm",
+                rolled_back = %rolled_back,
+                reverted_from = %crate::version::binary_version(),
+                "ALARM: OTA self-update auto-reverted to previous-good"
+            );
             tracing::warn!(%rolled_back, "post-swap watchdog reverted to previous-good");
             Ok(Some(rolled_back))
         }
@@ -330,6 +341,102 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             vec![vec!["restart".to_owned(), SUPERVISOR_UNIT.to_owned()]],
+        );
+    }
+
+    /// D4: every auto-revert emits a structured ALARM event at the stable
+    /// `selfupdate.revert.alarm` target with the rolled-back version + reason,
+    /// so Loki/promtail can fire on it (a silent revert is invisible today).
+    #[tokio::test]
+    async fn revert_emits_alarm_event() {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+
+        // A minimal subscriber that records (target, "rolled_back" field) for
+        // events at our alarm target.
+        #[derive(Default, Clone)]
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        struct Vis<'a>(&'a mut String);
+        impl Visit for Vis<'_> {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "rolled_back" {
+                    *self.0 = value.to_owned();
+                }
+            }
+            // `%rolled_back` (Display) is recorded through the debug visitor as a
+            // `DisplayValue`; capture it here too (Display formats without the
+            // surrounding quotes a `Debug` string would add).
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "rolled_back" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl Subscriber for Capture {
+            fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let target = event.metadata().target().to_owned();
+                let mut rolled = String::new();
+                event.record(&mut Vis(&mut rolled));
+                self.0.lock().unwrap().push((target, rolled));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let cap = Capture::default();
+        let sink = cap.0.clone();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage_release(&releases, ver);
+        }
+        for bin in SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &mark_pending_confirm(
+                VersionFile {
+                    current: "v2.0.0".into(),
+                    previous: vec!["v1.0.0".into()],
+                    pending_confirm: None,
+                },
+                "v2.0.0",
+            ),
+        )
+        .unwrap();
+
+        let (restart, _calls) = recording_restart();
+        let guard = tracing::subscriber::set_default(cap);
+        confirm_or_revert(
+            install,
+            &releases,
+            Duration::from_secs(90),
+            Duration::from_secs(120),
+            Duration::from_millis(1),
+            unhealthy_observe(),
+            &restart,
+        )
+        .await
+        .unwrap();
+        drop(guard);
+
+        let events = sink.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(t, v)| t == "selfupdate.revert.alarm" && v == "v1.0.0"),
+            "expected a selfupdate.revert.alarm event for v1.0.0, got {events:?}"
         );
     }
 }
