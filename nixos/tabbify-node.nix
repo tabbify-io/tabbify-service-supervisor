@@ -173,6 +173,107 @@ let
       echo "keeping prior lifeline joiner (fail-safe)"
     fi
   '';
+
+  # Crash-at-startup CATCH-NET script — the `ExecStart` of the
+  # `tabbify-boot-revert` OnFailure unit (svc #5d, mesh-resilience Phase 2). It is
+  # the no-live-process layer that rolls supervisord back to the previous-good
+  # release when the start path keeps crashing (the 2026-06-22 brick class).
+  #
+  # ⚠ IDEMPOTENT / RE-ENTRANT (review fixes #1 + #2). On systemd v256 `OnFailure=`
+  # fires on EVERY failed ExecStart, so this runs ~3-5× per crash burst. The
+  # durable `BootAttempts` counter (written by the supervisor binary at
+  # `${dataDir}/data/self-heal/boot-attempts.json`) is what makes per-attempt
+  # firing correct: every fire reads `count`; only the fire on which `count`
+  # crossed the threshold actually reverts, and `reset-failed && start` is
+  # STRICTLY gated behind a revert ACTUALLY performed THIS fire.
+  #
+  # ⚠ NEVER `systemctl reset-failed` on a sub-threshold fire — that resets the
+  # start-rate-limit counter (systemd #10529) → the §4 circuit-breaker NEVER
+  # trips → unbounded restart loop = the 06-22 class re-armed. A sub-threshold
+  # fire is a strict no-op (exit 0); `RestartSec` handles the transient retry.
+  #
+  # PATHS: the script and the `revert-to-previous` subcommand it invokes resolve
+  # the SAME on-host layout the supervisor binary uses — `TABBIFY_INSTALL_DIR`
+  # (=${dataDir}, the symlinks+VERSION ledger), `TABBIFY_RELEASES_DIR`
+  # (=${releasesDir}), and `SUPERVISOR_DATA_DIR` (=${dataDir}/data, the
+  # BootAttempts sidecar + the SHARED reboot-guard.json the Rust subcommand's
+  # RebootGuard consults — ONE host-wide ≤3/hr budget). These are set on the
+  # OnFailure unit's `environment` (svc #5d) AND re-asserted here so the script is
+  # correct even if invoked by hand.
+  #
+  # EXIT CODES of `supervisord revert-to-previous` (the load-bearing contract,
+  # main.rs `revert_exit`): 0 PERFORMED, 2 NO_PREVIOUS (O4 first-boot bail —
+  # nothing to roll back to), 3 FAILED (a real error), 4 REBOOT_PARKED (reboot
+  # last-resort exhausted via the guard → park for a human).
+  tabbifyBootRevertScript = pkgs.writeShellScript "tabbify-boot-revert" ''
+    # NOTE: deliberately NO `set -e` — this script BRANCHES on the non-zero exit
+    # codes of `revert-to-previous`, so an `-e` abort would defeat the whole gate.
+    set -u
+    PATH="${pkgs.systemd}/bin:${pkgs.coreutils}/bin:${pkgs.jq}/bin:$PATH"
+
+    THRESHOLD=3
+    DATA_DIR="${dataDir}/data"
+    SUPERVISORD="${dataDir}/supervisord"
+    ATTEMPTS_FILE="$DATA_DIR/self-heal/boot-attempts.json"
+
+    # The revert subcommand resolves its layout from these — keep them in lockstep
+    # with the supervisor unit so the symlinks/VERSION/sidecar/reboot-guard all
+    # land on the SAME files.
+    export TABBIFY_INSTALL_DIR="${dataDir}"
+    export TABBIFY_RELEASES_DIR="${releasesDir}"
+    export SUPERVISOR_DATA_DIR="$DATA_DIR"
+
+    # Read the durable counter. A missing/torn sidecar reads as count=0 (the
+    # fail-safe direction: a revert is at most delayed by one boot, never
+    # spuriously triggered) — exactly mirroring `BootAttempts::load`.
+    count=0
+    reverted_to=""
+    if [ -f "$ATTEMPTS_FILE" ]; then
+      count="$(jq -r '.count // 0' "$ATTEMPTS_FILE" 2>/dev/null || echo 0)"
+      reverted_to="$(jq -r '.reverted_to // ""' "$ATTEMPTS_FILE" 2>/dev/null || echo "")"
+    fi
+    case "$count" in (*[!0-9]*) count=0;; esac   # defensive: non-numeric -> 0
+    echo "tabbify-boot-revert: count=$count threshold=$THRESHOLD reverted_to='$reverted_to'"
+
+    # ── Sub-threshold fire: STRICT no-op. NEVER touch the breaker. ────────────
+    if [ "$count" -lt "$THRESHOLD" ]; then
+      echo "tabbify-boot-revert: sub-threshold ($count < $THRESHOLD) — letting RestartSec re-try (transient). No reset-failed."
+      exit 0
+    fi
+
+    # ── count >= THRESHOLD ────────────────────────────────────────────────────
+    if [ -z "$reverted_to" ]; then
+      # First escalation: try a revert to previous-good.
+      echo "tabbify-boot-revert: threshold reached, no prior revert — attempting revert-to-previous"
+      "$SUPERVISORD" revert-to-previous
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        # A revert was ACTUALLY performed this fire — ONLY now is it safe to
+        # reset the breaker and kick the (reverted) binary.
+        echo "tabbify-boot-revert: revert PERFORMED — reset-failed + start the reverted binary"
+        systemctl reset-failed tabbify-supervisor
+        systemctl start tabbify-supervisor
+        exit 0
+      elif [ "$rc" -eq 2 ]; then
+        # NO_PREVIOUS (O4 first-boot bail): nothing to roll back to → escalate to
+        # reboot-as-last-resort (guarded). Do NOT reset-failed (no revert happened).
+        echo "tabbify-boot-revert: no previous-good release (NO_PREVIOUS) — escalating with --reboot-on-exhausted"
+        "$SUPERVISORD" revert-to-previous --reboot-on-exhausted
+        exit $?
+      else
+        # FAILED (3) or any other error: leave the breaker intact, let systemd
+        # park. Do NOT reset-failed.
+        echo "tabbify-boot-revert: revert-to-previous returned $rc (not performed) — leaving unit parked for the breaker/human"
+        exit "$rc"
+      fi
+    else
+      # Already reverted once this streak and STILL failing (the reverted binary
+      # also crash-loops): reboot-as-last-resort via the guard, then park.
+      echo "tabbify-boot-revert: reverted binary still failing (reverted_to='$reverted_to') — reboot-as-last-resort"
+      "$SUPERVISORD" revert-to-previous --reboot-on-exhausted
+      exit $?
+    fi
+  '';
 in {
   # 1. Kernel modules.  kvm-intel = Intel CPU (Core i7).  On an AMD machine,
   #    change "kvm-intel" to "kvm-amd".
@@ -295,18 +396,25 @@ in {
   systemd.services.tabbify-supervisor = {
     description = "Tabbify supervisor node";
     wantedBy = [ "multi-user.target" ];
-    # Track B tier-2 loop-guard (systemd backstop). If the unit restart-loops
-    # (watchdog kill → restart → still data-plane-dead → kill …) more than 5
-    # times in 10 minutes, systemd stops restarting it and parks it `failed` for
-    # a human. This is the LAST line of defence behind the Rust reboot loop-guard
-    # (the SHARED RebootGuard, ≤3 reboots/hr): a wedged node never becomes an
-    # infinite restart/reboot storm on a box with no remote console (MSI). A
-    # human clears it with `systemctl reset-failed tabbify-supervisor`. These
-    # emit StartLimitIntervalSec=/StartLimitBurst= into the unit's [Unit] section;
-    # Restart=on-failure + the existing RestartSec/Steps/MaxDelaySec backoff
-    # (serviceConfig below) handle the spacing.
-    startLimitIntervalSec = 600;
-    startLimitBurst       = 5;
+    # CIRCUIT-BREAKER that TRIPS the auto-rollback catch-net — NOT a permanent
+    # brick (mesh-resilience review fix #4). When the start path keeps crashing,
+    # the breaker trips and `OnFailure=tabbify-boot-revert` (svc #5d) fires to roll
+    # back to the previous-good release. ~3 SPACED restarts (RestartSec 10/20/30,
+    # serviceConfig below) span ~60s of real retry, comfortably UNDER the 120s
+    # window: a one-off transient (the 2026-06-22 ~31ms exit class) recovers on
+    # the FIRST spaced retry; a persistent bad binary exhausts the burst on the
+    # 4th trip → park `failed` → OnFailure → revert. The park is now the
+    # DELIBERATE trigger for rollback, not a dead end.
+    #
+    # ⚠ This tighten (5/600 → 4/120) lands TOGETHER WITH the OnFailure unit in
+    # this same nix drop (review fix #4) — tightening the breaker BEFORE the
+    # catch-net exists would make the box strictly more brittle (a crash in that
+    # window bricks faster with NO rollback). The Rust reboot loop-guard (the
+    # SHARED RebootGuard, ≤3 reboots/hr) + systemd park remain the LAST resort if
+    # even the revert is exhausted; a human clears a park with
+    # `systemctl reset-failed tabbify-supervisor`.
+    startLimitIntervalSec = 120;
+    startLimitBurst       = 4;
     after    = [ "tabbify-fetch.service" "network-online.target" ];
     wants    = [ "network-online.target" ];
     requires = [ "tabbify-fetch.service" ];
@@ -439,11 +547,23 @@ in {
       # on-failure (NOT always): a clean exit during a watchdog rollback must
       # NOT auto-respawn the just-swapped-out binary. Exponential-ish backoff
       # (RestartSec grows over RestartSteps up to RestartMaxDelaySec) avoids a
-      # tight crash loop on a broken release.
+      # tight crash loop on a broken release. 3 SPACED attempts (RestartSec
+      # 10/20/30) span ~60s < the 120s StartLimit window: a transient recovers on
+      # the first retry; a persistent bad binary exhausts the burst → park →
+      # OnFailure → revert (mesh-resilience review fix #4, folded in with the
+      # OnFailure catch-net below so the breaker never precedes it).
       Restart            = "on-failure";
-      RestartSec         = 3;
-      RestartSteps       = 5;
-      RestartMaxDelaySec = 60;
+      RestartSec         = 10;
+      RestartSteps       = 3;
+      RestartMaxDelaySec = 30;
+      # CRASH-AT-STARTUP CATCH-NET (mesh-resilience Phase 2 keystone). When the
+      # start path keeps crashing — the ~31ms pre-READY exit class the in-process
+      # watchdog (Track B/D) can NEVER see because it arms only after join+READY —
+      # systemd fires this OnFailure unit (svc #5d). On systemd v256 it fires on
+      # EVERY failed ExecStart, so tabbify-boot-revert is idempotent and only the
+      # fire on which the durable BootAttempts counter crosses the threshold
+      # actually reverts. This is the ONLY layer that works with no live process.
+      OnFailure          = [ "tabbify-boot-revert.service" ];
       # root for TUN + Firecracker tap + /dev/kvm:
       User = "root";
     };
@@ -477,6 +597,12 @@ in {
     before   = [ "tabbify-supervisor.service" ];
     after    = [ "network-online.target" ];
     wants    = [ "network-online.target" ];
+    # NEVER park the lifeline: disable the start-rate-limit burst cap entirely so
+    # it keeps trying forever. This is a `[Unit]` directive — set via the NixOS
+    # top-level `startLimitIntervalSec` option (NOT `serviceConfig`, which would
+    # emit it into `[Service]` where systemd ignores it), mirroring how
+    # tabbify-supervisor sets its breaker.
+    startLimitIntervalSec = 0;
     # `ip`/`iptables` for the lifeline's own TUN + overlay routing; coreutils for
     # the fetch script's readlink/ln.
     path     = [ pkgs.iproute2 pkgs.iptables pkgs.coreutils pkgs.curl pkgs.jq ];
@@ -502,11 +628,56 @@ in {
       ExecStart = ''${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --super-admin-pubkey ''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY} --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline'';
       # SAME canonical env path as the supervisor (review fix #11): rotation only.
       EnvironmentFile = "-${dataDir}/supervisor.env";
-      # The lifeline NEVER gives up: always restart, spaced, and NEVER park.
+      # The lifeline NEVER gives up: always restart, spaced, and NEVER park
+      # (the burst cap is disabled via top-level `startLimitIntervalSec = 0` above).
       Restart    = "always";
       RestartSec = 10;
-      StartLimitIntervalSec = 0;   # disable the burst cap — keep trying forever
       # root for the TUN + overlay routing.
+      User = "root";
+    };
+  };
+
+  # 5d. Crash-at-startup auto-rollback CATCH-NET (mesh-resilience Phase 2
+  #     keystone). Triggered ONLY via `OnFailure=` on tabbify-supervisor (svc #5)
+  #     — NOT `wantedBy` any target. It is the no-live-process layer that reverts
+  #     supervisord to the previous-good release when the start path keeps
+  #     crashing (the ~31ms pre-READY exit the in-process watchdog can never see).
+  #
+  #     ⚠ v256 fires OnFailure PER failed attempt (~3-5×/burst): the
+  #     `tabbifyBootRevertScript` is IDEMPOTENT and the durable BootAttempts
+  #     counter gates the revert (only the fire that crosses the threshold acts;
+  #     `reset-failed && start` is strictly gated behind a revert performed THIS
+  #     fire — never on a sub-threshold fire, or the start-rate-limit counter
+  #     would reset and the breaker would never trip = the 06-22 class re-armed).
+  #
+  #     ⚠ This oneshot itself sets StartLimitIntervalSec=0 (review fix #2): WITHOUT
+  #     it the catch-net would hit its OWN default StartLimitBurst (5/10s) under
+  #     the per-attempt re-triggering and get PARKED mid-incident → the catch-net
+  #     goes silent exactly when it is needed.
+  systemd.services.tabbify-boot-revert = {
+    description = "Revert tabbify-supervisor to previous-good release on crash-at-startup";
+    # Deliberately NOT wantedBy any target — only fired via OnFailure=.
+    # ⚠ Disable the burst cap on the catch-net ITSELF (review fix #2) so the
+    # per-attempt OnFailure re-triggering on systemd v256 can never park it
+    # mid-incident. This is a `[Unit]` directive — set via the NixOS top-level
+    # `startLimitIntervalSec` option (NOT `serviceConfig`, where it would land in
+    # `[Service]` and be ignored).
+    startLimitIntervalSec = 0;
+    # systemctl (reset-failed/start), coreutils, jq (parse boot-attempts.json).
+    path = [ pkgs.systemd pkgs.coreutils pkgs.jq ];
+    environment = {
+      # The revert subcommand + the script resolve the SAME on-host layout the
+      # supervisor binary uses (symlinks+VERSION under ${dataDir}; BootAttempts
+      # sidecar + the SHARED reboot-guard.json under ${dataDir}/data — one
+      # host-wide ≤3/hr budget shared with Track B/C).
+      SUPERVISOR_DATA_DIR  = "${dataDir}/data";
+      TABBIFY_INSTALL_DIR  = dataDir;
+      TABBIFY_RELEASES_DIR = releasesDir;
+      RUST_LOG             = "info";
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${tabbifyBootRevertScript}";
       User = "root";
     };
   };
