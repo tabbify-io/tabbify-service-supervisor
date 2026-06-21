@@ -10,8 +10,14 @@ use std::time::Duration;
 
 use sd_notify::NotifyState;
 
+pub mod tier1_backoff;
 pub mod tier2;
 
+pub use tier1_backoff::{
+    BACKOFF_BASE, BACKOFF_MAX, HEALTHY_RESET, RestartAttempts, backoff_floor, fold_boot_attempts,
+    load_restart_attempts, now_micros, restart_attempts_path, save_restart_attempts,
+    withhold_allowed,
+};
 pub use tier2::{
     DeadStreak, REBOOT_AFTER_CONSECUTIVE_DEAD, RebootRunner, SystemctlReboot, TIER2_GRACE,
     Tier2Action, apply_tier2, dead_streak_path, escalate_decision, fold_observation,
@@ -112,25 +118,53 @@ pub const fn guard_black_hole(data_plane_healthy: bool, relay_only: bool) -> Pet
 /// closure can move into the spawned task.
 pub type DataPlaneProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// One pet tick: sample the data plane, gate on `relay_only` (§3), and apply the
-/// decision through the petter. Pure given its injected collaborators — the live
-/// loop is just this on a `W/2` timer. The probe self-clocks (Track K reads the
-/// current monotonic clock internally), so no `now` is plumbed here.
+/// One pet tick: sample the data plane, gate on `relay_only` (§3), gate on the
+/// ESCALATING RESTART BACKOFF (B-fix-2), and apply the decision through the
+/// petter. Pure given its injected collaborators — the live loop is just this on
+/// a `W/2` timer. The probe self-clocks (Track K reads the current monotonic
+/// clock internally); `uptime` is threaded in (no `Instant::now` here) so the
+/// backoff floor stays a pure function of injected state.
+///
+/// Backoff gate: even on a real black hole, the pet is only WITHHELD once the
+/// process has been up at least [`tier1_backoff::backoff_floor`] for the current
+/// consecutive-black-hole-restart count (`attempts`). Below the floor we keep
+/// PETTING (suppress the kill) so a chronically-flaky WAN (MSI) cannot tight-loop
+/// restarts faster than the floor. `attempts == 0` ⇒ floor 0 ⇒ the FIRST
+/// black-hole kill is instant (Leo default).
 #[must_use]
 pub fn run_once<Pe: Petter + ?Sized>(
     probe: &dyn Fn() -> bool,
     petter: &Pe,
     relay_only: bool,
+    uptime: Duration,
+    attempts: u32,
 ) -> PetOutcome {
     let healthy = probe();
-    let action = guard_black_hole(healthy, relay_only);
-    if action == PetAction::Skip {
+    let mut action = guard_black_hole(healthy, relay_only);
+    if action == PetAction::Skip && !tier1_backoff::withhold_allowed(uptime, attempts) {
+        // A real black hole, but the backoff floor for this attempt count has not
+        // yet elapsed — SUPPRESS the kill (keep petting) so successive black-hole
+        // restarts can't recur faster than the floor. Below the floor the unit
+        // stays alive and keeps trying to converge on its own.
+        tracing::warn!(
+            relay_only,
+            attempts,
+            uptime_secs = uptime.as_secs(),
+            backoff_floor_secs = tier1_backoff::backoff_floor(attempts).as_secs(),
+            "watchdog-pet: black hole but within restart-backoff floor — \
+             SUPPRESSING the self-restart this tick (still petting)"
+        );
+        action = PetAction::Pet;
+    } else if action == PetAction::Skip {
         // About to let systemd SIGKILL+restart us — make the cause forensically
         // obvious in the journal (the restart itself otherwise looks unexplained).
         tracing::error!(
             relay_only,
-            "watchdog-pet: sustained data-plane black hole — WITHHOLDING WATCHDOG=1; \
-             systemd will restart the unit for a fresh handshake (relay_only preserved)"
+            attempts,
+            backoff_floor_secs = tier1_backoff::backoff_floor(attempts).as_secs(),
+            "watchdog-pet: sustained data-plane black hole past the backoff floor — \
+             WITHHOLDING WATCHDOG=1; systemd will restart the unit for a fresh \
+             handshake (relay_only preserved)"
         );
     }
     apply_decision(action, petter)
@@ -157,19 +191,50 @@ pub fn spawn_watchdog_pet(
         return None;
     };
     let interval = pet_interval(window);
+
+    // ── B-fix-2 ESCALATING RESTART BACKOFF ───────────────────────────────────
+    // The attempt count from PRIOR boots fixes the backoff floor for THIS
+    // incarnation: how long this process must be up before it may withhold the
+    // pet (self-restart) again. Loaded ONCE here (corrupt/missing ⇒ 0 ⇒ instant
+    // kill eligible — the fail-safe direction). The tier-2 boot-check below
+    // re-folds the sidecar for the NEXT boot.
+    let attempts_path = restart_attempts_path(data_dir);
+    let attempts = load_restart_attempts(&attempts_path).attempts;
+    let backoff = backoff_floor(attempts);
+
     tracing::info!(
         watchdog_window_secs = window.as_secs(),
         pet_interval_secs = interval.as_secs(),
-        "watchdog-pet armed: petting every W/2 while data-plane healthy"
+        prior_black_hole_restarts = attempts,
+        restart_backoff_floor_secs = backoff.as_secs(),
+        "watchdog-pet armed: petting every W/2 while data-plane healthy \
+         (self-restart suppressed below the backoff floor)"
     );
 
     // Tier-2 boot-check: one-shot, after a grace window long enough for a fresh
     // post-restart handshake to converge. Spawned independently so a slow grace
-    // never delays the pet.
+    // never delays the pet. It ALSO folds the tier-1 restart-attempts sidecar
+    // off the SAME post-grace data-plane sample: still-dead ⇒ the prior tier-1
+    // restart failed ⇒ ++attempts (the floor ramps); healthy past HEALTHY_RESET
+    // ⇒ reset to 0 (the next incident starts instant again).
     let tier2_probe = std::sync::Arc::clone(&probe);
     let data_dir = data_dir.to_path_buf();
     tokio::spawn(async move {
         tokio::time::sleep(TIER2_GRACE).await;
+        let healthy = tier2_probe();
+        // Fold the tier-1 backoff sidecar (still-dead ⇒ a black-hole restart just
+        // failed). Best-effort persist; a corrupt/failed write only ever lets the
+        // next kill happen sooner (fail-safe).
+        let folded = fold_boot_attempts(
+            load_restart_attempts(&attempts_path),
+            !healthy,
+            now_micros(),
+        );
+        if let Err(e) = save_restart_attempts(&attempts_path, folded) {
+            tracing::warn!(error = %e, "watchdog tier-1: restart-attempts persist failed");
+        }
+        // Then run the tier-2 escalation off the SAME observation (re-samples the
+        // probe internally; the grace window already elapsed so it is consistent).
         run_tier2_boot_check(
             tier2_probe.as_ref(),
             &dead_streak_path(&data_dir),
@@ -181,13 +246,20 @@ pub fn spawn_watchdog_pet(
     });
 
     let petter = SdPetter;
+    let started = std::time::Instant::now();
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // First tick fires immediately: pet right away so the unit is fed before
         // the very first W elapses (we just reached READY).
         loop {
             tick.tick().await;
-            let _ = run_once(probe.as_ref(), &petter, relay_only);
+            let _ = run_once(
+                probe.as_ref(),
+                &petter,
+                relay_only,
+                started.elapsed(),
+                attempts,
+            );
         }
     }))
 }
@@ -292,7 +364,8 @@ mod tests {
     #[test]
     fn run_once_pets_then_withholds_on_black_hole() {
         // A probe that flips healthy→dead after the first sample, so two ticks
-        // exercise both branches.
+        // exercise both branches. attempts=0 ⇒ floor 0 ⇒ the black hole withholds
+        // INSTANTLY (Leo default: the first kill is never delayed).
         let calls = Cell::new(0u32);
         let probe = || {
             let n = calls.get();
@@ -301,9 +374,15 @@ mod tests {
         };
         let spy = SpyPetter::new(|| Ok(()));
         // First tick: healthy + relay_only ⇒ Petted.
-        assert_eq!(run_once(&probe, &spy, true), PetOutcome::Petted);
-        // Second tick: dead + relay_only ⇒ Withheld (systemd will restart).
-        assert_eq!(run_once(&probe, &spy, true), PetOutcome::Withheld);
+        assert_eq!(
+            run_once(&probe, &spy, true, Duration::ZERO, 0),
+            PetOutcome::Petted
+        );
+        // Second tick: dead + relay_only + attempts=0 ⇒ Withheld (systemd restarts).
+        assert_eq!(
+            run_once(&probe, &spy, true, Duration::ZERO, 0),
+            PetOutcome::Withheld
+        );
         assert_eq!(spy.pets.get(), 1, "exactly one pet across the two ticks");
     }
 
@@ -312,7 +391,51 @@ mod tests {
         let probe = || false; // dead data plane
         let spy = SpyPetter::new(|| Ok(()));
         // Dead data plane but relay_only=false ⇒ fail-open ⇒ Petted (never kill).
-        assert_eq!(run_once(&probe, &spy, false), PetOutcome::Petted);
+        assert_eq!(
+            run_once(&probe, &spy, false, Duration::from_secs(9999), 5),
+            PetOutcome::Petted
+        );
         assert_eq!(spy.pets.get(), 1);
+    }
+
+    #[test]
+    fn run_once_suppresses_black_hole_kill_below_the_backoff_floor() {
+        // A real black hole (dead + relay_only), but attempts=2 ⇒ floor 60s and we
+        // are only 30s up ⇒ the kill is SUPPRESSED: we keep PETTING so successive
+        // restarts cannot recur faster than the floor (the B-fix-2 guarantee).
+        let probe = || false;
+        let spy = SpyPetter::new(|| Ok(()));
+        assert_eq!(
+            run_once(&probe, &spy, true, Duration::from_secs(30), 2),
+            PetOutcome::Petted,
+            "below the 60s floor a black hole must NOT withhold — it pets"
+        );
+        assert_eq!(spy.pets.get(), 1, "suppression still pets the unit");
+    }
+
+    #[test]
+    fn run_once_withholds_black_hole_once_above_the_backoff_floor() {
+        // Same black hole, attempts=2 ⇒ floor 60s, now 60s up ⇒ the floor elapsed
+        // ⇒ the withhold is finally allowed (self-restart fires).
+        let probe = || false;
+        let spy = SpyPetter::new(|| Ok(()));
+        assert_eq!(
+            run_once(&probe, &spy, true, Duration::from_secs(60), 2),
+            PetOutcome::Withheld,
+            "at/above the floor the black hole withholds (restart fires)"
+        );
+        assert_eq!(spy.pets.get(), 0, "a real withhold never pets");
+    }
+
+    #[test]
+    fn run_once_first_attempt_is_instant_kill() {
+        // attempts=0 ⇒ floor 0 ⇒ even a 0s-uptime black hole withholds instantly.
+        let probe = || false;
+        let spy = SpyPetter::new(|| Ok(()));
+        assert_eq!(
+            run_once(&probe, &spy, true, Duration::ZERO, 0),
+            PetOutcome::Withheld,
+            "the first black-hole kill is instant (no backoff on attempt #0)"
+        );
     }
 }
