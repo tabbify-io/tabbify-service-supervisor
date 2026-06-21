@@ -248,6 +248,36 @@ mod tests {
         assert!(args.contains("init=/init"));
     }
 
+    /// F4 (audit #93) — ANTI-REGRESSION GUARD: the single boot-args builder must
+    /// NEVER emit `acpi=off`. The legacy docker-derived guest kernel baked
+    /// `acpi=off`, which disabled the LAPIC → the guest fell back to the PIT and
+    /// busy-spun a core forever instead of HLT-idling (task #23, the MSI "furnace"
+    /// amplifier). The stock Firecracker CI kernel (ACPI on) is correct today and
+    /// this builder is kernel-agnostic; this test FAILS LOUDLY the moment anyone
+    /// reintroduces `acpi=off` into `boot_source_body` (e.g. copy-pasting a legacy
+    /// docker cmdline). Asserted across several kernel/IP inputs so no code path
+    /// can sneak it in. The kernel SOURCE is pinned in `nixos/tabbify-node.nix`
+    /// (`kernelUrl`) so the digest can't silently regress either.
+    #[test]
+    fn boot_source_body_never_disables_acpi() {
+        for (kernel, guest, host) in [
+            ("/opt/tabbify/vmlinux", "172.31.0.2", "172.31.0.1"),
+            ("/opt/tabbify/vmlinux-6.1.128", "10.0.0.2", "10.0.0.1"),
+            ("", "192.168.255.2", "192.168.255.1"),
+        ] {
+            let b = boot_source_body(kernel, guest, host);
+            let args = b["boot_args"].as_str().unwrap();
+            assert!(
+                !args.contains("acpi=off"),
+                "boot_source_body must NEVER emit acpi=off (busy-spin kernel regression, audit #93): got {args:?}"
+            );
+            // Positive companion: pci=off + the working serial console stay, so a
+            // blanket "strip everything" edit doesn't pass this test vacuously.
+            assert!(args.contains("pci=off"), "pci=off expected: {args:?}");
+            assert!(args.contains("console=ttyS0"), "console=ttyS0 expected: {args:?}");
+        }
+    }
+
     #[test]
     fn rootfs_drive_body_is_root_and_writable() {
         let b = rootfs_drive_body("/var/lib/tabbify/rootfs.ext4", false);
