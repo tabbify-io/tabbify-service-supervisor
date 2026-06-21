@@ -168,6 +168,22 @@ pub enum Command {
         #[arg(long = "to", value_name = "VERSION")]
         to: String,
     },
+    /// Roll the binary symlinks back to the newest previous-good release and exit
+    /// (the crash-at-startup catch-net's remediation, spec §3.2). Reuses the
+    /// audited `selfupdate::watchdog::revert_to_previous` (symlink re-point +
+    /// VERSION rewrite ONLY — systemd owns the restart), stamps the reverted-from
+    /// version into the VERSION `quarantine` list so the OTA poller can't re-swap
+    /// the known-bad release, and is invoked by the `OnFailure=tabbify-boot-revert`
+    /// unit. When there is no complete previous release (a genuine first boot):
+    /// with `--reboot-on-exhausted` it consults the `RebootGuard` and reboots as a
+    /// last resort, then parks; without it, it exits non-zero so the OnFailure
+    /// script can distinguish "no previous (bail)" from "revert failed".
+    RevertToPrevious {
+        /// On an exhausted revert (no complete previous-good release), reboot the
+        /// host as a last resort (guarded ≤3/hr) instead of just exiting non-zero.
+        #[arg(long = "reboot-on-exhausted")]
+        reboot_on_exhausted: bool,
+    },
 }
 
 /// Default firecracker binary (looked up on `$PATH`).
@@ -472,6 +488,38 @@ mod tests {
     fn self_update_requires_to_version() {
         // `self-update` with no `--to` is a usage error, not a silent no-op.
         assert!(Config::try_parse_from(["supervisord", "self-update"]).is_err());
+    }
+
+    #[test]
+    fn parses_revert_to_previous_subcommand() {
+        // The bare subcommand: reboot-on-exhausted defaults to false (the
+        // OnFailure script only opts into the reboot escalation explicitly).
+        let cfg = Config::try_parse_from(["supervisord", "revert-to-previous"]).unwrap();
+        match cfg.command {
+            Some(Command::RevertToPrevious {
+                reboot_on_exhausted,
+            }) => assert!(
+                !reboot_on_exhausted,
+                "reboot-on-exhausted must default to false"
+            ),
+            other => panic!("expected RevertToPrevious, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_revert_to_previous_with_reboot_on_exhausted() {
+        let cfg =
+            Config::try_parse_from(["supervisord", "revert-to-previous", "--reboot-on-exhausted"])
+                .unwrap();
+        match cfg.command {
+            Some(Command::RevertToPrevious {
+                reboot_on_exhausted,
+            }) => assert!(
+                reboot_on_exhausted,
+                "--reboot-on-exhausted must set the flag"
+            ),
+            other => panic!("expected RevertToPrevious, got {other:?}"),
+        }
     }
 
     #[test]
