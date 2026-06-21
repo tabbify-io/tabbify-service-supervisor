@@ -23,8 +23,29 @@ let
 
   # Fixed download locations (anonymous, public read — no AWS account).
   releaseBase = "https://tabbify-releases-leo.s3.eu-central-1.amazonaws.com";
+  # ⚠ PINNED kernel (F4, audit #93). The stock Firecracker CI vmlinux (ACPI on →
+  #   working LAPIC, no idle core-spin) is the CORRECT kernel; the legacy
+  #   docker-derived kernel baked `acpi=off` which busy-spun a core. This URL is
+  #   version-pinned (`v1.12/.../vmlinux-6.1.128`) so the boot path can never
+  #   silently regress to a busy-spin kernel. The supervisor's `boot_source_body`
+  #   never emits `acpi=off` (guard-tested in `protocol.rs`); pin the SOURCE here.
   kernelUrl   = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128";
   dataDir     = "/opt/tabbify";
+
+  # F1 (audit #93) — AGGREGATE CPU ceiling for the `tabbify-fc.slice` (the sum of
+  # ALL Firecracker guests). `300%` == at most 3 full cores for ALL guests
+  # combined, reserving the rest of the box for the supervisor + mesh data-plane
+  # so a swarm/orphan of guests can never saturate the host and black-hole the
+  # mesh. ⚠ OWNER DECISION (capacity planning on the sole MSI worker): raise on a
+  # bigger box, lower to reserve more headroom. The PER-GUEST caps are the
+  # supervisor's own knobs (`fcCpuQuotaServing`/`fcCpuQuotaBuild`), independent.
+  fcSliceCpuQuota   = "300%";
+  # Per-guest caps baked onto the supervisor unit (inherited by the one-shot
+  # build runner via env). Serving ~1 core, build ~2 cores; weight below the
+  # supervisor's default 100 so the box stays steerable under guest contention.
+  fcCpuQuotaServing = "100";
+  fcCpuQuotaBuild   = "200";
+  fcCpuWeight       = "80";
 
   # Prod mesh coordinator control-plane URL — the SAME baked EIP the supervisor
   # binary defaults to (src/config.rs `DEFAULT_COORDINATOR_URL`) and the
@@ -389,6 +410,31 @@ in {
     '';
   };
 
+  # 4c. tabbify-fc.slice — the AGGREGATE CPU ceiling for every Firecracker guest
+  #     (F1, audit #93). Each FC child runs in its OWN transient
+  #     `tabbify-fc-<id>.scope` UNDER this slice (the supervisor spawns them via
+  #     `systemd-run --scope --slice=tabbify-fc.slice -p CPUQuota=… -p CPUWeight=…`),
+  #     so the slice's own `CPUQuota` caps the SUM of all guests and always leaves
+  #     the host headroom the supervisor + mesh data-plane need. This is the
+  #     defence that turns "one runaway/orphaned FC saturates the box → mesh
+  #     starves → liveness reads black-hole → watchdog SIGKILL → crash-loop →
+  #     more orphans → hotter" into a bounded, steerable load — AND it survives a
+  #     dead supervisor (systemd owns the slice + scopes; `systemctl stop
+  #     tabbify-fc.slice` tears every guest down even with supervisord gone).
+  #
+  #     ⚠ OWNER DECISION (capacity planning, #93): `fcSliceCpuQuota` reserves host
+  #     headroom on the sole MSI worker. `${fcSliceCpuQuota}` here leaves ~1 core
+  #     for the supervisor/mesh on a typical multi-core box; tune per host. The
+  #     PER-GUEST caps are the supervisor's own knobs (SUPERVISOR_FC_CPU_QUOTA_*,
+  #     baked on the unit below) — slice = aggregate, scope = per-guest, decoupled.
+  systemd.slices.tabbify-fc = {
+    description = "Tabbify Firecracker guests (aggregate CPU ceiling — F1, audit #93)";
+    sliceConfig = {
+      CPUAccounting = true;
+      CPUQuota      = fcSliceCpuQuota;
+    };
+  };
+
   # 5. The supervisor itself — managed, auto-restart, starts on boot.
   #    Runs as root: it opens a host TUN device (CAP_NET_ADMIN), creates
   #    Firecracker taps, and opens /dev/kvm. The coordinator address is already
@@ -423,8 +469,10 @@ in {
     # iptables for per-tap guest-egress NAT (MASQUERADE/FORWARD) set up after the
     # FC tap so the in-VM node can reach the public mesh coordinator (B3);
     # git clones the source on the HOST when this node is a `builder` (the
-    # FC-build sandbox clones host-side so the token never enters the guest):
-    path = [ pkgs.firecracker pkgs.iproute2 pkgs.iptables pkgs.busybox pkgs.e2fsprogs pkgs.oras pkgs.coreutils pkgs.curl pkgs.jq pkgs.git ];
+    # FC-build sandbox clones host-side so the token never enters the guest);
+    # systemd provides `systemd-run` (F1 — wraps each FC spawn in a CPU-capped
+    # scope under tabbify-fc.slice) + `systemctl` (scope teardown reaper):
+    path = [ pkgs.firecracker pkgs.iproute2 pkgs.iptables pkgs.busybox pkgs.e2fsprogs pkgs.oras pkgs.coreutils pkgs.curl pkgs.jq pkgs.git pkgs.systemd ];
     environment = {
       SUPERVISOR_NAME        = nodeName;
       SUPERVISOR_DATA_DIR    = "${dataDir}/data";
@@ -468,6 +516,14 @@ in {
       # (src/firecracker/linux.rs::console_stdio) — without it a spawn failure
       # inside the guest is invisible (the 500 only carries the top-level error).
       SUPERVISOR_FC_DEBUG    = "1";
+      # F1 (audit #93): per-FC CPU-scope caps. The supervisor wraps each
+      # firecracker child in a `systemd-run --scope --slice=tabbify-fc.slice`
+      # with these quotas; the one-shot build runner reads the SAME envs. Serving
+      # ~1 core, build ~2 cores, weight below the supervisor's 100 so the box
+      # stays steerable. Slice aggregate ceiling is `tabbify-fc.slice` (svc #4c).
+      SUPERVISOR_FC_CPU_QUOTA_SERVING = fcCpuQuotaServing;
+      SUPERVISOR_FC_CPU_QUOTA_BUILD   = fcCpuQuotaBuild;
+      SUPERVISOR_FC_CPU_WEIGHT        = fcCpuWeight;
       RUST_LOG               = "info";
     };
     serviceConfig = {

@@ -44,6 +44,10 @@ pub(crate) mod build_vm;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 pub(crate) mod pidfile;
+// Pure, host-agnostic per-FC CPU-scope argv + scope-name builder (F1, audit
+// #93) — NO cfg gate so the argv/fallback LOGIC is unit-testable on macOS (the
+// spawn + `systemctl stop` reaping that consume it are behind the Linux gate).
+pub(crate) mod cpu_scope;
 mod protocol;
 pub(crate) mod snapshot;
 // Pure, host-agnostic snapshot DECISION logic — NO cfg gate so it is unit-

@@ -228,6 +228,51 @@ pub struct FcConfig {
         default_value_t = 8080
     )]
     pub app_port: u16,
+
+    /// F1 (audit #93) — per-SERVING-guest `CPUQuota` percent for the transient
+    /// systemd scope each Firecracker child runs in (`100` == one full core).
+    /// Bounds a runaway/busy serving app to a fraction of the box so a single
+    /// guest can never starve the supervisor's mesh data-plane. Operator-tunable
+    /// (a capacity-planning call on the sole worker — NOT hardcoded magic).
+    #[arg(
+        long = "firecracker-cpu-quota-serving",
+        env = "SUPERVISOR_FC_CPU_QUOTA_SERVING",
+        default_value_t = 100
+    )]
+    pub cpu_quota_serving_pct: u32,
+
+    /// F1 — per-BUILD-VM `CPUQuota` percent (`200` == two cores). Build VMs are
+    /// 2-vCPU + compile-heavy, so the default is higher than serving, but still
+    /// capped so a wedged build can't take the whole host.
+    #[arg(
+        long = "firecracker-cpu-quota-build",
+        env = "SUPERVISOR_FC_CPU_QUOTA_BUILD",
+        default_value_t = 200
+    )]
+    pub cpu_quota_build_pct: u32,
+
+    /// F1 — `CPUWeight` (cgroup-v2 relative share, 1..=10000) for every FC scope.
+    /// Below the supervisor's own default 100 so under CPU contention the
+    /// supervisor + mesh win the scheduler and the box stays steerable.
+    #[arg(
+        long = "firecracker-cpu-weight",
+        env = "SUPERVISOR_FC_CPU_WEIGHT",
+        default_value_t = 80
+    )]
+    pub cpu_weight: u32,
+}
+
+impl FcConfig {
+    /// Assemble the F1 [`crate::firecracker::cpu_scope::CpuScopeCfg`] from the
+    /// operator-tunable quota/weight knobs.
+    #[must_use]
+    pub fn cpu_scope_cfg(&self) -> crate::firecracker::cpu_scope::CpuScopeCfg {
+        crate::firecracker::cpu_scope::CpuScopeCfg {
+            serving_quota_pct: self.cpu_quota_serving_pct,
+            build_quota_pct: self.cpu_quota_build_pct,
+            weight: self.cpu_weight,
+        }
+    }
 }
 
 impl Default for FcConfig {
@@ -240,6 +285,11 @@ impl Default for FcConfig {
             vcpus: 1,
             tap_subnet: DEFAULT_FC_TAP_SUBNET.to_owned(),
             app_port: 8080,
+            // Mirror the clap defaults (F1, audit #93): serving ~1 core, build
+            // ~2 cores, weight below the supervisor's own 100.
+            cpu_quota_serving_pct: 100,
+            cpu_quota_build_pct: 200,
+            cpu_weight: 80,
         }
     }
 }

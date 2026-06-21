@@ -286,6 +286,7 @@ pub async fn run_sandboxed_build(
             scratch: &scratch,
             cache: &cache,
             console_log: &console_log,
+            data_dir,
             cfg: &fc_cfg,
         };
         crate::firecracker::build_vm::run_build_vm(&spec).await?;
@@ -472,7 +473,24 @@ fn fc_config_from_env() -> crate::config::FcConfig {
         tap_subnet: std::env::var("SUPERVISOR_FC_TAP_SUBNET")
             .unwrap_or_else(|_| crate::config::DEFAULT_FC_TAP_SUBNET.to_owned()),
         app_port: 8080,
+        // F1 (audit #93): the one-shot build runner has no clap context, so read
+        // the per-FC CPU-scope knobs from the SAME envs clap binds (the daemon
+        // bakes them into the unit), falling back to the audited defaults. Bad /
+        // missing values use the default so a build never fails to spawn over a
+        // malformed knob.
+        cpu_quota_serving_pct: env_u32("SUPERVISOR_FC_CPU_QUOTA_SERVING", 100),
+        cpu_quota_build_pct: env_u32("SUPERVISOR_FC_CPU_QUOTA_BUILD", 200),
+        cpu_weight: env_u32("SUPERVISOR_FC_CPU_WEIGHT", 80),
     }
+}
+
+/// Parse a `u32` from env `var`, falling back to `default` on absent/unparseable.
+#[cfg(target_os = "linux")]
+fn env_u32(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

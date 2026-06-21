@@ -18,7 +18,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::process::Command;
 
 use super::linux::{
     api_put_sock, derive_link_ips, run_ip, setup_guest_nat, setup_tap, teardown_guest_nat,
@@ -36,6 +35,12 @@ use crate::config::FcConfig;
 /// NEVER name, address, or `ip link del` a device a serving app VM in the
 /// SAME host netns could own (serving + build runners share one netns).
 pub(crate) const BUILD_TAP: &str = "fc-bld0";
+/// F1/F2 (audit #93): the fixed scope/pidfile identity for the build VM. Drives
+/// the deterministic systemd scope name (`tabbify-fc-build0.scope`) AND the
+/// build-VM pidfile (`tabbify-fc-build0.pid`) so the build orphan — the hottest,
+/// previously-unreapable guest (no record, no pidfile) — is both CPU-capped and
+/// kill-able by the record-less orphan sweep.
+pub(crate) const BUILD_SCOPE_ID: &str = "build0";
 /// `02:FB:…` (locally-administered, distinct from serving's `02:FC:…`).
 pub(crate) const BUILD_MAC: &str = "02:FB:00:00:00:01";
 /// /30 carved from the TOP of the tap /16 (172.31.255.x), where the serving
@@ -65,6 +70,12 @@ pub struct BuildVmSpec<'a> {
     /// Console log path (always captured for builds — the guest build log's
     /// last resort when the scratch comes back unreadable).
     pub console_log: &'a Path,
+    /// The supervisor data dir. F2.3 (audit #93): the build VM writes a
+    /// deterministic pidfile (`<data_dir>/tabbify-fc-build0.pid`) here after
+    /// spawn so the record-less orphan sweep + the per-uuid reaper have a handle
+    /// on the build orphan (the hottest, previously-unreapable guest). Mirrors
+    /// the serving path's per-uuid pidfile under the same dir.
+    pub data_dir: &'a Path,
     /// Firecracker runtime config (binary, kernel, tap subnet).
     pub cfg: &'a FcConfig,
 }
@@ -122,20 +133,40 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
     // serving path's /dev/null-by-default rationale doesn't apply); it's the
     // last-resort build log if the scratch comes back unreadable.
     let (stdout, stderr) = build_console_stdio(spec.console_log);
-    let mut child = match Command::new(&spec.cfg.bin)
-        .arg("--api-sock")
-        .arg(&api_sock)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-    {
-        Ok(c) => c,
+    // F1 (audit #93): wrap the build FC in its OWN CPU-capped systemd scope
+    // (`tabbify-fc-build-<seq>.scope`, the BUILD quota — 2 cores by default, the
+    // hottest possible guest). `BUILD_SCOPE_ID` is the fixed build identity, so
+    // the scope name is deterministic + kill-able even with the supervisor dead.
+    // Off-systemd → bare spawn (scope=None), preserving the legacy direct-child
+    // `child.wait()`/`child.kill()` lifecycle so this path is host-agnostic.
+    let fc_args = vec![
+        "--api-sock".to_owned(),
+        api_sock.to_string_lossy().into_owned(),
+    ];
+    let (mut child, fc_scope) = match super::linux::spawn_build_firecracker(
+        spec.cfg,
+        BUILD_SCOPE_ID,
+        &fc_args,
+        stdout,
+        stderr,
+    ) {
+        Ok(pair) => pair,
         Err(e) => {
             cleanup().await;
             return Err(e).with_context(|| format!("spawn {} for build VM", spec.cfg.bin));
         }
     };
+
+    // F2.3 (audit #93): record the build VM's pid under the deterministic build
+    // identity so the record-less orphan sweep + per-uuid reaper can find + kill
+    // a build orphan (the hottest guest; previously had NO pidfile + NO record →
+    // unreapable short of reboot). When the FC runs in a systemd scope, `child`
+    // is the foreground `systemd-run` wrapper whose pid == the live build's
+    // handle (it dies with the FC); off-systemd it is firecracker directly.
+    // Removed on every exit below (`pidfile::take`).
+    if let Some(pid) = child.id() {
+        super::pidfile::write(spec.data_dir, BUILD_SCOPE_ID, pid);
+    }
 
     // Configure + boot. Any failure here kills the half-configured VM.
     let boot = async {
@@ -223,6 +254,16 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
         }
     };
 
+    // F1 (audit #93): tear down the build scope so the FC inside it is SIGKILLed
+    // in its cgroup — `child.kill()` above only reaps the `systemd-run` wrapper;
+    // the FC would survive into the supervisor-independent scope otherwise.
+    // Idempotent (a clean power-off already GC'd the scope via `--collect`).
+    if let Some(scope) = fc_scope.as_deref() {
+        super::linux::stop_fc_scope(scope);
+    }
+    // F2.3: consume the build pidfile on EVERY exit so a fresh build's sweep
+    // doesn't see a stale build0 handle.
+    let _ = super::pidfile::take(spec.data_dir, BUILD_SCOPE_ID);
     // VM-scoped host state dies with the VM, success or not.
     let _ = std::fs::remove_file(&api_sock);
     cleanup().await;

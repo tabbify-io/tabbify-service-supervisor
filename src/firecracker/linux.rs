@@ -169,6 +169,15 @@ pub struct FirecrackerRuntime {
     child: Option<Child>,
     tap_name: String,
     api_sock: PathBuf,
+    /// F1 (audit #93): the transient systemd SCOPE name the firecracker child
+    /// runs in (`tabbify-fc-<uuid>.scope`), when this host wrapped the spawn in
+    /// `systemd-run --scope` for a host-enforced CPU cap. `None` off-systemd
+    /// (macOS dev / CI / a plain container) where the child was bare-spawned and
+    /// `child` IS firecracker directly. When `Some`, `child` is the `systemd-run`
+    /// FOREGROUND wrapper (synchronous → it lives exactly as long as the FC), and
+    /// teardown must `systemctl stop` the scope (killing the wrapper PID alone
+    /// would orphan the FC INTO the now-supervisor-independent scope).
+    fc_scope: Option<String>,
     /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
     guest_base: String,
     /// The guest's IPv4 address on its /30 tap. Used by the L4 SSH forwarder
@@ -282,19 +291,29 @@ impl FirecrackerRuntime {
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
         let _ = std::fs::remove_file(&api_sock);
         let (stdout, stderr) = console_stdio(console_log);
-        let child = Command::new(&cfg.bin)
-            .arg("--api-sock")
-            .arg(&api_sock)
-            .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(stderr)
-            .spawn()
-            .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
+        // F1 (audit #93): wrap in a per-FC CPU-capped systemd scope. The scope
+        // id is `vm_key` (`uuid:reff`) — STABLE per (app, version) and distinct
+        // from the old/new VMs of a zero-downtime swap, exactly like the tap, so
+        // both coexist with their own scope. Off-systemd → bare spawn (scope=None).
+        let fc_args = vec![
+            "--api-sock".to_owned(),
+            api_sock.to_string_lossy().into_owned(),
+        ];
+        let (child, fc_scope) = spawn_firecracker(
+            cfg,
+            super::cpu_scope::FcKind::Serving,
+            vm_key,
+            &fc_args,
+            Stdio::null(),
+            stdout,
+            stderr,
+        )?;
 
         let me = Self {
             child: Some(child),
             tap_name,
             api_sock: api_sock.clone(),
+            fc_scope,
             guest_base,
             guest_ip,
             client: reqwest::Client::new(),
@@ -554,19 +573,28 @@ impl FirecrackerRuntime {
         let api_sock = PathBuf::from(format!("/tmp/firecracker-{tap_name}.sock"));
         let _ = std::fs::remove_file(&api_sock);
         let (stdout, stderr) = console_stdio(console_log);
-        let child = Command::new(&cfg.bin)
-            .arg("--api-sock")
-            .arg(&api_sock)
-            .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(stderr)
-            .spawn()
-            .with_context(|| format!("spawn firecracker binary {:?}", cfg.bin))?;
+        // F1 (audit #93): the warm-restore FC gets the SAME per-FC CPU-capped
+        // scope as the cold boot (scope id = `vm_key`), so a restored guest is
+        // bounded + kill-able identically. Off-systemd → bare spawn (scope=None).
+        let fc_args = vec![
+            "--api-sock".to_owned(),
+            api_sock.to_string_lossy().into_owned(),
+        ];
+        let (child, fc_scope) = spawn_firecracker(
+            cfg,
+            super::cpu_scope::FcKind::Serving,
+            vm_key,
+            &fc_args,
+            Stdio::null(),
+            stdout,
+            stderr,
+        )?;
 
         let me = Self {
             child: Some(child),
             tap_name,
             api_sock: api_sock.clone(),
+            fc_scope,
             guest_base,
             guest_ip,
             client: reqwest::Client::new(),
@@ -831,6 +859,7 @@ impl FirecrackerRuntime {
             child: None,
             tap_name: "fc-tap-test".to_owned(),
             api_sock: PathBuf::from("/tmp/firecracker-test.sock"),
+            fc_scope: None,
             guest_base: guest_base.to_owned(),
             guest_ip: Ipv4Addr::new(169, 254, 0, 2),
             client: reqwest::Client::new(),
@@ -927,6 +956,15 @@ impl AppRuntime for FirecrackerRuntime {
         if let Some(pid) = pid {
             tracing::info!(pid, tap = %self.tap_name, "fc shutdown: killing FC child");
             pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
+        }
+        // F1 (audit #93): when the FC runs in a systemd scope, killing the
+        // `systemd-run` wrapper PID above is NOT sufficient — systemd owns the
+        // scope, so the firecracker process survives INTO the
+        // supervisor-independent scope. `systemctl stop` the scope to SIGKILL the
+        // FC in its cgroup + GC the unit. Synchronous-ish (detached), idempotent.
+        if let Some(scope) = self.fc_scope.as_deref() {
+            tracing::info!(scope, tap = %self.tap_name, "fc shutdown: stopping CPU-capped scope");
+            stop_fc_scope(scope);
         }
         let tap = self.tap_name.clone();
         Box::pin(async move {
@@ -1033,6 +1071,13 @@ impl Drop for FirecrackerRuntime {
                 }
             }
         }
+        // F1 (audit #93): tear down the systemd scope so the FC inside it is
+        // SIGKILLed in its cgroup (killing the `systemd-run` wrapper child above
+        // would otherwise orphan the FC into the supervisor-independent scope).
+        // Safety net mirroring `shutdown`; idempotent if already stopped.
+        if let Some(scope) = self.fc_scope.as_deref() {
+            stop_fc_scope(scope);
+        }
         let _ = std::fs::remove_file(&self.api_sock);
         let tap = self.tap_name.clone();
         match std::process::Command::new("ip")
@@ -1058,6 +1103,142 @@ pub(crate) async fn setup_tap(tap_name: &str, host_ip: Ipv4Addr) -> Result<()> {
         .await
         .with_context(|| format!("ip link set {tap_name} up"))?;
     Ok(())
+}
+
+/// F1 (audit #93) — spawn the firecracker child, wrapped in a per-FC,
+/// CPU-capped, supervisor-independent systemd SCOPE when this host runs systemd.
+///
+/// On a systemd host the child is launched as
+/// `systemd-run --scope --collect --unit=tabbify-fc-<id>.scope
+/// --slice=tabbify-fc.slice -p CPUQuota=<n>% -p CPUWeight=<w> -- firecracker
+/// --api-sock <sock>`. `--scope` keeps firecracker as our DIRECT, FOREGROUND
+/// child (so the existing `Child`/`waitpid` exit-detection is unchanged — the
+/// `systemd-run` process lives exactly as long as the FC) while systemd wraps a
+/// cgroup with the CPU cap + the named kill handle. Off-systemd (macOS dev / CI
+/// / plain container) it falls back to a BARE `firecracker` spawn, preserving
+/// the legacy "child IS firecracker" lifecycle so tests stay host-agnostic.
+///
+/// Returns `(child, scope)` where `scope` is `Some(name)` iff the spawn was
+/// wrapped — the caller stores it so [`stop_fc_scope`] can tear the guest down
+/// even with the supervisor dead.
+///
+/// `scope_id` is the per-FC identity (an app uuid, or `build-<seq>`); `fc_args`
+/// is the verbatim firecracker argv tail (`["--api-sock", "<sock>"]`).
+fn spawn_firecracker(
+    cfg: &FcConfig,
+    kind: super::cpu_scope::FcKind,
+    scope_id: &str,
+    fc_args: &[String],
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<(Child, Option<String>)> {
+    use super::cpu_scope;
+
+    let wrap = cpu_scope::should_wrap(systemd_run_available(), cpu_scope::host_has_systemd());
+    if wrap {
+        let scope = cpu_scope::scope_name(scope_id);
+        let argv =
+            cpu_scope::systemd_run_argv(&scope, &cfg.cpu_scope_cfg(), kind, &cfg.bin, fc_args);
+        // argv[0] == "systemd-run"; the rest are its args.
+        let child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "spawn firecracker under systemd scope {scope} (systemd-run wrapping {})",
+                    cfg.bin
+                )
+            })?;
+        tracing::debug!(
+            scope = %scope,
+            quota_serving = cfg.cpu_quota_serving_pct,
+            quota_build = cfg.cpu_quota_build_pct,
+            weight = cfg.cpu_weight,
+            "fc spawn: wrapped in CPU-capped systemd scope (F1)"
+        );
+        Ok((child, Some(scope)))
+    } else {
+        let child = Command::new(&cfg.bin)
+            .args(fc_args)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("spawn firecracker binary {:?} (no systemd scope)", cfg.bin))?;
+        Ok((child, None))
+    }
+}
+
+/// F1 — build-VM spawn wrapper: [`spawn_firecracker`] with the BUILD kind/quota.
+/// Exposed `pub(crate)` so [`super::build_vm`] can route its FC spawn through the
+/// SAME CPU-scope path (the build VM is the hottest, 2-vCPU guest). `stdin` is
+/// always `null` for builds (no interactive input).
+pub(crate) fn spawn_build_firecracker(
+    cfg: &FcConfig,
+    scope_id: &str,
+    fc_args: &[String],
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<(Child, Option<String>)> {
+    spawn_firecracker(
+        cfg,
+        super::cpu_scope::FcKind::Build,
+        scope_id,
+        fc_args,
+        Stdio::null(),
+        stdout,
+        stderr,
+    )
+}
+
+/// Is a usable `systemd-run` on `$PATH`? Cheap existence check (no fork): scans
+/// the `PATH` dirs for an executable `systemd-run`. Pairs with
+/// [`super::cpu_scope::host_has_systemd`] in [`spawn_firecracker`]'s wrap gate.
+fn systemd_run_available() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join("systemd-run");
+        candidate.is_file()
+            || std::fs::metadata(&candidate)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+    })
+}
+
+/// F1 — stop the transient FC scope `scope` (`systemctl stop <scope>`).
+///
+/// This is the supervisor-INDEPENDENT teardown: systemd owns the scope, so a
+/// `systemctl stop` SIGTERM→SIGKILLs every process in the scope's cgroup
+/// (the firecracker child) and garbage-collects the unit, even if the
+/// `systemd-run` wrapper PID was already reaped/killed. Best-effort + fire-and-
+/// forget (spawned detached) so teardown never blocks on systemd; a missing
+/// scope (already gone) is a harmless non-zero exit. Idempotent.
+pub(crate) fn stop_fc_scope(scope: &str) {
+    let scope = scope.to_owned();
+    let spawn = std::process::Command::new("systemctl")
+        .args(["stop", &scope])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawn {
+        Ok(mut child) => {
+            // Reap asynchronously if we're on a tokio runtime; else detach. We
+            // never block the caller (shutdown/Drop) on systemd.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            tracing::debug!(scope = %scope, error = %e, "systemctl stop fc scope failed to spawn (systemd absent?)");
+        }
+    }
 }
 
 /// Run an `ip ...` command, erroring on a non-zero exit.
