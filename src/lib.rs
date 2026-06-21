@@ -38,6 +38,7 @@
 pub mod api;
 pub mod app_runtime;
 pub mod app_ula;
+pub mod boot_health;
 pub mod build;
 pub mod build_backend;
 pub mod capability_tags;
