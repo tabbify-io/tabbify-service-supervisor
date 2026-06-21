@@ -27,13 +27,21 @@ let
   dataDir     = "/opt/tabbify";
 
   # Track C signed remote-restart: the super-admin Ed25519 PUBLIC key (64-char
-  # hex) this node verifies every remote command against, end-to-end. Empty (the
-  # default) DISABLES remote commands — the supervisor's gate is fail-closed, so
-  # an unset / malformed key means every signed command is rejected. It is a
-  # PUBLIC key (safe in git / the Nix store), but for rotation without a rebuild
-  # it can also be supplied via the `${dataDir}/supervisor.env` EnvironmentFile
-  # drop-in (TABBIFY_MESH_SUPER_ADMIN_PUBKEY=<hex>), which overrides this default.
-  meshSuperAdminPubkey = "";
+  # hex) this node verifies every remote command against, end-to-end. It is a
+  # PUBLIC key (safe in git / the Nix store), so it is BAKED here as the default
+  # — a fresh box has Track-C armed without a drop-in. For rotation without a
+  # rebuild it can also be supplied via the `${dataDir}/supervisor.env`
+  # EnvironmentFile drop-in (TABBIFY_MESH_SUPER_ADMIN_PUBKEY=<hex>), which
+  # overrides this default.
+  #
+  # ⚠ SPLIT PER UNIT (Track-C single-authority — mesh-resilience review fix #5):
+  # this baked pubkey is routed ONLY to the `tabbify-mesh-lifeline` unit's
+  # `environment` (the lifeline is the SOLE Track-C restart authority on the
+  # host). The IN-PROCESS supervisor joiner is given an EMPTY pubkey
+  # (`TABBIFY_MESH_SUPER_ADMIN_PUBKEY = ""` on the `tabbify-supervisor` unit), so
+  # there is exactly ONE armed peer per host → no addressing ambiguity and a
+  # SINGLE host-wide RebootGuard (≤3 reboots/hr), never two.
+  meshSuperAdminPubkey = "da24f9580c671a7b26c85175631b5797682041a4e8e695a32f70ee21f16324ba";
 
   # On-host versioned layout (persistent, OUTSIDE the Nix store — this module
   # manages the systemd UNIT, never the binaries as derivations). The binaries
@@ -274,13 +282,19 @@ in {
       # forwards `--mesh-relay-only` to every runner it spawns (which share this
       # host's NAT/firewall), so the whole node converges over the relay.
       TABBIFY_MESH_RELAY_ONLY = "true";
-      # Track C signed remote-restart: the super-admin Ed25519 PUBLIC key (hex)
-      # this node verifies remote commands against end-to-end. Empty default →
-      # remote commands DISABLED (fail-closed gate). The EnvironmentFile drop-in
-      # (supervisor.env) overrides this when set, so the key can be rotated
-      # without a Nix rebuild. A compromised coordinator can relay but never
-      # forge a command (the node verifies this key, not the transport).
-      TABBIFY_MESH_SUPER_ADMIN_PUBKEY = meshSuperAdminPubkey;
+      # Track C signed remote-restart: the supervisor's IN-PROCESS joiner is
+      # DELIBERATELY NOT a Track-C target (mesh-resilience review fix #5). The
+      # SOLE Track-C authority on this host is the out-of-process
+      # `tabbify-mesh-lifeline` unit (which reads the REAL `meshSuperAdminPubkey`);
+      # arming BOTH joiners would put two signed-command peers on one host →
+      # addressing ambiguity + two separate RebootGuards (up to 6 reboots/hr).
+      # So this in-process joiner gets an EMPTY pubkey → `parse_super_admin_pubkey`
+      # returns None → fail-closed (every signed command rejected here). The
+      # supervisor is restarted BY the lifeline's sink (`systemctl restart
+      # tabbify-supervisor`), so it never needs to receive remote commands itself.
+      # (An EnvironmentFile drop-in could still override this for a one-off, but
+      # the canonical Track-C target is the lifeline.)
+      TABBIFY_MESH_SUPER_ADMIN_PUBKEY = "";
       # Always capture the Firecracker serial console: runners inherit this env
       # and append guest console output to <data_dir>/fc/<uuid>.console.log
       # (src/firecracker/linux.rs::console_stdio) — without it a spawn failure
@@ -350,6 +364,17 @@ in {
       # installer writes (scripts/install.sh), so both install paths share one
       # canonical token location. The leading '-' makes a missing file
       # non-fatal, so a dev / no-mesh node still starts.
+      #
+      # ⚠ CANONICAL PATH — DO NOT HAND-EDIT to `/etc/tabbify/supervisor.env`
+      # (mesh-resilience review fix #11 / GAP#6). The committed path is
+      # `${dataDir}/supervisor.env` (= /opt/tabbify/supervisor.env); the
+      # lifeline + boot-revert units read the SAME path. The 2026-06-22 brick was
+      # exactly this GitOps drift — a hand-pointed `/etc/tabbify/...`
+      # EnvironmentFile (and a hand ExecStart override WITHOUT RestartSec) diverged
+      # from the committed unit. A `nixos-rebuild switch` does NOT remove a
+      # pre-existing hand-edit, so after a rebuild VERIFY the live unit matches
+      # this file (`systemctl cat tabbify-supervisor`). Rotate the env via this
+      # one path only; never hand-edit a second location.
       EnvironmentFile  = "-${dataDir}/supervisor.env";
       # on-failure (NOT always): a clean exit during a watchdog rollback must
       # NOT auto-respawn the just-swapped-out binary. Exponential-ish backoff
