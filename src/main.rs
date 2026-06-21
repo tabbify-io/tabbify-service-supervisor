@@ -61,6 +61,24 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(code);
     }
 
+    // ── revert-to-previous subcommand (crash-at-startup catch-net, spec §3.2) ─
+    // `supervisord revert-to-previous [--reboot-on-exhausted]` is the audited
+    // remediation the `OnFailure=tabbify-boot-revert` unit invokes when the start
+    // path keeps crashing. It re-points the binary symlinks to the previous-good
+    // release (reusing `watchdog::revert_to_previous` — symlink + VERSION only,
+    // systemd owns the restart), stamps the reverted-from version into the
+    // VERSION `quarantine` list (so the OTA poller can't re-swap the known-bad
+    // tag), and records the revert in the BootAttempts sidecar. It runs to
+    // completion and exits with a code the OnFailure script reads (see
+    // `RevertExit`). It never falls through to the daemon boot.
+    if let Some(tabbify_supervisor::config::Command::RevertToPrevious {
+        reboot_on_exhausted,
+    }) = &config.command
+    {
+        let code = run_revert_to_previous(*reboot_on_exhausted).await;
+        std::process::exit(code);
+    }
+
     // ── Probe entrypoint (self-update candidate, spec §4) ───────────────────
     // If `--check` is set, this process is an OUT-OF-BAND candidate: it joins
     // the mesh with a TRANSIENT identity, runs the 3-part health gate against
@@ -417,6 +435,184 @@ async fn run_self_update(to: &str) -> i32 {
     }
 }
 
+/// Exit codes for `revert-to-previous`, read by the `OnFailure=tabbify-boot-revert`
+/// shell wrapper to decide its next step. DISTINCT codes let the script tell
+/// "a revert was actually performed (now `reset-failed && start`)" from "no
+/// previous to roll back to (O4 — escalate to reboot)" from "the revert itself
+/// failed". These are the load-bearing contract between the Rust subcommand and
+/// the nix OnFailure script (spec §3.5).
+mod revert_exit {
+    /// A revert was performed this fire (symlinks repointed + quarantine stamped):
+    /// the OnFailure script may now `systemctl reset-failed && start`.
+    pub const PERFORMED: i32 = 0;
+    /// No completely-staged previous-good release (O4 first-boot bail) and
+    /// `--reboot-on-exhausted` was NOT set: the script can re-invoke with
+    /// `--reboot-on-exhausted` to escalate.
+    pub const NO_PREVIOUS: i32 = 2;
+    /// The revert was attempted but FAILED for some other reason (a symlink /
+    /// VERSION write error) — distinct from NO_PREVIOUS so a real first boot is
+    /// never confused with a broken install.
+    pub const FAILED: i32 = 3;
+    /// `--reboot-on-exhausted` was set, the revert was exhausted (no previous),
+    /// and the reboot loop-guard PARKED (≤3/hr exhausted): leave the unit failed
+    /// for a human (systemd `StartLimit` is the backstop).
+    pub const REBOOT_PARKED: i32 = 4;
+}
+
+/// Run the audited `revert-to-previous` flow and return the process exit code
+/// (see [`revert_exit`]). Wires the PRODUCTION seams: the default
+/// [`SelfUpdateConfig`] layout, a NO-OP restart runner (systemd owns the restart
+/// via the OnFailure script's `reset-failed && start`), the real `systemctl
+/// reboot` reboot seam, and the shared host-wide `RebootGuard`
+/// (`<data_dir>/reboot-guard.json` — the SAME ≤3/hr budget as Track B/C).
+async fn run_revert_to_previous(reboot_on_exhausted: bool) -> i32 {
+    use tabbify_supervisor::mesh_command::reboot_guard::RebootGuard;
+    use tabbify_supervisor::mesh_command::sink::reboot_history_path;
+    use tabbify_supervisor::selfupdate::SelfUpdateConfig;
+
+    let cfg = SelfUpdateConfig::default();
+    let data_dir = boot_health_data_dir();
+    // The revert itself triggers NO restart — systemd owns it (the OnFailure
+    // script does `reset-failed && start`). Pass a no-op restart runner so the
+    // audited `watchdog::revert_to_previous` repoints symlinks + rewrites VERSION
+    // only.
+    let restart: tabbify_supervisor::selfupdate::swap::RestartRunner =
+        std::sync::Arc::new(|_args| Box::pin(async { true }));
+    // Real reboot seam: guarded `systemctl reboot` as a last resort.
+    let guard = RebootGuard::new(reboot_history_path(&data_dir));
+    let reboot = || {
+        if !guard.try_reboot_now() {
+            return false;
+        }
+        tracing::error!(
+            "revert-to-previous: no previous-good release and --reboot-on-exhausted set \
+             — rebooting as a last resort (guard slot consumed)"
+        );
+        let _ = std::process::Command::new("systemctl").arg("reboot").status();
+        true
+    };
+
+    let outcome = revert_to_previous_flow(
+        &cfg.install_dir,
+        &cfg.releases_dir,
+        &data_dir,
+        reboot_on_exhausted,
+        &restart,
+        &reboot,
+    )
+    .await;
+    outcome.exit_code()
+}
+
+/// What the revert flow did, mapped to a [`revert_exit`] code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RevertFlowOutcome {
+    /// A revert was performed; carries the rolled-back-to version.
+    Performed(String),
+    /// No previous-good release (O4 bail); `--reboot-on-exhausted` was not set.
+    NoPrevious,
+    /// No previous-good release; reboot escalation fired (host is rebooting).
+    Rebooted,
+    /// No previous-good release; reboot escalation was PARKED by the loop-guard.
+    RebootParked,
+    /// The revert was attempted but failed for another reason.
+    Failed(String),
+}
+
+impl RevertFlowOutcome {
+    const fn exit_code(&self) -> i32 {
+        match self {
+            // A reboot is in progress: exit cleanly (the box is going down).
+            Self::Performed(_) | Self::Rebooted => revert_exit::PERFORMED,
+            Self::NoPrevious => revert_exit::NO_PREVIOUS,
+            Self::RebootParked => revert_exit::REBOOT_PARKED,
+            Self::Failed(_) => revert_exit::FAILED,
+        }
+    }
+}
+
+/// The testable core of `revert-to-previous` (the production wiring is in
+/// [`run_revert_to_previous`]). Reads VERSION to capture the reverted-FROM
+/// version, runs the audited [`revert_to_previous`], and on success stamps the
+/// reverted-FROM version into the VERSION `quarantine` list + records the revert
+/// in the BootAttempts sidecar. On a no-previous bail (O4): with
+/// `reboot_on_exhausted` it consults the injected `reboot` seam (guarded); else
+/// it returns [`RevertFlowOutcome::NoPrevious`]. A non-bail error returns
+/// [`RevertFlowOutcome::Failed`]. The `restart` + `reboot` collaborators are
+/// injected so the flow is unit-testable without poking systemd.
+async fn revert_to_previous_flow(
+    install_dir: &std::path::Path,
+    releases_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    reboot_on_exhausted: bool,
+    restart: &tabbify_supervisor::selfupdate::swap::RestartRunner,
+    reboot: &dyn Fn() -> bool,
+) -> RevertFlowOutcome {
+    use tabbify_supervisor::boot_health::BootAttempts;
+    use tabbify_supervisor::selfupdate::swap::{read_version_file, write_version_file};
+    use tabbify_supervisor::selfupdate::watchdog::revert_to_previous;
+
+    // Capture the reverted-FROM version BEFORE the revert rewrites VERSION. A
+    // missing/unreadable ledger means there is nothing to revert FROM either.
+    let reverted_from = read_version_file(install_dir)
+        .ok()
+        .map(|vf| vf.current)
+        .filter(|c| !c.is_empty());
+
+    match revert_to_previous(install_dir, releases_dir, restart).await {
+        Ok(rolled_back) => {
+            // Stamp the reverted-FROM version into the quarantine list so the OTA
+            // poller can never re-swap the known-bad release. `revert_to_previous`
+            // already rewrote VERSION (preserving the existing quarantine), so we
+            // re-read, append, and re-write — idempotent (the helper de-dups).
+            if let Some(bad) = &reverted_from {
+                match read_version_file(install_dir) {
+                    Ok(vf) => {
+                        let stamped = vf.quarantine_version(bad);
+                        if let Err(e) = write_version_file(install_dir, &stamped) {
+                            tracing::warn!(error = %format!("{e:#}"), "revert: quarantine stamp write failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "revert: re-read VERSION for quarantine failed");
+                    }
+                }
+                // Record the revert in the boot-attempts sidecar: zero the streak
+                // (the reverted binary gets its OWN fresh budget) and mark
+                // `reverted_to` so a re-crash of the reverted binary escalates to
+                // reboot-as-last-resort instead of reverting forever.
+                BootAttempts::mark_reverted(&rolled_back, data_dir);
+            }
+            tracing::info!(version = %rolled_back, "revert-to-previous: rolled back to previous-good (systemd owns the restart)");
+            RevertFlowOutcome::Performed(rolled_back)
+        }
+        Err(e) => {
+            // Distinguish the O4 "no previous to roll back to" bail (which is
+            // RECOVERABLE only by a reboot/park) from a genuine revert FAILURE.
+            // `revert_to_previous` bails with "no previous-good" /
+            // "completely-staged" in exactly the no-target cases.
+            let msg = format!("{e:#}");
+            let is_no_previous =
+                msg.contains("no previous-good") || msg.contains("completely-staged");
+            if !is_no_previous {
+                tracing::error!(error = %msg, "revert-to-previous: revert FAILED");
+                return RevertFlowOutcome::Failed(msg);
+            }
+            tracing::warn!(error = %msg, "revert-to-previous: no completely-staged previous-good release");
+            if reboot_on_exhausted {
+                if reboot() {
+                    RevertFlowOutcome::Rebooted
+                } else {
+                    tracing::error!("revert-to-previous: reboot loop-guard PARKED — leaving failed for a human");
+                    RevertFlowOutcome::RebootParked
+                }
+            } else {
+                RevertFlowOutcome::NoPrevious
+            }
+        }
+    }
+}
+
 /// Spawn the post-restart self-watchdog if VERSION records a pending-confirm
 /// swap. The watchdog polls the live local `/health` + `/v1/about` over the
 /// stability window; on confirm it clears the marker, on failure it rolls back
@@ -696,6 +892,190 @@ mod tests {
         // Production boot (no --check) is unaffected regardless of the identity flag.
         assert!(!candidate_identity_required(false, false));
         assert!(!candidate_identity_required(false, true));
+    }
+
+    // ── revert-to-previous flow (crash-at-startup catch-net) ────────────────
+
+    use tabbify_supervisor::boot_health::BootAttempts;
+    use tabbify_supervisor::selfupdate::swap::{
+        RestartRunner, VersionFile, read_version_file, repoint_symlink, write_version_file,
+    };
+
+    /// The two binaries the swap/revert re-points (mirrors swap::SWAP_BINARIES,
+    /// which is crate-private to the library and not reachable from the bin).
+    const TEST_SWAP_BINARIES: [&str; 2] = ["supervisord", "tabbify-runner"];
+
+    /// A no-op restart runner (systemd owns the restart in production).
+    fn noop_restart() -> RestartRunner {
+        std::sync::Arc::new(|_args| Box::pin(async { true }))
+    }
+
+    /// Stage `version`'s binaries under `<releases>/<version>/` as runnable files
+    /// so `release_is_complete` accepts the release as a rollback target.
+    fn stage(releases: &std::path::Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = releases.join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        for bin in TEST_SWAP_BINARIES {
+            let p = dir.join(bin);
+            std::fs::write(&p, format!("{version}-{bin}")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Happy path: a complete previous-good release exists → the flow rolls the
+    /// symlinks back to v1, rewrites VERSION (current=v1), STAMPS the reverted-from
+    /// v2 into quarantine, and records the revert in the BootAttempts sidecar.
+    #[tokio::test]
+    async fn revert_flow_rolls_back_quarantines_and_marks_reverted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage(&releases, ver);
+        }
+        for bin in TEST_SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let restart = noop_restart();
+        let reboot = || panic!("reboot must NOT fire when a revert succeeds");
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, false, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(outcome, RevertFlowOutcome::Performed("v1.0.0".to_owned()));
+        assert_eq!(outcome.exit_code(), revert_exit::PERFORMED);
+
+        // Symlinks rolled back to v1.0.0.
+        for bin in TEST_SWAP_BINARIES {
+            assert_eq!(
+                std::fs::read(install.join(bin)).unwrap(),
+                format!("v1.0.0-{bin}").into_bytes(),
+            );
+        }
+        // VERSION: current=v1, the reverted-from v2 is QUARANTINED.
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v1.0.0");
+        assert_eq!(
+            vf.quarantine,
+            vec!["v2.0.0".to_owned()],
+            "the reverted-from version must be stamped into quarantine",
+        );
+        // BootAttempts: streak reset, reverted_to recorded.
+        let ba = BootAttempts::load(&data_dir);
+        assert_eq!(ba.count, 0);
+        assert_eq!(ba.reverted_to.as_deref(), Some("v1.0.0"));
+    }
+
+    /// O4 first-boot: an EMPTY `previous[]` → the audited revert bails. WITHOUT
+    /// `--reboot-on-exhausted` the flow returns NoPrevious gracefully (NOT a panic,
+    /// NOT a reboot) so a genuinely-first-boot box is never reboot-looped.
+    #[tokio::test]
+    async fn revert_flow_no_previous_is_graceful_without_reboot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec![],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let restart = noop_restart();
+        let reboot = || panic!("reboot must NOT fire without --reboot-on-exhausted");
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, false, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(outcome, RevertFlowOutcome::NoPrevious);
+        assert_eq!(outcome.exit_code(), revert_exit::NO_PREVIOUS);
+        // VERSION untouched, nothing quarantined.
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v2.0.0");
+        assert!(vf.quarantine.is_empty());
+    }
+
+    /// O4 first-boot WITH `--reboot-on-exhausted`: an empty `previous[]` bails →
+    /// the flow consults the (injected) reboot seam. When the seam grants a slot
+    /// the outcome is Rebooted (exit 0 — the box is going down).
+    #[tokio::test]
+    async fn revert_flow_no_previous_reboots_when_exhausted_flag_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec![],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let restart = noop_restart();
+        let fired = std::cell::Cell::new(false);
+        let reboot = || {
+            fired.set(true);
+            true // guard granted a slot
+        };
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, true, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(outcome, RevertFlowOutcome::Rebooted);
+        assert_eq!(outcome.exit_code(), revert_exit::PERFORMED);
+        assert!(fired.get(), "the reboot seam must fire on exhausted+flag");
+    }
+
+    /// O4 first-boot WITH `--reboot-on-exhausted` but the loop-guard PARKS (seam
+    /// returns false) → RebootParked (a distinct exit code so the OnFailure script
+    /// leaves the unit failed for a human instead of looping).
+    #[tokio::test]
+    async fn revert_flow_no_previous_parks_when_reboot_guard_exhausted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec![],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let restart = noop_restart();
+        let reboot = || false; // guard exhausted → parked
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, true, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(outcome, RevertFlowOutcome::RebootParked);
+        assert_eq!(outcome.exit_code(), revert_exit::REBOOT_PARKED);
     }
 
     // ── boot-health loop-guard: which invocations count as a real boot ──────
