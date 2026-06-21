@@ -28,6 +28,26 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
+    // ── Crash-at-startup loop-guard: BUMP first (spec §3.3) ──────────────────
+    // Bump the durable boot-attempt counter at the very TOP of main — BEFORE
+    // `Config::from_env` and any fallible startup step — so a binary that exits
+    // before READY (the 2026-06-22 ~31ms pre-network crash class) is still
+    // counted. The `OnFailure=tabbify-boot-revert` catch-net reads this counter
+    // and reverts to previous-good once the streak crosses the threshold.
+    //
+    // GUARDED: the `self-update` / `--check` / `revert-to-previous` invocations
+    // are NOT "boots" (they run-to-completion-and-exit, or are out-of-band
+    // candidates) — counting them would poison the streak. We inspect argv
+    // directly (a lightweight check that does not depend on the full clap parse,
+    // so a config-parse crash on a REAL boot is still counted). `data_dir` is
+    // read from the same `SUPERVISOR_DATA_DIR` env the config uses.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let boot_data_dir = boot_health_data_dir();
+    if is_boot_invocation(&raw_args) {
+        let _ = tabbify_supervisor::boot_health::BootAttempts::load(&boot_data_dir)
+            .bump(&boot_data_dir);
+    }
+
     let config = Config::from_env();
 
     // ── self-update subcommand (production self-update flow, spec §3-§6) ─────
@@ -312,6 +332,18 @@ async fn main() -> anyhow::Result<()> {
     // above and never reaches here, so readiness is emitted only on real boot.
     tabbify_supervisor::readiness::notify_ready();
 
+    // ── Crash-at-startup loop-guard: CLEAR on READY (spec §3.3) ──────────────
+    // This boot reached READY — the binary can at least boot, bind, and serve —
+    // so the crash-at-startup streak (and any `reverted_to` marker a prior revert
+    // left) is cleared. The next incident starts from a clean slate. Guarded by
+    // the same `is_boot_invocation` predicate as the bump so the two are
+    // symmetric; in practice the self-update/--check/revert paths never reach
+    // here (they exit earlier), but keeping the guard explicit documents the
+    // invariant.
+    if is_boot_invocation(&raw_args) {
+        tabbify_supervisor::boot_health::BootAttempts::clear(&boot_data_dir);
+    }
+
     // ── Track B tier-1: arm the independent watchdog-pet ─────────────────────
     // It pets systemd (WATCHDOG=1) every WatchdogSec/2 ONLY while the data plane
     // is healthy (Track-K `dataplane_healthy`, self-clocking). On a sustained
@@ -593,6 +625,43 @@ async fn self_check(addr: SocketAddr, timeout: std::time::Duration) -> (bool, bo
         .unwrap_or((false, false))
 }
 
+/// The data dir the crash-at-startup loop-guard persists under, read directly
+/// from `SUPERVISOR_DATA_DIR` (the SAME env the clap [`Config`] uses,
+/// config.rs:114) with the same `/var/lib/tabbify` default. Resolved WITHOUT a
+/// full config parse so the bump can run before `Config::from_env` — a
+/// config-parse crash on a real boot is then still counted.
+fn boot_health_data_dir() -> std::path::PathBuf {
+    std::env::var("SUPERVISOR_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/tabbify"))
+}
+
+/// Whether this invocation is a REAL daemon boot (so the crash-at-startup
+/// loop-guard should bump/clear its counter), as opposed to a run-to-completion
+/// subcommand (`self-update`, `revert-to-previous`) or an out-of-band candidate
+/// (`--check`). Those are NOT "boots": a `self-update` deliberately exits, a
+/// candidate is a throwaway probe, and a `revert-to-previous` is the loop-guard's
+/// OWN remediation — counting any of them would poison the streak (and a
+/// `revert-to-previous` counting itself would be a feedback loop). Pure over the
+/// argv slice (everything after `argv[0]`) so it is unit-testable.
+#[must_use]
+fn is_boot_invocation(args: &[String]) -> bool {
+    // `--check` (the out-of-band candidate) appears as a flag anywhere in argv.
+    if args.iter().any(|a| a == "--check") {
+        return false;
+    }
+    // The run-to-completion subcommands are the FIRST non-flag token (clap
+    // subcommand position). Scanning for the bare token is robust to leading
+    // global flags and matches how clap dispatches the subcommand.
+    if args
+        .iter()
+        .any(|a| a == "self-update" || a == "revert-to-previous")
+    {
+        return false;
+    }
+    true
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,tabbify_supervisor=debug,supervisord=debug"));
@@ -627,6 +696,46 @@ mod tests {
         // Production boot (no --check) is unaffected regardless of the identity flag.
         assert!(!candidate_identity_required(false, false));
         assert!(!candidate_identity_required(false, true));
+    }
+
+    // ── boot-health loop-guard: which invocations count as a real boot ──────
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn bare_daemon_boot_is_a_boot_invocation() {
+        // The plain daemon boot (and one with global flags) bumps the counter.
+        assert!(is_boot_invocation(&args(&[])));
+        assert!(is_boot_invocation(&args(&["--data-dir", "/var/lib/tabbify"])));
+        assert!(is_boot_invocation(&args(&["--relay-only"])));
+    }
+
+    #[test]
+    fn self_update_is_not_a_boot_invocation() {
+        // `self-update --to vX` runs to completion and exits — never a boot.
+        assert!(!is_boot_invocation(&args(&["self-update", "--to", "v1.4.0"])));
+    }
+
+    #[test]
+    fn revert_to_previous_is_not_a_boot_invocation() {
+        // The loop-guard's OWN remediation must never count itself (feedback loop).
+        assert!(!is_boot_invocation(&args(&["revert-to-previous"])));
+        assert!(!is_boot_invocation(&args(&[
+            "revert-to-previous",
+            "--reboot-on-exhausted"
+        ])));
+    }
+
+    #[test]
+    fn check_candidate_is_not_a_boot_invocation() {
+        // The out-of-band `--check` candidate is a throwaway probe, not a boot.
+        assert!(!is_boot_invocation(&args(&[
+            "--check",
+            "--candidate-identity-path",
+            "/tmp/id.json"
+        ])));
     }
 
     // ── Fix 2: gate part 3 (pong) probes a DISTINCT route from part 2 ───────
