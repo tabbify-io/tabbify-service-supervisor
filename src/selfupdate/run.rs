@@ -115,9 +115,22 @@ pub async fn self_update_to(
     restart: &RestartRunner,
 ) -> Result<SelfUpdateOutcome> {
     // Short-circuit a no-op update so a re-run (or a desired == current trigger)
-    // does not re-stage / re-probe / restart for nothing.
+    // does not re-stage / re-probe / restart for nothing. ALSO short-circuit a
+    // QUARANTINED target (review fix #3 / O2): the crash-at-startup catch-net
+    // reverted away from this version, but the 2-min OTA poller still reads
+    // `supervisor/latest` (which on a bad-tag MSI still points at the known-bad
+    // release) and would re-pull → re-swap → re-crash → re-revert = an
+    // OSCILLATOR. Refusing the swap here breaks that loop; a fleet-wide re-tag of
+    // `latest` is the operator's separate remediation.
     if let Ok(vf) = read_version_file(&cfg.install_dir) {
         if vf.current == version {
+            return Ok(SelfUpdateOutcome::AlreadyCurrent(version.to_owned()));
+        }
+        if vf.is_quarantined(version) {
+            tracing::warn!(
+                %version,
+                "self-update: target is QUARANTINED (a prior crash-at-startup revert flagged it bad) — refusing to re-swap"
+            );
             return Ok(SelfUpdateOutcome::AlreadyCurrent(version.to_owned()));
         }
     }
@@ -298,6 +311,7 @@ mod tests {
                 current: "v1.0.0".into(),
                 previous: vec![],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -351,6 +365,7 @@ mod tests {
                 current: "v1.0.0".into(),
                 previous: vec![],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -394,6 +409,7 @@ mod tests {
                 current: "v9.9.9".into(),
                 previous: vec![],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -412,5 +428,60 @@ mod tests {
             outcome,
             SelfUpdateOutcome::AlreadyCurrent("v9.9.9".to_owned())
         );
+    }
+
+    /// O2 / review fix #3: a target on the `quarantine` list is REFUSED — the
+    /// crash-at-startup catch-net reverted away from `vBAD`, so the OTA poller
+    /// (which still reads `supervisor/latest` = the bad tag on a bricked MSI) must
+    /// NOT re-pull / re-probe / re-swap it. Without this skip the revert is an
+    /// OSCILLATOR. `current` is a DIFFERENT version, so this is NOT the
+    /// already-current short-circuit — it is the quarantine skip specifically.
+    #[tokio::test]
+    async fn self_update_skips_a_quarantined_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = SelfUpdateConfig {
+            release_base_url: "http://127.0.0.1:1/none".to_owned(),
+            arch: "x86_64".to_owned(),
+            releases_dir: tmp.path().join("releases"),
+            install_dir: tmp.path().to_path_buf(),
+            candidate_identity_path: tmp.path().join("candidate-identity.json"),
+            gate_timeout: Duration::from_secs(1),
+            stability_window: Duration::from_secs(1),
+        };
+        // Current is v1.0.0 (the rolled-back-to good build); vBAD is quarantined.
+        write_version_file(
+            &cfg.install_dir,
+            &VersionFile {
+                current: "v1.0.0".into(),
+                previous: vec![],
+                pending_confirm: None,
+                quarantine: vec!["vBAD".into()],
+            },
+        )
+        .unwrap();
+
+        // Probe / restart that PANIC if invoked: a quarantined target must hit
+        // neither (no fetch either — the base URL is a dead loopback, so a fetch
+        // attempt would error, not panic, but the skip returns BEFORE the fetch).
+        let probe: CandidateProbe = Box::new(|_b, _i, _t| {
+            Box::pin(async { panic!("probe must not run for a quarantined target") })
+        });
+        let restart: RestartRunner = Arc::new(|_args| {
+            Box::pin(async { panic!("restart must not run for a quarantined target") })
+        });
+
+        let outcome = self_update_to("vBAD", &cfg, &probe, &restart)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SelfUpdateOutcome::AlreadyCurrent("vBAD".to_owned()),
+            "a quarantined target is refused as a no-op (not swapped)",
+        );
+
+        // The ledger is untouched: current is still the good build, no swap.
+        let vf = read_version_file(&cfg.install_dir).unwrap();
+        assert_eq!(vf.current, "v1.0.0");
+        assert_eq!(vf.quarantine, vec!["vBAD".to_owned()]);
     }
 }

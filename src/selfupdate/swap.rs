@@ -49,6 +49,38 @@ pub struct VersionFile {
     /// runs the watchdog and clears it on confirm. Absent in steady state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_confirm: Option<String>,
+    /// Versions the crash-at-startup catch-net reverted AWAY from (the
+    /// reverted-from version is appended on every `revert-to-previous`). The
+    /// 2-min OTA poller still reads `supervisor/latest` (which on a bad-tag MSI
+    /// still points at the known-bad release), so without this the poller would
+    /// re-pull → re-swap → re-crash → re-revert = an OSCILLATOR. `self_update_to`
+    /// early-returns on a quarantined target, breaking that loop. Empty in steady
+    /// state; a ledger written without the key (legacy bash bootstrap) parses to
+    /// an empty list via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantine: Vec<String>,
+}
+
+impl VersionFile {
+    /// Append `version` to the quarantine list (idempotent — a version already
+    /// quarantined is not duplicated), returning the updated ledger. Pure; the
+    /// caller persists. The `revert-to-previous` CLI calls this with the
+    /// reverted-FROM version so the OTA poller can never re-swap the known-bad
+    /// release.
+    #[must_use]
+    pub fn quarantine_version(mut self, version: &str) -> Self {
+        if !self.quarantine.iter().any(|v| v == version) {
+            self.quarantine.push(version.to_owned());
+        }
+        self
+    }
+
+    /// Whether `version` is on the quarantine list (a known-bad release the OTA
+    /// poller must NOT re-swap to).
+    #[must_use]
+    pub fn is_quarantined(&self, version: &str) -> bool {
+        self.quarantine.iter().any(|v| v == version)
+    }
 }
 
 impl Default for VersionFile {
@@ -59,6 +91,7 @@ impl Default for VersionFile {
             current: String::new(),
             previous: Vec::new(),
             pending_confirm: None,
+            quarantine: Vec::new(),
         }
     }
 }
@@ -301,6 +334,7 @@ mod tests {
             current: "v2.0.0".into(),
             previous: vec!["v1.0.0".into()],
             pending_confirm: None,
+            quarantine: Vec::new(),
         };
         write_version_file(install, &vf).unwrap();
 
@@ -317,6 +351,7 @@ mod tests {
             current: "v1.0.0".into(),
             previous: vec![],
             pending_confirm: None,
+            quarantine: Vec::new(),
         };
         let after = push_version(before, "v2.0.0", 3);
         assert_eq!(after.current, "v2.0.0");
@@ -340,6 +375,7 @@ mod tests {
                 current: "v1.0.0".into(),
                 previous: vec![],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -397,6 +433,7 @@ mod tests {
             current: "v2.0.0".into(),
             previous: vec!["v1.0.0".into()],
             pending_confirm: None,
+            quarantine: Vec::new(),
         };
         // Steady state: no marker.
         assert_eq!(pending_confirm_of(&vf), None);
@@ -428,6 +465,7 @@ mod tests {
                     current: "v2.0.0".into(),
                     previous: vec!["v1.0.0".into()],
                     pending_confirm: None,
+                    quarantine: Vec::new(),
                 },
                 "v2.0.0",
             ),
@@ -462,10 +500,81 @@ mod tests {
                 current: "v1.0.0".into(),
                 previous: vec![],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
             "v1.0.0",
         );
         let after = push_version(before, "v2.0.0", 3);
         assert_eq!(after.pending_confirm, None);
+    }
+
+    // ── quarantine (OTA re-swap loop break, review fix #3) ──────────────────
+
+    /// `quarantine_version` appends a known-bad version and is idempotent — a
+    /// second stamp of the same version does not duplicate it.
+    #[test]
+    fn quarantine_version_appends_and_is_idempotent() {
+        let vf = VersionFile::default().quarantine_version("vBAD");
+        assert_eq!(vf.quarantine, vec!["vBAD".to_owned()]);
+        assert!(vf.is_quarantined("vBAD"));
+        assert!(!vf.is_quarantined("vGOOD"));
+
+        // Re-stamping the same version is a no-op (no duplicate entry).
+        let again = vf.quarantine_version("vBAD");
+        assert_eq!(again.quarantine, vec!["vBAD".to_owned()]);
+
+        // A different bad version accumulates.
+        let two = again.quarantine_version("vWORSE");
+        assert_eq!(two.quarantine, vec!["vBAD".to_owned(), "vWORSE".to_owned()]);
+    }
+
+    /// `push_version` PRESERVES the quarantine list across a later swap — a
+    /// version flagged bad stays quarantined even after the ledger rotates, so
+    /// the OTA poller can never re-swap it just because history advanced.
+    #[test]
+    fn push_version_preserves_quarantine_across_a_swap() {
+        let before = VersionFile {
+            current: "v1.0.0".into(),
+            previous: vec![],
+            pending_confirm: None,
+            quarantine: vec!["vBAD".into()],
+        };
+        let after = push_version(before, "v2.0.0", 3);
+        assert_eq!(
+            after.quarantine,
+            vec!["vBAD".to_owned()],
+            "a quarantined version must survive a subsequent swap",
+        );
+    }
+
+    /// The quarantine list survives the on-disk round-trip, and a legacy VERSION
+    /// written WITHOUT the key parses to an empty list (`#[serde(default)]`).
+    #[test]
+    fn quarantine_persists_and_legacy_ledger_parses_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v1.0.0".into(),
+                previous: vec![],
+                pending_confirm: None,
+                quarantine: vec!["vBAD".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_version_file(install).unwrap().quarantine,
+            vec!["vBAD".to_owned()],
+        );
+
+        // A legacy VERSION with no `quarantine` key parses to an empty list.
+        std::fs::write(
+            install.join("VERSION"),
+            r#"{"current":"v3.0.0","previous":[]}"#,
+        )
+        .unwrap();
+        let legacy = read_version_file(install).unwrap();
+        assert!(legacy.quarantine.is_empty());
     }
 }

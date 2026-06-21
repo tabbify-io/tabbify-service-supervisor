@@ -147,6 +147,7 @@ pub async fn revert_to_previous(
     // The rolled-back version becomes current again; any incomplete entries we
     // skipped over (plus the promoted entry itself) are dropped from history,
     // and the rest is preserved.
+    let quarantine = current.quarantine;
     let mut remaining = current.previous;
     remaining.drain(..=skipped);
     write_version_file(
@@ -157,6 +158,12 @@ pub async fn revert_to_previous(
             // A completed rollback IS a confirmed state — the rolled-back
             // version is known-good, so drop any pending-confirm marker.
             pending_confirm: None,
+            // PRESERVE the quarantine list across the rollback — a version a
+            // prior boot-revert flagged as known-bad must stay quarantined so the
+            // OTA poller can't re-swap it (the CLI wrapper appends the NEW
+            // reverted-from version on top of this; the audited path only carries
+            // the existing list through, never drops it).
+            quarantine,
         },
     )
     .context("write VERSION after rollback")?;
@@ -408,6 +415,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -439,6 +447,49 @@ mod tests {
         );
     }
 
+    /// The audited revert PRESERVES any existing `quarantine` list across the
+    /// rollback (review fix #3): a version a prior boot-revert flagged as known-bad
+    /// must stay quarantined after the ledger rotates, otherwise the OTA poller
+    /// could re-swap it. The audited path only carries the list through — the
+    /// CLI wrapper (run_revert_to_previous) is what APPENDS the new reverted-from
+    /// version on top.
+    #[tokio::test]
+    async fn revert_to_previous_preserves_quarantine_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage_release(&releases, ver);
+        }
+        for bin in SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+                quarantine: vec!["vOLDBAD".into()],
+            },
+        )
+        .unwrap();
+
+        let (restart, _calls) = recording_restart();
+        let rolled_back = revert_to_previous(install, &releases, &restart)
+            .await
+            .unwrap();
+        assert_eq!(rolled_back, "v1.0.0");
+
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v1.0.0");
+        assert_eq!(
+            vf.quarantine,
+            vec!["vOLDBAD".to_owned()],
+            "the audited revert must carry the existing quarantine through, never drop it",
+        );
+    }
+
     /// With no previous-good version recorded, a rollback is impossible and errors
     /// instead of silently leaving a broken install.
     #[tokio::test]
@@ -451,6 +502,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec![],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -523,6 +575,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -584,6 +637,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -654,6 +708,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -755,6 +810,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -807,6 +863,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.5.0".into(), "v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -857,6 +914,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
@@ -971,6 +1029,7 @@ mod tests {
                 current: "v2.0.0".into(),
                 previous: vec!["v1.0.0".into()],
                 pending_confirm: None,
+                quarantine: Vec::new(),
             },
         )
         .unwrap();
