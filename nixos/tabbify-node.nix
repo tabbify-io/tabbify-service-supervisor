@@ -26,6 +26,14 @@ let
   kernelUrl   = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128";
   dataDir     = "/opt/tabbify";
 
+  # Prod mesh coordinator control-plane URL — the SAME baked EIP the supervisor
+  # binary defaults to (src/config.rs `DEFAULT_COORDINATOR_URL`) and the
+  # standalone `tabbify-mesh` tool defaults to (tools/tabbify-mesh cli.rs). The
+  # supervisor's in-process joiner uses its baked default (no `--coordinator`
+  # passed in svc #5); the lifeline unit (svc #5a) passes this explicitly so the
+  # two joiners always reach the SAME coordinator.
+  coordinatorUrl = "http://3.124.69.92:8888";
+
   # Track C signed remote-restart: the super-admin Ed25519 PUBLIC key (64-char
   # hex) this node verifies every remote command against, end-to-end. It is a
   # PUBLIC key (safe in git / the Nix store), so it is BAKED here as the default
@@ -111,6 +119,58 @@ let
       # not start onto a host with a broken joiner.
       [ -x "${dataDir}/tabbify-mesh" ] || { echo "and no prior joiner present -> refusing to start"; exit 1; }
       echo "keeping prior joiner (fail-safe)"
+    fi
+  '';
+
+  # Lifeline joiner self-update — the lifeline unit's OWN ExecStartPre
+  # (mesh-resilience review fix #7). It is a copy of `supervisorFetchJoiner` that
+  # promotes to a DISTINCT top-level symlink `${dataDir}/tabbify-mesh-lifeline`
+  # (NOT the shared `${dataDir}/tabbify-mesh` the supervisor's ExecStartPre
+  # writes). Why a separate fetch+symlink instead of reusing
+  # `supervisorFetchJoiner`: the lifeline runs `Restart=always` and the two units
+  # are only `before`-ordered (NOT serialized across a single-unit restart), so a
+  # supervisor OTA restart re-running ITS ExecStartPre while the lifeline restarts
+  # on its own cycle would have both `ln -sfn` the SAME path concurrently → a
+  # symlink race where one unit yanks the target out from under the other. With a
+  # lifeline-distinct symlink there is no shared mutable path → no race. It also
+  # saves `${dataDir}/tabbify-mesh-lifeline.prev` (the prior promoted target)
+  # BEFORE `ln -sfn`, so the lifeline can roll its own joiner back on repeated
+  # failure (spec §3.7) without ever touching the supervisor's diagnostics joiner.
+  supervisorFetchJoinerLifeline = pkgs.writeShellScript "tabbify-supervisor-fetch-joiner-lifeline" ''
+    set -eu
+    arch="${arch}"
+    manifest="$(${pkgs.curl}/bin/curl -fsSL "${releaseBase}/mesh/latest" || echo '{}')"
+    desired="''${TABBIFY_MESH_VERSION:-$(printf '%s' "$manifest" | ${pkgs.jq}/bin/jq -r '.latest // empty')}"
+    # No desired (offline / no manifest): keep whatever is current. Fail-safe.
+    [ -n "$desired" ] || { echo "no desired mesh version; keeping current lifeline joiner"; exit 0; }
+
+    rel="${meshDir}/$desired"
+    if [ ! -x "$rel/tabbify-mesh" ]; then
+      ${pkgs.coreutils}/bin/mkdir -p "$rel"
+      ${pkgs.curl}/bin/curl -fSL -o "$rel/tabbify-mesh" \
+        "${releaseBase}/mesh/$desired/$arch/tabbify-mesh" \
+        || ${pkgs.curl}/bin/curl -fSL -o "$rel/tabbify-mesh" "${releaseBase}/mesh/tabbify-mesh"
+      ${pkgs.coreutils}/bin/chmod +x "$rel/tabbify-mesh"
+    fi
+
+    # Self-check the candidate BEFORE promoting it. A binary that cannot even
+    # report its version is broken -> refuse to promote.
+    if "$rel/tabbify-mesh" --version >/dev/null 2>&1; then
+      # Save the prior promoted target (if any) so the lifeline can roll back a
+      # bad joiner on repeated failure (spec §3.7). Best-effort: a missing prior
+      # symlink (first promote) just leaves no .prev.
+      if [ -L "${dataDir}/tabbify-mesh-lifeline" ]; then
+        prev_target="$(${pkgs.coreutils}/bin/readlink "${dataDir}/tabbify-mesh-lifeline" || true)"
+        [ -n "$prev_target" ] && ${pkgs.coreutils}/bin/ln -sfn "$prev_target" "${dataDir}/tabbify-mesh-lifeline.prev" || true
+      fi
+      ${pkgs.coreutils}/bin/ln -sfn "mesh/$desired/tabbify-mesh" "${dataDir}/tabbify-mesh-lifeline"
+      echo "promoted lifeline joiner $desired"
+    else
+      echo "candidate lifeline joiner $desired failed --version self-check"
+      # If there is NO working prior lifeline joiner at all, fail hard so the unit
+      # does not start onto a host with a broken joiner.
+      [ -x "${dataDir}/tabbify-mesh-lifeline" ] || { echo "and no prior lifeline joiner present -> refusing to start"; exit 1; }
+      echo "keeping prior lifeline joiner (fail-safe)"
     fi
   '';
 in {
@@ -385,6 +445,68 @@ in {
       RestartSteps       = 5;
       RestartMaxDelaySec = 60;
       # root for TUN + Firecracker tap + /dev/kvm:
+      User = "root";
+    };
+  };
+
+  # 5a. Mesh LIFELINE joiner — the out-of-process survivability unit
+  #     (mesh-resilience Phase 1, Option B). The supervisor's in-process joiner
+  #     runs inside supervisord's tokio runtime, so a supervisord crash kills the
+  #     TUN, drops every WG session, and SSH-over-mesh dies WITH it. This unit is
+  #     an INDEPENDENT, REDUNDANT joiner on a SECOND identity/ULA
+  #     (`lifeline-identity.json`, its own ephemeral :51820) with its OWN
+  #     `Restart=always` lifetime — it is unaffected by a supervisord crash-loop
+  #     or a StartLimit park, so the lifeline ULA stays SSH-reachable and Leo can
+  #     always get in and fix the box. Option B keeps app-ULA hosting on the
+  #     supervisor's in-process joiner (zero contention); the lifeline is a pure
+  #     reachability path, NOT a hard dependency (supervisor must still start even
+  #     if the lifeline is flapping), so the supervisor does NOT `Requires` it.
+  #
+  #     Track-C SOLE AUTHORITY (review fix #5): this unit reads the REAL
+  #     super-admin pubkey (baked `meshSuperAdminPubkey` default + EnvironmentFile
+  #     override) and is the ONLY signed-command target on the host — the
+  #     supervisor's in-process joiner runs with an EMPTY pubkey (svc #5). One
+  #     armed peer per host → one RebootGuard, no addressing ambiguity. The
+  #     operator finds the lifeline node-id via its roster `display_name`
+  #     (`${nodeName}-lifeline`) or the `lifeline-status.json` it writes on join.
+  systemd.services.tabbify-mesh-lifeline = {
+    description = "Tabbify mesh lifeline joiner (survives a supervisord crash)";
+    wantedBy = [ "multi-user.target" ];
+    # Ordered BEFORE the supervisor so the lifeline ULA is up first, but NOT a
+    # hard dep of it (Option B: redundant, not required).
+    before   = [ "tabbify-supervisor.service" ];
+    after    = [ "network-online.target" ];
+    wants    = [ "network-online.target" ];
+    # `ip`/`iptables` for the lifeline's own TUN + overlay routing; coreutils for
+    # the fetch script's readlink/ln.
+    path     = [ pkgs.iproute2 pkgs.iptables pkgs.coreutils pkgs.curl pkgs.jq ];
+    environment = {
+      # NO TABBIFY_MESH_RELAY_ONLY here (review fix #12): the `--relay-only` CLI
+      # arg below is the SINGLE source of truth for the standalone tool. The env
+      # var only drives the IN-PROCESS supervisor joiner (svc #5).
+      RUST_LOG = "info";
+      # Track-C: the REAL super-admin pubkey for the SOLE authority (the lifeline).
+      # Baked default; the EnvironmentFile drop-in can rotate it without a rebuild.
+      TABBIFY_MESH_SUPER_ADMIN_PUBKEY = meshSuperAdminPubkey;
+    };
+    serviceConfig = {
+      # `exec`: the joiner joins+blocks; the standalone tool has no sd_notify yet,
+      # so "ready" == "exec'd".
+      Type    = "exec";
+      # The lifeline's OWN fetch writing its OWN symlink (review fix #7) — never
+      # the shared `${dataDir}/tabbify-mesh` the supervisor's ExecStartPre writes.
+      ExecStartPre = "${supervisorFetchJoinerLifeline}";
+      # Join on a SECOND identity/ULA, relay-only, as the sole Track-C target.
+      # `''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}` is expanded by systemd from this
+      # unit's environment (the baked default / EnvironmentFile override).
+      ExecStart = ''${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --super-admin-pubkey ''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY} --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline'';
+      # SAME canonical env path as the supervisor (review fix #11): rotation only.
+      EnvironmentFile = "-${dataDir}/supervisor.env";
+      # The lifeline NEVER gives up: always restart, spaced, and NEVER park.
+      Restart    = "always";
+      RestartSec = 10;
+      StartLimitIntervalSec = 0;   # disable the burst cap — keep trying forever
+      # root for the TUN + overlay routing.
       User = "root";
     };
   };
