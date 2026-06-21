@@ -506,7 +506,13 @@ pub async fn delete_dev_session(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(session) = state.dev_sessions.remove(&id) else {
+    // F2.2b (audit #93): REAP THE FC BEFORE forgetting the session. Look the
+    // session up WITHOUT removing it (still the 404 gate) so every handle that
+    // lets us find + reap the VM survives the purge; only AFTER `purge_app` has
+    // killed the FC do we drop the registry entry / cap / durable sidecar. The
+    // old order removed the registry entry + sidecar FIRST and purged LAST — a
+    // crash in between stranded the FC with no record + no pidfile.
+    let Some((app_uuid, cap)) = state.dev_sessions.lookup(&id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("dev session {id} not found") })),
@@ -514,27 +520,28 @@ pub async fn delete_dev_session(
             .into_response();
     };
 
-    // Revoke the git-proxy capability immediately.
-    state.git_sessions.revoke(&session.cap);
-
-    // Remove the durable sidecar so a later restart cannot resurrect a phantom
-    // session for the purged VM (best-effort).
-    if let Err(e) = DevSessionRecord::remove(state.orchestrator.runner_dir(), &session.app_uuid) {
+    // Purge the VM FIRST (purge NOT stop — the monitor must never respawn it).
+    if let Err(e) = state.orchestrator.purge_app(&app_uuid).await {
         tracing::warn!(
             session_id = %id,
-            app_uuid = %session.app_uuid,
+            app_uuid = %app_uuid,
             error = %e,
-            "failed to remove dev-session record on delete"
+            "dev-session purge_app failed (continuing)"
         );
     }
 
-    // Purge the VM (purge NOT stop — the monitor must never respawn it).
-    if let Err(e) = state.orchestrator.purge_app(&session.app_uuid).await {
+    // FC reaped — now forget the session everywhere.
+    state.dev_sessions.remove(&id);
+    // Revoke the git-proxy capability.
+    state.git_sessions.revoke(&cap);
+    // Remove the durable sidecar so a later restart cannot resurrect a phantom
+    // session for the purged VM (best-effort).
+    if let Err(e) = DevSessionRecord::remove(state.orchestrator.runner_dir(), &app_uuid) {
         tracing::warn!(
             session_id = %id,
-            app_uuid = %session.app_uuid,
+            app_uuid = %app_uuid,
             error = %e,
-            "dev-session purge_app failed (continuing)"
+            "failed to remove dev-session record on delete"
         );
     }
 
@@ -603,16 +610,12 @@ pub async fn sweep_expired(
 
     let mut purged = Vec::new();
     for (session_id, app_uuid, cap) in expired {
-        // Remove from registry first so a concurrent request gets 404.
-        state.dev_sessions.remove(&session_id);
-        // Revoke the git-proxy capability.
-        state.git_sessions.revoke(&cap);
-        // Remove the durable sidecar (third teardown path, alongside delete +
-        // async-deploy-failure) so a restart cannot resurrect a reaped session.
-        if let Err(e) = DevSessionRecord::remove(state.orchestrator.runner_dir(), &app_uuid) {
-            tracing::warn!(session_id, app_uuid, error = %e, "dev-session reap: failed to remove record");
-        }
-        // Purge the VM.
+        // F2.2b (audit #93): REAP THE FC BEFORE forgetting the session. The old
+        // order removed the registry entry + durable sidecar FIRST and purged the
+        // VM LAST — a crash between the two stranded the FC with NO record + NO
+        // pidfile, invisible to the per-uuid reaper (an orphan only the new
+        // record-less sweep could later catch). Purge first so the FC is gone
+        // before we drop every handle that lets us find it again.
         if let Err(e) = state.orchestrator.purge_app(&app_uuid).await {
             tracing::warn!(
                 session_id,
@@ -620,6 +623,16 @@ pub async fn sweep_expired(
                 error = %e,
                 "dev-session idle-reap purge_app failed (continuing)"
             );
+        }
+        // Now the FC is reaped — safe to forget the session everywhere.
+        // Remove from registry so a concurrent request gets 404.
+        state.dev_sessions.remove(&session_id);
+        // Revoke the git-proxy capability.
+        state.git_sessions.revoke(&cap);
+        // Remove the durable sidecar (third teardown path, alongside delete +
+        // async-deploy-failure) so a restart cannot resurrect a reaped session.
+        if let Err(e) = DevSessionRecord::remove(state.orchestrator.runner_dir(), &app_uuid) {
+            tracing::warn!(session_id, app_uuid, error = %e, "dev-session reap: failed to remove record");
         }
         tracing::info!(
             session_id,

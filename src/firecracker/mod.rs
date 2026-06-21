@@ -73,6 +73,53 @@ pub use stub::FirecrackerRuntime;
 #[cfg(target_os = "linux")]
 pub use linux::setup_git_proxy_firewall;
 
+/// The fixed build-VM tap name (`fc-bld0`). Cross-platform const so the F2.2
+/// orphan sweep can compute the build api-socket WITHOUT pulling in the
+/// Linux-only `build_vm` module (keeps the sweep's pure fns macOS-testable). The
+/// Linux `build_vm` module re-exports THIS as `BUILD_TAP` (single source).
+//
+// Only the Linux build_vm + the Linux sweep (+ cross-platform tests) consume
+// these; off Linux they have no non-test caller (allow-dead-code there only).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const BUILD_TAP_NAME: &str = "fc-bld0";
+
+/// The fixed build-VM scope/pidfile identity (`build0`). Cross-platform for the
+/// same reason as [`BUILD_TAP_NAME`]; `build_vm::BUILD_SCOPE_ID` re-exports it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const BUILD_SCOPE_ID_NAME: &str = "build0";
+
+/// The deterministic FC host TAP name for identity `key` (`uuid` on cold start,
+/// `uuid:reff` on a deploy). `fc-<48-bit blake3 hex>` — 15 chars (IFNAMSIZ).
+///
+/// CROSS-PLATFORM single source of truth: the Linux runtime's
+/// `linux::fc_identity_for_key` delegates here for the tap name, and the
+/// record-less FC orphan sweep (F2.2, audit #93) reconstructs the EXPECTED
+/// api-socket of every LIVE runner record by hashing its key the SAME way — so
+/// the sweep's "this FC belongs to a live runner" correlation can never drift
+/// from the spawn path. Pure, no I/O, unit-testable on macOS.
+#[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn fc_tap_name_for_key(key: &str) -> String {
+    let digest = blake3::hash(key.as_bytes());
+    let b = digest.as_bytes();
+    let hash48: u64 = (u64::from(b[0]) << 40)
+        | (u64::from(b[1]) << 32)
+        | (u64::from(b[2]) << 24)
+        | (u64::from(b[3]) << 16)
+        | (u64::from(b[4]) << 8)
+        | u64::from(b[5]);
+    format!("fc-{hash48:012x}")
+}
+
+/// The deterministic FC api-socket path for identity `key`:
+/// `/tmp/firecracker-<tap>.sock` (matches the spawn sites in `linux.rs` /
+/// `build_vm.rs`). Used by the orphan sweep to build the live-socket set.
+#[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn fc_api_sock_for_key(key: &str) -> String {
+    format!("/tmp/firecracker-{}.sock", fc_tap_name_for_key(key))
+}
+
 /// Path to the KVM device node; presence + R/W openability gates firecracker.
 const DEV_KVM: &str = "/dev/kvm";
 

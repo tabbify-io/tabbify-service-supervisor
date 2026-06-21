@@ -34,13 +34,14 @@ use crate::config::FcConfig;
 /// single fixed identity is enough — and critically, the build path must
 /// NEVER name, address, or `ip link del` a device a serving app VM in the
 /// SAME host netns could own (serving + build runners share one netns).
-pub(crate) const BUILD_TAP: &str = "fc-bld0";
+pub(crate) const BUILD_TAP: &str = super::BUILD_TAP_NAME;
 /// F1/F2 (audit #93): the fixed scope/pidfile identity for the build VM. Drives
 /// the deterministic systemd scope name (`tabbify-fc-build0.scope`) AND the
 /// build-VM pidfile (`tabbify-fc-build0.pid`) so the build orphan — the hottest,
 /// previously-unreapable guest (no record, no pidfile) — is both CPU-capped and
-/// kill-able by the record-less orphan sweep.
-pub(crate) const BUILD_SCOPE_ID: &str = "build0";
+/// kill-able by the record-less orphan sweep. Single source: the cross-platform
+/// `super::BUILD_SCOPE_ID_NAME` (so the macOS-testable sweep agrees on the name).
+pub(crate) const BUILD_SCOPE_ID: &str = super::BUILD_SCOPE_ID_NAME;
 /// `02:FB:…` (locally-administered, distinct from serving's `02:FC:…`).
 pub(crate) const BUILD_MAC: &str = "02:FB:00:00:00:01";
 /// /30 carved from the TOP of the tap /16 (172.31.255.x), where the serving

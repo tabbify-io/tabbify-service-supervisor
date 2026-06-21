@@ -302,7 +302,236 @@ fn pull_in_progress(data_dir: &Path, uuid: &str) -> bool {
     false
 }
 
+// ── F2.2 (audit #93) — record-less FC orphan sweep ───────────────────────────
+//
+// During a supervisor crash-loop nothing reaps the FCs left by a prior runner
+// death (the reaper IS the supervisor), and there is no per-uuid record/pidfile
+// for an FC whose record was already forgotten — or for the BUILD VM, which
+// (now) has a fixed pidfile but no runner record at all. Such an FC reparents to
+// PID 1 and spins/holds RAM until reboot. This sweep is the INDEPENDENT backstop:
+// scan `/proc` for tabbify firecracker processes, and SIGKILL any that are
+// PROVABLY orphaned. It is SAFETY-CRITICAL — a false positive kills a serving
+// app — so every gate fails toward NOT killing.
+
+/// The deterministic build-VM api-socket (`fc-bld0` is the fixed build tap).
+/// Uses the CROSS-PLATFORM build-tap const so this pure fn (and its tests) stay
+/// macOS-testable (the Linux-only `build_vm` module re-exports the same value).
+//
+// The sweep that calls these pure fns is `#[cfg(target_os = "linux")]` (it scans
+// `/proc`), so on a non-Linux build they have no non-test caller — but they ARE
+// exercised by the cross-platform unit tests below, hence allow-dead-code only
+// off Linux (mirrors `pidfile.rs` / `protocol.rs`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn build_fc_api_sock() -> String {
+    format!(
+        "/tmp/firecracker-{}.sock",
+        crate::firecracker::BUILD_TAP_NAME
+    )
+}
+
+/// Extract the `--api-sock <path>` value from a process's NUL-separated
+/// `/proc/<pid>/cmdline` argv, IF this looks like a tabbify firecracker process.
+///
+/// Recognises BOTH spawn shapes (F1, audit #93):
+/// - bare:  `firecracker\0--api-sock\0/tmp/firecracker-<tap>.sock\0`
+/// - scoped: `systemd-run\0--scope\0…\0--\0firecracker\0--api-sock\0/tmp/…\0`
+///
+/// Returns `Some(sock)` only when the argv contains the `firecracker` binary
+/// token AND an `--api-sock` whose value is under `/tmp/firecracker-….sock` (the
+/// deterministic tabbify socket prefix). Returns `None` for anything else — a
+/// non-FC process, a malformed cmdline, or a firecracker we don't recognise — so
+/// an unrecognised process is NEVER a kill candidate. Pure (testable).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_tabbify_fc_api_sock(cmdline: &[u8]) -> Option<String> {
+    // Split the NUL-separated argv into UTF-8-lossy tokens.
+    let argv: Vec<String> = cmdline
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    if argv.is_empty() {
+        return None;
+    }
+    // Must invoke the firecracker binary (the basename of SOME argv token equals
+    // `firecracker`). Covers both the bare `firecracker` argv[0] and the scoped
+    // `systemd-run … -- firecracker …` form.
+    let invokes_fc = argv.iter().any(|tok| {
+        std::path::Path::new(tok)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|base| base == "firecracker")
+    });
+    if !invokes_fc {
+        return None;
+    }
+    // Find the `--api-sock <value>` pair and require the deterministic tabbify
+    // socket prefix `/tmp/firecracker-….sock` (never matches an unrelated FC).
+    let pos = argv.iter().position(|t| t == "--api-sock")?;
+    let sock = argv.get(pos + 1)?;
+    if sock.starts_with("/tmp/firecracker-") && sock.ends_with(".sock") {
+        Some(sock.clone())
+    } else {
+        None
+    }
+}
+
+/// Build the set of api-sockets belonging to LIVE FCs that the sweep must NEVER
+/// kill, from the on-disk runner records.
+///
+/// For each record this adds BOTH reconstructible identities (the spawn path
+/// keys the FC tap on `uuid` for a cold start and on `uuid:reff` for a deploy —
+/// see `fc_identity_for_key`), so a live serving FC is always covered whichever
+/// key its tap was derived from. The BUILD socket is added unconditionally when
+/// a build may be in flight (`build_maybe_running`) — the build VM has no record.
+///
+/// NOTE — this set is INTENTIONALLY over-inclusive (it errs toward protecting
+/// more sockets): the swap's OLD VM (`uuid:old_reff`, whose reff the record no
+/// longer carries) is NOT reconstructible here, which is exactly why the sweep
+/// ALSO requires the orphan's parent to be PID 1 — a mid-swap old VM still has a
+/// live runner parent, so it is excluded by the parent gate, not this set.
+/// Pure (testable).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn live_fc_socket_set(records: &[RunnerHandle], build_maybe_running: bool) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for r in records {
+        // Cold-start key = uuid.
+        set.insert(crate::firecracker::fc_api_sock_for_key(&r.uuid));
+        // Deploy key = uuid:reff (the current deployed version, if any).
+        if let Some(reff) = r.image_ref.as_deref() {
+            set.insert(crate::firecracker::fc_api_sock_for_key(&format!(
+                "{}:{}",
+                r.uuid, reff
+            )));
+        }
+    }
+    if build_maybe_running {
+        set.insert(build_fc_api_sock());
+    }
+    set
+}
+
+/// THE safety-critical kill decision for ONE discovered firecracker process.
+///
+/// Returns `true` (REAP) only when ALL of these provable-orphan conditions hold;
+/// any uncertainty (a `None`, an unreadable field) returns `false` (DO NOT KILL):
+///
+/// 1. `api_sock` — the process WAS recognised as a tabbify FC with a
+///    `/tmp/firecracker-…sock` (the caller passes `Some` only then).
+/// 2. `parent_is_pid1 == true` — the FC has been REPARENTED to init, i.e. the
+///    runner (or its `systemd-run` wrapper) that spawned it is DEAD. A LIVE FC —
+///    serving OR mid-swap OR scoped — always has a living parent (the runner, or
+///    the foreground `systemd-run` child of the runner), so its parent is never
+///    PID 1. This is the strongest orphan signal and the primary guard.
+/// 3. `!live_sockets.contains(api_sock)` — its socket matches NO live runner
+///    record (and no in-flight build). Belt-and-braces with (2).
+///
+/// Both (2) AND (3) are required: (2) alone could in theory misfire if a future
+/// subreaper changed reparenting; (3) alone can't see the unreconstructible
+/// mid-swap old VM. Requiring BOTH makes a false-positive kill of a live app
+/// vanishingly unlikely — the audit's "fail toward NOT killing" bar. Pure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fc_orphan_should_reap(
+    api_sock: &str,
+    parent_is_pid1: bool,
+    live_sockets: &std::collections::HashSet<String>,
+) -> bool {
+    parent_is_pid1 && !live_sockets.contains(api_sock)
+}
+
+/// Read `PPid:` from `/proc/<pid>/status`. `Some(ppid)` on success; `None` if the
+/// file is gone/unreadable (the process exited mid-scan) — the caller treats
+/// `None` as "uncertain ⇒ do not kill".
+#[cfg(target_os = "linux")]
+fn read_parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
 impl Orchestrator {
+    /// F2.2 (audit #93) — INDEPENDENT record-less FC orphan sweep. Scans `/proc`
+    /// for tabbify firecracker processes and SIGKILLs any PROVABLY orphaned one
+    /// (reparented to PID 1 AND matching no live runner record / in-flight build).
+    /// Called on `readopt` (startup, after a possible crash-loop) and on each
+    /// monitor `tick`. Linux-only (`/proc`); a no-op elsewhere.
+    ///
+    /// Returns the count of orphans reaped (0 in the common healthy case). The
+    /// kill gate ([`fc_orphan_should_reap`]) fails toward NOT killing.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sweep_orphan_fcs(&self) -> usize {
+        let records = match RunnerHandle::list(&self.runner_dir) {
+            Ok(r) => r,
+            Err(e) => {
+                // Can't enumerate records ⇒ can't build the live-socket safe-set
+                // ⇒ DO NOT sweep (a sweep with an empty safe-set would nuke every
+                // live FC). Fail toward not killing.
+                tracing::warn!(error = %e, "orphan-FC sweep: cannot list runner records — skipping (fail-safe)");
+                return 0;
+            }
+        };
+        // A build may be running iff the build pidfile exists OR a deploy is in
+        // flight for any uuid; protect the build socket in either case.
+        let build_maybe_running = self.build_maybe_running();
+        let live = live_fc_socket_set(&records, build_maybe_running);
+
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+        let mut reaped = 0usize;
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let Some(api_sock) = parse_tabbify_fc_api_sock(&cmdline) else {
+                continue; // not a recognised tabbify FC ⇒ never a candidate
+            };
+            // Parent gate: unreadable ⇒ uncertain ⇒ do not kill.
+            let parent_is_pid1 = read_parent_pid(pid) == Some(1);
+            if fc_orphan_should_reap(&api_sock, parent_is_pid1, &live) {
+                tracing::warn!(
+                    pid,
+                    api_sock = %api_sock,
+                    "orphan-FC sweep: reaping record-less firecracker orphan (parent=pid1, no live record)"
+                );
+                pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
+                reaped += 1;
+            }
+        }
+        if reaped > 0 {
+            tracing::info!(reaped, "orphan-FC sweep: reaped record-less FC orphans");
+        }
+        reaped
+    }
+
+    /// Is a build possibly running right now? `true` if the build pidfile exists
+    /// (a build VM was spawned and hasn't been reaped) OR any uuid is mid-deploy
+    /// (a build precedes the deploy). Conservative — when in doubt, protect the
+    /// build socket from the sweep.
+    #[cfg(target_os = "linux")]
+    fn build_maybe_running(&self) -> bool {
+        let build_pidfile =
+            pidfile::path(&self.shared.data_dir, crate::firecracker::BUILD_SCOPE_ID_NAME);
+        if build_pidfile.exists() {
+            return true;
+        }
+        // Any in-flight deploy may be in its build phase (build VM not yet pidfiled).
+        RunnerHandle::list(&self.runner_dir)
+            .map(|recs| recs.iter().any(|r| self.is_deploying(&r.uuid)))
+            .unwrap_or(true) // can't tell ⇒ assume yes (protect build socket)
+    }
+
     /// Run ONE monitor pass over every recorded runner: probe liveness and
     /// respawn any that are dead (adopt the living ones untouched).
     ///
@@ -324,6 +553,13 @@ impl Orchestrator {
                 respawned.push(record.uuid);
             }
         }
+
+        // F2.2 (audit #93): record-less FC orphan sweep AFTER the per-record
+        // reconcile (so a just-respawned runner's fresh FC pidfile/record is in
+        // place before the sweep reads the live-socket set). Independent of the
+        // per-uuid reaper; catches FCs whose record was forgotten + the build VM.
+        #[cfg(target_os = "linux")]
+        self.sweep_orphan_fcs();
 
         Ok(respawned)
     }
@@ -654,6 +890,107 @@ mod tests {
     #[test]
     fn cmdline_matches_pull_is_false_for_empty_needle() {
         assert!(!cmdline_matches_pull(b"anything", ""));
+    }
+
+    // ── F2.2 record-less FC orphan sweep (audit #93) — SAFETY-CRITICAL gate ────
+
+    #[test]
+    fn parse_fc_sock_recognises_bare_firecracker_argv() {
+        let cmdline = b"firecracker\0--api-sock\0/tmp/firecracker-fc-deadbeef0000.sock\0";
+        assert_eq!(
+            parse_tabbify_fc_api_sock(cmdline).as_deref(),
+            Some("/tmp/firecracker-fc-deadbeef0000.sock")
+        );
+    }
+
+    #[test]
+    fn parse_fc_sock_recognises_systemd_run_scoped_argv() {
+        // F1 scoped spawn: systemd-run --scope … -- firecracker --api-sock <sock>
+        let cmdline = b"systemd-run\0--scope\0--collect\0--unit=tabbify-fc-x.scope\0--slice=tabbify-fc.slice\0-p\0CPUQuota=100%\0--\0firecracker\0--api-sock\0/tmp/firecracker-fc-abc123abc123.sock\0";
+        assert_eq!(
+            parse_tabbify_fc_api_sock(cmdline).as_deref(),
+            Some("/tmp/firecracker-fc-abc123abc123.sock")
+        );
+    }
+
+    #[test]
+    fn parse_fc_sock_rejects_non_firecracker_and_foreign_sockets() {
+        // Not firecracker at all (the oras pull) ⇒ None (never a kill candidate).
+        let oras = b"oras\0copy\0--to-oci-layout\0/opt/tabbify/data/apps/u/fc/.pull/oci\0";
+        assert!(parse_tabbify_fc_api_sock(oras).is_none());
+        // firecracker but a NON-tabbify socket path ⇒ None (don't touch a
+        // firecracker we didn't spawn / can't prove is ours).
+        let foreign = b"firecracker\0--api-sock\0/run/other/fc.sock\0";
+        assert!(parse_tabbify_fc_api_sock(foreign).is_none());
+        // firecracker with no --api-sock ⇒ None.
+        let nosock = b"firecracker\0--config-file\0/etc/fc.json\0";
+        assert!(parse_tabbify_fc_api_sock(nosock).is_none());
+        // Empty cmdline ⇒ None.
+        assert!(parse_tabbify_fc_api_sock(b"").is_none());
+    }
+
+    fn rec(uuid: &str, image_ref: Option<&str>) -> RunnerHandle {
+        RunnerHandle {
+            uuid: uuid.to_owned(),
+            pid: 1234,
+            control_sock: PathBuf::from("/tmp/x.sock"),
+            app_ula: "fd5a::1".to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: RestartState::default(),
+            image_ref: image_ref.map(str::to_owned),
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: None,
+            extra_env: None,
+            egress_allow: None,
+            crash_looped: false,
+            stopped: false,
+        }
+    }
+
+    #[test]
+    fn live_socket_set_covers_both_cold_and_deploy_keys() {
+        let records = vec![rec("uuid-a", Some("ref-1")), rec("uuid-b", None)];
+        let set = live_fc_socket_set(&records, false);
+        // uuid-a covered by BOTH its cold-start key AND its deploy key.
+        assert!(set.contains(&crate::firecracker::fc_api_sock_for_key("uuid-a")));
+        assert!(set.contains(&crate::firecracker::fc_api_sock_for_key("uuid-a:ref-1")));
+        // uuid-b (no deploy ref) covered by its cold-start key.
+        assert!(set.contains(&crate::firecracker::fc_api_sock_for_key("uuid-b")));
+        // Build socket absent when no build in flight.
+        assert!(!set.contains(&build_fc_api_sock()));
+    }
+
+    #[test]
+    fn live_socket_set_includes_build_socket_when_build_running() {
+        let set = live_fc_socket_set(&[], true);
+        assert!(set.contains(&build_fc_api_sock()));
+    }
+
+    #[test]
+    fn reap_only_when_parent_pid1_and_socket_unknown() {
+        let live: std::collections::HashSet<String> =
+            [crate::firecracker::fc_api_sock_for_key("uuid-a")]
+                .into_iter()
+                .collect();
+        let live_sock = crate::firecracker::fc_api_sock_for_key("uuid-a");
+        let orphan_sock = crate::firecracker::fc_api_sock_for_key("uuid-GONE");
+
+        // The provable orphan: reparented (ppid==1) AND no live record ⇒ REAP.
+        assert!(fc_orphan_should_reap(&orphan_sock, true, &live));
+
+        // A LIVE serving FC (socket in the safe-set) is NEVER killed, even if its
+        // parent momentarily reads as pid 1.
+        assert!(!fc_orphan_should_reap(&live_sock, true, &live));
+
+        // An FC with a LIVING parent (not reparented) is NEVER killed, even if we
+        // couldn't reconstruct its socket (the mid-swap old-VM case).
+        assert!(!fc_orphan_should_reap(&orphan_sock, false, &live));
+
+        // Both failing ⇒ never killed.
+        assert!(!fc_orphan_should_reap(&live_sock, false, &live));
     }
 
     // ── pid dead ─────────────────────────────────────────────────────────────

@@ -149,7 +149,11 @@ pub(crate) fn fc_identity_for_key(key: &str) -> (String, u32) {
         | (u64::from(b[3]) << 16)
         | (u64::from(b[4]) << 8)
         | u64::from(b[5]);
-    let tap_name = format!("fc-{hash48:012x}");
+    // Tap name comes from the CROSS-PLATFORM single source of truth so the F2.2
+    // orphan sweep reconstructs the exact same `/tmp/firecracker-<tap>.sock` as
+    // the spawn path (a drift here would make the sweep mis-correlate a LIVE FC).
+    let tap_name = super::fc_tap_name_for_key(key);
+    debug_assert_eq!(tap_name, format!("fc-{hash48:012x}"));
     let link_idx = u32::try_from(hash48 % u64::from(SERVING_LINK_SLOTS)).unwrap_or(0);
     (tap_name, link_idx)
 }

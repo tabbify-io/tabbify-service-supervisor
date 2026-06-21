@@ -328,6 +328,19 @@ impl Orchestrator {
             "re-adopted runner fleet on startup"
         );
 
+        // F2.2 (audit #93): on startup — especially after a supervisor crash-loop
+        // during which NOTHING reaped FCs left by prior runner deaths — sweep for
+        // record-less firecracker orphans (incl. the build VM) that reparented to
+        // PID 1 and would otherwise spin/hold RAM until reboot. Runs AFTER the
+        // re-adopt so every surviving runner's FC is in the live-socket safe-set.
+        #[cfg(target_os = "linux")]
+        {
+            let reaped = self.sweep_orphan_fcs();
+            if reaped > 0 {
+                tracing::warn!(reaped, "startup orphan-FC sweep reaped record-less FC orphans");
+            }
+        }
+
         Ok(summary)
     }
 
