@@ -278,12 +278,24 @@ let
   # (svc #5f) so a lifeline that has been actively joined for a while clears its
   # revert-attempt counter. Without this, attempts could SLOWLY accumulate across
   # unrelated, far-apart flaps and eventually trip a spurious rollback of a
-  # perfectly-good joiner. The lifeline ALSO writes `lifeline-status.json` on join;
-  # the timer firing while the unit is active is a sufficient liveness proxy.
+  # perfectly-good joiner.
+  # ⚠ LIVENESS GATE (review fix): the timer's `OnUnitActiveSec`/`OnBootSec` clock
+  # off the RESET service's OWN activation/boot, NOT the lifeline's — so an
+  # unconditional `rm -f` would also clear the counter mid-crash-loop (e.g. wipe a
+  # legit count=2 during a slow flap, so the §3.7 rollback never trips). Gate the
+  # clear on the lifeline being CURRENTLY `active` (a stably-joined unit), so the
+  # reset only fires for a genuinely-healthy lifeline and never rescues a flapping
+  # one from its own revert.
   tabbifyLifelineResetAttemptsScript = pkgs.writeShellScript "tabbify-mesh-lifeline-reset-attempts" ''
     set -u
-    PATH="${pkgs.coreutils}/bin:$PATH"
+    PATH="${pkgs.coreutils}/bin:${pkgs.systemd}/bin:$PATH"
+    state="$(systemctl show tabbify-mesh-lifeline.service -p ActiveState --value 2>/dev/null || echo unknown)"
+    if [ "$state" != "active" ]; then
+      echo "tabbify-mesh-lifeline-reset-attempts: lifeline ActiveState=$state (not stably active) — keeping the revert-attempt counter."
+      exit 0
+    fi
     rm -f "${dataDir}/data/self-heal/lifeline-revert-attempts"
+    echo "tabbify-mesh-lifeline-reset-attempts: lifeline active — revert-attempt counter cleared."
   '';
 
   # Crash-at-startup CATCH-NET script — the `ExecStart` of the
