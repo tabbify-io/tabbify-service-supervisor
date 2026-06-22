@@ -42,6 +42,7 @@ impl FirecrackerRuntime {
         _data_dir: &std::path::Path,
         _is_swap: bool,
         _egress_allow: Option<&[String]>,
+        _is_workspace: bool,
     ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }

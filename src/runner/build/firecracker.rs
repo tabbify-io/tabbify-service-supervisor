@@ -1748,7 +1748,7 @@ pub async fn run_firecracker_build(
                 "firecracker rootfs cache hit (pre-pull); skipping pull + conversion"
             );
             return launch_firecracker(
-                &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow,
+                &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
             )
             .await;
         }
@@ -1787,7 +1787,7 @@ pub async fn run_firecracker_build(
                     publish_rootfs_to_global(data_dir, digest, &built).await;
                 }
                 return launch_firecracker(
-                    &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow,
+                    &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
                 )
                 .await;
             }
@@ -1858,7 +1858,10 @@ pub async fn run_firecracker_build(
         }
     };
 
-    launch_firecracker(&rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow).await
+    launch_firecracker(
+        &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
+    )
+    .await
 }
 
 /// Launch the Firecracker microVM from a prepared rootfs and wrap it as an
@@ -1874,6 +1877,7 @@ async fn launch_firecracker(
     data_dir: &Path,
     is_swap: bool,
     egress_allow: Option<&[String]>,
+    is_workspace: bool,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         rootfs,
@@ -1884,6 +1888,7 @@ async fn launch_firecracker(
         data_dir,
         is_swap,
         egress_allow,
+        is_workspace,
     )
     .await?;
     Ok(std::sync::Arc::new(vm))
