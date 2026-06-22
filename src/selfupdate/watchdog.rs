@@ -45,11 +45,21 @@ pub struct WatchdogObservations {
     /// as the REAL rooted production process (unlike the `--no-mesh` candidate
     /// probe), so it CAN observe the live tunnel. `true` for an idle/quiet node.
     pub data_plane_live: bool,
-    /// The previous-good version (the rollback target) demonstrably had a live
-    /// tunnel before this swap. Gate for the data-plane revert: we only roll
-    /// back a build for breaking WG if rolling back would actually restore it.
-    /// `false` means the environment itself is down — rolling back is futile,
-    /// so we DON'T (fail-open for availability, spec §7).
+    /// Whether the previous-good version (the rollback target) had a live tunnel
+    /// before this swap. Gate for the data-plane revert: we only roll back a build
+    /// for breaking WG if rolling back would actually restore it. `false` means
+    /// the environment itself is down — rolling back is futile, so we DON'T
+    /// (fail-open for availability, spec §7).
+    ///
+    /// ⚠ FIX 9 (known imprecision): in production this is currently PROXIED by the
+    /// caller from "this boot has a live mesh-membership handle"
+    /// (`spawn_post_restart_watchdog` in `main.rs`), NOT from the rollback
+    /// target's ACTUAL recorded tunnel history. When the proxy reads `true` but
+    /// the previous-good build never really decapped a frame, this fail-open guard
+    /// is defeated. The honest fix is a per-version `had_live_tunnel` bit in the
+    /// VERSION ledger; see the FIX 9 TODO in `main.rs::spawn_post_restart_watchdog`.
+    /// This field's CONTRACT is unchanged — only the production source of its value
+    /// is approximate.
     pub previous_good_had_tunnel: bool,
 }
 

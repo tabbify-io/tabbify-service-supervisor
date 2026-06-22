@@ -390,10 +390,12 @@ async fn main() -> anyhow::Result<()> {
     // concern). Best-effort: a watchdog spawn must never block serving.
     if !config.no_mesh {
         // Capture the data-plane probe from the live membership (held for the
-        // process lifetime in `_membership`). The previous-good (rollback
-        // target) is the last CONFIRMED build, which passed its OWN data-plane
-        // watchdog, so it demonstrably had the tunnel — `data_plane_probe`
-        // present ⇒ the revert clause is armed (D6).
+        // process lifetime in `_membership`). `data_plane_probe` present ⇒ this
+        // boot has a live membership handle, which `spawn_post_restart_watchdog`
+        // uses as a PROXY for "the rollback target had the tunnel" to arm the D6
+        // data-plane revert clause. ⚠ That proxy is imprecise — see the FIX 9
+        // TODO in `spawn_post_restart_watchdog`; the honest per-version
+        // `had_live_tunnel` bit is deferred.
         let data_plane = _membership.as_ref().map(MeshMembership::data_plane_probe);
         spawn_post_restart_watchdog(bind_addr, data_plane);
     }
@@ -635,10 +637,34 @@ fn spawn_post_restart_watchdog(
     };
     tracing::info!(version = %pending, "post-restart self-watchdog: confirming pending swap");
 
-    // The previous-good (rollback target) is the last CONFIRMED build, which
-    // passed its OWN data-plane watchdog, so it demonstrably had the tunnel.
-    // No data-plane handle (e.g. a transient join failure) ⇒ treat the data
-    // plane as live (fail-open: the control-plane gate still guards us).
+    // ⚠ FIX 9 (known imprecision — see TODO): `prev_good_had_tunnel` is PROXIED
+    // from `data_plane.is_some()`, i.e. "THIS boot has a live mesh membership
+    // handle" — NOT the rollback target's ACTUAL tunnel history. The two usually
+    // coincide (the previous-good is normally a build that ran healthy with a live
+    // tunnel), but they are NOT the same fact:
+    //   - if this boot has a membership handle but the previous-good build NEVER
+    //     actually decapped a frame (e.g. it was confirmed purely on the
+    //     control-plane gate during a data-plane outage), this proxy reports
+    //     `true` and the watchdog's env-down fail-open guard (watchdog.rs §D1,
+    //     `decide_revert`'s `previous_good_had_tunnel` clause) is DEFEATED: a dead
+    //     data plane would trigger a revert to a target that also lacks the
+    //     tunnel — a futile thrash the fail-open is meant to prevent.
+    // The HONEST signal is a per-version `had_live_tunnel` bit recorded when a
+    // build's OWN data-plane watchdog observed a live decap, read back for the
+    // rollback target here. That is deferred (see TODO below) because the writer
+    // would have to persist into the VERSION ledger CONCURRENTLY with the
+    // swap/revert paths that also rewrite VERSION (a write-write race that needs
+    // ledger-level locking to be safe) — out of scope for a one-shot. Until then:
+    // no membership handle ⇒ treat the data plane as live (fail-open: the
+    // control-plane gate still guards us); a present handle ⇒ arm the clause.
+    //
+    // TODO(fix-9): add `VersionFile.had_live_tunnel: HashMap<String,bool>`
+    // (serde-default for back-compat), set `had_live_tunnel[current]=true` once a
+    // build observes its first live decap (both on post-restart confirm AND on a
+    // steady-state healthy boot — the rollback target is usually a long-running
+    // previously-confirmed build, not a freshly-pending one), guard those writes
+    // with a VERSION ledger lock shared with swap/revert, and read the rollback
+    // target's bit HERE instead of `data_plane.is_some()`.
     let prev_good_had_tunnel = data_plane.is_some();
     let data_plane = data_plane.unwrap_or_else(|| std::sync::Arc::new(|| true));
 
