@@ -353,6 +353,56 @@ let
       exit 0
     fi
 
+    # ── FIX 1: OLD-BINARY PROBE (must precede every `revert-to-previous`). ─────
+    # The whole rc ladder below invokes `"$SUPERVISORD" revert-to-previous` and
+    # branches on its EXIT CODE (0 PERFORMED / 2 NO_PREVIOUS / 3 FAILED / 4
+    # REBOOT_PARKED). But if the live (possibly OLD) supervisord binary PREDATES
+    # the `revert-to-previous` subcommand, clap aborts with "unrecognized
+    # subcommand" and exits 2 — which the ladder MIS-MAPS to NO_PREVIOUS, so the
+    # script does a NO-OP escalation that itself can't run on the old binary →
+    # no revert, no reboot, SILENT brick (the exact class this catch-net exists to
+    # break). `--help` short-circuits clap BEFORE any fallible startup (binds,
+    # mesh join, ...), exits 0, and lists the subcommands; an old binary prints
+    # help WITHOUT `revert-to-previous`. So probe FIRST: if the subcommand is
+    # absent, the rc ladder is meaningless — escalate straight to a guarded
+    # last-resort reboot.
+    #
+    # ⚠ REBOOT LOOP-GUARD (shell-side): the Rust RebootGuard (≤3/hr,
+    # reboot-guard.json) is NOT reachable here precisely because the binary is too
+    # old to run any subcommand. So gate the reboot with a tiny durable
+    # timestamp-ring file ($DATA_DIR/self-heal/old-binary-reboots) — at most 3
+    # reboots per hour — so a host whose old binary keeps crash-looping reboots a
+    # few times (which can recover a transient/disk/network fault) and then PARKS
+    # (exit 0, no reboot) for a human instead of looping forever.
+    if ! "$SUPERVISORD" --help 2>&1 | grep -q 'revert-to-previous'; then
+      echo "tabbify-boot-revert: live supervisord has NO 'revert-to-previous' subcommand (OLD binary) — rc ladder is unusable; escalating to guarded last-resort reboot"
+      RING="$DATA_DIR/self-heal/old-binary-reboots"
+      mkdir -p "$DATA_DIR/self-heal"
+      now="$(date +%s)"
+      # Keep only timestamps within the last hour; count them.
+      kept=""
+      n=0
+      if [ -f "$RING" ]; then
+        while IFS= read -r ts; do
+          case "$ts" in (*[!0-9]*) continue;; ("") continue;; esac
+          if [ $((now - ts)) -lt 3600 ]; then
+            kept="$kept$ts
+"
+            n=$((n + 1))
+          fi
+        done < "$RING"
+      fi
+      if [ "$n" -ge 3 ]; then
+        echo "tabbify-boot-revert: old-binary reboot budget exhausted (>=3/hr) — PARKING for a human (no reboot). Re-image or re-bootstrap the supervisord binary."
+        printf '%s' "$kept" > "$RING"
+        exit 0
+      fi
+      printf '%s%s\n' "$kept" "$now" > "$RING"
+      echo "tabbify-boot-revert: rebooting (old-binary reboot $((n + 1))/3 this hour)"
+      systemctl reboot
+      exit 0
+    fi
+
     # ── count >= THRESHOLD ────────────────────────────────────────────────────
     if [ -z "$reverted_to" ]; then
       # First escalation: try a revert to previous-good.
@@ -380,8 +430,17 @@ let
       fi
     else
       # Already reverted once this streak and STILL failing (the reverted binary
-      # also crash-loops): reboot-as-last-resort via the guard, then park.
-      echo "tabbify-boot-revert: reverted binary still failing (reverted_to='$reverted_to') — reboot-as-last-resort"
+      # also crash-loops): reboot-as-last-resort, then park.
+      #
+      # ⚠ FIX 2 (Rust, src/main.rs `revert_to_previous_flow`): with the sidecar's
+      # `reverted_to` ALREADY set + `--reboot-on-exhausted`, the subcommand now
+      # SHORT-CIRCUITS straight to the guarded RebootGuard reboot seam (it does
+      # NOT do a SECOND, deeper symlink revert that would walk history down to an
+      # even-older — possibly equally-broken — release). It returns PERFORMED (0,
+      # rebooting) or REBOOT_PARKED (4, ≤3/hr guard exhausted → leave failed for a
+      # human). So this single line is now CORRECT — it reboots as last resort
+      # instead of soft-bricking by reverting forever. We pass through its exit.
+      echo "tabbify-boot-revert: reverted binary still failing (reverted_to='$reverted_to') — reboot-as-last-resort (Rust skips a deeper revert)"
       "$SUPERVISORD" revert-to-previous --reboot-on-exhausted
       exit $?
     fi
