@@ -701,7 +701,20 @@ in {
       # no-AUTH_URL coordinator). `''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}` and
       # `''${TABBIFY_JOIN_TOKEN}` are expanded by the shell from this unit's
       # environment (baked default / `/etc` EnvironmentFile).
-      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline' '';
+      #
+      # ⚠ BUG 5 (2026-06-22, caught on the live deploy): the standalone joiner's
+      # config validation REQUIRES an explicit mTLS mode — either all three of
+      # `--tls-cert/--tls-key/--tls-ca` OR `--insecure-no-mtls` — and rejects the
+      # join with `invalid join config: mTLS requires all three paths` BEFORE ever
+      # contacting the coordinator. The supervisor's IN-PROCESS joiner builds its
+      # JoinConfig in code (no CLI validation) and defaults to no-mTLS against this
+      # plaintext `http://` coordinator, so it never tripped this. Every standalone
+      # joiner on THIS mesh (the coordinator runs without mTLS enforcement — real
+      # peer auth is the WireGuard keypair + the validated join-token claims, not
+      # mTLS) connects with `--insecure-no-mtls`; the lifeline must match. This is
+      # NOT a security downgrade — it is the established mesh-wide mode, consistent
+      # with the in-process joiner the lifeline mirrors.
+      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --insecure-no-mtls --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline' '';
       # CANONICAL env path = /etc/tabbify/supervisor.env (BUG 2 + BUG 3): carries
       # the VALID 1-year TABBIFY_JOIN_TOKEN the wrapper forwards into --join-token,
       # the SAME file the supervisor unit reads. Rotation only — never a 2nd path.
