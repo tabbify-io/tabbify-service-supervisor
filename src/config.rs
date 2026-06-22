@@ -103,6 +103,14 @@ pub struct Config {
     pub builder: bool,
 
     /// Display name advertised to the coordinator.
+    ///
+    /// Primary env is `SUPERVISOR_NAME`. As of FIX 5 the canonical HOST-IDENTITY
+    /// drop-in var is `TABBIFY_NODE_NAME` (written by the provisioner/controller
+    /// into `/etc/tabbify/supervisor.env`), which [`Config::node_name_env_bridge`]
+    /// maps onto `SUPERVISOR_NAME` before parsing IFF `SUPERVISOR_NAME` is unset —
+    /// so the NixOS unit no longer bakes a node name and a clean rebuild can never
+    /// silently mis-name a hand-patched box. `SUPERVISOR_NAME` still wins if both
+    /// are set (back-compat for anything already baking it).
     #[arg(long, env = "SUPERVISOR_NAME", default_value = "tabbify-supervisor")]
     pub display_name: String,
 
@@ -354,7 +362,33 @@ impl Config {
     /// Parse from the environment + argv.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::node_name_env_bridge();
         Config::parse()
+    }
+
+    /// FIX 5: bridge the canonical host-identity var `TABBIFY_NODE_NAME` (the one
+    /// the provisioner/controller writes into `/etc/tabbify/supervisor.env`) onto
+    /// `SUPERVISOR_NAME` (the var clap binds for [`Self::display_name`]) BEFORE
+    /// `Config::parse()`, but ONLY when `SUPERVISOR_NAME` is unset/empty — so an
+    /// explicit `SUPERVISOR_NAME` (or `--name`) still wins. This lets the NixOS
+    /// unit STOP baking a node name (it removed the hard-set `SUPERVISOR_NAME`)
+    /// and source the host identity purely from the `/etc` drop-in, so a clean
+    /// rebuild never silently mis-names a hand-patched box.
+    ///
+    /// Pure-ish (touches only this process's env, exactly as clap reads it); a
+    /// no-op when `TABBIFY_NODE_NAME` is unset/empty.
+    fn node_name_env_bridge() {
+        let supervisor_name = std::env::var_os("SUPERVISOR_NAME");
+        let node_name = std::env::var_os("TABBIFY_NODE_NAME");
+        if let Some(bridged) = resolve_node_name_override(
+            supervisor_name.as_deref(),
+            node_name.as_deref(),
+        ) {
+            // SAFETY: called at the very start of `from_env`, single-threaded
+            // (before tokio worker threads touch env); only sets a var clap is
+            // about to read.
+            unsafe { std::env::set_var("SUPERVISOR_NAME", bridged) };
+        }
     }
 
     /// Path to the persistent mesh identity file (`{private_key, ula}`), placed
@@ -385,6 +419,25 @@ impl Config {
     }
 }
 
+/// Pure decision for [`Config::node_name_env_bridge`] (FIX 5): given the current
+/// `SUPERVISOR_NAME` and `TABBIFY_NODE_NAME` env values, return `Some(value)` to
+/// set `SUPERVISOR_NAME` to, or `None` to leave it untouched.
+///
+/// `SUPERVISOR_NAME` wins whenever it is set AND non-empty (back-compat); the
+/// `TABBIFY_NODE_NAME` bridge applies only when `SUPERVISOR_NAME` is
+/// absent-or-empty AND `TABBIFY_NODE_NAME` is present-and-non-empty.
+#[must_use]
+fn resolve_node_name_override<'a>(
+    supervisor_name: Option<&std::ffi::OsStr>,
+    node_name: Option<&'a std::ffi::OsStr>,
+) -> Option<&'a std::ffi::OsStr> {
+    let supervisor_name_set = supervisor_name.is_some_and(|v| !v.is_empty());
+    if supervisor_name_set {
+        return None;
+    }
+    node_name.filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -395,6 +448,49 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Config::command().debug_assert();
+    }
+
+    // ── FIX 5: TABBIFY_NODE_NAME → SUPERVISOR_NAME bridge precedence ─────────
+
+    use std::ffi::OsStr;
+
+    #[test]
+    fn node_name_bridge_uses_tabbify_node_name_when_supervisor_name_unset() {
+        // /etc drop-in sets TABBIFY_NODE_NAME, the unit no longer bakes
+        // SUPERVISOR_NAME → bridge the host identity onto SUPERVISOR_NAME.
+        assert_eq!(
+            resolve_node_name_override(None, Some(OsStr::new("serbia:bg:msi"))),
+            Some(OsStr::new("serbia:bg:msi")),
+        );
+    }
+
+    #[test]
+    fn node_name_bridge_uses_tabbify_node_name_when_supervisor_name_empty() {
+        // An explicitly-empty SUPERVISOR_NAME must NOT shadow the host identity.
+        assert_eq!(
+            resolve_node_name_override(Some(OsStr::new("")), Some(OsStr::new("serbia:bg:msi"))),
+            Some(OsStr::new("serbia:bg:msi")),
+        );
+    }
+
+    #[test]
+    fn node_name_bridge_supervisor_name_wins_when_both_set() {
+        // Back-compat: a baked/explicit SUPERVISOR_NAME still wins → no override.
+        assert_eq!(
+            resolve_node_name_override(
+                Some(OsStr::new("explicit-name")),
+                Some(OsStr::new("serbia:bg:msi")),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn node_name_bridge_is_noop_when_neither_set_or_node_name_empty() {
+        // Neither var → no override (clap falls back to its default_value).
+        assert_eq!(resolve_node_name_override(None, None), None);
+        // An empty TABBIFY_NODE_NAME is not a usable identity → no override.
+        assert_eq!(resolve_node_name_override(None, Some(OsStr::new(""))), None);
     }
 
     #[test]

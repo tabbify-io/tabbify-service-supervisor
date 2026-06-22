@@ -472,8 +472,12 @@ in {
     curl jq python3 cacert
   ];
 
-  # 3. Open the WireGuard listen port (helps NAT traversal to the public coordinator).
-  networking.firewall.allowedUDPPorts = [ 51820 ];
+  # 3. Open the WireGuard listen ports (helps NAT traversal to the public
+  #    coordinator). 51820 = the supervisor's in-process joiner; 51821 = the
+  #    lifeline joiner's OWN port (FIX 8 — a distinct port so two same-host
+  #    joiners never SO_REUSEPORT-split inbound UDP once direct-UDP p2p is
+  #    re-enabled; see the lifeline ExecStart `--listen-port 51821`).
+  networking.firewall.allowedUDPPorts = [ 51820 51821 ];
 
   # 3b. Trust the mesh overlay TUN interfaces.
   #
@@ -633,7 +637,16 @@ in {
     # scope under tabbify-fc.slice) + `systemctl` (scope teardown reaper):
     path = [ pkgs.firecracker pkgs.iproute2 pkgs.iptables pkgs.busybox pkgs.e2fsprogs pkgs.oras pkgs.coreutils pkgs.curl pkgs.jq pkgs.git pkgs.systemd ];
     environment = {
-      SUPERVISOR_NAME        = nodeName;
+      # FIX 5: node name is NO LONGER baked here. systemd `Environment=`
+      # (this block) OVERRIDES `EnvironmentFile=`, so a hard-set `SUPERVISOR_NAME`
+      # would shadow the `/etc/tabbify/supervisor.env` drop-in forever — the exact
+      # trap that let a clean rebuild silently mis-name a hand-patched box
+      # ('serbia:bg:msi' on the live MSI vs 'thinkpad' in this repo). With it
+      # removed, the binary sources its display name from the drop-in's
+      # `TABBIFY_NODE_NAME` (the provisioner/controller writes it there), which
+      # `Config::node_name_env_bridge` maps onto the `SUPERVISOR_NAME` clap arg;
+      # with neither set the binary falls back to its own `default_value`
+      # ("tabbify-supervisor"). One host-local source of truth = /etc.
       SUPERVISOR_DATA_DIR    = "${dataDir}/data";
       SUPERVISOR_S3_BASE_URL = "http://127.0.0.1:9000";   # local app-staging server (svc #6)
       SUPERVISOR_FC_KERNEL   = "${dataDir}/vmlinux";
@@ -873,7 +886,26 @@ in {
       # mTLS) connects with `--insecure-no-mtls`; the lifeline must match. This is
       # NOT a security downgrade — it is the established mesh-wide mode, consistent
       # with the in-process joiner the lifeline mirrors.
-      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --insecure-no-mtls --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline' '';
+      #
+      # ⚠ FIX 8: `--listen-port 51821` gives the lifeline joiner its OWN WireGuard
+      # UDP port. The supervisor's in-process joiner owns the default 51820; if the
+      # lifeline also bound 51820, then once direct-UDP p2p is re-enabled (track #53)
+      # SO_REUSEPORT would let TWO same-port joiners on this host SPLIT inbound UDP
+      # at random → half the lifeline's handshake/keepalive datagrams would be
+      # delivered to the supervisor's socket (and vice-versa), silently breaking
+      # both. A distinct port keeps the two data planes cleanly separated. (51821 is
+      # opened in networking.firewall.allowedUDPPorts below.) Relay-only today means
+      # neither binds an inbound endpoint, but bake the separation in NOW so the
+      # direct-UDP flip is safe without touching this unit.
+      #
+      # ⚠ FIX 5: `--name` is sourced from the `/etc` drop-in's `TABBIFY_NODE_NAME`
+      # (the same host-identity var the supervisor binary reads), NOT the static
+      # repo `nodeName` — so a clean rebuild on a hand-patched box (e.g. MSI =
+      # 'serbia:bg:msi') names the lifeline `serbia:bg:msi-lifeline`, not
+      # 'thinkpad-lifeline'. `''${TABBIFY_NODE_NAME:-thinkpad}` falls back to
+      # `thinkpad` when the drop-in is absent (a fresh box), matching the binary's
+      # spirit. The shell expands it from this unit's EnvironmentFile environment.
+      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --listen-port 51821 --insecure-no-mtls --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name "''${TABBIFY_NODE_NAME:-thinkpad}-lifeline"' '';
       # CANONICAL env path = /etc/tabbify/supervisor.env (BUG 2 + BUG 3): carries
       # the VALID 1-year TABBIFY_JOIN_TOKEN the wrapper forwards into --join-token,
       # the SAME file the supervisor unit reads. Rotation only — never a 2nd path.
