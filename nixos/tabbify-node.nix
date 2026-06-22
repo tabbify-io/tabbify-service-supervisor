@@ -323,6 +323,15 @@ let
     set -u
     PATH="${pkgs.systemd}/bin:${pkgs.coreutils}/bin:${pkgs.jq}/bin:$PATH"
 
+    # ⚠ FIX 10 — LOCKSTEP with the Rust `REVERT_THRESHOLD` const
+    # (src/boot_health/mod.rs). THIS bash `THRESHOLD` is what ACTUALLY gates the
+    # production revert: the script reads the durable BootAttempts `count` from
+    # the sidecar and decides, on this fire, whether to call `revert-to-previous`.
+    # The Rust const of the same value gates ONLY unit tests
+    # (`BootAttempts::should_revert`); the boot path never calls it. Keep the two
+    # equal — change one, change the other. (Deliberately NOT shared via codegen:
+    # this script must work even with a supervisord binary that predates any
+    # threshold mechanism.)
     THRESHOLD=3
     DATA_DIR="${dataDir}/data"
     SUPERVISORD="${dataDir}/supervisord"
