@@ -20,6 +20,11 @@
 //!   `workspace_uuid`): register N caps + spawn the VM (async).
 //! - `GET    /v1/workspaces`      — list (ops).
 //! - `DELETE /v1/workspaces/:uuid` — purge the VM + revoke every cap (alarmed).
+//! - `POST   /v1/workspaces/:uuid/snapshot` — refresh the warm-LSP snapshot.
+//! - `POST   /v1/workspaces/:uuid/repos` — ADD one repo (additive cap +
+//!   respawn so the runner re-bakes the full cap-file set), async.
+//! - `POST   /v1/workspaces/:uuid/stop` — pause the VM, PRESERVING the record
+//!   (image_ref/extra_env) for a warm restore.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -39,6 +44,7 @@ use crate::api::{
     GIT_PROXY_IPV4_PORT, GitSessionEntry, SharedState, WorkspaceCap, WorkspaceRecord, now_unix,
 };
 use crate::orchestrator::api::DeployNetwork;
+use crate::orchestrator::handle::RunnerHandle;
 
 /// Hard TTL ceiling for a workspace. dev-sessions reclaim at 7d; a WORKSPACE is
 /// permanent (spec §3 re-key #3: "поднимаем MAX_TTL 7d → ~∞"). Set far beyond any
@@ -74,6 +80,42 @@ pub fn cap_repo_basename(repo_url: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
         .collect();
     if cleaned.is_empty() { "repo".to_owned() } else { cleaned }
+}
+
+/// MERGE a new `<repo>.url` cap-file entry into the persisted [`CAP_FILES_ENV`]
+/// JSON map in an existing workspace's `extra_env`, PRESERVING every other
+/// cap-file entry already baked in (the other repos' URLs, `forge-admin.token`,
+/// `authkeys.cap`). This is the additive `add_repo` respawn channel: the
+/// supervisor never persists the authorized-key / forge-admin token in the
+/// durable [`WorkspaceRecord`], but they DO live in the runner's persisted
+/// `extra_env` (the create-time `CAP_FILES_ENV` map) — so merging into that map
+/// (instead of rebuilding from the record) is what lets a respawn re-bake the
+/// FULL cap-file set without losing the authkeys/forge secrets. A record with no
+/// prior `CAP_FILES_ENV` starts a fresh single-entry map. All non-cap env keys
+/// (the workspace marker, user-id, authorized-key) are untouched.
+///
+/// `repo_file` is the cap-file name (`"<stem>.url"`, from [`cap_repo_basename`]);
+/// `git_remote` is the TOKENLESS git-proxy URL (no secret — the token stays
+/// host-side in `GitSessions`). A malformed prior value (not a JSON object) is
+/// replaced by a fresh single-entry map rather than propagating corruption.
+fn merge_cap_into_env(
+    extra_env: &mut HashMap<String, String>,
+    repo_file: &str,
+    git_remote: &str,
+) {
+    let mut cap_files: serde_json::Map<String, serde_json::Value> = extra_env
+        .get(CAP_FILES_ENV)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    cap_files.insert(
+        repo_file.to_owned(),
+        serde_json::Value::String(git_remote.to_owned()),
+    );
+    extra_env.insert(
+        CAP_FILES_ENV.to_owned(),
+        serde_json::Value::Object(cap_files).to_string(),
+    );
 }
 
 /// The reserved cap-file name for the §12-S6 authorized-keys cap (the `:8732`
@@ -165,6 +207,37 @@ pub struct WorkspaceCreated {
     pub authkeys_cap: String,
 }
 
+/// `POST /v1/workspaces/{uuid}/repos` request body — ADD one repo to an existing
+/// workspace. Mirrors [`RepoSpec`] field-for-field (the node mints the token +
+/// resolves the repo exactly like create, then sends this single-repo body).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AddRepoBody {
+    /// Provider clone URL WITHOUT credentials.
+    #[schema(example = "https://github.com/acme/app.git")]
+    pub repo_url: String,
+    /// Branch to make available.
+    #[schema(example = "main")]
+    pub branch: String,
+    /// Short-lived provider token (the git proxy injects it; the VM never sees it).
+    pub git_token: String,
+    /// Token TTL in seconds.
+    #[schema(example = "3600")]
+    pub git_token_ttl_secs: u64,
+}
+
+/// `POST /v1/workspaces/{uuid}/repos` response body.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AddRepoResult {
+    /// The workspace the repo was added to (== the FC app uuid).
+    pub workspace_uuid: String,
+    /// The cap-file stem the repo was registered under (`<stem>.url`), derived
+    /// from the clone URL's last path segment (sanitized). The node clones into
+    /// `~/projects/<stem>` after the respawn.
+    pub repo: String,
+    /// The TOKENLESS git-proxy remote the in-VM broker uses for this repo.
+    pub git_remote: String,
+}
+
 /// One live workspace in the in-memory registry.
 pub struct Workspace {
     /// Stable per-user workspace uuid (string form).
@@ -196,6 +269,25 @@ impl WorkspaceRegistry {
     /// Remove by uuid; returns the removed workspace (or `None`).
     pub fn remove(&self, workspace_uuid: &str) -> Option<Workspace> {
         self.0.lock().expect("workspace lock").remove(workspace_uuid)
+    }
+
+    /// Append one repo's git-proxy `cap` to a live workspace's cap list
+    /// (additive — keeps the existing caps so delete/snapshot 404-gating stays
+    /// correct after an `add_repo`). Returns `true` if the workspace existed and
+    /// the cap was appended, `false` (a no-op) for an unknown workspace.
+    pub fn append_cap(&self, workspace_uuid: &str, cap: String) -> bool {
+        match self
+            .0
+            .lock()
+            .expect("workspace lock")
+            .get_mut(workspace_uuid)
+        {
+            Some(ws) => {
+                ws.caps.push(cap);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Caps for a workspace (cheap clone), or `None` if absent.
@@ -511,6 +603,216 @@ pub async fn snapshot_workspace(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("snapshot failed: {e}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/workspaces/{uuid}/repos` — ADD one repo to an existing workspace
+/// (additive; NOT a hardcoded repo). Registers a NEW git-proxy cap host-side,
+/// appends the durable record + the in-mem registry, MERGES the new `<repo>.url`
+/// into the runner's persisted `CAP_FILES_ENV` (preserving the existing repos +
+/// the authkeys/forge-admin cap-files), and RESPAWNS the workspace VM so the
+/// runner re-bakes the FULL cap-file set at COLD boot (a warm zero-downtime swap
+/// re-bakes the OLD spawn-time env, so the new cap-file would not land — hence a
+/// stop + cold deploy). The node then drives a `clone` over `code_call` after the
+/// respawn so the repo lands in `~/projects` + rust-analyzer indexes it.
+///
+/// Async (202, mirror create): the respawn runs in the background (a stop + cold
+/// re-deploy takes seconds, image cached). A workspace this supervisor does not
+/// host (or one with no deployable artifact) is a 404 BEFORE any cap mutation.
+#[utoipa::path(
+    post,
+    path = "/v1/workspaces/{uuid}/repos",
+    params(("uuid" = String, Path, description = "Workspace uuid")),
+    request_body(content = AddRepoBody, content_type = "application/json"),
+    responses(
+        (status = 202, description = "Repo accepted; the workspace respawns asynchronously to re-bake the full cap-file set", body = AddRepoResult),
+        (status = 404, description = "Workspace not found (or no deployable artifact)", body = crate::api::ErrorResponse),
+    ),
+)]
+#[tracing::instrument(skip(state, body), fields(workspace_uuid = %uuid, repo_url = %body.repo_url))]
+pub async fn add_workspace_repo(
+    State(state): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<AddRepoBody>,
+) -> Response {
+    // Registry gate: only a workspace this supervisor hosts can gain a repo
+    // (mirror snapshot/delete) — a stray uuid is a 404, never a blind mutation.
+    if state.workspaces.caps_of(&uuid).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("workspace {uuid} not found") })),
+        )
+            .into_response();
+    }
+
+    // Load the durable RunnerHandle for (a) the workspace's `image_ref` (needed
+    // to derive the SAME tap host_ip the VM boots on AND to pin the respawn) and
+    // (b) the persisted `extra_env` (the create-time CAP_FILES_ENV map we MERGE
+    // the new repo into — that map also holds the authkeys/forge-admin caps the
+    // durable WorkspaceRecord does NOT persist, so merging the runner env is what
+    // keeps those secrets across the respawn). No artifact → cannot respawn → 404.
+    let runner = match RunnerHandle::load(state.orchestrator.runner_dir(), &uuid) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("workspace {uuid} has no runner record") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: could not load runner record");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("could not load workspace {uuid}: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let Some(image_ref) = runner.image_ref.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("workspace {uuid} has no image_ref to respawn") })),
+        )
+            .into_response();
+    };
+
+    // Register the NEW repo's git-proxy cap host-side (the SAME shared GitSessions
+    // the create path uses), so the respawned VM can reach the remote from boot.
+    let host_ip = derive_dev_fc_host_ip(&uuid, &image_ref, &state.tap_subnet);
+    let cap = generate_cap(&uuid, &body.repo_url);
+    let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
+    let expires_at = Instant::now() + Duration::from_secs(body.git_token_ttl_secs);
+    state.git_sessions.register(
+        cap.clone(),
+        GitSessionEntry {
+            upstream_url: body.repo_url.clone(),
+            token: body.git_token.clone(),
+            expires_at,
+        },
+    );
+
+    // Append to the in-mem registry (keep delete/snapshot 404-gating correct).
+    state.workspaces.append_cap(&uuid, cap.clone());
+
+    // Append to the durable WorkspaceRecord (cap + branch) so a supervisor
+    // restart re-registers this repo too. Best-effort persist (live in-mem still
+    // holds it). Load-modify-save the existing record.
+    let repo_stem = cap_repo_basename(&body.repo_url);
+    let repo_file = format!("{repo_stem}.url");
+    match WorkspaceRecord::load(state.orchestrator.runner_dir(), &uuid) {
+        Ok(Some(mut rec)) => {
+            rec.caps.push(WorkspaceCap {
+                cap: cap.clone(),
+                repo_url: body.repo_url.clone(),
+            });
+            rec.branches.push(body.branch.clone());
+            rec.last_activity_unix = now_unix();
+            if let Err(e) = rec.save(state.orchestrator.runner_dir()) {
+                tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: failed to persist appended workspace record");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(workspace_uuid = %uuid, "add_repo: no durable workspace record to append (in-mem only)");
+        }
+        Err(e) => {
+            tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: could not load workspace record to append");
+        }
+    }
+
+    // MERGE the new cap-file into the runner's persisted env (preserving the
+    // existing repos + authkeys/forge-admin caps) — this is the env the COLD
+    // respawn re-bakes into `/run/tabbify/caps/`.
+    let mut merged_env = runner.extra_env.clone().unwrap_or_default();
+    merge_cap_into_env(&mut merged_env, &repo_file, &git_remote);
+
+    // ASYNC respawn (202): a workspace add_repo is a rare, human-initiated op.
+    // STOP the live runner then COLD re-deploy with the merged env so the runner
+    // re-bakes the FULL cap-file set (a warm swap re-bakes the OLD spawn-time
+    // env). `stop_app` preserves the record; `deploy_app`'s cold path reads the
+    // passed `extra_env` and writes a fresh `stopped:false` record.
+    let net = DeployNetwork {
+        network: runner.network.clone(),
+        runner_join_token: runner.runner_join_token.clone(),
+    };
+    let bg = state.clone();
+    let app_uuid = uuid.clone();
+    let cap_for_bg = cap.clone();
+    tokio::spawn(async move {
+        if let Err(e) = bg.orchestrator.stop_app(&app_uuid).await {
+            tracing::warn!(workspace_uuid = %app_uuid, error = %e, "add_repo: stop before respawn failed (continuing)");
+        }
+        match bg
+            .orchestrator
+            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&merged_env), None)
+            .await
+        {
+            Ok(_) => tracing::info!(workspace_uuid = %app_uuid, "add_repo: workspace respawned with new repo cap (async)"),
+            Err(e) => {
+                // The new cap is durably recorded; a later respawn/ensure still
+                // picks it up. Revoke the freshly-minted git-session cap so a
+                // failed respawn does not leak a live token (the record keeps the
+                // cap row; the node's token sweep re-registers on the next adopt).
+                tracing::warn!(workspace_uuid = %app_uuid, error = %e, "add_repo: respawn failed (cap recorded; will converge on next ensure)");
+                bg.git_sessions.revoke(&cap_for_bg);
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(AddRepoResult {
+            workspace_uuid: uuid,
+            repo: repo_stem,
+            git_remote,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /v1/workspaces/{uuid}/stop` — PAUSE a workspace VM (the warm-restore
+/// twin of `delete`). Shuts the runner down while PRESERVING its durable record
+/// (`image_ref`/`extra_env`/`manifest_toml`/`runner_join_token`) so a later
+/// `create_workspace` / deploy warm-restores it. NOT a purge — caps stay
+/// registered, the record stays on disk; only the live FC is reaped.
+///
+/// The node calls this AFTER taking a warm snapshot (`snapshot_when_indexed`) so
+/// the paused VM can be restored with a warm LSP index. A workspace this
+/// supervisor does not host is a 404.
+#[utoipa::path(
+    post,
+    path = "/v1/workspaces/{uuid}/stop",
+    params(("uuid" = String, Path, description = "Workspace uuid")),
+    responses(
+        (status = 200, description = "Workspace stopped (record preserved for warm restore)"),
+        (status = 404, description = "Workspace not found", body = crate::api::ErrorResponse),
+        (status = 500, description = "Stop failed", body = crate::api::ErrorResponse),
+    ),
+)]
+#[tracing::instrument(skip(state), fields(workspace_uuid = %uuid))]
+pub async fn stop_workspace(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+    // Registry gate (mirror snapshot/delete): only stop a workspace this
+    // supervisor hosts.
+    if state.workspaces.caps_of(&uuid).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("workspace {uuid} not found") })),
+        )
+            .into_response();
+    }
+    // `stop_app` marks the record stopped + reaps the FC, PRESERVING the deploy
+    // artifact (image_ref/extra_env) for a warm restore. It tolerates a missing
+    // live runner (already gone) and only errors on a malformed uuid.
+    match state.orchestrator.stop_app(&uuid).await {
+        Ok(()) => Json(json!({ "stopped": true })).into_response(),
+        Err(e) => {
+            tracing::warn!(workspace_uuid = %uuid, error = %e, "workspace stop failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("stop failed: {e}") })),
             )
                 .into_response()
         }
