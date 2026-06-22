@@ -33,6 +33,15 @@ use serde::{Deserialize, Serialize};
 /// the previous-good release. Three spaced attempts (`RestartSec≈10s` each) span
 /// ~60s of real retry — a one-off transient recovers on the first spaced retry,
 /// a persistent bad binary exhausts the budget and triggers the revert.
+///
+/// ⚠ FIX 10 — LOCKSTEP with the nix OnFailure script's `THRESHOLD=3`
+/// (`nixos/tabbify-node.nix`, in `tabbifyBootRevertScript`). That BASH constant
+/// is what ACTUALLY gates the production revert (the script reads the sidecar
+/// `count` directly and decides whether to call `revert-to-previous`); THIS Rust
+/// const is consumed ONLY by [`BootAttempts::should_revert`] in unit tests — the
+/// boot path never calls it. They MUST stay equal: if you change one, change the
+/// other. (They are deliberately NOT shared via codegen — the script must work
+/// with a binary that predates any threshold mechanism.)
 pub const REVERT_THRESHOLD: u32 = 3;
 
 /// Persisted crash-at-startup boot-attempt counter
