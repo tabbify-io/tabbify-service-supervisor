@@ -195,6 +195,97 @@ let
     fi
   '';
 
+  # LIFELINE self-revert script (FIX 4, spec §3.7) — the `ExecStart` of the
+  # `tabbify-mesh-lifeline-revert` OnFailure unit (svc #5e). The other half of the
+  # half-implemented §3.7: `supervisorFetchJoinerLifeline` already SAVES
+  # `${dataDir}/tabbify-mesh-lifeline.prev` (the prior promoted joiner) before each
+  # promote, but until now NOTHING READ it — a freshly-promoted lifeline joiner
+  # that crash-loops had no rollback. This rolls the lifeline symlink back to
+  # `.prev` after the lifeline unit keeps failing.
+  #
+  # ⚠ IDEMPOTENT / RE-ENTRANT (mirrors `tabbifyBootRevertScript`): on systemd v256
+  # `OnFailure=` fires on EVERY failed start, so this runs repeatedly per burst. A
+  # DURABLE per-attempt counter
+  # (`${dataDir}/data/self-heal/lifeline-revert-attempts`) gates the action: every
+  # fire bumps + reads `count`; sub-threshold is a STRICT no-op (exit 0) so the
+  # lifeline's own `Restart=always`/`RestartSec` handles a transient retry; only
+  # the fire that crosses THRESHOLD actually repoints the symlink, and it CLEARS
+  # the counter so the rolled-back joiner gets a fresh budget (and a re-promote of
+  # a newer joiner later starts from zero). The counter is also reset on a
+  # successful lifeline join (svc #5f timer) so slow accumulation across unrelated
+  # flaps never trips a spurious revert.
+  #
+  # SAFE FAIL DIRECTIONS: no `.prev` (first promote / nothing to roll back to) →
+  # exit 0 and leave the counter, so the lifeline keeps retrying its current joiner
+  # (the fail-safe direction — never strand the lifeline on a dangling symlink). A
+  # `.prev` that points at the SAME target as the live symlink → still repoint
+  # (idempotent) and clear, breaking the loop. Best-effort throughout; a revert
+  # write failure is logged and the lifeline keeps retrying.
+  tabbifyLifelineRevertScript = pkgs.writeShellScript "tabbify-mesh-lifeline-revert" ''
+    # NO `set -e`: this branches on readlink/ln outcomes; an `-e` abort would
+    # defeat the gate. `set -u` for unset-var safety.
+    set -u
+    PATH="${pkgs.systemd}/bin:${pkgs.coreutils}/bin:$PATH"
+
+    THRESHOLD=3
+    SELF_HEAL="${dataDir}/data/self-heal"
+    ATTEMPTS_FILE="$SELF_HEAL/lifeline-revert-attempts"
+    LINK="${dataDir}/tabbify-mesh-lifeline"
+    PREV="${dataDir}/tabbify-mesh-lifeline.prev"
+
+    mkdir -p "$SELF_HEAL"
+
+    # Durable per-attempt counter (plain integer file — no jq dependency on this
+    # unit). Missing/torn reads as 0 (fail-safe: a revert is at most delayed).
+    count=0
+    [ -f "$ATTEMPTS_FILE" ] && count="$(cat "$ATTEMPTS_FILE" 2>/dev/null || echo 0)"
+    case "$count" in (*[!0-9]*) count=0;; ("") count=0;; esac
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$ATTEMPTS_FILE"
+    echo "tabbify-mesh-lifeline-revert: count=$count threshold=$THRESHOLD"
+
+    # ── Sub-threshold fire: STRICT no-op; let the lifeline's Restart re-try. ───
+    if [ "$count" -lt "$THRESHOLD" ]; then
+      echo "tabbify-mesh-lifeline-revert: sub-threshold ($count < $THRESHOLD) — letting the lifeline RestartSec re-try (transient)."
+      exit 0
+    fi
+
+    # ── count >= THRESHOLD: roll the lifeline joiner back to .prev. ────────────
+    if [ ! -L "$PREV" ] && [ ! -e "$PREV" ]; then
+      echo "tabbify-mesh-lifeline-revert: no .prev to roll back to (first promote / nothing prior) — leaving current joiner; lifeline keeps retrying."
+      exit 0
+    fi
+    prev_target="$(readlink "$PREV" 2>/dev/null || true)"
+    if [ -z "$prev_target" ]; then
+      echo "tabbify-mesh-lifeline-revert: .prev is not a readable symlink — cannot roll back; leaving current joiner."
+      exit 0
+    fi
+
+    echo "tabbify-mesh-lifeline-revert: threshold reached — rolling lifeline joiner back to .prev ($prev_target)"
+    if ln -sfn "$prev_target" "$LINK"; then
+      # Cleared so the rolled-back joiner gets its OWN fresh budget, and a later
+      # re-promote of a newer joiner starts from zero.
+      rm -f "$ATTEMPTS_FILE"
+      echo "tabbify-mesh-lifeline-revert: rolled back + counter cleared. systemd will restart the lifeline onto the prior joiner."
+      exit 0
+    else
+      echo "tabbify-mesh-lifeline-revert: ln -sfn rollback failed — leaving current joiner, lifeline keeps retrying."
+      exit 0
+    fi
+  '';
+
+  # LIFELINE counter-reset script (FIX 4) — run by a short OnUnitActiveSec timer
+  # (svc #5f) so a lifeline that has been actively joined for a while clears its
+  # revert-attempt counter. Without this, attempts could SLOWLY accumulate across
+  # unrelated, far-apart flaps and eventually trip a spurious rollback of a
+  # perfectly-good joiner. The lifeline ALSO writes `lifeline-status.json` on join;
+  # the timer firing while the unit is active is a sufficient liveness proxy.
+  tabbifyLifelineResetAttemptsScript = pkgs.writeShellScript "tabbify-mesh-lifeline-reset-attempts" ''
+    set -u
+    PATH="${pkgs.coreutils}/bin:$PATH"
+    rm -f "${dataDir}/data/self-heal/lifeline-revert-attempts"
+  '';
+
   # Crash-at-startup CATCH-NET script — the `ExecStart` of the
   # `tabbify-boot-revert` OnFailure unit (svc #5d, mesh-resilience Phase 2). It is
   # the no-live-process layer that rolls supervisord back to the previous-good
@@ -725,6 +816,71 @@ in {
       RestartSec = 10;
       # root for the TUN + overlay routing.
       User = "root";
+    };
+    # FIX 4 (spec §3.7): when the lifeline keeps FAILING to start (a freshly
+    # promoted joiner that crash-loops), fire the lifeline self-revert catch-net,
+    # which rolls `${dataDir}/tabbify-mesh-lifeline` back to its saved `.prev`.
+    # NixOS `.onFailure` emits this into `[Unit]` (the correct section — NOT
+    # `serviceConfig`/`[Service]`, where systemd would ignore it), and appends the
+    # `.service` suffix. The lifeline runs `Restart=always` + NEVER parks
+    # (`startLimitIntervalSec = 0`), so on systemd v256 this OnFailure re-fires per
+    # failed start — `tabbifyLifelineRevertScript` is idempotent and gated by its
+    # own durable per-attempt counter so only the fire that crosses the threshold
+    # actually rolls back.
+    onFailure = [ "tabbify-mesh-lifeline-revert.service" ];
+  };
+
+  # 5e. LIFELINE self-revert CATCH-NET (FIX 4, spec §3.7). Triggered ONLY via
+  #     `OnFailure=` on tabbify-mesh-lifeline (svc #5a) — NOT `wantedBy` any
+  #     target. Rolls the lifeline joiner symlink back to its saved `.prev` when a
+  #     freshly-promoted joiner crash-loops, so a bad lifeline OTA can self-heal
+  #     without ever touching the supervisor's diagnostics joiner.
+  #
+  #     ⚠ Disable the burst cap on the catch-net ITSELF (mirror svc #5d): the
+  #     lifeline's per-attempt OnFailure re-triggering on systemd v256 must never
+  #     park this oneshot mid-incident. `startLimitIntervalSec = 0` is a `[Unit]`
+  #     directive set via the NixOS top-level option (NOT `serviceConfig`).
+  systemd.services.tabbify-mesh-lifeline-revert = {
+    description = "Roll the mesh lifeline joiner back to previous on repeated start failure (spec §3.7)";
+    # Deliberately NOT wantedBy any target — only fired via OnFailure=.
+    startLimitIntervalSec = 0;
+    # coreutils for readlink/ln/cat/rm; systemd for PATH parity (no systemctl call
+    # here — systemd restarts the lifeline on its own `Restart=always` cycle).
+    path = [ pkgs.coreutils pkgs.systemd ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${tabbifyLifelineRevertScript}";
+      User = "root";
+    };
+  };
+
+  # 5f. LIFELINE revert-counter reset (FIX 4). A short timer that, while the
+  #     lifeline unit is active (joined), clears the lifeline-revert attempt
+  #     counter so attempts can never SLOWLY accumulate across far-apart,
+  #     unrelated flaps and trip a spurious rollback of a healthy joiner. The
+  #     oneshot is cheap (an `rm -f`); the timer's `OnUnitActiveSec` clocks off
+  #     the lifeline so it only runs once the lifeline has been up.
+  systemd.services.tabbify-mesh-lifeline-reset-attempts = {
+    description = "Reset the mesh lifeline revert-attempt counter while the lifeline is healthy (FIX 4)";
+    # Only meaningful alongside a running lifeline.
+    after = [ "tabbify-mesh-lifeline.service" ];
+    path = [ pkgs.coreutils ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${tabbifyLifelineResetAttemptsScript}";
+      User = "root";
+    };
+  };
+  systemd.timers.tabbify-mesh-lifeline-reset-attempts = {
+    description = "Periodically clear the lifeline revert-attempt counter when joined (FIX 4)";
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      # Clock off the lifeline being active: first reset ~10min after a join, then
+      # every 30min while it stays joined. Comfortably longer than the lifeline's
+      # RestartSec so a genuine crash-burst still crosses THRESHOLD before a reset.
+      OnUnitActiveSec = "30min";
+      OnBootSec       = "10min";
+      Unit            = "tabbify-mesh-lifeline-reset-attempts.service";
     };
   };
 
