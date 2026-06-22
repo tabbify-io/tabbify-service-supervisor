@@ -8,7 +8,7 @@
 use std::{net::Ipv6Addr, path::Path, sync::Arc};
 
 use anyhow::Context;
-use mesh_joiner::{JoinConfig, Joiner};
+use mesh_joiner::{JoinConfig, Joiner, JoinerError};
 
 use crate::host::MeshHost;
 use crate::mesh_command::sink::SupervisorCommandSink;
@@ -91,6 +91,35 @@ fn resolve_join_token(metadata_token: Option<String>) -> Option<String> {
     })
 }
 
+/// Operator-facing guidance appended to a coordinator 401 (expired / revoked
+/// join token). This is the EXACT message the 2026-06-22 MSI brick lacked: the
+/// supervisor exited with a bare `coordinator http status 401: "join token
+/// invalid or revoked"`, giving no hint that the fix is re-minting the token in
+/// `/etc/tabbify/supervisor.env`. Kept as a `const` so the wording is testable.
+pub const JOIN_401_GUIDANCE: &str = "join rejected (HTTP 401): the join token is expired or revoked — re-mint via admin 'Add a node' and update /etc/tabbify/supervisor.env (TABBIFY_JOIN_TOKEN=<jwt>), then `systemctl restart tabbify-supervisor`";
+
+/// Wrap a failed `Joiner::join` so an authentication failure is self-explaining.
+///
+/// BUG 4 (defensive): `Joiner::join` surfaces a coordinator rejection as an
+/// `anyhow` error wrapping [`JoinerError::HttpStatus`]. On a 401 the raw chain
+/// is the opaque `coordinator http status 401: "join token invalid or revoked"`
+/// — true but unactionable. We DOWNCAST the error chain to [`JoinerError`] and,
+/// only on a 401, append [`JOIN_401_GUIDANCE`] so the next person sees the cause
+/// (and the fix) in one second. Any other failure (transport, TUN, 4xx/5xx) is
+/// passed through with just the `ctx` it already had — we never mislabel a
+/// non-auth failure as a token problem.
+fn enrich_join_error(err: anyhow::Error, ctx: &'static str) -> anyhow::Error {
+    let is_401 = err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<JoinerError>())
+        .any(|je| matches!(je, JoinerError::HttpStatus { status: 401, .. }));
+    if is_401 {
+        err.context(JOIN_401_GUIDANCE).context(ctx)
+    } else {
+        err.context(ctx)
+    }
+}
+
 impl MeshMembership {
     /// Join the mesh tagged `["supervisor"]` (plus any `extra_tags`, e.g.
     /// `"firecracker"` on a KVM-capable host) against `coordinator_url`,
@@ -162,7 +191,9 @@ impl MeshMembership {
             Some(sink),
         )
         .await
-        .context("join mesh as supervisor")?;
+        // BUG 4: a coordinator 401 (expired/revoked join token) is enriched with
+        // actionable recovery guidance instead of the opaque `http status 401`.
+        .map_err(|e| enrich_join_error(e, "join mesh as supervisor"))?;
         Ok(Self::from_joiner(joiner))
     }
 
@@ -181,7 +212,10 @@ impl MeshMembership {
     /// Used by the runner path (which does NOT wire Track-C remote commands —
     /// only the long-lived supervisor is a restart target).
     async fn from_config(config: JoinConfig, ctx: &'static str) -> anyhow::Result<Self> {
-        let joiner = Joiner::join(config).await.context(ctx)?;
+        // BUG 4: same 401-enrichment as the supervisor join path.
+        let joiner = Joiner::join(config)
+            .await
+            .map_err(|e| enrich_join_error(e, ctx))?;
         Ok(Self::from_joiner(joiner))
     }
 
@@ -433,6 +467,49 @@ mod tests {
         assert!(super::parse_super_admin_pubkey(None).is_none());
         // Non-hex → None.
         assert!(super::parse_super_admin_pubkey(Some(&"zz".repeat(32))).is_none());
+    }
+
+    /// BUG 4 (defensive): a coordinator 401 in the join error chain is enriched
+    /// with actionable recovery guidance (re-mint the token + the canonical /etc
+    /// env path), so the next operator sees the cause in one second instead of an
+    /// opaque `http status 401`. Non-401 failures are passed through unchanged.
+    #[test]
+    fn enrich_join_error_appends_guidance_on_401_only() {
+        // A 401 wrapped exactly as `Joiner::join` surfaces it.
+        let raw_401: anyhow::Error = JoinerError::HttpStatus {
+            status: 401,
+            body: "join token invalid or revoked".to_owned(),
+        }
+        .into();
+        let enriched = super::enrich_join_error(raw_401, "join mesh as supervisor");
+        let rendered = format!("{enriched:#}");
+        assert!(
+            rendered.contains("/etc/tabbify/supervisor.env"),
+            "401 must surface the canonical /etc token path: {rendered}"
+        );
+        assert!(
+            rendered.contains("TABBIFY_JOIN_TOKEN"),
+            "401 must name the token env var: {rendered}"
+        );
+        assert!(
+            rendered.contains("join mesh as supervisor"),
+            "the original context must be preserved: {rendered}"
+        );
+
+        // A NON-401 failure (e.g. 500) is passed through WITHOUT the token
+        // guidance — we never mislabel a non-auth failure as a token problem.
+        let raw_500: anyhow::Error = JoinerError::HttpStatus {
+            status: 500,
+            body: "coordinator boom".to_owned(),
+        }
+        .into();
+        let passthrough = super::enrich_join_error(raw_500, "join mesh as supervisor");
+        let rendered = format!("{passthrough:#}");
+        assert!(
+            !rendered.contains("/etc/tabbify/supervisor.env"),
+            "a 500 must NOT get the token-401 guidance: {rendered}"
+        );
+        assert!(rendered.contains("join mesh as supervisor"));
     }
 
     /// The supervisor's software_version is wired onto `JoinConfig` so it rides

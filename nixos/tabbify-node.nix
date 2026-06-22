@@ -59,7 +59,7 @@ let
   # hex) this node verifies every remote command against, end-to-end. It is a
   # PUBLIC key (safe in git / the Nix store), so it is BAKED here as the default
   # — a fresh box has Track-C armed without a drop-in. For rotation without a
-  # rebuild it can also be supplied via the `${dataDir}/supervisor.env`
+  # rebuild it can also be supplied via the `/etc/tabbify/supervisor.env`
   # EnvironmentFile drop-in (TABBIFY_MESH_SUPER_ADMIN_PUBKEY=<hex>), which
   # overrides this default.
   #
@@ -582,24 +582,21 @@ in {
       # Phase-2 join token. A token-validating coordinator (AUTH_URL set) requires
       # this node to present a join token on register; the coordinator then stamps
       # the node's network + tags from the token CLAIMS. Kept OUT of the Nix store
-      # (no secret in git / world-readable store): drop it out-of-band into
-      #   ${dataDir}/supervisor.env   ->   TABBIFY_JOIN_TOKEN=<jwt>   (chmod 600)
-      # before `nixos-rebuild switch`. This is the SAME path the curl|sh
-      # installer writes (scripts/install.sh), so both install paths share one
-      # canonical token location. The leading '-' makes a missing file
+      # (no secret in git / world-readable store): the provisioner drops it into
+      #   /etc/tabbify/supervisor.env   ->   TABBIFY_JOIN_TOKEN=<jwt>   (chmod 600)
+      # before `nixos-rebuild switch`. The leading '-' makes a missing file
       # non-fatal, so a dev / no-mesh node still starts.
       #
-      # ⚠ CANONICAL PATH — DO NOT HAND-EDIT to `/etc/tabbify/supervisor.env`
-      # (mesh-resilience review fix #11 / GAP#6). The committed path is
-      # `${dataDir}/supervisor.env` (= /opt/tabbify/supervisor.env); the
-      # lifeline + boot-revert units read the SAME path. The 2026-06-22 brick was
-      # exactly this GitOps drift — a hand-pointed `/etc/tabbify/...`
-      # EnvironmentFile (and a hand ExecStart override WITHOUT RestartSec) diverged
-      # from the committed unit. A `nixos-rebuild switch` does NOT remove a
-      # pre-existing hand-edit, so after a rebuild VERIFY the live unit matches
-      # this file (`systemctl cat tabbify-supervisor`). Rotate the env via this
-      # one path only; never hand-edit a second location.
-      EnvironmentFile  = "-${dataDir}/supervisor.env";
+      # ⚠ CANONICAL PATH = /etc/tabbify/supervisor.env (BUG 2, 2026-06-22 root
+      # cause + revert of the mis-aimed GAP#6 /opt canonicalization). This is where
+      # the provisioner writes the VALID 1-year join token; it is the SAME path the
+      # supervisor joins with today. The 06-22 brick was caused by the keystone
+      # pointing this at `${dataDir}/supervisor.env` (= /opt/tabbify/supervisor.env),
+      # which held a STRAY EXPIRED 1-hour token → coordinator returned 401 ("join
+      # token invalid or revoked") → crash-loop. /etc is the single source of truth;
+      # the lifeline unit (svc #5a) reads the SAME /etc file so both joiners present
+      # the SAME valid token. Rotate the token via this one /etc path only.
+      EnvironmentFile  = "-/etc/tabbify/supervisor.env";
       # on-failure (NOT always): a clean exit during a watchdog rollback must
       # NOT auto-respawn the just-swapped-out binary. Exponential-ish backoff
       # (RestartSec grows over RestartSteps up to RestartMaxDelaySec) avoids a
@@ -612,17 +609,25 @@ in {
       RestartSec         = 10;
       RestartSteps       = 3;
       RestartMaxDelaySec = 30;
-      # CRASH-AT-STARTUP CATCH-NET (mesh-resilience Phase 2 keystone). When the
-      # start path keeps crashing — the ~31ms pre-READY exit class the in-process
-      # watchdog (Track B/D) can NEVER see because it arms only after join+READY —
-      # systemd fires this OnFailure unit (svc #5d). On systemd v256 it fires on
-      # EVERY failed ExecStart, so tabbify-boot-revert is idempotent and only the
-      # fire on which the durable BootAttempts counter crosses the threshold
-      # actually reverts. This is the ONLY layer that works with no live process.
-      OnFailure          = [ "tabbify-boot-revert.service" ];
       # root for TUN + Firecracker tap + /dev/kvm:
       User = "root";
     };
+    # CRASH-AT-STARTUP CATCH-NET (mesh-resilience Phase 2 keystone). When the
+    # start path keeps crashing — the ~31ms pre-READY exit class the in-process
+    # watchdog (Track B/D) can NEVER see because it arms only after join+READY —
+    # systemd fires this OnFailure unit (svc #5d). On systemd v256 it fires on
+    # EVERY failed ExecStart, so tabbify-boot-revert is idempotent and only the
+    # fire on which the durable BootAttempts counter crosses the threshold
+    # actually reverts. This is the ONLY layer that works with no live process.
+    #
+    # ⚠ BUG 1 (2026-06-22 root cause): `OnFailure=` is a `[Unit]` directive. The
+    # keystone put it under `serviceConfig` → systemd rendered it into `[Service]`
+    # and logged `Unknown key 'OnFailure' in section [Service], ignoring` → the
+    # catch-net NEVER ARMED. The NixOS `.onFailure` list shortcut emits it into
+    # `[Unit]` (NOT `unitConfig.OnFailure`, which would not append the systemd
+    # `.service` suffix). Verified by rendering: the unit file carries
+    # `OnFailure=tabbify-boot-revert.service` under `[Unit]`.
+    onFailure = [ "tabbify-boot-revert.service" ];
   };
 
   # 5a. Mesh LIFELINE joiner — the out-of-process survivability unit
@@ -679,11 +684,28 @@ in {
       # the shared `${dataDir}/tabbify-mesh` the supervisor's ExecStartPre writes.
       ExecStartPre = "${supervisorFetchJoinerLifeline}";
       # Join on a SECOND identity/ULA, relay-only, as the sole Track-C target.
-      # `''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}` is expanded by systemd from this
-      # unit's environment (the baked default / EnvironmentFile override).
-      ExecStart = ''${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --super-admin-pubkey ''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY} --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline'';
-      # SAME canonical env path as the supervisor (review fix #11): rotation only.
-      EnvironmentFile = "-${dataDir}/supervisor.env";
+      #
+      # ⚠ BUG 3 (2026-06-22 root cause): the lifeline joined WITHOUT a join token,
+      # so a token-validating coordinator (AUTH_URL set) rejected its register with
+      # 401 → the lifeline crash-looped and never appeared in the roster (its whole
+      # reason to exist — an SSH-reachable lifeline — was therefore absent during
+      # the incident). FIX: the lifeline now sources `/etc/tabbify/supervisor.env`
+      # (the SAME VALID 1-year token the supervisor joins with — both this box's
+      # tag:net peer) and passes it as `--join-token`. The standalone tool reads
+      # the token from `--join-token` (env `MESH_JOIN_TOKEN`), but the canonical
+      # file exports it as `TABBIFY_JOIN_TOKEN` (what the supervisor binary reads),
+      # so we reconcile cleanly with a tiny `sh -c` wrapper that forwards
+      # `$TABBIFY_JOIN_TOKEN` into `--join-token`. A missing/empty token degrades
+      # to today's no-token behavior (the `-` on EnvironmentFile keeps it
+      # non-fatal; an unset var expands empty → still a valid CLI against a
+      # no-AUTH_URL coordinator). `''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}` and
+      # `''${TABBIFY_JOIN_TOKEN}` are expanded by the shell from this unit's
+      # environment (baked default / `/etc` EnvironmentFile).
+      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name ${nodeName}-lifeline' '';
+      # CANONICAL env path = /etc/tabbify/supervisor.env (BUG 2 + BUG 3): carries
+      # the VALID 1-year TABBIFY_JOIN_TOKEN the wrapper forwards into --join-token,
+      # the SAME file the supervisor unit reads. Rotation only — never a 2nd path.
+      EnvironmentFile = "-/etc/tabbify/supervisor.env";
       # The lifeline NEVER gives up: always restart, spaced, and NEVER park
       # (the burst cap is disabled via top-level `startLimitIntervalSec = 0` above).
       Restart    = "always";
