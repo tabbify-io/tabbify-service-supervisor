@@ -542,6 +542,15 @@ impl RevertFlowOutcome {
 /// it returns [`RevertFlowOutcome::NoPrevious`]. A non-bail error returns
 /// [`RevertFlowOutcome::Failed`]. The `restart` + `reboot` collaborators are
 /// injected so the flow is unit-testable without poking systemd.
+///
+/// FIX 2 (option-a, spec §3.5 intent — reboot-as-last-resort once already
+/// reverted): when the BootAttempts sidecar already records a `reverted_to`
+/// (we reverted once this streak and the REVERTED binary is ALSO crash-looping)
+/// AND `--reboot-on-exhausted` is set, we SKIP a second `revert_to_previous`
+/// (which would walk history DOWN to an even-older release — not the spec intent,
+/// and a soft-brick if those are bad too) and go STRAIGHT to the guarded reboot
+/// seam. Without the flag the historical behaviour is preserved (a deeper revert
+/// is still attempted) so the no-reboot OnFailure path is unchanged.
 async fn revert_to_previous_flow(
     install_dir: &std::path::Path,
     releases_dir: &std::path::Path,
@@ -553,6 +562,27 @@ async fn revert_to_previous_flow(
     use tabbify_supervisor::boot_health::BootAttempts;
     use tabbify_supervisor::selfupdate::swap::{read_version_file, write_version_file};
     use tabbify_supervisor::selfupdate::watchdog::revert_to_previous;
+
+    // FIX 2: already-reverted + --reboot-on-exhausted ⇒ reboot-as-last-resort,
+    // NOT a deeper revert. The reverted binary (recorded as `reverted_to` by the
+    // prior `mark_reverted`) is itself crash-looping; reverting AGAIN just walks
+    // the symlinks to an older-still release. Go straight to the guarded reboot
+    // seam instead. (Without the flag we fall through to the normal revert below,
+    // preserving the historical no-reboot OnFailure behaviour.)
+    if reboot_on_exhausted && BootAttempts::load(data_dir).reverted_to.is_some() {
+        tracing::warn!(
+            "revert-to-previous: already reverted this streak and the reverted binary is \
+             still crash-looping — reboot-as-last-resort (skipping a deeper revert)"
+        );
+        return if reboot() {
+            RevertFlowOutcome::Rebooted
+        } else {
+            tracing::error!(
+                "revert-to-previous: reboot loop-guard PARKED (already reverted) — leaving failed for a human"
+            );
+            RevertFlowOutcome::RebootParked
+        };
+    }
 
     // Capture the reverted-FROM version BEFORE the revert rewrites VERSION. A
     // missing/unreadable ledger means there is nothing to revert FROM either.
@@ -1102,6 +1132,146 @@ mod tests {
         .await;
         assert_eq!(outcome, RevertFlowOutcome::RebootParked);
         assert_eq!(outcome.exit_code(), revert_exit::REBOOT_PARKED);
+    }
+
+    /// FIX 2 (option-a, spec-matching): the reverted binary ALSO crash-loops.
+    /// When `reverted_to` is ALREADY set in the BootAttempts sidecar AND
+    /// `--reboot-on-exhausted` is passed, the flow must NOT walk history down with
+    /// ANOTHER symlink revert — it must go STRAIGHT to the reboot seam. A
+    /// COMPLETE previous-good (v1) is staged so the OLD behaviour would have
+    /// reverted to it; this test proves we reboot instead and leave the symlinks
+    /// pointing at v2 (no deeper revert).
+    #[tokio::test]
+    async fn revert_flow_reboots_when_already_reverted_even_with_previous_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage(&releases, ver);
+        }
+        for bin in TEST_SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+        // Already reverted once this streak (the reverted binary is now crash-looping).
+        BootAttempts::mark_reverted("v2.0.0", &data_dir);
+
+        let restart = noop_restart();
+        let fired = std::cell::Cell::new(false);
+        let reboot = || {
+            fired.set(true);
+            true // guard granted a slot
+        };
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, true, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            RevertFlowOutcome::Rebooted,
+            "already-reverted + --reboot-on-exhausted must reboot, not revert deeper",
+        );
+        assert_eq!(outcome.exit_code(), revert_exit::PERFORMED);
+        assert!(fired.get(), "the reboot seam must fire when already reverted");
+        // NO deeper revert: the symlinks + VERSION still point at v2 (untouched),
+        // and nothing new was quarantined.
+        for bin in TEST_SWAP_BINARIES {
+            assert_eq!(
+                std::fs::read(install.join(bin)).unwrap(),
+                format!("v2.0.0-{bin}").into_bytes(),
+                "symlinks must NOT walk down to v1 when already reverted",
+            );
+        }
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v2.0.0", "VERSION must stay at v2 — no deeper revert");
+        assert!(vf.quarantine.is_empty(), "no new quarantine on a reboot-only path");
+    }
+
+    /// FIX 2 companion: already-reverted + `--reboot-on-exhausted` but the
+    /// loop-guard PARKS (seam returns false) → RebootParked, and STILL no deeper
+    /// revert (symlinks stay at v2).
+    #[tokio::test]
+    async fn revert_flow_parks_when_already_reverted_and_guard_exhausted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage(&releases, ver);
+        }
+        for bin in TEST_SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+        BootAttempts::mark_reverted("v2.0.0", &data_dir);
+
+        let restart = noop_restart();
+        let reboot = || false; // guard exhausted → parked
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, true, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(outcome, RevertFlowOutcome::RebootParked);
+        assert_eq!(outcome.exit_code(), revert_exit::REBOOT_PARKED);
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v2.0.0", "no deeper revert even when parked");
+    }
+
+    /// FIX 2 negative guard: already-reverted but WITHOUT `--reboot-on-exhausted`
+    /// still performs a deeper revert (the historical behaviour is preserved when
+    /// reboot is not requested — the reboot shortcut is gated on the flag).
+    #[tokio::test]
+    async fn revert_flow_still_reverts_when_already_reverted_but_no_reboot_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path();
+        let releases = install.join("releases");
+        let data_dir = install.join("data");
+        for ver in ["v1.0.0", "v2.0.0"] {
+            stage(&releases, ver);
+        }
+        for bin in TEST_SWAP_BINARIES {
+            repoint_symlink(install, bin, &releases.join("v2.0.0").join(bin)).unwrap();
+        }
+        write_version_file(
+            install,
+            &VersionFile {
+                current: "v2.0.0".into(),
+                previous: vec!["v1.0.0".into()],
+                pending_confirm: None,
+                quarantine: Vec::new(),
+            },
+        )
+        .unwrap();
+        BootAttempts::mark_reverted("v2.0.0", &data_dir);
+
+        let restart = noop_restart();
+        let reboot = || panic!("reboot must NOT fire without --reboot-on-exhausted");
+        let outcome = revert_to_previous_flow(
+            install, &releases, &data_dir, false, &restart, &reboot,
+        )
+        .await;
+        assert_eq!(outcome, RevertFlowOutcome::Performed("v1.0.0".to_owned()));
+        let vf = read_version_file(install).unwrap();
+        assert_eq!(vf.current, "v1.0.0", "without the reboot flag, a deeper revert still happens");
     }
 
     // ── boot-health loop-guard: which invocations count as a real boot ──────
