@@ -224,8 +224,37 @@ fn kill_pid(pid: u32) {
     }
 }
 
+/// The systemd-scope names that, post-F1, own the firecracker process for an
+/// app — so a per-uuid reap must `systemctl stop` ALL of them to actually kill
+/// the scoped FC (not merely the `systemd-run` wrapper PID in the pidfile).
+///
+/// The FC spawn keys its CPU scope on the SAME `vm_key` as the tap/socket
+/// (`fc_identity_for_key`): a deploy boots under `uuid:reff` and a cold start
+/// under `uuid` (`firecracker/linux.rs` `cold_boot` / `launch_with_uuid`). We
+/// can't know from the call site which key a given live FC used, so we return
+/// BOTH candidate scope names when an `image_ref` is known (deploy-key first,
+/// then the defensive cold-start key), or just the cold-start key when it isn't.
+/// `stop_fc_scope` is idempotent and a no-op for a non-existent scope, so
+/// stopping a name that was never used is harmless. Pure (testable).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fc_scope_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
+    let mut names = Vec::with_capacity(2);
+    // Deploy key (`uuid:reff`) — the production serving identity. First so the
+    // most-likely-live scope is torn down first.
+    if let Some(reff) = image_ref {
+        names.push(crate::firecracker::cpu_scope::scope_name(&format!(
+            "{uuid}:{reff}"
+        )));
+    }
+    // Cold-start key (`uuid`) — the bare cold-boot identity; also defensive when
+    // a record carries a stale/absent reff.
+    names.push(crate::firecracker::cpu_scope::scope_name(uuid));
+    names
+}
+
 /// Kill the Firecracker child process for `uuid` by reading its pidfile from
-/// `data_dir`. Best-effort: logs if the pidfile is absent or the kill fails.
+/// `data_dir`, AND tear down its CPU-capped systemd scope(s). Best-effort: logs
+/// if the pidfile is absent or the kill fails.
 ///
 /// Mechanism: the runner writes `<data_dir>/tabbify-fc-<uuid>.pid` after
 /// spawning the firecracker child (via [`crate::firecracker::pidfile::write`]).
@@ -235,20 +264,45 @@ fn kill_pid(pid: u32) {
 /// and spins forever at 100% CPU. Reading + consuming the pidfile here lets
 /// the supervisor kill the orphan before it spawns a fresh runner.
 ///
+/// F1 (audit #93) — CRITICAL completeness fix: on a systemd host the FC now runs
+/// inside a `systemd-run --scope`, so the pidfile records the `systemd-run`
+/// WRAPPER pid, not firecracker. SIGKILLing that wrapper does NOT propagate into
+/// the scope cgroup — the firecracker reparents to PID 1 and the scope leaks (a
+/// capped-but-live "hot furnace" the F2 sweep can't catch, because a same-version
+/// respawn boots an FC on the IDENTICAL socket). So after killing the pidfile pid
+/// we ALSO `systemctl stop` the reconstructed scope name(s) (deploy key
+/// `uuid:reff` + cold-start key `uuid` — see [`fc_scope_names_for_uuid`]).
+/// `stop_fc_scope` is idempotent + a no-op off-systemd, so this is safe on every
+/// host. `image_ref` is the record's deployed ref (the caller passes it from the
+/// `RunnerHandle` / loaded record); `None` falls back to the cold-start scope.
+///
 /// The pidfile is consumed by this call (removed from disk) so the fresh
 /// runner's own cold-start reconciliation does not re-kill the NEW FC.
 ///
 /// Exposed as `pub(crate)` so [`crate::orchestrator::api::Orchestrator::purge_app`]
 /// can reuse the same reaping logic (FIX C: purge must also reap the FC orphan).
-pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str) {
+pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Option<&str>) {
     if let Some(fc_pid) = pidfile::take(data_dir, uuid) {
         tracing::info!(
             uuid,
             fc_pid,
-            "killing orphaned FC child before runner respawn"
+            "killing orphaned FC child (pidfile pid) before runner respawn"
         );
         pidfile::kill_stale_if_alive(fc_pid, pidfile::process_is_alive);
     }
+    // F1 — also stop the CPU-capped scope(s): on systemd the pidfile pid above is
+    // only the `systemd-run` wrapper; the firecracker lives inside the scope and
+    // survives the wrapper's death. `stop_fc_scope` SIGKILLs everything in the
+    // scope cgroup (the real FC) and GCs the unit; idempotent + no-op off-systemd.
+    // The `stop_fc_scope` primitive lives in the Linux-only runtime, and FC scopes
+    // only exist on a systemd Linux host, so the teardown is `cfg`-gated; the pure
+    // name reconstruction ([`fc_scope_names_for_uuid`]) stays cross-platform tested.
+    #[cfg(target_os = "linux")]
+    for scope in fc_scope_names_for_uuid(uuid, image_ref) {
+        crate::firecracker::linux::stop_fc_scope(&scope);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = image_ref; // used only by the Linux scope-teardown above
 }
 
 /// The path token that a live `oras` image pull for `uuid` carries in its
@@ -629,7 +683,11 @@ impl Orchestrator {
                     );
                     // Kill the FC orphan (best-effort) even when parking: the
                     // runner is dead and the FC child is spinning at 100% CPU.
-                    kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
+                    kill_fc_child_for_uuid(
+                        &self.shared.data_dir,
+                        &record.uuid,
+                        record.image_ref.as_deref(),
+                    );
                     return self.park_runner(record, new_restart).await;
                 }
 
@@ -641,7 +699,11 @@ impl Orchestrator {
                 );
                 // Kill any lingering FC child left by the dead runner before
                 // spawning a fresh one so we do not accumulate orphaned VMs.
-                kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
+                kill_fc_child_for_uuid(
+                    &self.shared.data_dir,
+                    &record.uuid,
+                    record.image_ref.as_deref(),
+                );
                 self.do_respawn(record, None, new_restart).await
             }
 
@@ -728,7 +790,11 @@ impl Orchestrator {
                             "runner exceeded crash-loop threshold — parking (no further respawns until re-deployed)"
                         );
                         kill_pid(record.pid);
-                        kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
+                        kill_fc_child_for_uuid(
+                        &self.shared.data_dir,
+                        &record.uuid,
+                        record.image_ref.as_deref(),
+                    );
                         return self.park_runner(record, new_restart).await;
                     }
 
@@ -739,7 +805,11 @@ impl Orchestrator {
                         "runner alive but socket unhealthy past grace window — killing before respawn"
                     );
                     kill_pid(record.pid);
-                    kill_fc_child_for_uuid(&self.shared.data_dir, &record.uuid);
+                    kill_fc_child_for_uuid(
+                        &self.shared.data_dir,
+                        &record.uuid,
+                        record.image_ref.as_deref(),
+                    );
                     self.do_respawn(record, Some(record.pid), new_restart).await
                 }
             }
@@ -991,6 +1061,72 @@ mod tests {
 
         // Both failing ⇒ never killed.
         assert!(!fc_orphan_should_reap(&live_sock, false, &live));
+    }
+
+    // ── F1 (audit #93) — scoped-FC reap completeness ──────────────────────────
+    //
+    // Post-F1 the FC runs inside a `systemd-run --scope` named on its `vm_key`,
+    // and the pidfile records the WRAPPER pid (not firecracker). `kill_fc_child_
+    // for_uuid` therefore MUST also `systemctl stop` the reconstructed scope(s),
+    // or a same-version respawn leaks the old scoped FC (the F2 socket-identity
+    // sweep can't catch it — old+new share the socket). These prove the pure name
+    // reconstruction yields BOTH candidate scopes (deploy key + cold-start key).
+
+    #[test]
+    fn scope_names_cover_deploy_and_cold_start_keys() {
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let reff = "[fd5a:1f02::1]:5000/acme/app:sha256abc";
+        let names = fc_scope_names_for_uuid(uuid, Some(reff));
+
+        // The DEPLOY-key scope (`uuid:reff`) is the production serving identity —
+        // it MUST be present (this is the leak the review flagged), and FIRST.
+        let deploy_scope =
+            crate::firecracker::cpu_scope::scope_name(&format!("{uuid}:{reff}"));
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(deploy_scope.as_str()),
+            "deploy-key scope (uuid:reff) must be stopped first — it owns the live serving FC"
+        );
+
+        // The cold-start key (`uuid`) is also present (defensive: a cold boot /
+        // stale-reff record uses it).
+        let cold_scope = crate::firecracker::cpu_scope::scope_name(uuid);
+        assert!(
+            names.contains(&cold_scope),
+            "cold-start-key scope (uuid) must also be stopped"
+        );
+        assert_eq!(names.len(), 2, "exactly the two candidate scopes, no more");
+    }
+
+    #[test]
+    fn scope_names_fall_back_to_cold_start_when_no_image_ref() {
+        let uuid = "0191e7c2-2222-7222-8333-444455556666";
+        let names = fc_scope_names_for_uuid(uuid, None);
+        // With no deployed ref we can only reconstruct the cold-start scope.
+        assert_eq!(
+            names,
+            vec![crate::firecracker::cpu_scope::scope_name(uuid)],
+            "no image_ref ⇒ stop only the cold-start-key scope"
+        );
+    }
+
+    #[test]
+    fn scope_names_match_the_spawn_path_scope_id() {
+        // The reap MUST reconstruct the SAME scope name the spawn path
+        // (`firecracker::cold_boot` → `spawn_firecracker(scope_id = vm_key)`)
+        // registered, or `systemctl stop` would target a non-existent unit and
+        // the scoped FC would leak. The spawn keys the serving scope on the
+        // `uuid:reff` vm_key; assert the reaper's first candidate equals exactly
+        // `cpu_scope::scope_name("{uuid}:{reff}")` — the spawn-side derivation.
+        let uuid = "abc-123";
+        let reff = "registry/x:sha-NEW";
+        let vm_key = format!("{uuid}:{reff}");
+        let names = fc_scope_names_for_uuid(uuid, Some(reff));
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(crate::firecracker::cpu_scope::scope_name(&vm_key).as_str()),
+            "reaper scope name must equal the spawn-path scope id (uuid:reff)"
+        );
     }
 
     // ── pid dead ─────────────────────────────────────────────────────────────

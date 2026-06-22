@@ -303,8 +303,13 @@ impl Orchestrator {
         // artifact (image_ref/manifest_toml/extra_env/runner_join_token); only
         // the live identity (pid) is cleared so the monitor never adopts a stale
         // live pid for a stopped app. A missing record is a no-op (already gone).
+        // F1 (audit #93): capture the deployed `image_ref` so the FC reap below
+        // can `systemctl stop` the right CPU scope (`uuid:reff`) — the pidfile pid
+        // is only the `systemd-run` wrapper, so the scoped FC leaks without it.
+        let mut image_ref: Option<String> = None;
         match RunnerHandle::load(self.runner_dir(), uuid) {
             Ok(Some(mut record)) => {
+                image_ref = record.image_ref.clone();
                 record.stopped = true;
                 // Clear the live pid: pid 0 reads as DEAD to the monitor's
                 // liveness probe, and the `stopped` gate short-circuits the
@@ -334,7 +339,9 @@ impl Orchestrator {
         // Reap any FC child the runner left behind (the FC process is not a
         // child of the supervisor — it busy-spins until reaped). Mirrors
         // purge_app's reap so a stopped app does not leak a 100%-CPU FC orphan.
-        kill_fc_child_for_uuid(&self.shared().data_dir, uuid);
+        // Pass the captured `image_ref` so the scoped FC's `uuid:reff` scope is
+        // also stopped (F1) — killing the pidfile wrapper pid alone leaks it.
+        kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref.as_deref());
         Ok(())
     }
 
@@ -347,6 +354,15 @@ impl Orchestrator {
     /// logged + tolerated; the record + cache are removed regardless.
     pub async fn purge_app(&self, uuid: &str) -> Result<()> {
         let _ = self.app_ula_for(uuid)?;
+
+        // F1 (audit #93): read the deployed `image_ref` BEFORE `forget_record`
+        // deletes the record, so the FC reap below can `systemctl stop` the
+        // scoped FC's `uuid:reff` scope (the pidfile pid is only the
+        // `systemd-run` wrapper — stopping it alone leaks the scoped firecracker).
+        let image_ref: Option<String> = RunnerHandle::load(self.runner_dir(), uuid)
+            .ok()
+            .flatten()
+            .and_then(|r| r.image_ref);
 
         let client = self.client_for(uuid);
         // Purge clears the runner's cache + docker image (the runner stays up),
@@ -373,8 +389,9 @@ impl Orchestrator {
         // reparented to PID 1 where it busy-spins at 100% CPU. The monitor
         // already does this reap on its kill-before-respawn path; purge_app
         // did not, leaving FC orphans alive until the next monitor tick found a
-        // dead runner. Call the same helper here, best-effort.
-        kill_fc_child_for_uuid(&self.shared().data_dir, uuid);
+        // dead runner. Call the same helper here, best-effort. The pre-forget
+        // `image_ref` lets it stop the scoped FC's `uuid:reff` scope too (F1).
+        kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref.as_deref());
 
         // Reclaim the on-disk cache from our side too: the runner's own purge
         // already cleared it, but if the runner was unreachable we still want a
