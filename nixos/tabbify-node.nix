@@ -471,6 +471,25 @@ in {
   #    change "kvm-intel" to "kvm-amd".
   boot.kernelModules = [ "tun" "kvm-intel" ];
 
+  # 1b. Durable TCP receive-buffer cap (task #25, mesh relay bufferbloat).
+  #     This FC worker is the bulk CONSUMER on the mesh: it pulls large OCI
+  #     images from the in-mesh registry over the DERP relay. All of its mesh
+  #     traffic rides ONE wss/TCP connection, whose kernel receive buffer
+  #     auto-tunes up to net.ipv4.tcp_rmem's MAX. A large rmem (the distro
+  #     default is several MB) lets the relay's bulk stream fill seconds of
+  #     in-kernel queue BELOW the joiner's app-level priority lanes → mesh
+  #     control-plane RTT idle 32 ms → ~10 s, 75% loss (2026-06-15 bufferbloat
+  #     finding). Receiver `tcp_rmem` DOMINATES here (TCP ACKs are paced off the
+  #     receive buffer, not on app read). Capping the rmem MAX to 256 KiB
+  #     (262144 B) — together with the coordinator's tcp_wmem cap — drove RTT
+  #     back to ~0.88 s / 0% loss. That cap was applied EPHEMERALLY via SSM
+  #     `sysctl -w` and LOST on reboot/re-provision; baking it into the nix
+  #     config makes it durable. Triplet is `min default max` — keep the kernel
+  #     min/default, cap only the max.
+  boot.kernel.sysctl = {
+    "net.ipv4.tcp_rmem" = "4096 131072 262144";
+  };
+
   # 2. Host tools the supervisor and the runtimes invoke.
   #    FC rootfs conversion is DOCKER-LESS: oras pulls the image as an OCI
   #    layout, the supervisor untars layers (tar, via busybox) and runs
