@@ -89,3 +89,76 @@
         let token2 = insert_authkeys_cap("ws-uuid-1", &mut cap_files2);
         assert_ne!(token, token2, "each workspace-create mints a fresh cap");
     }
+
+    /// `append_cap` adds a repo's cap to the live in-mem registry WITHOUT dropping
+    /// the existing caps (additive, mirrors the durable record append). A missing
+    /// workspace is a no-op `false`.
+    #[test]
+    fn append_cap_is_additive_and_noops_on_missing() {
+        let reg = WorkspaceRegistry::default();
+        reg.insert(Workspace {
+            workspace_uuid: "ws-1".to_owned(),
+            user_id: "u".to_owned(),
+            caps: vec!["capA".to_owned()],
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
+        });
+        assert!(reg.append_cap("ws-1", "capB".to_owned()));
+        let caps = reg.caps_of("ws-1").unwrap();
+        assert_eq!(caps.len(), 2, "append must keep the existing cap");
+        assert!(caps.contains(&"capA".to_owned()));
+        assert!(caps.contains(&"capB".to_owned()));
+        // Unknown workspace → false, no panic.
+        assert!(!reg.append_cap("ws-missing", "capX".to_owned()));
+    }
+
+    /// `merge_cap_into_env` MERGES a new `<repo>.url` entry into the persisted
+    /// `CAP_FILES_ENV` JSON map, preserving every existing cap-file (the
+    /// authkeys/forge-admin/other-repo entries the respawn must re-bake). A
+    /// record with no prior CAP_FILES_ENV starts a fresh single-entry map; all
+    /// other env keys (marker, user-id, authorized-key) are untouched.
+    #[test]
+    fn merge_cap_into_env_preserves_existing_cap_files() {
+        // Existing env: marker + a CAP_FILES_ENV holding repo-A + authkeys.
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert(crate::api::WORKSPACE_MARKER_ENV.to_owned(), "ws-1".to_owned());
+        env.insert("TABBIFY_USER_ID".to_owned(), "acct_a".to_owned());
+        env.insert(
+            CAP_FILES_ENV.to_owned(),
+            serde_json::json!({
+                "app.url": "http://h:8788/git/capA",
+                "authkeys.cap": "deadbeef",
+            })
+            .to_string(),
+        );
+
+        merge_cap_into_env(&mut env, "extra.url", "http://h:8788/git/capB");
+
+        // Non-cap env keys are untouched.
+        assert_eq!(env.get(crate::api::WORKSPACE_MARKER_ENV).unwrap(), "ws-1");
+        assert_eq!(env.get("TABBIFY_USER_ID").unwrap(), "acct_a");
+        // The cap-file map now has BOTH repos + the preserved authkeys cap.
+        let cap_files: serde_json::Value =
+            serde_json::from_str(env.get(CAP_FILES_ENV).unwrap()).unwrap();
+        assert_eq!(cap_files["app.url"], "http://h:8788/git/capA");
+        assert_eq!(cap_files["extra.url"], "http://h:8788/git/capB");
+        assert_eq!(
+            cap_files["authkeys.cap"], "deadbeef",
+            "the authkeys cap must survive the merge"
+        );
+    }
+
+    /// With no prior `CAP_FILES_ENV`, the merge creates a single-entry map.
+    #[test]
+    fn merge_cap_into_env_starts_fresh_map_when_absent() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        merge_cap_into_env(&mut env, "extra.url", "http://h:8788/git/capB");
+        let cap_files: serde_json::Value =
+            serde_json::from_str(env.get(CAP_FILES_ENV).unwrap()).unwrap();
+        assert_eq!(cap_files["extra.url"], "http://h:8788/git/capB");
+        assert_eq!(
+            cap_files.as_object().unwrap().len(),
+            1,
+            "a fresh map holds exactly the new entry"
+        );
+    }

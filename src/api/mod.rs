@@ -51,9 +51,9 @@ pub use workspace_record::{
     readopt_workspaces, workspaces_dir,
 };
 pub use workspaces::{
-    CAP_FILES_ENV, CreateWorkspaceBody, RepoSpec, WORKSPACE_MAX_TTL, Workspace, WorkspaceCreated,
-    WorkspaceRegistry, cap_repo_basename, create_workspace, delete_workspace, list_workspaces,
-    snapshot_workspace,
+    AddRepoBody, AddRepoResult, CAP_FILES_ENV, CreateWorkspaceBody, RepoSpec, WORKSPACE_MAX_TTL,
+    Workspace, WorkspaceCreated, WorkspaceRegistry, add_workspace_repo, cap_repo_basename,
+    create_workspace, delete_workspace, list_workspaces, snapshot_workspace, stop_workspace,
 };
 pub use dev_sessions::{
     CreateDevSessionBody, DEV_SESSION_IDLE_TTL, DEV_SESSION_MAX_TTL, DevSessionCreated,
@@ -83,8 +83,8 @@ pub use dev_sessions::{
 };
 #[doc(hidden)]
 pub use workspaces::{
-    __path_create_workspace, __path_delete_workspace, __path_list_workspaces,
-    __path_snapshot_workspace,
+    __path_add_workspace_repo, __path_create_workspace, __path_delete_workspace,
+    __path_list_workspaces, __path_snapshot_workspace, __path_stop_workspace,
 };
 #[doc(hidden)]
 pub use handlers::{
@@ -235,6 +235,11 @@ pub fn router(state: SupervisorState) -> Router {
             "/v1/workspaces/:uuid/snapshot",
             post(workspaces::snapshot_workspace),
         )
+        .route(
+            "/v1/workspaces/:uuid/repos",
+            post(workspaces::add_workspace_repo),
+        )
+        .route("/v1/workspaces/:uuid/stop", post(workspaces::stop_workspace))
         // Git smart-HTTP proxy — tokenless in-VM remote (dev sessions).
         // Not in OpenAPI (wire protocol, not REST).
         .route(

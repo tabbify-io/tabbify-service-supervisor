@@ -13,10 +13,11 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api::{
-    AboutResponse, AppActionResponse, AppListResponse, AppPresence, AppPurgeResponse,
-    AppStopResponse, BuildBody, CreateDevSessionBody, CreateWorkspaceBody, DeployBody,
-    DevSessionCreated, DevSessionPurged, DevSessionRow, ErrorResponse, GitTokenRefreshed,
-    HealthResponse, RefreshGitTokenBody, RepoSpec, SupervisorState, WorkspaceCreated,
+    AboutResponse, AddRepoBody, AddRepoResult, AppActionResponse, AppListResponse, AppPresence,
+    AppPurgeResponse, AppStopResponse, BuildBody, CreateDevSessionBody, CreateWorkspaceBody,
+    DeployBody, DevSessionCreated, DevSessionPurged, DevSessionRow, ErrorResponse,
+    GitTokenRefreshed, HealthResponse, RefreshGitTokenBody, RepoSpec, SupervisorState,
+    WorkspaceCreated,
 };
 use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
 
@@ -49,6 +50,8 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         crate::api::list_workspaces,
         crate::api::delete_workspace,
         crate::api::snapshot_workspace,
+        crate::api::add_workspace_repo,
+        crate::api::stop_workspace,
     ),
     components(schemas(
         HealthResponse,
@@ -73,6 +76,8 @@ use crate::runner::build::{ArtifactRef, BuildJob, BuildKind};
         CreateWorkspaceBody,
         RepoSpec,
         WorkspaceCreated,
+        AddRepoBody,
+        AddRepoResult,
     ))
 )]
 pub struct ApiDoc;

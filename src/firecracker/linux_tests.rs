@@ -279,3 +279,75 @@ async fn snapshot_noop_without_cache_dir() {
         "snapshot() with no cache dir must be a no-op Ok(())"
     );
 }
+
+/// A throwaway HTTP/1.1 server that answers the FIRST connection with `status`,
+/// then returns its bound base URL (`http://127.0.0.1:<port>`). Used to drive the
+/// GAP#4 `pre_snapshot_scrub` fail-closed semantics without a real microVM.
+async fn stub_scrub_server(status: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = "ok";
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        }
+    });
+    base
+}
+
+/// GAP#4: a NON-workspace runtime never scrubs — `pre_snapshot_scrub` is an
+/// immediate `Ok(())` even with NO server reachable (no broker, no creds).
+#[tokio::test]
+async fn pre_snapshot_scrub_skips_for_non_workspace() {
+    // Point at a dead port; a non-workspace must NOT dial it.
+    let rt = FirecrackerRuntime::with_scrub_target_for_test("http://127.0.0.1:1", false);
+    assert!(
+        rt.pre_snapshot_scrub().await.is_ok(),
+        "non-workspace scrub must be a no-op Ok(()) (no broker to scrub)"
+    );
+}
+
+/// GAP#4: a WORKSPACE whose broker scrub returns 200 → `Ok(())` (proceed to snapshot).
+#[tokio::test]
+async fn pre_snapshot_scrub_ok_for_workspace_on_200() {
+    let base = stub_scrub_server(200).await;
+    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true);
+    assert!(
+        rt.pre_snapshot_scrub().await.is_ok(),
+        "a 200 scrub must let the snapshot proceed"
+    );
+}
+
+/// GAP#4 FAIL-CLOSED: a WORKSPACE whose broker scrub returns 500 → `Err` so the
+/// caller ABORTS the snapshot (never freeze a held secret).
+#[tokio::test]
+async fn pre_snapshot_scrub_aborts_for_workspace_on_500() {
+    let base = stub_scrub_server(500).await;
+    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true);
+    let err = rt
+        .pre_snapshot_scrub()
+        .await
+        .expect_err("a non-2xx scrub must abort the snapshot");
+    assert!(err.to_string().contains("500"), "error names the status: {err}");
+}
+
+/// GAP#4 FAIL-CLOSED: a WORKSPACE whose broker is UNREACHABLE → `Err` (abort).
+/// A workspace's broker must be live to scrub; a connect refusal means it died /
+/// never came up, so we must NOT snapshot creds.
+#[tokio::test]
+async fn pre_snapshot_scrub_aborts_for_workspace_when_unreachable() {
+    // Port 1 on loopback refuses immediately.
+    let rt = FirecrackerRuntime::with_scrub_target_for_test("http://127.0.0.1:1", true);
+    assert!(
+        rt.pre_snapshot_scrub().await.is_err(),
+        "an unreachable workspace broker must abort the snapshot (fail-closed)"
+    );
+}

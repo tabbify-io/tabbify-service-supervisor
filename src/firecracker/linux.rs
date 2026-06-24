@@ -199,11 +199,24 @@ pub struct FirecrackerRuntime {
     /// deployed image changes (cache is keyed by uuid only — see
     /// `snapshot::ref_matches`). `None` mirrors `snapshot_cache_dir`.
     image_ref: Option<String>,
+    /// Is this a WORKSPACE VM (vs a regular app / dev-FC)? Set true only on the
+    /// workspace spawn path (detected via the workspace marker env). Gates the
+    /// GAP#4 pre-snapshot scrub: a workspace holds provider creds in the broker's
+    /// RAM + tmpfs and takes a Full (RAM-freezing) snapshot, so `snapshot()` MUST
+    /// drop those creds via the in-guest broker before pausing — and ABORT the
+    /// snapshot if the scrub fails. A non-workspace FC has no broker / no creds.
+    is_workspace: bool,
     /// Test-only injectable reachability probe. Production leaves this `None`
     /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
     /// closure via [`Self::with_probe_for_test`] so no real microVM is needed.
     #[cfg(test)]
     probe: Option<TcpProbe>,
+    /// Test-only override for the pre-snapshot scrub target base URL (e.g.
+    /// `http://127.0.0.1:<ephemeral>`). Production leaves this `None` and
+    /// `pre_snapshot_scrub` dials the real `guest_ip:8732`; a test points it at a
+    /// local stub server so the fail-closed semantics are exercised without a VM.
+    #[cfg(test)]
+    scrub_base_override: Option<String>,
 }
 
 impl FirecrackerRuntime {
@@ -223,8 +236,8 @@ impl FirecrackerRuntime {
         // single-VM callers): a fixed identity is fine. The per-uuid production
         // path is `launch_with_uuid`.
         // The bare entry carries no deploy egress allow-list → `None` keeps the
-        // legacy unrestricted egress.
-        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default", None, None).await
+        // legacy unrestricted egress. Never a workspace (no creds to scrub).
+        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default", None, None, false).await
     }
 
     /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
@@ -246,6 +259,7 @@ impl FirecrackerRuntime {
         vm_key: &str,
         image_ref: Option<&str>,
         egress_allow: Option<&[String]>,
+        is_workspace: bool,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -323,8 +337,11 @@ impl FirecrackerRuntime {
             client: reqwest::Client::new(),
             snapshot_cache_dir: cache_dir.map(Path::to_path_buf),
             image_ref: image_ref.map(str::to_owned),
+            is_workspace,
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            scrub_base_override: None,
         };
 
         // Configure + boot the VM, then wait for the guest app. On any
@@ -379,6 +396,7 @@ impl FirecrackerRuntime {
     /// # Errors
     /// See [`Self::launch`].
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn launch_with_uuid(
         rootfs: &Path,
         rt: &Runtime,
@@ -388,6 +406,7 @@ impl FirecrackerRuntime {
         data_dir: &Path,
         is_swap: bool,
         egress_allow: Option<&[String]>,
+        is_workspace: bool,
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
         // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
@@ -419,6 +438,7 @@ impl FirecrackerRuntime {
                 &vm_key,
                 Some(reff),
                 egress_allow,
+                is_workspace,
             )
             .await?
         } else {
@@ -442,6 +462,7 @@ impl FirecrackerRuntime {
                     resolve_port(rt, cfg),
                     data_dir,
                     uuid,
+                    is_workspace,
                 )
                 .await
                 {
@@ -460,6 +481,7 @@ impl FirecrackerRuntime {
                             &vm_key,
                             Some(reff),
                             egress_allow,
+                            is_workspace,
                         )
                         .await?
                     }
@@ -485,6 +507,7 @@ impl FirecrackerRuntime {
                     &vm_key,
                     Some(reff),
                     egress_allow,
+                    is_workspace,
                 )
                 .await?
             }
@@ -515,6 +538,7 @@ impl FirecrackerRuntime {
     /// # Errors
     /// Tap setup failure, firecracker spawn failure, snapshot load API failure,
     /// or the guest app failing to answer within [`READY_TIMEOUT`].
+    #[allow(clippy::too_many_arguments)]
     async fn launch_from_snapshot(
         cache_dir: &Path,
         cfg: &FcConfig,
@@ -523,6 +547,7 @@ impl FirecrackerRuntime {
         app_port: u16,
         data_dir: &Path,
         uuid: &str,
+        is_workspace: bool,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -607,8 +632,11 @@ impl FirecrackerRuntime {
             // Cmd::Snapshot re-stamps the same ref (best-effort read; None on
             // any error → the snapshot() path simply skips the ref write).
             image_ref: std::fs::read_to_string(snapshot::ref_path(cache_dir)).ok(),
+            is_workspace,
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            scrub_base_override: None,
         };
 
         // Wait for the API socket, then load the snapshot (resume_vm=true).
@@ -789,6 +817,67 @@ impl FirecrackerRuntime {
         Ok(())
     }
 
+    /// GAP#4 — make the (still-running) workspace VM snapshot-safe BEFORE we pause
+    /// it: POST the broker's host-reachable `:8732` scrub route so it drops its
+    /// in-RAM creds + removes the tmpfs cred files. Only workspaces hold creds and
+    /// take a Full snapshot, so this is gated on `is_workspace`
+    /// ([`super::snapshot_decision::must_scrub_before_snapshot`]); a non-workspace
+    /// FC has no broker on `:8732` and skips.
+    ///
+    /// FAIL-CLOSED: for a workspace, ANY scrub failure (broker unreachable, a
+    /// non-2xx, or a transport error) returns `Err` so the caller ABORTS the
+    /// snapshot — we NEVER freeze a held secret into a warm restore. The broker
+    /// must be live (the scrub is a real socket round-trip inside the guest), so a
+    /// connect refusal on a WORKSPACE means the broker died/never came up → abort
+    /// rather than silently snapshot creds.
+    ///
+    /// # Errors
+    /// The workspace broker scrub did not return 2xx (so the snapshot must not run).
+    async fn pre_snapshot_scrub(&self) -> Result<()> {
+        if !super::snapshot_decision::must_scrub_before_snapshot(self.is_workspace) {
+            return Ok(());
+        }
+        let base = {
+            #[cfg(test)]
+            {
+                self.scrub_base_override.clone().unwrap_or_else(|| {
+                    format!(
+                        "http://{}:{}",
+                        self.guest_ip,
+                        crate::tcp_forward::GUEST_BROKER_CTRL_PORT
+                    )
+                })
+            }
+            #[cfg(not(test))]
+            {
+                format!(
+                    "http://{}:{}",
+                    self.guest_ip,
+                    crate::tcp_forward::GUEST_BROKER_CTRL_PORT
+                )
+            }
+        };
+        let url = format!("{base}{}", super::snapshot_decision::PRE_SNAPSHOT_SCRUB_PATH);
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(API_TIMEOUT)
+            .send()
+            .await
+            .with_context(|| {
+                format!("pre-snapshot scrub POST to {url} failed (workspace broker unreachable)")
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("pre-snapshot scrub returned HTTP {status}; aborting snapshot (would freeze a held secret)");
+        }
+        tracing::info!(
+            guest_ip = %self.guest_ip,
+            "pre-snapshot scrub OK: broker dropped in-RAM creds + cred files before snapshot"
+        );
+        Ok(())
+    }
+
     /// Poll the guest app's HTTP server until it answers (any status) or
     /// [`READY_TIMEOUT`] elapses.
     async fn wait_until_ready(&self) -> Result<()> {
@@ -869,8 +958,22 @@ impl FirecrackerRuntime {
             client: reqwest::Client::new(),
             snapshot_cache_dir: None,
             image_ref: None,
+            is_workspace: false,
             probe: Some(probe),
+            scrub_base_override: None,
         }
+    }
+
+    /// Test-only: build a runtime whose `pre_snapshot_scrub` targets `scrub_base`
+    /// (e.g. a local stub server) and whose `is_workspace` flag is set, so the
+    /// GAP#4 fail-closed scrub path is exercised without a real microVM. There is
+    /// no live child/tap (mirrors [`Self::with_probe_for_test`]).
+    #[cfg(test)]
+    pub fn with_scrub_target_for_test(scrub_base: &str, is_workspace: bool) -> Self {
+        let mut me = Self::with_probe_for_test("http://169.254.0.2:8080", std::sync::Arc::new(|_| true));
+        me.is_workspace = is_workspace;
+        me.scrub_base_override = Some(scrub_base.to_owned());
+        me
     }
 }
 
@@ -1019,6 +1122,15 @@ impl AppRuntime for FirecrackerRuntime {
                 // No cache dir (bare launch / build VM): nothing to refresh.
                 return Ok(());
             };
+            // GAP#4 (spec §4): a workspace's warm snapshot is a FULL snapshot — it
+            // freezes ALL guest RAM + fs. Before we PAUSE, the in-guest broker MUST
+            // drop its in-RAM creds (the per-repo git cap-URLs + the forge-admin
+            // token) and remove the tmpfs cred files, or the snapshot would freeze
+            // a live token into EVERY warm restore (a rotated/expired token, AND a
+            // secret-in-snapshot leak). A scrub FAILURE ABORTS the snapshot — we
+            // never freeze a held secret. This runs while the VM is still RUNNING
+            // (the broker socket must be live to scrub) so it precedes the pause.
+            self.pre_snapshot_scrub().await?;
             // §12 snapshot-timing: this is the explicit POST-INDEX refresh. We do
             // NOT check `snapshot::is_suppressed(&cache_dir)` — a workspace cache
             // dir CARRIES the `.no-snapshot` marker (Task 9) so cold_boot never

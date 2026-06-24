@@ -1023,3 +1023,228 @@ async fn snapshot_known_workspace_dispatches_and_500s_without_runner() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+// ── POST /v1/workspaces/:uuid/repos — 404 for unknown workspace ─────────────
+
+/// Adding a repo to a workspace this supervisor does not host returns 404 BEFORE
+/// any cap registration / respawn — gated on the registry (mirror snapshot).
+#[tokio::test]
+async fn add_repo_unknown_workspace_returns_404() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "repo_url": "https://github.com/acme/extra.git",
+        "branch": "main",
+        "git_token": "ghs_xxx",
+        "git_token_ttl_secs": 3300_u64,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workspaces/{APP_UUID}/repos"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A KNOWN workspace: add_repo registers a NEW git-proxy cap (host-side), appends
+/// the durable record, appends the in-mem registry caps, and merges the new
+/// `<repo>.url` into the persisted `CAP_FILES_ENV` so the background respawn
+/// re-bakes the FULL cap-file set. Returns 202 (async respawn, mirror create).
+#[tokio::test]
+async fn add_repo_known_workspace_registers_cap_and_appends_record() {
+    use crate::api::{
+        CAP_FILES_ENV, WORKSPACE_MARKER_ENV, Workspace, WorkspaceCap, WorkspaceRecord,
+        cap_repo_basename,
+    };
+    use crate::orchestrator::handle::RunnerHandle;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+
+    // Seed the workspace: registry entry (caps gate), a durable WorkspaceRecord
+    // with one existing repo, and a RunnerHandle carrying the FULL extra_env
+    // (CAP_FILES_ENV with the first repo) the respawn merges into.
+    let existing_cap = "cap-existing";
+    state.workspaces.insert(Workspace {
+        workspace_uuid: APP_UUID.to_owned(),
+        user_id: "acct_a".to_owned(),
+        caps: vec![existing_cap.to_owned()],
+        created_at: Instant::now(),
+        last_activity: Instant::now(),
+    });
+    WorkspaceRecord {
+        workspace_uuid: APP_UUID.to_owned(),
+        user_id: "acct_a".to_owned(),
+        caps: vec![WorkspaceCap {
+            cap: existing_cap.to_owned(),
+            repo_url: "https://github.com/acme/app.git".to_owned(),
+        }],
+        branches: vec!["main".to_owned()],
+        created_at_unix: 1_700_000_000,
+        last_activity_unix: 1_700_000_000,
+    }
+    .save(state.orchestrator.runner_dir())
+    .unwrap();
+    let mut extra_env = HashMap::new();
+    extra_env.insert(WORKSPACE_MARKER_ENV.to_owned(), APP_UUID.to_owned());
+    extra_env.insert(
+        CAP_FILES_ENV.to_owned(),
+        serde_json::json!({ "app.url": "http://h:8788/git/cap-existing" }).to_string(),
+    );
+    let runner = RunnerHandle {
+        uuid: APP_UUID.to_owned(),
+        pid: 0,
+        control_sock: dir.path().join(format!("{APP_UUID}.sock")),
+        app_ula: APP_ULA.to_owned(),
+        parent: None,
+        spawned_at: 0,
+        restart: Default::default(),
+        image_ref: Some("reg/ws:latest".to_owned()),
+        requested_runtime: None,
+        network: None,
+        runner_join_token: None,
+        manifest_toml: None,
+        extra_env: Some(extra_env),
+        egress_allow: None,
+        crash_looped: false,
+        stopped: false,
+    };
+    runner.save(state.orchestrator.runner_dir()).unwrap();
+
+    let app = router(state.clone());
+    let body = serde_json::json!({
+        "repo_url": "https://github.com/acme/extra.git",
+        "branch": "dev",
+        "git_token": "ghs_xxx",
+        "git_token_ttl_secs": 3300_u64,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workspaces/{APP_UUID}/repos"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["workspace_uuid"], APP_UUID);
+    assert_eq!(json["repo"], cap_repo_basename("https://github.com/acme/extra.git"));
+    let git_remote = json["git_remote"].as_str().unwrap();
+    assert!(git_remote.contains("/git/"), "git_remote must be a proxy URL");
+
+    // A NEW cap was registered host-side (2 total now).
+    assert_eq!(
+        state.workspaces.caps_of(APP_UUID).unwrap().len(),
+        2,
+        "the new repo cap must be appended to the in-mem registry"
+    );
+    // The durable record gained the repo (2 caps, 2 branches).
+    let rec = WorkspaceRecord::load(state.orchestrator.runner_dir(), APP_UUID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.caps.len(), 2, "durable record must append the new cap");
+    assert_eq!(rec.caps[1].repo_url, "https://github.com/acme/extra.git");
+    assert_eq!(rec.branches, vec!["main".to_owned(), "dev".to_owned()]);
+    // The registered git-session cap actually resolves (token injectable).
+    let new_cap = &rec.caps[1].cap;
+    assert!(
+        state.git_sessions.registered_caps().contains(new_cap),
+        "the new git-proxy cap must be live in the session registry"
+    );
+}
+
+// ── POST /v1/workspaces/:uuid/stop — 404 for unknown workspace ──────────────
+
+/// Stopping a workspace this supervisor does not host returns 404 (registry gate,
+/// mirror snapshot/delete) — no stray stop dispatch.
+#[tokio::test]
+async fn stop_unknown_workspace_returns_404() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workspaces/{APP_UUID}/stop"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A KNOWN workspace stop returns 200 `{stopped:true}` and drives
+/// `orchestrator.stop_app` (which PRESERVES the record's image_ref/extra_env for
+/// a later warm restore). No live runner is wired — stop_app tolerates that and
+/// marks the record stopped regardless.
+#[tokio::test]
+async fn stop_known_workspace_returns_200_and_marks_stopped() {
+    use crate::api::Workspace;
+    use crate::orchestrator::handle::RunnerHandle;
+    use std::time::Instant;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    state.workspaces.insert(Workspace {
+        workspace_uuid: APP_UUID.to_owned(),
+        user_id: "acct_a".to_owned(),
+        caps: vec!["cap".to_owned()],
+        created_at: Instant::now(),
+        last_activity: Instant::now(),
+    });
+    // A runner record so stop_app has something to mark stopped + its
+    // image_ref/extra_env are preserved (the warm-restore invariant).
+    let runner = RunnerHandle {
+        uuid: APP_UUID.to_owned(),
+        pid: 4242,
+        control_sock: dir.path().join(format!("{APP_UUID}.sock")),
+        app_ula: APP_ULA.to_owned(),
+        parent: None,
+        spawned_at: 0,
+        restart: Default::default(),
+        image_ref: Some("reg/ws:latest".to_owned()),
+        requested_runtime: None,
+        network: None,
+        runner_join_token: None,
+        manifest_toml: None,
+        extra_env: None,
+        egress_allow: None,
+        crash_looped: false,
+        stopped: false,
+    };
+    runner.save(state.orchestrator.runner_dir()).unwrap();
+
+    let app = router(state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/workspaces/{APP_UUID}/stop"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(json["stopped"], true);
+
+    // The record is preserved + marked stopped, with image_ref intact (warm
+    // restore can respawn from it).
+    let rec = RunnerHandle::load(state.orchestrator.runner_dir(), APP_UUID)
+        .unwrap()
+        .unwrap();
+    assert!(rec.stopped, "stop_app must mark the record stopped");
+    assert_eq!(
+        rec.image_ref.as_deref(),
+        Some("reg/ws:latest"),
+        "stop must PRESERVE image_ref for warm restore"
+    );
+}

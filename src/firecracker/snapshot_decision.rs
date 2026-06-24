@@ -80,9 +80,41 @@ where
     Ok(())
 }
 
+/// The in-guest broker route the runner POSTs to RIGHT BEFORE pausing a workspace
+/// VM for a Full snapshot (GAP#4). The broker's `:8732` control listener serves it
+/// (broker-uid) and drops ALL in-RAM creds + removes the tmpfs cred files, so the
+/// paused VM the snapshot freezes carries no live git/forge token. The runner
+/// reaches it host-side at `http://<guest_ip>:8732<PATH>`.
+pub const PRE_SNAPSHOT_SCRUB_PATH: &str = "/v1/pre-snapshot-scrub";
+
+/// Must the pre-snapshot scrub run before THIS VM's warm snapshot?
+///
+/// Only a WORKSPACE holds provider creds (the per-repo git cap-URLs + the
+/// forge-admin token) in the broker's RAM + tmpfs, and only a workspace takes a
+/// Full (RAM-freezing) warm snapshot via `Cmd::Snapshot`. A non-workspace FC has
+/// no broker / no creds → nothing to scrub, and dialing `:8732` would just refuse.
+/// So the scrub is gated on `is_workspace`. When it returns `true`, a scrub
+/// FAILURE must ABORT the snapshot (never freeze a held secret); when `false`, the
+/// snapshot proceeds with no scrub. Pure so it is unit-testable on macOS.
+#[must_use]
+pub const fn must_scrub_before_snapshot(is_workspace: bool) -> bool {
+    is_workspace
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_required_only_for_workspaces() {
+        assert!(must_scrub_before_snapshot(true), "a workspace MUST scrub creds before a Full snapshot");
+        assert!(!must_scrub_before_snapshot(false), "a non-workspace FC has no creds to scrub");
+    }
+
+    #[test]
+    fn scrub_path_is_the_broker_route() {
+        assert_eq!(PRE_SNAPSHOT_SCRUB_PATH, "/v1/pre-snapshot-scrub");
+    }
 
     #[test]
     fn cold_boot_snapshots_only_when_no_snapshot_and_not_suppressed() {
