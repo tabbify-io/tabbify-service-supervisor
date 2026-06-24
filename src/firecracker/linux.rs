@@ -1357,6 +1357,34 @@ pub(crate) fn stop_fc_scope(scope: &str) {
     }
 }
 
+/// #17 — delete the host tap device `tap` (`ip link del <tap>`), SYNC + best-
+/// effort. This is the network half of the orphan teardown: when a runner dies
+/// abnormally its [`Drop`] (which deletes the tap, see the `Drop for
+/// FirecrackerRuntime` impl above) never runs, so the reaped FC's tap leaks. The
+/// atomic per-uuid teardown (`kill_fc_child_for_uuid`) reconstructs the tap
+/// name(s) the SAME way the spawn keyed them and calls this for each. Mirrors the
+/// `Drop` impl's `ip link del` exactly (same sync `std::process::Command`), so it
+/// stays callable from the sync reap path with no async-coloring. Deleting a tap
+/// that was never created (or already gone) is a harmless non-zero exit, so this
+/// is idempotent + safe to call on every reap, including just before a respawn
+/// (the fresh boot re-creates the tap via `setup_tap`). A missing `ip` binary is
+/// logged at debug and ignored (off-Linux / minimal hosts).
+pub(crate) fn delete_fc_tap(tap: &str) {
+    match std::process::Command::new("ip")
+        .args(["link", "del", tap])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        // Non-zero exit = the tap was already gone (the common, healthy case on a
+        // respawn where the runner's Drop already removed it). Debug, not warn.
+        Ok(s) => tracing::debug!(%tap, code = ?s.code(), "ip link del tap nonzero exit (already gone?)"),
+        Err(e) => tracing::debug!(%tap, error = %e, "ip link del tap failed to spawn (ip absent?)"),
+    }
+}
+
 /// Run an `ip ...` command, erroring on a non-zero exit.
 pub(crate) async fn run_ip(args: &[&str]) -> Result<()> {
     let out = Command::new("ip")

@@ -252,6 +252,26 @@ fn fc_scope_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
     names
 }
 
+/// #17 — the host TAP name(s) a live FC for `uuid` may own, reconstructed from
+/// the SAME keys as the scope/socket ([`fc_scope_names_for_uuid`] /
+/// [`crate::firecracker::fc_tap_name_for_key`]): a deploy boots its tap under
+/// `uuid:reff` and a cold start under `uuid`. The call site can't know which key
+/// a given leaked FC used, so we return BOTH candidate tap names when an
+/// `image_ref` is known (deploy-key first), or just the cold-start key when it
+/// isn't. `delete_fc_tap` is idempotent + a no-op for a non-existent tap, so
+/// deleting a name that was never used is harmless. Pure (testable on macOS).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fc_tap_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
+    let mut names = Vec::with_capacity(2);
+    if let Some(reff) = image_ref {
+        names.push(crate::firecracker::fc_tap_name_for_key(&format!(
+            "{uuid}:{reff}"
+        )));
+    }
+    names.push(crate::firecracker::fc_tap_name_for_key(uuid));
+    names
+}
+
 /// Kill the Firecracker child process for `uuid` by reading its pidfile from
 /// `data_dir`, AND tear down its CPU-capped systemd scope(s). Best-effort: logs
 /// if the pidfile is absent or the kill fails.
@@ -279,8 +299,43 @@ fn fc_scope_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
 /// The pidfile is consumed by this call (removed from disk) so the fresh
 /// runner's own cold-start reconciliation does not re-kill the NEW FC.
 ///
-/// Exposed as `pub(crate)` so [`crate::orchestrator::api::Orchestrator::purge_app`]
-/// can reuse the same reaping logic (FIX C: purge must also reap the FC orphan).
+/// #17 — ATOMIC per-uuid FC teardown. Historically the orphan cleanup was split
+/// across several steps that did not all run together (pidfile-pid kill, the F1
+/// scope `systemctl stop`, the F2 record-less sweep, and — only on `purge_app` —
+/// the rootfs/cache purge), so a reaped FC could leave its scope, its host TAP,
+/// or its NAT rules behind. This function is now THE single place that tears down
+/// the in-host footprint of one app's FC, in one shot:
+///
+///   1. SIGKILL the pidfile pid (the `systemd-run` wrapper, or the bare FC).
+///   2. `systemctl stop` the reconstructed CPU scope(s) (F1) — kills the real FC
+///      inside the cgroup when (1) only hit the wrapper.
+///   3. `ip link del` the reconstructed host TAP(s) (#17) — the runner's `Drop`
+///      deletes the tap on a graceful exit, but on an abnormal death (the orphan
+///      case this function exists for) Drop never runs, so the tap leaks. Doing
+///      it here means the FC process AND its network device die together.
+///
+/// Steps 2+3 reconstruct the deploy-key (`uuid:reff`) + cold-start (`uuid`)
+/// identities the SAME way the spawn keyed them (see [`fc_scope_names_for_uuid`]
+/// / [`fc_tap_names_for_uuid`]); every primitive is idempotent + a no-op for a
+/// non-existent scope/tap, so this is safe to call before a respawn (the fresh
+/// boot re-creates its tap via `setup_tap`) and on a record-less orphan.
+///
+/// The app's MESH REGISTRATION needs no explicit withdrawal here: in the FC model
+/// each app IS its own mesh peer — the runner joins claiming
+/// `requested_ula = derive_app_ula(uuid)` via `AppHost::mesh_self` (no host-side
+/// `host_app_ula` advertisement to unhost). When the runner process dies its mesh
+/// peer / TUN identity dies with it and the coordinator ages the peer out, so
+/// killing the FC + its runner already removes the registration. (The on-disk
+/// runner RECORD is cleared by the caller: `forget_record` on purge, or kept on a
+/// respawn/stop by design.)
+///
+/// The on-disk ROOTFS/cache is INTENTIONALLY not purged here: the respawn, park,
+/// and stop paths all reuse it (deleting it would force a re-pull or brick a
+/// restart). The real destructive cache reclaim stays in `purge_app`, which calls
+/// this for the process/scope/tap teardown and then `purge_cache` for the rootfs.
+///
+/// Exposed as `pub(crate)` so `purge_app` / `stop_app` reuse the same reaping
+/// logic (FIX C: purge must also reap the FC orphan).
 pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Option<&str>) {
     if let Some(fc_pid) = pidfile::take(data_dir, uuid) {
         tracing::info!(
@@ -294,15 +349,23 @@ pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Opt
     // only the `systemd-run` wrapper; the firecracker lives inside the scope and
     // survives the wrapper's death. `stop_fc_scope` SIGKILLs everything in the
     // scope cgroup (the real FC) and GCs the unit; idempotent + no-op off-systemd.
-    // The `stop_fc_scope` primitive lives in the Linux-only runtime, and FC scopes
-    // only exist on a systemd Linux host, so the teardown is `cfg`-gated; the pure
-    // name reconstruction ([`fc_scope_names_for_uuid`]) stays cross-platform tested.
+    // #17 — and `ip link del` the host tap(s): on an abnormal runner death the
+    // runner's Drop never deletes the tap, so it leaks alongside the FC. Both
+    // primitives live in the Linux-only runtime (scopes + taps only exist on a
+    // Linux host), so the teardown is `cfg`-gated; the pure name reconstructions
+    // ([`fc_scope_names_for_uuid`] / [`fc_tap_names_for_uuid`]) stay
+    // cross-platform tested.
     #[cfg(target_os = "linux")]
-    for scope in fc_scope_names_for_uuid(uuid, image_ref) {
-        crate::firecracker::linux::stop_fc_scope(&scope);
+    {
+        for scope in fc_scope_names_for_uuid(uuid, image_ref) {
+            crate::firecracker::linux::stop_fc_scope(&scope);
+        }
+        for tap in fc_tap_names_for_uuid(uuid, image_ref) {
+            crate::firecracker::linux::delete_fc_tap(&tap);
+        }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = image_ref; // used only by the Linux scope-teardown above
+    let _ = image_ref; // used only by the Linux scope/tap-teardown above
 }
 
 /// The path token that a live `oras` image pull for `uuid` carries in its
@@ -1126,6 +1189,60 @@ mod tests {
             names.first().map(String::as_str),
             Some(crate::firecracker::cpu_scope::scope_name(&vm_key).as_str()),
             "reaper scope name must equal the spawn-path scope id (uuid:reff)"
+        );
+    }
+
+    // ── #17 — tap-name reconstruction for the atomic teardown ─────────────────
+
+    /// The atomic teardown deletes BOTH candidate taps (deploy key first, then
+    /// the defensive cold-start key) so a reaped FC never leaks its host tap,
+    /// whichever key its boot used.
+    #[test]
+    fn tap_names_cover_deploy_and_cold_start_keys() {
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let reff = "[fd5a:1f02::1]:5000/acme/app:sha256abc";
+        let names = fc_tap_names_for_uuid(uuid, Some(reff));
+
+        let deploy_tap =
+            crate::firecracker::fc_tap_name_for_key(&format!("{uuid}:{reff}"));
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(deploy_tap.as_str()),
+            "deploy-key tap (uuid:reff) must be deleted first — it owns the live serving FC"
+        );
+        let cold_tap = crate::firecracker::fc_tap_name_for_key(uuid);
+        assert!(
+            names.contains(&cold_tap),
+            "cold-start-key tap (uuid) must also be deleted"
+        );
+        assert_eq!(names.len(), 2, "exactly the two candidate taps, no more");
+    }
+
+    /// No deployed ref ⇒ only the cold-start tap is reconstructible.
+    #[test]
+    fn tap_names_fall_back_to_cold_start_when_no_image_ref() {
+        let uuid = "0191e7c2-2222-7222-8333-444455556666";
+        let names = fc_tap_names_for_uuid(uuid, None);
+        assert_eq!(
+            names,
+            vec![crate::firecracker::fc_tap_name_for_key(uuid)],
+            "no image_ref ⇒ delete only the cold-start-key tap"
+        );
+    }
+
+    /// The reaped tap name MUST equal the tap the spawn path keyed (the FC boots
+    /// its tap on the same `uuid:reff` vm_key — see `firecracker::fc_tap_name_for_key`),
+    /// or `ip link del` targets a phantom and the real tap leaks.
+    #[test]
+    fn tap_names_match_the_spawn_path_tap_key() {
+        let uuid = "abc-123";
+        let reff = "registry/x:sha-NEW";
+        let vm_key = format!("{uuid}:{reff}");
+        let names = fc_tap_names_for_uuid(uuid, Some(reff));
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(crate::firecracker::fc_tap_name_for_key(&vm_key).as_str()),
+            "reaper tap name must equal the spawn-path tap key (uuid:reff)"
         );
     }
 
