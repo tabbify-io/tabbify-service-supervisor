@@ -2304,7 +2304,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-fabric"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=6059c00c30ca1eb8d3ed288d21153795fa8b77a6#6059c00c30ca1eb8d3ed288d21153795fa8b77a6"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=d83c4f8ba864821970fd8e1bf5acc3c38a567909#d83c4f8ba864821970fd8e1bf5acc3c38a567909"
 dependencies = [
  "async-trait",
  "boringtun",
@@ -2321,7 +2321,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-joiner"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=6059c00c30ca1eb8d3ed288d21153795fa8b77a6#6059c00c30ca1eb8d3ed288d21153795fa8b77a6"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=d83c4f8ba864821970fd8e1bf5acc3c38a567909#d83c4f8ba864821970fd8e1bf5acc3c38a567909"
 dependencies = [
  "anyhow",
  "base64",
@@ -2352,7 +2352,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-log"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=6059c00c30ca1eb8d3ed288d21153795fa8b77a6#6059c00c30ca1eb8d3ed288d21153795fa8b77a6"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=d83c4f8ba864821970fd8e1bf5acc3c38a567909#d83c4f8ba864821970fd8e1bf5acc3c38a567909"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "tabbify-service-supervisor"
-version = "1.4.75"
+version = "1.4.76"
 dependencies = [
  "anyhow",
  "arc-swap",
