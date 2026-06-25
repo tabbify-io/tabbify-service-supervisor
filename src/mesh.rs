@@ -5,7 +5,11 @@
 //! the CONTROL listener, and hands out an [`Arc<dyn MeshHost>`] the per-app-ULA
 //! hosting layer ([`crate::host::AppHost`]) uses to route app-ULAs.
 
-use std::{net::Ipv6Addr, path::Path, sync::Arc};
+use std::{
+    net::{Ipv6Addr, SocketAddr},
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::Context;
 use mesh_joiner::{JoinConfig, Joiner, JoinerError};
@@ -161,6 +165,7 @@ impl MeshMembership {
         relay_url: Option<String>,
         relay_only: bool,
         advertise_endpoint: Option<String>,
+        stun_server: Option<SocketAddr>,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
         let config = build_supervisor_join_config(
@@ -171,6 +176,7 @@ impl MeshMembership {
             relay_url,
             relay_only,
             advertise_endpoint,
+            stun_server,
         );
         // Track C: resolve the super-admin pubkey (fail-closed when unset /
         // malformed) + build the production restart/reboot sink. A node without
@@ -323,6 +329,7 @@ pub async fn advertise_own_ula(mesh: &Arc<dyn MeshHost>, my_ula: Ipv6Addr) -> an
 /// `software_version` riding onto the wire — is unit-testable without joining
 /// the mesh. Mirrors the runner's
 /// [`crate::runner::serve::build_runner_join_config`] seam.
+#[allow(clippy::too_many_arguments)]
 fn build_supervisor_join_config(
     coordinator_url: &str,
     display_name: &str,
@@ -331,6 +338,7 @@ fn build_supervisor_join_config(
     relay_url: Option<String>,
     relay_only: bool,
     advertise_endpoint: Option<String>,
+    stun_server: Option<SocketAddr>,
 ) -> JoinConfig {
     let mut tags = vec!["supervisor".to_owned()];
     tags.extend_from_slice(extra_tags);
@@ -373,6 +381,13 @@ fn build_supervisor_join_config(
         // each other directly (e.g. `10.17.21.133:51820`). `None` keeps the
         // default reflexive-endpoint behavior, unchanged for cloud/public peers.
         advertise_endpoint,
+        // Self-hosted STUN server (`TABBIFY_MESH_STUN_SERVER`). When `Some`, the
+        // joiner issues a STUN binding request over its WG socket to discover its
+        // reflexive UDP mapping, which it then advertises for hole-punching —
+        // needed for direct traversal of a symmetric/port-randomizing NAT that
+        // the coordinator's observed-source reflexive can't solve. `None` (the
+        // default) keeps today's behaviour (reflexive from the observed source).
+        stun_server,
         // The supervisor is the HOST daemon: it owns the main-table routes
         // (no source-scoping — its per-app runners scope themselves), and
         // it keeps the host firewall from dropping inbound overlay dials
@@ -521,7 +536,7 @@ mod tests {
             ..Default::default()
         };
         let config =
-            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false, None);
+            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false, None, None);
         assert_eq!(config.software_version.as_deref(), Some("1.4.0"));
         // The supervisor tag is always present; metadata fields ride through.
         assert!(config.tags.contains(&"supervisor".to_owned()));
@@ -538,6 +553,7 @@ mod tests {
             JoinMetadata::default(),
             None,
             false,
+            None,
             None,
         );
         assert!(config.software_version.is_none());
@@ -557,6 +573,7 @@ mod tests {
             JoinMetadata::default(),
             Some("wss://relay.tabbify.io/v1/mesh/relay".to_owned()),
             false,
+            None,
             None,
         );
         assert_eq!(
@@ -581,6 +598,7 @@ mod tests {
             None,
             true,
             None,
+            None,
         );
         assert!(
             config.relay_only,
@@ -599,6 +617,7 @@ mod tests {
             JoinMetadata::default(),
             None,
             false,
+            None,
             None,
         );
         assert!(
@@ -622,6 +641,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert!(
             config.manage_firewall,
@@ -643,7 +663,7 @@ mod tests {
             ..Default::default()
         };
         let config =
-            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false, None);
+            build_supervisor_join_config("http://coord:8888", "node-1", &[], md, None, false, None, None);
         assert_eq!(
             config.join_token.as_deref(),
             Some("infra-join-jwt"),
@@ -699,6 +719,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert!(
             config.relay_url.is_none(),
@@ -721,6 +742,7 @@ mod tests {
             None,
             false,
             Some("10.17.21.133:51820".to_owned()),
+            None,
         );
         assert_eq!(
             config.advertise_endpoint.as_deref(),
@@ -743,10 +765,56 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert!(
             config.advertise_endpoint.is_none(),
             "None advertise_endpoint must keep reflexive-endpoint behavior"
+        );
+    }
+
+    /// An explicit `stun_server` (from `TABBIFY_MESH_STUN_SERVER`) rides onto the
+    /// supervisor's `JoinConfig.stun_server` verbatim, so the joiner queries that
+    /// STUN responder to learn its reflexive UDP mapping for hole-punching across
+    /// a symmetric / port-randomizing NAT (Tailscale-model direct-p2p).
+    #[test]
+    fn build_config_wires_stun_server_onto_join_config() {
+        let stun: SocketAddr = "203.0.113.7:3478".parse().unwrap();
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+            false,
+            None,
+            Some(stun),
+        );
+        assert_eq!(
+            config.stun_server,
+            Some(stun),
+            "explicit stun_server must ride onto JoinConfig verbatim"
+        );
+    }
+
+    /// A `None` `stun_server` (the default) leaves `JoinConfig.stun_server`
+    /// `None`, so the joiner derives its reflexive endpoint from the observed
+    /// register source as before — inert until a STUN responder is configured.
+    #[test]
+    fn build_config_omits_absent_stun_server() {
+        let config = build_supervisor_join_config(
+            "http://coord:8888",
+            "node-1",
+            &[],
+            JoinMetadata::default(),
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(
+            config.stun_server.is_none(),
+            "None stun_server must keep observed-source reflexive behavior"
         );
     }
 }

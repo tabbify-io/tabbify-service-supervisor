@@ -89,6 +89,15 @@ pub struct Config {
     )]
     pub advertise_endpoint: Option<String>,
 
+    /// Self-hosted STUN server (`host:port`) the joiner queries over its WG
+    /// socket to learn its reflexive UDP mapping for hole-punching. Needed to
+    /// traverse a symmetric / port-randomizing NAT the coordinator's
+    /// observed-source reflexive can't solve (Tailscale-model direct-p2p).
+    /// Unset (the default) keeps today's behavior — reflexive from the observed
+    /// register source — so this is inert until a STUN responder is reachable.
+    #[arg(long = "mesh-stun-server", env = "TABBIFY_MESH_STUN_SERVER")]
+    pub stun_server: Option<SocketAddr>,
+
     /// Skip mesh join entirely and bind a plain loopback/`--bind` addr. Used
     /// for local runs/tests without root + TUN. Defaults off (join the mesh).
     #[arg(long, env = "SUPERVISOR_NO_MESH", default_value_t = false)]
