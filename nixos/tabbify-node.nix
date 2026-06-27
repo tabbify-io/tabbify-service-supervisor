@@ -878,6 +878,16 @@ in {
       # Track-C: the REAL super-admin pubkey for the SOLE authority (the lifeline).
       # Baked default; the EnvironmentFile drop-in can rotate it without a rebuild.
       TABBIFY_MESH_SUPER_ADMIN_PUBKEY = meshSuperAdminPubkey;
+      # ⚠ PIN the lifeline joiner to the version that introduced `--route-metric`
+      # (mesh v1.4.8). `supervisorFetchJoinerLifeline` (ExecStartPre) reads this
+      # `TABBIFY_MESH_VERSION` env FIRST (else `mesh/latest`), so it fetches +
+      # self-checks + promotes v1.4.8 BEFORE ExecStart runs the `--route-metric
+      # 4096` flag below — closing the flag/binary skew where an older joiner
+      # (the box still has v1.4.6) would reject the unknown flag and crash-loop
+      # the lifeline. Bump this in lockstep when adopting a newer joiner. The
+      # SUPERVISOR's in-process joiner (svc #5) is unaffected — it carries the
+      # joiner in-process at its pinned mesh-joiner crate rev, default metric.
+      TABBIFY_MESH_VERSION = "v1.4.8";
     };
     serviceConfig = {
       # `exec`: the joiner joins+blocks; the standalone tool has no sd_notify yet,
@@ -918,6 +928,23 @@ in {
       # NOT a security downgrade — it is the established mesh-wide mode, consistent
       # with the in-process joiner the lifeline mirrors.
       #
+      # ⚠ ROUTE-METRIC (#46 durable fix): `--route-metric 4096` makes the lifeline
+      # the SECONDARY joiner for kernel route preference. The lifeline and the
+      # supervisor's in-process joiner BOTH run relay-only in this host's root
+      # netns and BOTH install a `/128` for every peer into `main`. At the
+      # kernel's default IPv6 metric (1024) the two collide — the kernel keeps
+      # only one route per prefix (last-writer race), and when the LIFELINE won a
+      # peer's route, that peer's return traffic (e.g. a SYN-ACK from the
+      # supervisor's :8730 deploy-control) egressed the LIFELINE's WG tunnel,
+      # whose cryptokey-routing the peer rejects → dropped → deploys to this box
+      # hung. A WORSE metric (4096 > 1024) makes the two routes DISTINCT, so the
+      # kernel always prefers the lower-metric PRIMARY (the supervisor's joiner)
+      # while its TUN is up; the lifeline's routes only take over as fallback when
+      # supervisord crashed and its TUN is gone — exactly the lifeline's purpose.
+      # Requires the v1.4.8+ joiner pinned via TABBIFY_MESH_VERSION above (older
+      # joiners do not know the flag). The supervisor's in-process joiner keeps the
+      # default metric (it is the primary) — do NOT add this flag there.
+      #
       # ⚠ FIX 8: `--listen-port 51821` gives the lifeline joiner its OWN WireGuard
       # UDP port. The supervisor's in-process joiner owns the default 51820; if the
       # lifeline also bound 51820, then once direct-UDP p2p is re-enabled (track #53)
@@ -936,7 +963,7 @@ in {
       # 'thinkpad-lifeline'. `''${TABBIFY_NODE_NAME:-thinkpad}` falls back to
       # `thinkpad` when the drop-in is absent (a fresh box), matching the binary's
       # spirit. The shell expands it from this unit's EnvironmentFile environment.
-      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --listen-port 51821 --insecure-no-mtls --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name "''${TABBIFY_NODE_NAME:-thinkpad}-lifeline"' '';
+      ExecStart = ''${pkgs.bash}/bin/sh -c 'exec ${dataDir}/tabbify-mesh-lifeline join --coordinator ${coordinatorUrl} --identity-path ${dataDir}/data/lifeline-identity.json --relay-only --listen-port 51821 --route-metric 4096 --insecure-no-mtls --join-token "''${TABBIFY_JOIN_TOKEN:-}" --super-admin-pubkey "''${TABBIFY_MESH_SUPER_ADMIN_PUBKEY}" --status-file ${dataDir}/data/lifeline-status.json --name "''${TABBIFY_NODE_NAME:-thinkpad}-lifeline"' '';
       # CANONICAL env path = /etc/tabbify/supervisor.env (BUG 2 + BUG 3): carries
       # the VALID 1-year TABBIFY_JOIN_TOKEN the wrapper forwards into --join-token,
       # the SAME file the supervisor unit reads. Rotation only — never a 2nd path.
