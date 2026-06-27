@@ -241,10 +241,27 @@ pub async fn run_build(
                 )
                 .await
                 .context("sandboxed (firecracker) build")?;
+
+                // Phase-A: write oras auth config when a push token is supplied.
+                let oras_cfg_owned: Option<String> = if let Some(ref token) = job.push_token {
+                    let cfg_dir = workdir.join("oras-cfg");
+                    crate::skopeo::write_registry_config(token, &job.registry_ula, &cfg_dir)
+                        .with_context(|| {
+                            format!(
+                                "write oras registry auth config to {}",
+                                cfg_dir.display()
+                            )
+                        })?;
+                    Some(cfg_dir.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+
                 if let Err(e) = (tool_runner)(crate::skopeo::oras_push_args(
                     oras_bin,
                     &layout.to_string_lossy(),
                     &reff,
+                    oras_cfg_owned.as_deref(),
                 ))
                 .await
                 {

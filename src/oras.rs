@@ -21,23 +21,34 @@
 /// source is plain HTTP on the encrypted WireGuard overlay `[ula]:5000`), NOT
 /// `--plain-http`: `--plain-http` would not register as the copy SOURCE flag.
 ///
+/// When `registry_config_dir` is `Some(dir)`, prepends `--registry-config <dir>`
+/// so oras reads credentials from `<dir>/config.json` (docker-format auth).
+/// Callers that do not need auth pass `None` (anonymous; today's default).
+///
 /// # Example
 /// ```
 /// # use tabbify_supervisor::oras::oras_copy_to_oci_layout_args;
-/// let args = oras_copy_to_oci_layout_args("[fd5a::1]:5000/acme/vm@sha256:abc", "/tmp/oci");
+/// let args = oras_copy_to_oci_layout_args("[fd5a::1]:5000/acme/vm@sha256:abc", "/tmp/oci", None);
 /// assert_eq!(args[0], "copy");
 /// assert!(args.contains(&"--from-plain-http".to_owned()));
 /// assert!(args.contains(&"--to-oci-layout".to_owned()));
 /// ```
 #[must_use]
-pub fn oras_copy_to_oci_layout_args(reff: &str, layout_dir: &str) -> Vec<String> {
-    vec![
-        "copy".to_owned(),
-        "--from-plain-http".to_owned(),
-        reff.to_owned(),
-        "--to-oci-layout".to_owned(),
-        layout_dir.to_owned(),
-    ]
+pub fn oras_copy_to_oci_layout_args(
+    reff: &str,
+    layout_dir: &str,
+    registry_config_dir: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["copy".to_owned()];
+    if let Some(dir) = registry_config_dir {
+        args.push("--registry-config".to_owned());
+        args.push(dir.to_owned());
+    }
+    args.push("--from-plain-http".to_owned());
+    args.push(reff.to_owned());
+    args.push("--to-oci-layout".to_owned());
+    args.push(layout_dir.to_owned());
+    args
 }
 
 /// Build the `oras resolve --plain-http <ref>` argument list (sans the leading
@@ -54,19 +65,26 @@ pub fn oras_copy_to_oci_layout_args(reff: &str, layout_dir: &str) -> Vec<String>
 /// copy-specific `--from-plain-http`). The digest is printed to stdout as a
 /// single `sha256:<hex>` line.
 ///
+/// When `registry_config_dir` is `Some(dir)`, prepends `--registry-config <dir>`
+/// so oras reads credentials from `<dir>/config.json` (docker-format auth).
+/// Callers that do not need auth pass `None` (anonymous; today's default).
+///
 /// # Example
 /// ```
 /// # use tabbify_supervisor::oras::oras_resolve_args;
-/// let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag");
+/// let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag", None);
 /// assert_eq!(args, vec!["resolve", "--plain-http", "[fd5a::1]:5000/acme/vm:tag"]);
 /// ```
 #[must_use]
-pub fn oras_resolve_args(reff: &str) -> Vec<String> {
-    vec![
-        "resolve".to_owned(),
-        "--plain-http".to_owned(),
-        reff.to_owned(),
-    ]
+pub fn oras_resolve_args(reff: &str, registry_config_dir: Option<&str>) -> Vec<String> {
+    let mut args = vec!["resolve".to_owned()];
+    if let Some(dir) = registry_config_dir {
+        args.push("--registry-config".to_owned());
+        args.push(dir.to_owned());
+    }
+    args.push("--plain-http".to_owned());
+    args.push(reff.to_owned());
+    args
 }
 
 /// Lowercase the repository portion of an OCI reference, preserving the tag /
@@ -105,7 +123,7 @@ mod tests {
     fn copy_to_oci_layout_args_uses_from_plain_http_and_to_oci_layout() {
         let reff = "[fd5a:1f02::1]:5000/acme/vm@sha256:abc";
         let dir = "/tmp/oci";
-        let args = oras_copy_to_oci_layout_args(reff, dir);
+        let args = oras_copy_to_oci_layout_args(reff, dir, None);
         assert_eq!(args[0], "copy", "first arg must be 'copy'");
         assert!(
             args.contains(&"--from-plain-http".to_owned()),
@@ -133,11 +151,11 @@ mod tests {
         );
     }
 
-    /// Exact argv shape:
+    /// Exact argv shape without auth (None):
     /// `["copy", "--from-plain-http", <reff>, "--to-oci-layout", <dir>]`.
     #[test]
-    fn copy_to_oci_layout_args_exact_shape() {
-        let args = oras_copy_to_oci_layout_args("reg/app@sha256:abc", "/out/oci");
+    fn copy_to_oci_layout_args_exact_shape_anonymous() {
+        let args = oras_copy_to_oci_layout_args("reg/app@sha256:abc", "/out/oci", None);
         assert_eq!(
             args,
             vec![
@@ -150,13 +168,32 @@ mod tests {
         );
     }
 
+    /// With `registry_config_dir = Some(dir)`, `--registry-config <dir>` is
+    /// prepended right after the `copy` subcommand so oras loads credentials
+    /// from `<dir>/config.json` before attempting the pull.
+    #[test]
+    fn copy_to_oci_layout_args_prepends_registry_config_when_some() {
+        let args = oras_copy_to_oci_layout_args(
+            "reg/app@sha256:abc",
+            "/out/oci",
+            Some("/tmp/oras-cfg"),
+        );
+        assert_eq!(args[0], "copy");
+        assert_eq!(args[1], "--registry-config");
+        assert_eq!(args[2], "/tmp/oras-cfg");
+        // The rest of the flags must still be present.
+        assert!(args.contains(&"--from-plain-http".to_owned()));
+        assert!(args.contains(&"--to-oci-layout".to_owned()));
+        assert!(args.contains(&"reg/app@sha256:abc".to_owned()));
+    }
+
     // ---- oras_resolve_args ---------------------------------------------------
 
     /// The resolve args must be `oras resolve --plain-http <ref>` (single-target
     /// command ⇒ `--plain-http`, NOT the copy-only `--from-plain-http`).
     #[test]
-    fn resolve_args_exact_shape() {
-        let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag");
+    fn resolve_args_exact_shape_anonymous() {
+        let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag", None);
         assert_eq!(
             args,
             vec!["resolve", "--plain-http", "[fd5a::1]:5000/acme/vm:tag"]
@@ -165,6 +202,18 @@ mod tests {
             !args.contains(&"--from-plain-http".to_owned()),
             "resolve is single-target; must use --plain-http; got {args:?}"
         );
+    }
+
+    /// With `registry_config_dir = Some(dir)`, `--registry-config <dir>` is
+    /// prepended so oras loads credentials before resolving.
+    #[test]
+    fn resolve_args_prepends_registry_config_when_some() {
+        let args = oras_resolve_args("[fd5a::1]:5000/acme/vm:tag", Some("/tmp/oras-cfg"));
+        assert_eq!(args[0], "resolve");
+        assert_eq!(args[1], "--registry-config");
+        assert_eq!(args[2], "/tmp/oras-cfg");
+        assert!(args.contains(&"--plain-http".to_owned()));
+        assert!(args.contains(&"[fd5a::1]:5000/acme/vm:tag".to_owned()));
     }
 
     // ---- lowercase_oci_repo --------------------------------------------------

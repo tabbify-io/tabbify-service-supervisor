@@ -77,6 +77,26 @@ pub(super) async fn run_docker_build(
         .join("oci-out")
         .to_string_lossy()
         .into_owned();
+
+    // Phase-A registry auth: when a push token is supplied (minted by the
+    // node before dispatching the build job), write a docker-format auth
+    // config and pass its dir to oras. When None (today's default), oras
+    // pushes anonymously — no behaviour change for existing jobs.
+    let oras_cfg_owned: Option<String> = if let Some(ref token) = job.push_token {
+        let cfg_dir = spec
+            .clone_root
+            .parent()
+            .unwrap_or(&spec.clone_root)
+            .join("oras-cfg");
+        crate::skopeo::write_registry_config(token, &job.registry_ula, &cfg_dir)
+            .with_context(|| {
+                format!("write oras registry auth config to {}", cfg_dir.display())
+            })?;
+        Some(cfg_dir.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     if let Err(e) = crate::skopeo::push_to_registry(
         skopeo_bin,
         oras_bin,
@@ -84,6 +104,7 @@ pub(super) async fn run_docker_build(
         &reff,
         &layout_dir,
         tool_runner,
+        oras_cfg_owned.as_deref(),
     )
     .await
     {

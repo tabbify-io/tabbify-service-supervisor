@@ -1084,7 +1084,7 @@ async fn pull_oci_layout_uses_oras_copy_to_oci_layout() {
         Box::pin(async { (true, Vec::new()) })
     });
 
-    let layout = super::pull_oci_layout(reff, &out, &runner)
+    let layout = super::pull_oci_layout(reff, &out, &runner, None)
         .await
         .expect("pull must succeed");
     assert_eq!(layout, out.join("oci"), "layout dir is <out>/oci");
@@ -1133,7 +1133,7 @@ async fn pull_oci_layout_uses_oras_copy_to_oci_layout() {
 async fn pull_oci_layout_errors_when_oras_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let runner: super::FcBuildRunner = Arc::new(|_| Box::pin(async { (false, Vec::new()) }));
-    let err = super::pull_oci_layout("reg/img@sha256:x", tmp.path(), &runner)
+    let err = super::pull_oci_layout("reg/img@sha256:x", tmp.path(), &runner, None)
         .await
         .expect_err("must error when oras pull fails");
     assert!(
@@ -1915,7 +1915,7 @@ async fn pull_oci_layout_resumes_until_success() {
         let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
         Box::pin(async move { (n >= 3, Vec::new()) })
     });
-    let layout = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+    let layout = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
         .await
         .expect("pull must converge after the relay-flaky attempts");
     assert_eq!(layout, out_dir.join("oci"));
@@ -1936,7 +1936,7 @@ async fn pull_oci_layout_bails_after_max_attempts() {
         calls2.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move { (false, Vec::new()) })
     });
-    let err = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+    let err = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
         .await
         .expect_err("an always-failing pull must error out");
     assert!(
@@ -1975,7 +1975,7 @@ async fn pull_oci_layout_wipes_and_retries_fresh_after_resume_budget() {
         })
     });
 
-    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
         .await
         .expect_err("all attempts fail → pull bails");
 
@@ -2005,7 +2005,7 @@ async fn pull_oci_layout_recovers_when_fresh_pull_succeeds() {
         // Fail through the resume budget; succeed on the first fresh attempt.
         Box::pin(async move { (n > super::PULL_RESUME_ATTEMPTS, Vec::new()) })
     });
-    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner)
+    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
         .await
         .expect("a fresh re-pull after the resume budget must recover");
 }

@@ -12,6 +12,8 @@
 //! what it is uniquely good at — reading the built image out of the docker
 //! daemon into an OCI layout — and oras does the registry push.
 
+use base64::Engine as _;
+
 use crate::docker::CommandRunner;
 
 /// Fixed tag the intermediate OCI layout is written/read under. Internal to
@@ -51,25 +53,64 @@ pub fn skopeo_to_layout_args(skopeo_bin: &str, local_tag: &str, layout_dir: &str
 /// `--to-plain-http` matches the plain-HTTP mesh registry over the encrypted
 /// overlay (mirrors the pull side's `--from-plain-http`).
 ///
+/// When `registry_config_dir` is `Some(dir)`, prepends `--registry-config <dir>`
+/// so oras reads push credentials from `<dir>/config.json` (docker-format auth).
+/// Callers that do not need auth pass `None` (anonymous; today's default).
+///
 /// # Example
 /// ```
 /// # use tabbify_supervisor::skopeo::oras_push_args;
-/// let args = oras_push_args("oras", "/tmp/oci", "[fd5a::1]:5000/acme/u:abc");
+/// let args = oras_push_args("oras", "/tmp/oci", "[fd5a::1]:5000/acme/u:abc", None);
 /// assert_eq!(args[0], "oras");
 /// assert_eq!(args[1], "copy");
 /// assert!(args.contains(&"--from-oci-layout".to_owned()));
 /// assert!(args.contains(&"--to-plain-http".to_owned()));
 /// ```
 #[must_use]
-pub fn oras_push_args(oras_bin: &str, layout_dir: &str, reff: &str) -> Vec<String> {
-    vec![
-        oras_bin.to_owned(),
-        "copy".to_owned(),
-        "--from-oci-layout".to_owned(),
-        format!("{layout_dir}:{LAYOUT_TAG}"),
-        "--to-plain-http".to_owned(),
-        reff.to_owned(),
-    ]
+pub fn oras_push_args(
+    oras_bin: &str,
+    layout_dir: &str,
+    reff: &str,
+    registry_config_dir: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![oras_bin.to_owned(), "copy".to_owned()];
+    if let Some(dir) = registry_config_dir {
+        args.push("--registry-config".to_owned());
+        args.push(dir.to_owned());
+    }
+    args.push("--from-oci-layout".to_owned());
+    args.push(format!("{layout_dir}:{LAYOUT_TAG}"));
+    args.push("--to-plain-http".to_owned());
+    args.push(reff.to_owned());
+    args
+}
+
+/// Write a docker-format `config.json` containing a single-registry auth entry
+/// to `out_dir/config.json`. Both `oras push` (via [`oras_push_args`]) and
+/// `oras copy/resolve` (via [`crate::oras::oras_copy_to_oci_layout_args`] /
+/// [`crate::oras::oras_resolve_args`]) accept `--registry-config <dir>` and
+/// read credentials from `<dir>/config.json`.
+///
+/// The auth value is `base64("x:<token>")`, matching the docker credential
+/// convention for token-based authentication (no username, token as password).
+///
+/// # Errors
+/// Directory creation or file write failure.
+pub fn write_registry_config(
+    token: &str,
+    registry_host: &str,
+    out_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("x:{token}"));
+    // The registry host is a bracketed IPv6 address like `[fd5a::1]:5000`.
+    // JSON string values permit `[`, `]`, and `:` verbatim, so a format!-built
+    // string is correct here — no serde escaping needed for these characters.
+    let json = format!(
+        "{{\"auths\":{{\"{}\":{{\"auth\":\"{}\"}}}}}}",
+        registry_host, auth
+    );
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::write(out_dir.join("config.json"), json.as_bytes())
 }
 
 /// Push the built image to the registry: docker daemon → OCI layout
@@ -80,6 +121,10 @@ pub fn oras_push_args(oras_bin: &str, layout_dir: &str, reff: &str) -> Vec<Strin
 /// iff both steps exit successfully; `Err(stderr)` carries the captured
 /// diagnostic of the FAILED step so the build runner bails with the real
 /// reason (e.g. `unauthorized` / `name unknown`) instead of a bare ref.
+///
+/// `registry_config_dir`: when `Some(dir)`, threads `--registry-config <dir>`
+/// into the oras step so pushes are authenticated. Pass `None` for anonymous
+/// registry access (today's default behaviour; all existing callers use `None`).
 pub async fn push_to_registry(
     skopeo_bin: &str,
     oras_bin: &str,
@@ -87,9 +132,10 @@ pub async fn push_to_registry(
     reff: &str,
     layout_dir: &str,
     runner: &CommandRunner,
+    registry_config_dir: Option<&str>,
 ) -> Result<(), String> {
     (runner)(skopeo_to_layout_args(skopeo_bin, local_tag, layout_dir)).await?;
-    (runner)(oras_push_args(oras_bin, layout_dir, reff)).await
+    (runner)(oras_push_args(oras_bin, layout_dir, reff, registry_config_dir)).await
 }
 
 /// Build a production [`CommandRunner`] that spawns `args[0]` as the binary
@@ -168,6 +214,7 @@ pub fn production_tool_runner() -> CommandRunner {
 mod tests {
     use super::*;
 
+
     /// Step-1 argv: binary-prefixed, local transports only (docker-daemon →
     /// oci layout), and NO registry reference anywhere — skopeo cannot parse
     /// the mesh registry's bracketed-IPv6 refs.
@@ -185,11 +232,11 @@ mod tests {
         );
     }
 
-    /// Step-2 argv: binary-prefixed oras copy, layout source, plain-http
-    /// registry destination carrying the bracketed-IPv6 reff VERBATIM.
+    /// Step-2 argv without auth: binary-prefixed oras copy, layout source,
+    /// plain-http registry destination carrying the bracketed-IPv6 reff VERBATIM.
     #[test]
-    fn oras_push_args_exact_shape() {
-        let args = oras_push_args("oras", "/tmp/w/oci", "[fd5a:1f02::1]:5000/acme/app:abc");
+    fn oras_push_args_exact_shape_anonymous() {
+        let args = oras_push_args("oras", "/tmp/w/oci", "[fd5a:1f02::1]:5000/acme/app:abc", None);
         assert_eq!(
             args,
             vec![
@@ -201,6 +248,45 @@ mod tests {
                 "[fd5a:1f02::1]:5000/acme/app:abc",
             ]
         );
+    }
+
+    /// With `registry_config_dir = Some(dir)`, `--registry-config <dir>` is
+    /// prepended after `copy` so oras loads push credentials.
+    #[test]
+    fn oras_push_args_prepends_registry_config_when_some() {
+        let args = oras_push_args(
+            "oras",
+            "/tmp/w/oci",
+            "[fd5a::1]:5000/acme/app:abc",
+            Some("/tmp/oras-cfg"),
+        );
+        assert_eq!(args[0], "oras");
+        assert_eq!(args[1], "copy");
+        assert_eq!(args[2], "--registry-config");
+        assert_eq!(args[3], "/tmp/oras-cfg");
+        assert!(args.contains(&"--from-oci-layout".to_owned()));
+        assert!(args.contains(&"--to-plain-http".to_owned()));
+    }
+
+    /// `write_registry_config` creates `config.json` with the correct JSON
+    /// auth structure: `base64("x:<token>")` keyed by `registry_host`.
+    #[test]
+    fn write_registry_config_creates_correct_config_json() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        write_registry_config("mytoken", "[fd5a::1]:5000", dir.path()).unwrap();
+        let path = dir.path().join("config.json");
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Must be valid JSON and carry the auths key.
+        let v: serde_json::Value = serde_json::from_str(&content)
+            .expect("config.json must be valid JSON");
+        let auth_val = &v["auths"]["[fd5a::1]:5000"]["auth"];
+        let encoded = auth_val.as_str().expect("auth must be a string");
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, "x:mytoken", "auth must be base64(\"x:<token>\")");
     }
 
     /// The two-step push drives the runner twice — skopeo first (daemon →
@@ -217,7 +303,9 @@ mod tests {
         });
 
         let reff = "[fd5a::1]:5000/myapp:latest";
-        let res = push_to_registry("skopeo", "oras", "tbf-build-u", reff, "/w/oci", &runner).await;
+        let res =
+            push_to_registry("skopeo", "oras", "tbf-build-u", reff, "/w/oci", &runner, None)
+                .await;
         assert!(res.is_ok(), "both steps Ok → push Ok; got {res:?}");
 
         let calls = captured.lock().unwrap();
@@ -248,7 +336,8 @@ mod tests {
             })
         });
 
-        let res = push_to_registry("skopeo", "oras", "t", "reg/app:v1", "/w/oci", &runner).await;
+        let res =
+            push_to_registry("skopeo", "oras", "t", "reg/app:v1", "/w/oci", &runner, None).await;
         let err = res.unwrap_err();
         assert!(err.contains("daemon not reachable"), "got {err}");
         assert_eq!(captured.lock().unwrap().len(), 1, "oras must not run");
@@ -268,7 +357,8 @@ mod tests {
                 }
             })
         });
-        let res = push_to_registry("skopeo", "oras", "t", "reg/app:v1", "/w/oci", &runner).await;
+        let res =
+            push_to_registry("skopeo", "oras", "t", "reg/app:v1", "/w/oci", &runner, None).await;
         assert!(res.unwrap_err().contains("name unknown"));
     }
 

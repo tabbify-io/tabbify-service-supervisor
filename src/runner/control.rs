@@ -252,7 +252,10 @@ impl RunnerLifecycle {
         let serving = self.active.health().await == RuntimeHealth::Serving;
         if serving {
             let runner = self.digest_runner();
-            match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner).await {
+            // `None` = anonymous resolve; the deploy guard only needs a
+            // digest, not auth (fail-open on any error is the existing contract).
+            match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None).await
+            {
                 Ok(want) => {
                     if Some(want.as_str()) == self.current_digest.lock().await.as_deref() {
                         tracing::info!(
@@ -326,7 +329,9 @@ impl RunnerLifecycle {
                 // leave `current_digest = None` (the next deploy then rebuilds —
                 // safe) and warn; we never strand a stale digest.
                 let runner = self.digest_runner();
-                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner).await {
+                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None)
+                    .await
+                {
                     Ok(d) => *self.current_digest.lock().await = Some(d),
                     Err(e) => {
                         *self.current_digest.lock().await = None;

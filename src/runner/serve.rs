@@ -476,7 +476,11 @@ impl RunnerServe {
         let initial_digest: Option<String> = match &initial_ref {
             Some(reff) => {
                 let runner = crate::runner::build::firecracker::production_fc_build_runner();
-                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner).await {
+                // `None` = anonymous resolve; the cold-start guard only needs a
+                // digest baseline — fail-open on any error is the existing contract.
+                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None)
+                    .await
+                {
                     Ok(d) => Some(d),
                     Err(e) => {
                         tracing::warn!(

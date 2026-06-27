@@ -421,11 +421,19 @@ pub fn global_rootfs_is_cached(data_dir: &Path, digest: &str) -> bool {
 /// pulling layer blobs (`oras resolve`, ~0.2 s). Lets the build consult the
 /// digest-keyed caches BEFORE the (slow) `oras copy` and skip the pull on a hit.
 ///
+/// `registry_config_dir`: when `Some(dir)`, passes `--registry-config <dir>` to
+/// oras so the resolve is authenticated (Phase-A). Pass `None` for anonymous
+/// access (today's default; all existing callers use `None`).
+///
 /// # Errors
 /// The runner reports failure, or stdout is not a `sha256:…` digest line.
-pub(crate) async fn resolve_oci_digest(reff: &str, runner: &FcBuildRunner) -> Result<String> {
+pub(crate) async fn resolve_oci_digest(
+    reff: &str,
+    runner: &FcBuildRunner,
+    registry_config_dir: Option<&str>,
+) -> Result<String> {
     let mut argv = vec!["oras".to_owned()];
-    argv.extend(crate::oras::oras_resolve_args(reff));
+    argv.extend(crate::oras::oras_resolve_args(reff, registry_config_dir));
     let (ok, out) = (runner)(argv).await;
     let digest = String::from_utf8_lossy(&out).trim().to_owned();
     if !ok || !digest.starts_with("sha256:") {
@@ -1068,6 +1076,16 @@ fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageCo
     Ok(cfg)
 }
 
+/// Extract the registry host portion from an OCI reference (everything before
+/// the first `/`). Used to key the oras auth config to the correct registry.
+///
+/// # Examples
+/// - `"[fd5a::1]:5000/acme/app:sha"` → `"[fd5a::1]:5000"`
+/// - `"reg.example.com/acme/app:v1"` → `"reg.example.com"`
+fn registry_host_from_ref(reff: &str) -> &str {
+    reff.split('/').next().unwrap_or(reff)
+}
+
 /// Resolve `<layout>/index.json` → the first image-manifest descriptor. Shared
 /// by [`read_oci_config_from_layout`] (which then reads the manifest+config
 /// blobs) and [`read_manifest_digest_from_layout`] (which only needs the
@@ -1510,7 +1528,12 @@ async fn wipe_oci_layout(layout: &Path) -> Result<()> {
 
 /// # Errors
 /// A failing `oras copy`.
-async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> Result<PathBuf> {
+async fn pull_oci_layout(
+    reff: &str,
+    out_dir: &Path,
+    runner: &FcBuildRunner,
+    registry_config_dir: Option<&str>,
+) -> Result<PathBuf> {
     let layout = out_dir.join("oci");
     // SPEED + CORRECTNESS: for a MUTABLE tag ref (no `@sha256`), wipe the layout
     // dir first so `oras copy --to-oci-layout` resolves the tag to its CURRENT
@@ -1534,6 +1557,7 @@ async fn pull_oci_layout(reff: &str, out_dir: &Path, runner: &FcBuildRunner) -> 
     argv.extend(crate::oras::oras_copy_to_oci_layout_args(
         reff,
         &layout.to_string_lossy(),
+        registry_config_dir,
     ));
     // TWO-PHASE retry. Phase A (the first PULL_RESUME_ATTEMPTS tries) re-`oras
     // copy`s into the SAME content-addressed layout: blobs already present are
@@ -1598,7 +1622,8 @@ pub(crate) async fn ensure_toolchain_rootfs(
 ) -> Result<PathBuf> {
     let root = data_dir.join("build-toolchain");
     let pull = root.join(".pull");
-    let layout = pull_oci_layout(reff, &pull, runner).await?;
+    // Toolchain pulls are not part of Phase-A auth scope; pass None (anonymous).
+    let layout = pull_oci_layout(reff, &pull, runner, None).await?;
     let digest = read_manifest_digest_from_layout(&layout)?;
     let dir = root.join(digest.replace(':', "-"));
     let cached = dir.join("rootfs.ext4");
@@ -1722,6 +1747,35 @@ pub async fn run_firecracker_build(
     let reff = crate::oras::lowercase_oci_repo(reff);
     let reff = reff.as_str();
 
+    // Phase-A registry auth: read `TABBIFY_RUNNER_JOIN_TOKEN` once (already set
+    // by the supervisor when launching this runner). When present, write a
+    // docker-format auth config keyed to this ref's registry host and pass its
+    // dir to every `oras resolve` / `oras copy` call so pulls are authenticated.
+    // When absent (anonymous registry or Phase-A not yet enabled), pass `None`
+    // — identical to today's behaviour.
+    let oras_cfg_owned: Option<String> = match std::env::var("TABBIFY_RUNNER_JOIN_TOKEN") {
+        Ok(token) if !token.is_empty() => {
+            let cfg_dir = data_dir.join("oras-cfg");
+            let host = registry_host_from_ref(reff);
+            match crate::skopeo::write_registry_config(&token, host, &cfg_dir) {
+                Ok(()) => {
+                    tracing::debug!(host, "oras auth config written for registry pull");
+                    Some(cfg_dir.to_string_lossy().into_owned())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        host,
+                        error = %e,
+                        "failed to write oras auth config; proceeding anonymous"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let oras_cfg = oras_cfg_owned.as_deref();
+
     // FAST PATH (digest-shared cache): resolve the IMMUTABLE digest WITHOUT
     // pulling layer blobs, so the digest-keyed caches (per-uuid + the GLOBAL
     // digest-shared cache) can be consulted BEFORE paying a multi-minute pull. A
@@ -1732,7 +1786,7 @@ pub async fn run_firecracker_build(
     // the second start the cached rootfs is hard-linked and the pull is skipped.
     let pre_digest: Option<String> = match reff.rsplit_once('@') {
         Some((_, d)) => Some(d.to_owned()),
-        None => match resolve_oci_digest(reff, runner).await {
+        None => match resolve_oci_digest(reff, runner, oras_cfg).await {
             Ok(d) => Some(d),
             Err(e) => {
                 tracing::warn!(reff, error = %e, "oras resolve failed; pulling to derive digest");
@@ -1808,7 +1862,7 @@ pub async fn run_firecracker_build(
     // the layout. No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
     let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
         let work = digest_work_dir(data_dir, uuid, digest)?;
-        let layout = pull_oci_layout(reff, &work, runner).await?;
+        let layout = pull_oci_layout(reff, &work, runner, oras_cfg).await?;
         // Seed the global layout cache so the NEXT uuid with this digest skips
         // the pull (env-free → always safe; keyed by the immutable ref digest).
         publish_layout_to_global(data_dir, digest, uuid, &layout).await;
@@ -1823,7 +1877,7 @@ pub async fn run_firecracker_build(
         built
     } else {
         let work = fresh_tag_pull_dir(data_dir, uuid).await?;
-        let layout = pull_oci_layout(reff, &work, runner).await?;
+        let layout = pull_oci_layout(reff, &work, runner, oras_cfg).await?;
         let digest = read_manifest_digest_from_layout(&layout)?;
         // Seed the global layout cache keyed by the AUTHORITATIVE manifest digest
         // derived FROM the pulled layout — NOT the pre-pull `oras resolve` guess,
