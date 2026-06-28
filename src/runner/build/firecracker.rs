@@ -1760,7 +1760,9 @@ pub async fn run_firecracker_build(
             match crate::skopeo::write_registry_config(&token, host, &cfg_dir) {
                 Ok(()) => {
                     tracing::debug!(host, "oras auth config written for registry pull");
-                    Some(cfg_dir.to_string_lossy().into_owned())
+                    // oras `--from-registry-config` wants the auth FILE, not its
+                    // dir: write_registry_config writes `<cfg_dir>/config.json`.
+                    Some(cfg_dir.join("config.json").to_string_lossy().into_owned())
                 }
                 Err(e) => {
                     tracing::warn!(

@@ -92,7 +92,9 @@ pub(super) async fn run_docker_build(
             .with_context(|| {
                 format!("write oras registry auth config to {}", cfg_dir.display())
             })?;
-        Some(cfg_dir.to_string_lossy().into_owned())
+        // oras `--to-registry-config` wants the auth FILE, not its dir:
+        // write_registry_config writes `<cfg_dir>/config.json`.
+        Some(cfg_dir.join("config.json").to_string_lossy().into_owned())
     } else {
         None
     };
