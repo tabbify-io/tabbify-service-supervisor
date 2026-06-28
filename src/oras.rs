@@ -21,9 +21,12 @@
 /// source is plain HTTP on the encrypted WireGuard overlay `[ula]:5000`), NOT
 /// `--plain-http`: `--plain-http` would not register as the copy SOURCE flag.
 ///
-/// When `registry_config_dir` is `Some(dir)`, prepends `--registry-config <dir>`
-/// so oras reads credentials from `<dir>/config.json` (docker-format auth).
-/// Callers that do not need auth pass `None` (anonymous; today's default).
+/// When `registry_config_dir` is `Some(dir)`, prepends `--from-registry-config <dir>`
+/// so oras reads source-registry credentials from `<dir>/config.json` (docker-format
+/// auth). `oras copy` is a two-endpoint command: the source flag is
+/// `--from-registry-config`, NOT the plain `--registry-config` (which only exists on
+/// single-endpoint commands like `oras resolve`). Callers that do not need auth pass
+/// `None` (anonymous; today's default).
 ///
 /// # Example
 /// ```
@@ -41,7 +44,7 @@ pub fn oras_copy_to_oci_layout_args(
 ) -> Vec<String> {
     let mut args = vec!["copy".to_owned()];
     if let Some(dir) = registry_config_dir {
-        args.push("--registry-config".to_owned());
+        args.push("--from-registry-config".to_owned());
         args.push(dir.to_owned());
     }
     args.push("--from-plain-http".to_owned());
@@ -168,9 +171,11 @@ mod tests {
         );
     }
 
-    /// With `registry_config_dir = Some(dir)`, `--registry-config <dir>` is
-    /// prepended right after the `copy` subcommand so oras loads credentials
-    /// from `<dir>/config.json` before attempting the pull.
+    /// With `registry_config_dir = Some(dir)`, `--from-registry-config <dir>` is
+    /// prepended right after the `copy` subcommand so oras loads source-registry
+    /// credentials from `<dir>/config.json` before attempting the pull.
+    /// (`oras copy` is two-endpoint; the source flag is `--from-registry-config`,
+    /// never the plain `--registry-config` that `oras resolve` uses.)
     #[test]
     fn copy_to_oci_layout_args_prepends_registry_config_when_some() {
         let args = oras_copy_to_oci_layout_args(
@@ -179,7 +184,7 @@ mod tests {
             Some("/tmp/oras-cfg"),
         );
         assert_eq!(args[0], "copy");
-        assert_eq!(args[1], "--registry-config");
+        assert_eq!(args[1], "--from-registry-config");
         assert_eq!(args[2], "/tmp/oras-cfg");
         // The rest of the flags must still be present.
         assert!(args.contains(&"--from-plain-http".to_owned()));

@@ -53,9 +53,12 @@ pub fn skopeo_to_layout_args(skopeo_bin: &str, local_tag: &str, layout_dir: &str
 /// `--to-plain-http` matches the plain-HTTP mesh registry over the encrypted
 /// overlay (mirrors the pull side's `--from-plain-http`).
 ///
-/// When `registry_config_dir` is `Some(dir)`, prepends `--registry-config <dir>`
-/// so oras reads push credentials from `<dir>/config.json` (docker-format auth).
-/// Callers that do not need auth pass `None` (anonymous; today's default).
+/// When `registry_config_dir` is `Some(dir)`, prepends `--to-registry-config <dir>`
+/// so oras reads destination-registry push credentials from `<dir>/config.json`
+/// (docker-format auth). `oras copy` is a two-endpoint command: the destination flag
+/// is `--to-registry-config`, NOT the plain `--registry-config` (which only exists on
+/// single-endpoint commands like `oras resolve`). Callers that do not need auth pass
+/// `None` (anonymous; today's default).
 ///
 /// # Example
 /// ```
@@ -75,7 +78,7 @@ pub fn oras_push_args(
 ) -> Vec<String> {
     let mut args = vec![oras_bin.to_owned(), "copy".to_owned()];
     if let Some(dir) = registry_config_dir {
-        args.push("--registry-config".to_owned());
+        args.push("--to-registry-config".to_owned());
         args.push(dir.to_owned());
     }
     args.push("--from-oci-layout".to_owned());
@@ -86,10 +89,13 @@ pub fn oras_push_args(
 }
 
 /// Write a docker-format `config.json` containing a single-registry auth entry
-/// to `out_dir/config.json`. Both `oras push` (via [`oras_push_args`]) and
-/// `oras copy/resolve` (via [`crate::oras::oras_copy_to_oci_layout_args`] /
-/// [`crate::oras::oras_resolve_args`]) accept `--registry-config <dir>` and
-/// read credentials from `<dir>/config.json`.
+/// to `out_dir/config.json`. The file is consumed by oras via the directional
+/// registry-config flags: `--to-registry-config <dir>` for pushes (via
+/// [`oras_push_args`]), `--from-registry-config <dir>` for pulls (via
+/// [`crate::oras::oras_copy_to_oci_layout_args`]), and `--registry-config <dir>`
+/// for single-endpoint commands like `oras resolve` (via
+/// [`crate::oras::oras_resolve_args`]). All forms read credentials from
+/// `<dir>/config.json`.
 ///
 /// The auth value is `base64("x:<token>")`, matching the docker credential
 /// convention for token-based authentication (no username, token as password).
@@ -122,7 +128,7 @@ pub fn write_registry_config(
 /// diagnostic of the FAILED step so the build runner bails with the real
 /// reason (e.g. `unauthorized` / `name unknown`) instead of a bare ref.
 ///
-/// `registry_config_dir`: when `Some(dir)`, threads `--registry-config <dir>`
+/// `registry_config_dir`: when `Some(dir)`, threads `--to-registry-config <dir>`
 /// into the oras step so pushes are authenticated. Pass `None` for anonymous
 /// registry access (today's default behaviour; all existing callers use `None`).
 pub async fn push_to_registry(
@@ -250,8 +256,10 @@ mod tests {
         );
     }
 
-    /// With `registry_config_dir = Some(dir)`, `--registry-config <dir>` is
-    /// prepended after `copy` so oras loads push credentials.
+    /// With `registry_config_dir = Some(dir)`, `--to-registry-config <dir>` is
+    /// prepended after `copy` so oras loads push credentials for the destination
+    /// registry. (`oras copy` is two-endpoint; the destination flag is
+    /// `--to-registry-config`, not the plain `--registry-config`.)
     #[test]
     fn oras_push_args_prepends_registry_config_when_some() {
         let args = oras_push_args(
@@ -262,7 +270,7 @@ mod tests {
         );
         assert_eq!(args[0], "oras");
         assert_eq!(args[1], "copy");
-        assert_eq!(args[2], "--registry-config");
+        assert_eq!(args[2], "--to-registry-config");
         assert_eq!(args[3], "/tmp/oras-cfg");
         assert!(args.contains(&"--from-oci-layout".to_owned()));
         assert!(args.contains(&"--to-plain-http".to_owned()));
