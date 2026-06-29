@@ -11,11 +11,12 @@ COPY entrypoint.sh /tbf-build-entrypoint.sh
 # (shared, digest-cached), so the guest entrypoint CANNOT `mkdir` them at
 # runtime — they must already exist in the image.
 # ca-certificates: buildkit pulls base images over TLS from Docker Hub.
+# jq: the entrypoint reads the job.json v2 build layout (context/dockerfile).
 # resolv.conf baked in (the rootfs is mounted READ-ONLY at runtime, so the
 # guest can't write it — and a tmpfs over /etc would SHADOW the CA bundle,
 # breaking TLS verification of the base-image registry).
 RUN chmod +x /tbf-build-entrypoint.sh \
  && mkdir -p /scratch /cache \
- && apk add --no-cache ca-certificates \
+ && apk add --no-cache ca-certificates jq \
  && update-ca-certificates 2>/dev/null || true
 ENTRYPOINT ["/bin/sh", "/tbf-build-entrypoint.sh"]

@@ -1,10 +1,14 @@
 #!/bin/sh
-# Build-VM guest entrypoint (v1 contract — see runner/build/fc_sandbox.rs).
+# Build-VM guest entrypoint (v2 contract — see runner/build/fc_sandbox.rs).
 #
-# Drives: /dev/vda = this rootfs, /dev/vdb = scratch (src/ in, out/ + result
-# out), /dev/vdc = persistent buildkit cache. The host cloned the source and
-# will push the result — this guest only BUILDS. No git, no tokens, no mesh;
-# network egress (NAT'd tap) is for base-image pulls only.
+# Drives: /dev/vda = this rootfs, /dev/vdb = scratch (src/ + job.json in, out/
+# + result out), /dev/vdc = persistent buildkit cache. The host cloned the
+# source and will push the result — this guest only BUILDS. No git, no tokens,
+# no mesh; network egress (NAT'd tap) is for base-image pulls only.
+#
+# job.json (v2) carries the build LAYOUT: `context` + `dockerfile`, RELATIVE to
+# the cloned source. Absent fields / a v1 job.json fall back to the default
+# layout (context ".", "Dockerfile" at the repo root) — back-compatible.
 #
 # The guest powers off when done (sysrq), which exits the firecracker
 # process — that exit IS the completion signal the host waits on.
@@ -63,6 +67,23 @@ echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
 mkdir -p /scratch/out /cache/buildkit /cache/bk
 
+# Build layout from the job contract (job.json v2). The fields are RELATIVE to
+# the cloned source; defaults match the v1 contract (context ".", "Dockerfile"
+# at the repo root). A v1 job.json (no fields) or a missing file → defaults.
+CONTEXT="."
+DOCKERFILE="Dockerfile"
+if [ -f /scratch/job.json ]; then
+  c=$(jq -r '.context // empty' /scratch/job.json 2>/dev/null)
+  d=$(jq -r '.dockerfile // empty' /scratch/job.json 2>/dev/null)
+  [ -n "$c" ] && CONTEXT="$c"
+  [ -n "$d" ] && DOCKERFILE="$d"
+fi
+# buildkit takes the Dockerfile's DIRECTORY as the `dockerfile` local + the
+# filename via `--opt filename=`; resolve both under the cloned source.
+CONTEXT_DIR="/scratch/src/$CONTEXT"
+DOCKERFILE_DIR="/scratch/src/$(dirname "$DOCKERFILE")"
+DOCKERFILE_NAME="$(basename "$DOCKERFILE")"
+
 # buildkitd with its state on the persistent cache disk. The NATIVE
 # snapshotter works on any kernel (no overlayfs requirement) — builds are
 # already disk-backed and serialized, so the overlay speed-up is not worth a
@@ -80,8 +101,9 @@ done
 
 if buildctl build \
     --frontend dockerfile.v0 \
-    --local context=/scratch/src \
-    --local dockerfile=/scratch/src \
+    --local context="$CONTEXT_DIR" \
+    --local dockerfile="$DOCKERFILE_DIR" \
+    --opt filename="$DOCKERFILE_NAME" \
     --output type=oci,name=build,dest=/scratch/out/oci.tar \
     --export-cache type=local,dest=/cache/bk,mode=max \
     --import-cache type=local,src=/cache/bk \

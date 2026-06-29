@@ -77,7 +77,13 @@ const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Stage the scratch-disk content tree under `staging`:
 /// `src/` (the host-cloned worktree), an empty `out/`, and a version-stamped
-/// `job.json`. The tree is then baked into the ext4 via `mkfs -d` — no mount.
+/// `job.json` (v2). The tree is then baked into the ext4 via `mkfs -d` — no mount.
+///
+/// `context` + `dockerfile` are the resolved `[build]` directives RELATIVE to
+/// the clone root (`"."` / `"Dockerfile"` by default). They ride in via job.json
+/// so the guest builder can honor a subdir Dockerfile/context: a v2 guest reads
+/// them (falling back to the defaults when absent), while a legacy v1 guest
+/// ignores job.json and always builds the default layout.
 ///
 /// The source is UNTRUSTED (a freshly-cloned repo): its total real size is
 /// checked against [`MAX_SOURCE_BYTES`] BEFORE any copy (host-disk-exhaustion
@@ -86,7 +92,7 @@ const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 ///
 /// # Errors
 /// Source exceeds the budget, or an I/O failure copying the tree.
-pub fn stage_scratch(staging: &Path, src: &Path) -> Result<()> {
+pub fn stage_scratch(staging: &Path, src: &Path, context: &str, dockerfile: &str) -> Result<()> {
     let total = tree_size(src)?;
     if total > MAX_SOURCE_BYTES {
         bail!("source tree is {total} bytes, over the {MAX_SOURCE_BYTES}-byte build limit");
@@ -94,9 +100,16 @@ pub fn stage_scratch(staging: &Path, src: &Path) -> Result<()> {
     let dst_src = staging.join("src");
     copy_tree(src, &dst_src).context("copy source into scratch staging")?;
     std::fs::create_dir_all(staging.join("out")).context("create scratch out/")?;
-    // Versioned for forward evolution; the v1 guest entrypoint is parameter-
-    // free (fixed context/dockerfile/output paths).
-    std::fs::write(staging.join("job.json"), "{\"v\":1}\n").context("write job.json")?;
+    // job.json v2: the build layout the guest honors. `context`/`dockerfile`
+    // are RELATIVE to the cloned source (the guest prefixes `/scratch/src`). A
+    // v2 guest reads them + falls back to the v1 defaults (`.` / `Dockerfile`)
+    // when absent; a legacy v1 guest ignored job.json entirely.
+    let job = serde_json::json!({
+        "v": 2,
+        "context": context,
+        "dockerfile": dockerfile,
+    });
+    std::fs::write(staging.join("job.json"), format!("{job}\n")).context("write job.json")?;
     Ok(())
 }
 
@@ -222,9 +235,15 @@ async fn run_host(argv: &[String], runner: &FcBuildRunner) -> Result<()> {
 /// # Errors
 /// Toolchain/scratch/VM/result failures. Linux-only (callers gate on
 /// [`enabled`]).
+// Each parameter is a distinct build input threaded from `run_build` (identity
+// + source + build layout + registry + on-disk locations + the injected host
+// runner); bundling them into a struct would only obscure the one call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sandboxed_build(
     app_uuid: &str,
     src: &Path,
+    context: &str,
+    dockerfile: &str,
     registry_ula: &str,
     data_dir: &Path,
     workdir: &Path,
@@ -232,7 +251,16 @@ pub async fn run_sandboxed_build(
 ) -> Result<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (app_uuid, src, registry_ula, data_dir, workdir, runner);
+        let _ = (
+            app_uuid,
+            src,
+            context,
+            dockerfile,
+            registry_ula,
+            data_dir,
+            workdir,
+            runner,
+        );
         bail!("the firecracker build sandbox is Linux-only")
     }
     #[cfg(target_os = "linux")]
@@ -247,8 +275,10 @@ pub async fn run_sandboxed_build(
             super::firecracker::ensure_toolchain_rootfs(&toolchain, data_dir, runner).await?;
 
         // 2. Scratch disk: staged tree → mkfs -d (untrusted source size-capped).
+        //    `context`/`dockerfile` ride in via job.json v2 so the guest builds
+        //    the right layout (subdir Dockerfile/context supported).
         let staging = workdir.join("scratch-staging");
-        stage_scratch(&staging, src)?;
+        stage_scratch(&staging, src, context, dockerfile)?;
         let scratch = workdir.join("scratch.ext4");
         make_ext4(&scratch, SCRATCH_MIB, Some(&staging), runner).await?;
 
@@ -499,9 +529,10 @@ mod tests {
     use super::*;
 
     /// The scratch staging tree must carry the source under `src/`, an empty
-    /// `out/`, and a versioned `job.json` — the v1 guest contract.
+    /// `out/`, and a versioned `job.json` — the v2 guest contract carries the
+    /// build layout (context + dockerfile) for the guest to honor.
     #[test]
-    fn stage_scratch_lays_out_the_v1_contract() {
+    fn stage_scratch_lays_out_the_v2_contract() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("clone");
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -509,13 +540,36 @@ mod tests {
         std::fs::write(src.join("sub").join("a.txt"), "x").unwrap();
 
         let staging = tmp.path().join("staging");
-        stage_scratch(&staging, &src).unwrap();
+        stage_scratch(&staging, &src, ".", "Dockerfile").unwrap();
 
         assert!(staging.join("src").join("Dockerfile").is_file());
         assert!(staging.join("src").join("sub").join("a.txt").is_file());
         assert!(staging.join("out").is_dir());
         let job = std::fs::read_to_string(staging.join("job.json")).unwrap();
-        assert!(job.contains("\"v\":1"), "got: {job}");
+        let v: serde_json::Value = serde_json::from_str(&job).unwrap();
+        assert_eq!(v["v"], 2, "got: {job}");
+        assert_eq!(v["context"], ".");
+        assert_eq!(v["dockerfile"], "Dockerfile");
+    }
+
+    /// A NON-default `[build]` layout (subdir context + subdir Dockerfile) is
+    /// threaded VERBATIM into job.json v2 — the host no longer rejects it; the
+    /// guest reads these RELATIVE paths and prefixes `/scratch/src`.
+    #[test]
+    fn stage_scratch_threads_custom_layout_into_job_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("clone");
+        std::fs::create_dir_all(src.join("frontend")).unwrap();
+        std::fs::write(src.join("frontend").join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let staging = tmp.path().join("staging");
+        stage_scratch(&staging, &src, "frontend", "frontend/Dockerfile").unwrap();
+
+        let job = std::fs::read_to_string(staging.join("job.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&job).unwrap();
+        assert_eq!(v["v"], 2);
+        assert_eq!(v["context"], "frontend");
+        assert_eq!(v["dockerfile"], "frontend/Dockerfile");
     }
 
     /// mkfs argv shape: force + no reserved blocks + optional populate dir,
@@ -580,7 +634,9 @@ mod tests {
         let f = std::fs::File::create(src.join("big")).unwrap();
         f.set_len(MAX_SOURCE_BYTES + 1).unwrap();
         let staging = tmp.path().join("staging");
-        let err = stage_scratch(&staging, &src).unwrap_err().to_string();
+        let err = stage_scratch(&staging, &src, ".", "Dockerfile")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("over the"), "got: {err}");
         assert!(!staging.join("src").exists(), "must not copy on reject");
     }

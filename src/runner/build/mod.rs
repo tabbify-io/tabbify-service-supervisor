@@ -206,34 +206,22 @@ pub async fn run_build(
             // (explicit opt-in + KVM). The host clones (above), the VM
             // builds, the host pushes — no docker daemon anywhere.
             if fc_sandbox::enabled() {
-                // The fc-sandbox v1 guest contract (the prebuilt
-                // `tabbify/buildkit-toolchain` image) builds the DEFAULT layout
-                // only: context `.` + `Dockerfile` at the clone root. It cannot
-                // honor a `[build].dockerfile`/`[build].context` override (that
-                // needs a guest-image rebuild — TODO: job.json v2 + guest
-                // builder reads the override; tracked as a follow-up). Until
-                // then, REJECT a non-default layout here rather than silently
-                // building the wrong context.
-                if !build_spec.is_default_layout() {
-                    anyhow::bail!(
-                        "tabbify.toml sets a non-default [build] (context = {:?}, \
-                         dockerfile = {:?}), but the Firecracker build sandbox only \
-                         supports context \".\" + \"Dockerfile\" at the repo root. \
-                         Move the Dockerfile to the repo root, or build on a \
-                         host-docker builder.",
-                        build_spec.raw_context,
-                        build_spec.raw_dockerfile,
-                    );
-                }
                 let fc_runner = firecracker::production_fc_build_runner();
                 // The one-shot build child resolves data_dir from
                 // SUPERVISOR_DATA_DIR (the spawner injects the supervisor's
                 // resolved value); fall back to the install default.
                 let data_dir = std::env::var("SUPERVISOR_DATA_DIR")
                     .unwrap_or_else(|_| "/var/lib/tabbify".to_owned());
+                // Thread the resolved `[build]` layout (context + dockerfile,
+                // RELATIVE to the clone root) into the job contract the guest
+                // reads (job.json v2). Defaults (`.` / `Dockerfile` at the root)
+                // keep the v1 behaviour; a subdir Dockerfile/context is honoured
+                // by the v2 guest builder (the buildkit-toolchain image).
                 let layout = fc_sandbox::run_sandboxed_build(
                     &job.app_uuid,
                     &src,
+                    &build_spec.raw_context,
+                    &build_spec.raw_dockerfile,
                     &job.registry_ula,
                     std::path::Path::new(&data_dir),
                     workdir,
@@ -243,19 +231,8 @@ pub async fn run_build(
                 .context("sandboxed (firecracker) build")?;
 
                 // Phase-A: write oras auth config when a push token is supplied.
-                let oras_cfg_owned: Option<String> = if let Some(ref token) = job.push_token {
-                    let cfg_dir = workdir.join("oras-cfg");
-                    crate::skopeo::write_registry_config(token, &job.registry_ula, &cfg_dir)
-                        .with_context(|| {
-                            format!(
-                                "write oras registry auth config to {}",
-                                cfg_dir.display()
-                            )
-                        })?;
-                    Some(cfg_dir.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
+                let oras_cfg_owned =
+                    oras_push_cfg_file(workdir, job.push_token.as_deref(), &job.registry_ula)?;
 
                 if let Err(e) = (tool_runner)(crate::skopeo::oras_push_args(
                     oras_bin,
@@ -288,6 +265,34 @@ pub async fn run_build(
     }
 }
 
+/// Build the oras `--to-registry-config` value for a SANDBOXED-build push.
+///
+/// [`crate::skopeo::write_registry_config`] writes `<workdir>/oras-cfg/config.json`;
+/// oras's `--to-registry-config` flag wants that config.json FILE, NOT the
+/// containing dir — the SAME dir-vs-file contract the v1.4.79 PULL/copy fix
+/// established for `--from-registry-config` (this sandbox PUSH path was missed).
+/// Returns `None` when no push token is supplied (anonymous registry — today's
+/// default), so an unauthenticated push is byte-for-byte unchanged.
+///
+/// # Errors
+/// Auth-config write failure.
+fn oras_push_cfg_file(
+    workdir: &Path,
+    push_token: Option<&str>,
+    registry_ula: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(token) = push_token else {
+        return Ok(None);
+    };
+    let cfg_dir = workdir.join("oras-cfg");
+    crate::skopeo::write_registry_config(token, registry_ula, &cfg_dir)
+        .with_context(|| format!("write oras registry auth config to {}", cfg_dir.display()))?;
+    // The FILE, not the dir — `--to-registry-config` decodes it as config.json.
+    Ok(Some(
+        cfg_dir.join("config.json").to_string_lossy().into_owned(),
+    ))
+}
+
 /// The resolved `[build]` directives for a docker build: the clone root, the
 /// context directory the image is built from, and the optional Dockerfile path.
 /// All are absolute paths under the clone root.
@@ -301,21 +306,25 @@ pub(crate) struct BuildSpec {
     /// The Dockerfile path (`<src>/<[build].dockerfile>`). `None` ⇒ Docker's
     /// default (`<context_dir>/Dockerfile`).
     pub dockerfile: Option<std::path::PathBuf>,
-    /// The raw `[build].context` from the toml (default `"."`). Kept verbatim so
-    /// the fc-sandbox path can detect a non-default value (the v1 guest contract
-    /// is parameter-free; honoring it requires a guest-image rebuild — see
-    /// [`run_build`]).
+    /// The raw `[build].context` from the toml (default `"."`), RELATIVE to the
+    /// clone root. Threaded verbatim into the fc-sandbox job contract (job.json
+    /// v2) so the guest builder can honor a subdir context; the docker path uses
+    /// the absolute [`Self::context_dir`].
     pub raw_context: String,
-    /// The raw `[build].dockerfile` from the toml (default `"Dockerfile"`). Kept
-    /// verbatim for the same fc-sandbox non-default detection.
+    /// The raw `[build].dockerfile` from the toml (default `"Dockerfile"`),
+    /// RELATIVE to the clone root. Threaded into job.json v2 alongside
+    /// [`Self::raw_context`]; the guest splits it into a dockerfile DIR +
+    /// `--opt filename=` basename for buildkit.
     pub raw_dockerfile: String,
 }
 
+#[cfg(test)]
 impl BuildSpec {
     /// `true` when `[build].context`/`[build].dockerfile` are at their defaults
-    /// (`"."` / `"Dockerfile"`). The fc-sandbox v1 guest contract only builds the
-    /// default layout, so a NON-default layout must be rejected on that path
-    /// rather than silently built wrong.
+    /// (`"."` / `"Dockerfile"`). Test-only predicate over the resolved raw
+    /// fields: the fc-sandbox path no longer rejects a non-default layout (the
+    /// v2 guest honors it), so this is just a readability helper for the
+    /// `resolve_build_spec` resolution tests.
     fn is_default_layout(&self) -> bool {
         self.raw_context == "." && self.raw_dockerfile == "Dockerfile"
     }

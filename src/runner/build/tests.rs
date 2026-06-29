@@ -736,6 +736,82 @@ fn resolve_build_spec_custom_context_is_not_default_layout() {
     assert_eq!(spec.raw_context, "service");
 }
 
+/// END-TO-END host thread of a NON-default layout: `resolve_build_spec` reads a
+/// subdir `[build]`, and those raw paths flow into the fc-sandbox job.json v2
+/// with NO rejection in between (the old `is_default_layout()` bail is gone).
+/// This is the host half of "a subdir Dockerfile/context is accepted and
+/// threaded to the guest".
+#[test]
+fn subdir_layout_resolves_and_threads_into_job_json_unrejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("frontend")).unwrap();
+    std::fs::write(src.join("frontend").join("Dockerfile"), "FROM scratch\n").unwrap();
+    let toml_path = src.join("tabbify.toml");
+    std::fs::write(
+        &toml_path,
+        "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\ncontext = \"frontend\"\ndockerfile = \"frontend/Dockerfile\"\n",
+    )
+    .unwrap();
+
+    // Resolve a NON-default layout — the old fc-sandbox guard rejected exactly
+    // this (`is_default_layout()` false).
+    let spec = resolve_build_spec(&src, &toml_path).unwrap();
+    assert!(!spec.is_default_layout());
+
+    // Thread it through the SAME staging the sandbox build uses; the raw paths
+    // land verbatim in job.json v2 (accepted, not rejected).
+    let staging = dir.path().join("staging");
+    fc_sandbox::stage_scratch(&staging, &src, &spec.raw_context, &spec.raw_dockerfile).unwrap();
+    let job = std::fs::read_to_string(staging.join("job.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&job).unwrap();
+    assert_eq!(v["context"], "frontend");
+    assert_eq!(v["dockerfile"], "frontend/Dockerfile");
+}
+
+// ── oras_push_cfg_file (sandbox push auth: FILE, not dir) ──────────────────
+
+/// The sandboxed-build push must point oras's `--to-registry-config` at the
+/// config.json FILE, NOT the `oras-cfg` DIRECTORY — oras decodes the value as a
+/// config file, so a dir yields `invalid config format: ... is a directory`
+/// (the v1.4.79 fix for the PULL path; this PUSH path was missed). The file
+/// must also actually exist (the auth was written).
+#[test]
+fn oras_push_cfg_file_points_at_config_json_file_not_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let got = oras_push_cfg_file(dir.path(), Some("tok"), "[fd5a::1]:5000")
+        .unwrap()
+        .expect("a push token yields Some(config-file path)");
+    assert!(
+        got.ends_with("oras-cfg/config.json"),
+        "must be the config.json FILE, not the oras-cfg dir; got {got}"
+    );
+    assert!(
+        Path::new(&got).is_file(),
+        "the auth config.json must exist on disk; got {got}"
+    );
+    assert!(
+        !Path::new(&got).is_dir(),
+        "the value must not be a directory (oras rejects a dir); got {got}"
+    );
+}
+
+/// No push token → `None` (anonymous registry): the unauthenticated push is
+/// byte-for-byte unchanged, and nothing is written.
+#[test]
+fn oras_push_cfg_file_none_without_token() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        oras_push_cfg_file(dir.path(), None, "[fd5a::1]:5000")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !dir.path().join("oras-cfg").exists(),
+        "anonymous push must not write an auth config"
+    );
+}
+
 // ── run_one_shot_build (I/O + parse) ──────────────────────────────────────
 
 /// A missing spec file must return a read error (not a panic).
