@@ -50,6 +50,7 @@ fn make_session(id: &str, app: &str, cap: &str) -> DevSession {
         last_activity: now,
         repo_url: "https://github.com/acme/app.git".to_owned(),
         branch: "main".to_owned(),
+        ssh_jump: None,
     }
 }
 
@@ -153,6 +154,7 @@ fn insert_session_aged(
         last_activity: now - idle,
         repo_url: "https://github.com/acme/app.git".to_owned(),
         branch: "main".to_owned(),
+        ssh_jump: None,
     };
     state.dev_sessions.insert(session);
     // Also register a git cap so revoke has something to operate on.
@@ -268,6 +270,7 @@ async fn sweep_removes_dev_session_record_sidecar() {
         branch: "main".to_owned(),
         created_at_unix: crate::api::now_unix(),
         last_activity_unix: crate::api::now_unix(),
+        ssh_jump_port: None,
     }
     .save(&runner_dir)
     .unwrap();

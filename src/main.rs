@@ -245,11 +245,17 @@ async fn main() -> anyhow::Result<()> {
     // `dev_session_*`, git push 403s). Re-insert each from its on-disk sidecar so
     // it reappears in `GET /v1/dev-sessions`; the node's standing token sweep then
     // restores the git token. Runs unconditionally on every start (incl. OTA).
+    // `my_ula` (the mesh control ULA) is where the per-session SSH-jump listeners
+    // bind; `None` off-mesh (`--no-mesh`) ⇒ re-adoption skips re-binding jumps.
+    let my_ula: Option<std::net::IpAddr> = state.ula.parse().ok();
     tabbify_supervisor::api::readopt_dev_sessions(
         state.orchestrator.runner_dir(),
         &state.dev_sessions,
         &state.git_sessions,
-    );
+        &state.tap_subnet,
+        my_ula,
+    )
+    .await;
 
     // Re-adopt persisted WORKSPACES on the same principle: the workspace VMs
     // survive a restart/OTA but the in-memory registries do not. Re-register

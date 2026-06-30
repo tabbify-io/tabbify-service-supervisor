@@ -40,6 +40,7 @@ mod dev_sessions;
 mod dto;
 mod git_proxy;
 mod handlers;
+mod ssh_jump;
 mod workspace_record;
 mod workspaces;
 
@@ -61,6 +62,7 @@ pub use dev_sessions::{
     sweep_expired,
 };
 pub use git_proxy::{GIT_PROXY_IPV4_PORT, GitSessionEntry, GitSessions, git_proxy_ipv4_router};
+pub use ssh_jump::SshJump;
 
 // ── Public re-exports — must remain stable for `crate::openapi` + tests. ─────
 

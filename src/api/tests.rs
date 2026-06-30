@@ -673,6 +673,46 @@ async fn post_v1_dev_sessions_route_is_registered() {
     assert_ne!(status, 422, "body must parse correctly");
 }
 
+/// `POST /v1/dev-sessions` 202 response carries `ssh_jump_addr` (`[<ula>]:<port>`):
+/// the supervisor binds the per-session jump SYNCHRONOUSLY before answering (the
+/// FC then provisions in the background). Linux-only because the jump target
+/// `guest_ip` derivation lives in `firecracker::linux` (non-Linux ⇒ no jump).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn create_dev_session_response_carries_ssh_jump_addr() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf()); // control ULA = "::1"
+    let app = router(state);
+
+    let body = serde_json::json!({
+        "app_uuid": APP_UUID,
+        "image_ref": "[fd5a::1]:5000/tabbify/devbox:latest",
+        "repo_url": "https://github.com/acme/app.git",
+        "branch": "main",
+        "git_token": "tok",
+        "git_token_ttl_secs": 3600,
+        "authorized_key": "ssh-ed25519 AAAA test"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/dev-sessions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let addr = json
+        .get("ssh_jump_addr")
+        .and_then(|v| v.as_str())
+        .expect("202 body must carry ssh_jump_addr on a Linux host");
+    assert!(
+        addr.starts_with("[::1]:"),
+        "ssh_jump_addr must be [<control-ula>]:<port>; got {addr}"
+    );
+}
+
 // ── POST /v1/dev-sessions/:id/git-token ───────────────────────────────────────
 
 /// `POST /v1/dev-sessions/:id/git-token` for an unknown session id returns 404.
@@ -726,6 +766,7 @@ async fn refresh_git_token_known_session_returns_200() {
         last_activity: now,
         repo_url: "https://github.com/acme/app.git".to_owned(),
         branch: "main".to_owned(),
+        ssh_jump: None,
     });
 
     let app = router(state.clone());
@@ -804,6 +845,7 @@ async fn delete_dev_session_known_returns_200_and_cleans_up() {
         last_activity: now,
         repo_url: "https://github.com/acme/app.git".to_owned(),
         branch: "main".to_owned(),
+        ssh_jump: None,
     });
 
     // First DELETE: should return 200.
@@ -907,6 +949,7 @@ async fn get_dev_sessions_with_one_session_returns_row() {
         last_activity: now,
         repo_url: "https://github.com/acme/app.git".to_owned(),
         branch: "main".to_owned(),
+        ssh_jump: None,
     });
 
     let app = router(state);
@@ -938,6 +981,56 @@ async fn get_dev_sessions_with_one_session_returns_row() {
         "row must have created_age_secs"
     );
     assert!(row.get("idle_secs").is_some(), "row must have idle_secs");
+}
+
+/// `GET /v1/dev-sessions` surfaces the per-session `ssh_jump_addr` built from the
+/// supervisor's control ULA + the bound jump port, so a restarted node can
+/// re-learn the current jump address. Cross-platform: the jump is bound on a
+/// loopback ULA (its dial target never has to connect — only the bound port is
+/// asserted), so it does not need a live FC / Linux.
+#[tokio::test]
+async fn get_dev_sessions_row_carries_ssh_jump_addr() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Instant;
+
+    use crate::api::dev_sessions::DevSession;
+    use crate::api::SshJump;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf()); // control ULA = "::1"
+
+    let jump = SshJump::start(IpAddr::V6(Ipv6Addr::LOCALHOST), Ipv4Addr::LOCALHOST)
+        .await
+        .unwrap();
+    let port = jump.port();
+    let now = Instant::now();
+    state.dev_sessions.insert(DevSession {
+        session_id: "jump-sess".to_owned(),
+        app_uuid: APP_UUID.to_owned(),
+        cap: "c".repeat(64),
+        created_at: now,
+        last_activity: now,
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
+        ssh_jump: Some(jump),
+    });
+
+    let app = router(state);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/dev-sessions")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let row = &json["sessions"][0];
+    assert_eq!(
+        row.get("ssh_jump_addr").and_then(|v| v.as_str()),
+        Some(format!("[::1]:{port}").as_str()),
+        "list row must carry [<control-ula>]:<bound-port>"
+    );
 }
 
 // ── git_remote URL shape ──────────────────────────────────────────────────────

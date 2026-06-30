@@ -16,6 +16,7 @@
 //! - `GET /v1/dev-sessions` — list (ops).
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,10 @@ use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::api::{DevSessionRecord, GIT_PROXY_IPV4_PORT, GitSessionEntry, SharedState, now_unix};
+use super::ssh_jump::{jump_addr_string, start_dev_ssh_jump};
+use crate::api::{
+    DevSessionRecord, GIT_PROXY_IPV4_PORT, GitSessionEntry, SharedState, SshJump, now_unix,
+};
 use crate::orchestrator::api::DeployNetwork;
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
@@ -69,6 +73,14 @@ pub struct DevSession {
     pub repo_url: String,
     /// The branch checked out at `/workspace`.
     pub branch: String,
+    /// The per-session SSH TCP jump: a transparent forward on `[my_ula]:<port>`
+    /// that relays node SSH to the dev-FC's tap `guest_ip:2222` (the node has no
+    /// route into the tenant network — see [`crate::api::SshJump`]). `None` when
+    /// the forward could not be started (non-Linux / un-derivable guest_ip /
+    /// bind failure); the node then falls back to the direct app-ULA path.
+    /// Owning it here ties the forward's lifetime to the session: a `remove`
+    /// drops it and frees the port.
+    pub ssh_jump: Option<SshJump>,
 }
 
 /// Dev-session registry: `session_id` → `DevSession`.
@@ -109,11 +121,23 @@ impl DevSessionRegistry {
         }
     }
 
-    /// Returns a snapshot of
-    /// `(session_id, app_uuid, cap, created_at, last_activity, repo_url, branch)`
-    /// for every session. Used by the list endpoint and the max-age reaper.
+    /// Returns a snapshot of `(session_id, app_uuid, cap, created_at,
+    /// last_activity, repo_url, branch, ssh_jump_port)` for every session. Used
+    /// by the list endpoint (which turns `ssh_jump_port` into `ssh_jump_addr`)
+    /// and the max-age reaper.
     #[allow(clippy::type_complexity)]
-    pub fn snapshot(&self) -> Vec<(String, String, String, Instant, Instant, String, String)> {
+    pub fn snapshot(
+        &self,
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Instant,
+        Instant,
+        String,
+        String,
+        Option<u16>,
+    )> {
         let guard = self.0.lock().expect("dev session lock");
         guard
             .values()
@@ -126,6 +150,7 @@ impl DevSessionRegistry {
                     s.last_activity,
                     s.repo_url.clone(),
                     s.branch.clone(),
+                    s.ssh_jump.as_ref().map(SshJump::port),
                 )
             })
             .collect()
@@ -159,31 +184,15 @@ impl DevSessionRegistry {
 /// `"127.0.0.1"` (functionally harmless — non-Linux hosts can't boot FC VMs;
 /// tests that need the real value must run on Linux).
 pub(crate) fn derive_dev_fc_host_ip(app_uuid: &str, image_ref: &str, tap_subnet: &str) -> String {
-    // vm_key matches `launch_with_uuid` cold-start: `format!("{uuid}:{reff}")`.
-    let vm_key = format!("{app_uuid}:{image_ref}");
-    #[cfg(target_os = "linux")]
-    {
-        let (_, link_idx) = crate::firecracker::linux::fc_identity_for_key(&vm_key);
-        match crate::firecracker::linux::derive_link_ips(tap_subnet, link_idx) {
-            Ok((host_ip, _)) => host_ip.to_string(),
-            Err(e) => {
-                tracing::warn!(
-                    app_uuid,
-                    error = %e,
-                    "dev-session: failed to derive host_ip; falling back to 127.0.0.1"
-                );
-                "127.0.0.1".to_owned()
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Non-Linux: FC VMs cannot run; return a sentinel. Dev-session create
-        // will succeed on Linux hosts in production.
-        let _ = (vm_key, tap_subnet); // suppress unused warnings
-        "127.0.0.1".to_owned()
-    }
+    super::ssh_jump::derive_dev_fc_link_ips(app_uuid, image_ref, tap_subnet)
+        .map(|(host_ip, _)| host_ip.to_string())
+        // Non-Linux / un-derivable: FC VMs cannot run here, so a sentinel is
+        // harmless (dev-session create only really runs on a Linux KVM host).
+        .unwrap_or_else(|| "127.0.0.1".to_owned())
 }
+
+// The `(host_ip, guest_ip)` /30 derivation + the SSH-jump start/address helpers
+// live in `super::ssh_jump` (cohesive with the forward itself); see that module.
 
 // ── Capability generation ─────────────────────────────────────────────────────
 
@@ -244,6 +253,13 @@ pub struct DevSessionCreated {
     pub app_uuid: String,
     /// Tokenless git remote URL — pass this to the in-VM git clone.
     pub git_remote: String,
+    /// Node-facing SSH-jump address (`"[<my_ula>]:<port>"`): the supervisor mesh
+    /// ULA + ephemeral port the node SSHes to instead of the (unrouted) dev-FC
+    /// app-ULA. `None` when no jump was started (the node falls back to the
+    /// direct path). Omitted from the wire when absent so an older node ignores
+    /// it cleanly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_jump_addr: Option<String>,
 }
 
 /// `POST /v1/dev-sessions/:id/git-token` request body.
@@ -286,6 +302,12 @@ pub struct DevSessionRow {
     pub repo_url: String,
     /// The branch checked out at `/workspace`.
     pub branch: String,
+    /// Node-facing SSH-jump address (`"[<my_ula>]:<port>"`) — see
+    /// [`DevSessionCreated::ssh_jump_addr`]. Lets a node that lost its in-memory
+    /// map (restart) re-learn the current jump address from the list. Omitted
+    /// when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_jump_addr: Option<String>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -332,6 +354,27 @@ pub async fn create_dev_session(
     let host_ip = derive_dev_fc_host_ip(&body.app_uuid, &body.image_ref, &state.tap_subnet);
     let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
 
+    // Start the per-session SSH TCP jump: the node has NO route into the tenant
+    // network where this dev-FC lives, so it SSHes to a transparent forward on
+    // the supervisor's OWN mesh ULA (`[my_ula]:<ephemeral>`) which relays to the
+    // dev-FC tap `guest_ip:2222`. SSH auth stays end-to-end node↔dev-FC. The
+    // listener binds NOW (before the FC boots); the node's exec retry absorbs the
+    // window where the dial to `guest_ip:2222` is refused until sshd is up.
+    // `None` (non-Linux / un-derivable / bind failure) ⇒ no `ssh_jump_addr` →
+    // the node falls back to the direct app-ULA path.
+    let ssh_jump = match state.ula.parse::<IpAddr>() {
+        Ok(my_ula) => {
+            start_dev_ssh_jump(my_ula, &body.app_uuid, &body.image_ref, &state.tap_subnet, None)
+                .await
+        }
+        Err(e) => {
+            tracing::warn!(ula = %state.ula, error = %e, "control ULA not an IP; ssh-jump disabled");
+            None
+        }
+    };
+    let ssh_jump_port = ssh_jump.as_ref().map(SshJump::port);
+    let ssh_jump_addr = ssh_jump_port.map(|p| jump_addr_string(&state.ula, p));
+
     // Register the git proxy capability BEFORE spawning (so the VM can reach it
     // from first boot). Revoked below on deploy failure.
     let expires_at = Instant::now() + Duration::from_secs(body.git_token_ttl_secs);
@@ -375,6 +418,9 @@ pub async fn create_dev_session(
         last_activity: now,
         repo_url: body.repo_url.clone(),
         branch: body.branch.clone(),
+        // The registry OWNS the forward: dropping this session (delete / reap /
+        // async-deploy-failure) aborts the listener and frees the port.
+        ssh_jump,
     });
 
     // Persist a durable sidecar so this session survives a supervisor restart/OTA:
@@ -392,6 +438,10 @@ pub async fn create_dev_session(
         branch: body.branch.clone(),
         created_at_unix: now_u,
         last_activity_unix: now_u,
+        // Persist the jump port so a supervisor restart can re-bind the SAME port
+        // (keeping the node's cached jump address valid). `readopt_dev_sessions`
+        // reads it back.
+        ssh_jump_port,
     };
     if let Err(e) = record.save(state.orchestrator.runner_dir()) {
         tracing::warn!(app_uuid = %body.app_uuid, error = %e, "failed to persist dev-session record (session live in-memory only)");
@@ -432,6 +482,7 @@ pub async fn create_dev_session(
             session_id,
             app_uuid: body.app_uuid,
             git_remote,
+            ssh_jump_addr,
         }),
     )
         .into_response()
@@ -564,13 +615,18 @@ pub async fn list_dev_sessions(State(state): State<SharedState>) -> Response {
         .snapshot()
         .into_iter()
         .map(
-            |(session_id, app_uuid, _, created_at, last_activity, repo_url, branch)| DevSessionRow {
-                session_id,
-                app_uuid,
-                created_age_secs: now.duration_since(created_at).as_secs(),
-                idle_secs: now.duration_since(last_activity).as_secs(),
-                repo_url,
-                branch,
+            |(session_id, app_uuid, _, created_at, last_activity, repo_url, branch, ssh_jump_port)| {
+                DevSessionRow {
+                    session_id,
+                    app_uuid,
+                    created_age_secs: now.duration_since(created_at).as_secs(),
+                    idle_secs: now.duration_since(last_activity).as_secs(),
+                    repo_url,
+                    branch,
+                    // Re-derive the node-facing jump address from our control ULA
+                    // + the bound port so a restarted node can re-learn it.
+                    ssh_jump_addr: ssh_jump_port.map(|p| jump_addr_string(&state.ula, p)),
+                }
             },
         )
         .collect();
@@ -597,7 +653,7 @@ pub async fn sweep_expired(
         .dev_sessions
         .snapshot()
         .into_iter()
-        .filter_map(|(session_id, app_uuid, cap, created_at, last_activity, _, _)| {
+        .filter_map(|(session_id, app_uuid, cap, created_at, last_activity, _, _, _)| {
             let idle = now.duration_since(last_activity);
             let age = now.duration_since(created_at);
             if idle > idle_ttl || age > max_ttl {

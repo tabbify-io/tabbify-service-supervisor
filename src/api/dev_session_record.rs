@@ -19,15 +19,17 @@
 //! sweep lists the re-adopted session and POSTs a fresh token — restoring push
 //! within one sweep interval, with ZERO node-side change.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use super::dev_sessions::DevSession;
+use super::ssh_jump::start_dev_ssh_jump;
 use crate::api::{DevSessionRegistry, GitSessionEntry, GitSessions};
 use crate::orchestrator::handle::RunnerHandle;
 
@@ -72,6 +74,13 @@ pub struct DevSessionRecord {
     pub created_at_unix: u64,
     /// Last-activity time, wall-clock unix seconds; bumped on token refresh.
     pub last_activity_unix: u64,
+    /// The SSH-jump listener port (`[my_ula]:<port>`) bound for this session, so
+    /// a restart can RE-BIND the same port and keep the node's cached jump
+    /// address valid. `#[serde(default)]` ⇒ a record written before this field
+    /// existed decodes as `None` (re-adoption then binds a fresh port; the node
+    /// re-lists to learn it).
+    #[serde(default)]
+    pub ssh_jump_port: Option<u16>,
 }
 
 /// The directory holding dev-session sidecars, given the runner dir.
@@ -190,19 +199,32 @@ fn unix_to_instant(unix_secs: u64) -> Instant {
 /// `git push`. The cap MUST be re-registered (even with a dud token) because the
 /// node's `refresh_token` is a no-op on an unknown cap.
 ///
+/// It ALSO re-establishes the per-session SSH TCP jump (the in-memory listener
+/// died with the old process): using the live runner's `image_ref` + the
+/// `tap_subnet` to re-derive the dev-FC `guest_ip`, and the persisted
+/// `ssh_jump_port` to re-bind the SAME port when free (so a node's cached jump
+/// address keeps working) — else a fresh port, which the node re-learns on its
+/// next list. Skipped when `my_ula` is `None` (no mesh) or the guest_ip cannot
+/// be derived; the session still adopts (the node then uses the direct path).
+///
 /// Records whose runner is gone (purged) are skipped and their orphan sidecar is
 /// GC'd, so no phantom session ever appears for a dead `app_uuid`.
 ///
 /// Infallible: all I/O errors are logged and treated as "nothing to adopt" so a
 /// transient FS hiccup never blocks startup.
-pub fn readopt_dev_sessions(
+pub async fn readopt_dev_sessions(
     runner_dir: &Path,
     dev_sessions: &DevSessionRegistry,
     git_sessions: &GitSessions,
+    tap_subnet: &str,
+    my_ula: Option<IpAddr>,
 ) -> ReadoptDevSummary {
     let mut summary = ReadoptDevSummary::default();
 
-    let dev_runner_uuids: HashSet<String> = RunnerHandle::list(runner_dir)
+    // Map live dev-FC runner uuid → its `image_ref` (needed to re-derive the tap
+    // `guest_ip` the SSH jump dials). A runner with the dev marker but no
+    // image_ref still adopts; only its jump is skipped.
+    let dev_runners: HashMap<String, Option<String>> = RunnerHandle::list(runner_dir)
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "dev re-adopt: cannot list runner records");
             Vec::new()
@@ -213,7 +235,7 @@ pub fn readopt_dev_sessions(
                 .as_ref()
                 .is_some_and(|e| e.contains_key(DEV_MARKER_ENV))
         })
-        .map(|h| h.uuid)
+        .map(|h| (h.uuid, h.image_ref))
         .collect();
 
     let records = DevSessionRecord::list(runner_dir).unwrap_or_else(|e| {
@@ -222,7 +244,7 @@ pub fn readopt_dev_sessions(
     });
 
     for rec in records {
-        if !dev_runner_uuids.contains(&rec.app_uuid) {
+        let Some(image_ref) = dev_runners.get(&rec.app_uuid) else {
             // The dev-VM is gone (purged) — GC the orphan sidecar so no phantom
             // session surfaces for a dead app_uuid (and the node sweep does not
             // waste a token mint on it).
@@ -231,7 +253,7 @@ pub fn readopt_dev_sessions(
             }
             summary.gc += 1;
             continue;
-        }
+        };
 
         // Re-register the cap with an already-expired placeholder token so the
         // node's refresh_token (a no-op on an unknown cap) can later restore it.
@@ -243,6 +265,17 @@ pub fn readopt_dev_sessions(
                 expires_at: Instant::now(),
             },
         );
+
+        // Re-establish the SSH jump (best-effort; `None` ⇒ node uses the direct
+        // path). Re-bind the persisted port when possible so a node's cached
+        // address survives this restart.
+        let ssh_jump = match (my_ula, image_ref.as_deref()) {
+            (Some(ula), Some(reff)) => {
+                start_dev_ssh_jump(ula, &rec.app_uuid, reff, tap_subnet, rec.ssh_jump_port).await
+            }
+            _ => None,
+        };
+
         dev_sessions.insert(DevSession {
             session_id: rec.session_id.clone(),
             app_uuid: rec.app_uuid.clone(),
@@ -251,6 +284,7 @@ pub fn readopt_dev_sessions(
             last_activity: unix_to_instant(rec.last_activity_unix),
             repo_url: rec.repo_url.clone(),
             branch: rec.branch.clone(),
+            ssh_jump,
         });
         summary.adopted += 1;
     }
@@ -311,6 +345,7 @@ mod tests {
             branch: "main".to_owned(),
             created_at_unix: now_unix().saturating_sub(100),
             last_activity_unix: now_unix().saturating_sub(10),
+            ssh_jump_port: None,
         }
     }
 
@@ -331,6 +366,29 @@ mod tests {
         assert!(DevSessionRecord::list(dir.path()).unwrap().is_empty());
     }
 
+    /// `ssh_jump_port` round-trips through disk, AND a record written before the
+    /// field existed (JSON without the key) decodes as `None` (serde default) —
+    /// so an OTA over old sidecars never fails to parse.
+    #[test]
+    fn ssh_jump_port_round_trips_and_defaults() {
+        let dir = TempDir::new().unwrap();
+        let mut rec = record("sess-j", "app-j", "cap-j");
+        rec.ssh_jump_port = Some(54321);
+        rec.save(dir.path()).unwrap();
+        let loaded = DevSessionRecord::list(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].ssh_jump_port, Some(54321));
+
+        // Back-compat: a sidecar JSON with no `ssh_jump_port` key decodes as None.
+        let legacy = r#"{
+            "session_id": "old", "app_uuid": "app-old", "cap": "c",
+            "repo_url": "https://github.com/acme/app.git", "branch": "main",
+            "created_at_unix": 1, "last_activity_unix": 2
+        }"#;
+        let decoded: DevSessionRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.ssh_jump_port, None, "pre-field record must default to None");
+    }
+
     #[test]
     fn remove_is_idempotent() {
         let dir = TempDir::new().unwrap();
@@ -343,15 +401,17 @@ mod tests {
     /// Re-adopt: a live dev-FC runner + its sidecar → the session is re-inserted
     /// AND the cap is re-registered so the node's token refresh will succeed
     /// (the keystone that restores `git push`).
-    #[test]
-    fn readopt_reinserts_session_and_registers_cap() {
+    #[tokio::test]
+    async fn readopt_reinserts_session_and_registers_cap() {
         let dir = TempDir::new().unwrap();
         dev_runner("app-1", true).save(dir.path()).unwrap();
         record("sess-1", "app-1", "cap-1").save(dir.path()).unwrap();
 
         let dev = DevSessionRegistry::default();
         let git = GitSessions::default();
-        let summary = readopt_dev_sessions(dir.path(), &dev, &git);
+        // `my_ula = None` ⇒ no SSH jump is bound (keeps this test off the network
+        // + cross-platform); the adopt/cap-register path is what's under test.
+        let summary = readopt_dev_sessions(dir.path(), &dev, &git, "172.31.0.0/16", None).await;
 
         assert_eq!(summary.adopted, 1);
         assert_eq!(summary.gc, 0);
@@ -373,8 +433,8 @@ mod tests {
 
     /// A sidecar with no matching live runner (the VM was purged) is GC'd, not
     /// re-adopted — no phantom session for a dead app_uuid.
-    #[test]
-    fn readopt_gcs_orphan_record_with_no_runner() {
+    #[tokio::test]
+    async fn readopt_gcs_orphan_record_with_no_runner() {
         let dir = TempDir::new().unwrap();
         record("sess-x", "app-gone", "cap-x")
             .save(dir.path())
@@ -382,7 +442,7 @@ mod tests {
 
         let dev = DevSessionRegistry::default();
         let git = GitSessions::default();
-        let summary = readopt_dev_sessions(dir.path(), &dev, &git);
+        let summary = readopt_dev_sessions(dir.path(), &dev, &git, "172.31.0.0/16", None).await;
 
         assert_eq!(summary.adopted, 0);
         assert_eq!(summary.gc, 1);
@@ -394,14 +454,14 @@ mod tests {
     }
 
     /// A normal (non-dev) runner with no marker + no sidecar is ignored entirely.
-    #[test]
-    fn readopt_ignores_non_dev_runners() {
+    #[tokio::test]
+    async fn readopt_ignores_non_dev_runners() {
         let dir = TempDir::new().unwrap();
         dev_runner("app-normal", false).save(dir.path()).unwrap();
 
         let dev = DevSessionRegistry::default();
         let git = GitSessions::default();
-        let summary = readopt_dev_sessions(dir.path(), &dev, &git);
+        let summary = readopt_dev_sessions(dir.path(), &dev, &git, "172.31.0.0/16", None).await;
 
         assert_eq!(summary.adopted, 0);
         assert_eq!(summary.gc, 0);
