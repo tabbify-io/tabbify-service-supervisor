@@ -1718,9 +1718,27 @@ pub(crate) fn derive_guest_mac(seq: u32) -> String {
     format!("02:FC:{:02X}:{:02X}:{:02X}:{:02X}", b[0], b[1], b[2], b[3])
 }
 
-/// Wait (bounded) for firecracker to create its API socket after spawn.
+/// How long to wait for firecracker to create its API socket after spawn.
+///
+/// A raw spawn creates the socket in ~50ms, but a socket created DURING a deploy
+/// swap races with the oras image pull (over the mesh relay) + the OCI→ext4
+/// conversion + any concurrently-booting guests — all of which can push the
+/// fork/exec and socket creation well past a few seconds under I/O/CPU pressure.
+/// A tight 5s window turned that transient slowness into a hard "socket never
+/// appeared" deploy failure (and a kill→respawn loop), even though the very same
+/// image boots fine moments later under calmer load. The poll exits the instant
+/// the socket appears, so a generous ceiling costs nothing on the happy path.
+const SOCKET_WAIT: Duration = Duration::from_secs(30);
+
+/// Wait (bounded by [`SOCKET_WAIT`]) for firecracker to create its API socket.
 async fn wait_for_socket(sock: &Path) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_for_socket_within(sock, SOCKET_WAIT).await
+}
+
+/// [`wait_for_socket`] with an explicit timeout — split out so the bring-up
+/// tolerance is unit-testable without a real 30s wait.
+async fn wait_for_socket_within(sock: &Path, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
     while !sock.exists() {
         if tokio::time::Instant::now() >= deadline {
             bail!("firecracker API socket {} never appeared", sock.display());

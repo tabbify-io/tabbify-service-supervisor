@@ -286,10 +286,14 @@ fn build_console_stdio(console_log: &Path) -> (Stdio, Stdio) {
     }
 }
 
-/// The firecracker API socket appears asynchronously after spawn; poll
-/// briefly (mirrors the serving runtime's bring-up tolerance).
+/// The firecracker API socket appears asynchronously after spawn; poll until it
+/// shows up (mirrors the serving runtime's bring-up tolerance, `SOCKET_WAIT`).
+/// 30s, not 5s: a build-VM spawns right after the oras image pull (over the mesh
+/// relay) and competes with any concurrently-booting guests, so fork/exec +
+/// socket creation can exceed a few seconds under I/O/CPU pressure. The poll
+/// exits the instant the socket appears, so the ceiling is free headroom.
 async fn wait_for_api_sock(api_sock: &Path) -> Result<()> {
-    for _ in 0..50 {
+    for _ in 0..300 {
         if api_sock.exists() {
             return Ok(());
         }

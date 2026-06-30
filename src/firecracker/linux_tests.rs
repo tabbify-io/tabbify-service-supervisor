@@ -351,3 +351,29 @@ async fn pre_snapshot_scrub_aborts_for_workspace_when_unreachable() {
         "an unreachable workspace broker must abort the snapshot (fail-closed)"
     );
 }
+
+#[tokio::test]
+async fn wait_for_socket_returns_immediately_when_present() {
+    // A path that already exists (stand-in for the firecracker API socket)
+    // resolves on the first poll — the happy path is not slowed by the
+    // generous ceiling.
+    let f = tempfile::NamedTempFile::new().unwrap();
+    wait_for_socket_within(f.path(), Duration::from_secs(30))
+        .await
+        .expect("present socket must resolve immediately");
+}
+
+#[tokio::test]
+async fn wait_for_socket_times_out_with_actionable_error_when_absent() {
+    // An absent socket past the deadline yields the actionable "never appeared"
+    // error (a tiny timeout keeps the test fast; the real ceiling is 30s).
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("firecracker-fc-deadbeef.sock");
+    let err = wait_for_socket_within(&missing, Duration::from_millis(60))
+        .await
+        .expect_err("an absent socket past the deadline must error");
+    assert!(
+        err.to_string().contains("never appeared"),
+        "error should name the missing socket: {err}"
+    );
+}
