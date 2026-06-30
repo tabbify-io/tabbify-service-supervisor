@@ -251,13 +251,22 @@ impl RunnerLifecycle {
         // an unprovable digest must not BLOCK a deploy.)
         let serving = self.active.health().await == RuntimeHealth::Serving;
         if serving {
+            // The FC host identity (tap / api-sock / /30 link) is
+            // `blake3(uuid:reff)`, so a deploy whose ref STRING equals the live
+            // ref derives the IDENTICAL identity as the still-running VM. A
+            // coexist-swap onto that identity collides on the api-socket and
+            // fails "firecracker API socket never appeared" (the new VM cannot
+            // create a socket the live one already holds). A coexist-swap is
+            // therefore safe ONLY when `reff != current_ref`; when the ref is
+            // unchanged we must NOT rebuild unless we can PROVE the image moved.
+            let same_ref = self.current_ref.lock().await.as_deref() == Some(reff);
             let runner = self.digest_runner();
-            // `None` = anonymous resolve; the deploy guard only needs a
-            // digest, not auth (fail-open on any error is the existing contract).
+            // `None` = anonymous resolve; the deploy guard only needs a digest.
             match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None).await
             {
                 Ok(want) => {
-                    if Some(want.as_str()) == self.current_digest.lock().await.as_deref() {
+                    let current = self.current_digest.lock().await.clone();
+                    if Some(want.as_str()) == current.as_deref() {
                         tracing::info!(
                             uuid = %self.uuid,
                             reff = %reff,
@@ -266,9 +275,38 @@ impl RunnerLifecycle {
                         );
                         return Reply::Ok;
                     }
+                    // Same ref string but no recorded digest to disprove sameness
+                    // (e.g. post-respawn `current_digest = None`): a rebuild would
+                    // collide on the identical identity and we have no evidence the
+                    // image changed → no-op. (A KNOWN-moved digest still falls
+                    // through to rebuild — the TAB-10 moving-tag case, which needs
+                    // a distinct identity, is out of scope here.)
+                    if same_ref && current.is_none() {
+                        tracing::warn!(
+                            uuid = %self.uuid,
+                            reff = %reff,
+                            "deploy: ref already live, digest unknown — no-op (avoids same-identity FC tap collision)"
+                        );
+                        return Reply::Ok;
+                    }
                 }
                 Err(e) => {
-                    // Fail-open: resolve failed → do NOT short-circuit; rebuild.
+                    if same_ref {
+                        // Cannot prove the image moved AND the ref is unchanged → a
+                        // fail-open rebuild would collide on the identical
+                        // `uuid:reff` identity ("socket never appeared"). The safe
+                        // degradation is a no-op (keep serving the live VM); a new
+                        // image must ship under a NEW ref (commit SHA / digest),
+                        // which takes a distinct identity and swaps cleanly.
+                        tracing::warn!(
+                            uuid = %self.uuid,
+                            reff = %reff,
+                            error = %e,
+                            "deploy: digest unresolved + ref already live — no-op (avoids same-identity FC tap collision)"
+                        );
+                        return Reply::Ok;
+                    }
+                    // Different ref → fail-open rebuild is safe (distinct identity).
                     tracing::warn!(
                         uuid = %self.uuid,
                         reff = %reff,
@@ -758,18 +796,93 @@ mod tests {
         }
     }
 
-    /// FAIL-OPEN: when the digest cannot be resolved (registry flap), the guard
-    /// must NOT short-circuit even if `current_digest` is set — it must fall
-    /// through to a rebuild (a rebuild is always safe). Here the resolver fails
+    /// FAIL-OPEN (DIFFERENT ref): when the digest cannot be resolved (registry
+    /// flap) AND the requested ref differs from the live ref, the guard must NOT
+    /// short-circuit — a rebuild onto a DISTINCT `uuid:reff` identity is safe (no
+    /// tap collision), so it falls through to a rebuild. Here the resolver fails
     /// and the FC build then fails on the unroutable ref → Err.
     #[tokio::test]
-    async fn deploy_resolve_failure_fails_open_and_rebuilds() {
+    async fn deploy_resolve_failure_different_ref_fails_open_and_rebuilds() {
         const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let mut lc = fake_lifecycle(RuntimeHealth::Serving);
         lc.digest_resolver = Some(failing_digest_runner());
         *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
-        let live_ref = "[fd5a::1]:5000/acme/app:main";
+        *lc.current_ref.lock().await = Some("[fd5a::1]:5000/acme/app:oldsha".to_owned());
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                // DIFFERENT ref than the live one → distinct FC identity → a
+                // rebuild cannot collide, so fail-open rebuild is correct.
+                reff: "[fd5a::1]:5000/acme/app:newsha".to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        // Resolve failed + different ref → fail-open → rebuild attempted → FC
+        // build fails on the unreachable ref → Err (NOT a no-op Ok).
+        match reply {
+            Reply::Err { message } => assert!(
+                message.contains("deploy"),
+                "fail-open resolve (different ref) must attempt a rebuild (Err), got: {message}"
+            ),
+            other => panic!(
+                "fail-open (resolve error, different ref) must rebuild, never no-op; got {other:?}"
+            ),
+        }
+    }
+
+    /// COLLISION AVOIDANCE: when the digest cannot be resolved (registry flap
+    /// over the relay) AND the requested ref equals the live ref, a fail-open
+    /// rebuild would derive the IDENTICAL `uuid:reff` firecracker identity as the
+    /// still-running VM and collide on its api-socket ("socket never appeared").
+    /// Since we cannot prove the image moved and the ref is unchanged, the guard
+    /// must NO-OP (keep serving the live VM) — NOT fail open to a colliding
+    /// rebuild. This is the regression for the "Redeploy an unchanged commit"
+    /// deploy failure (the resolve fails over the flaky relay, the old fail-open
+    /// rebuilt onto the same identity, and the swap died "socket never appeared").
+    #[tokio::test]
+    async fn deploy_resolve_failure_same_ref_is_noop() {
+        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        lc.digest_resolver = Some(failing_digest_runner());
+        *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
+        let live_ref = "[fd5a::1]:5000/acme/app:6457e5c";
         *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        let before = lc.active.load();
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: live_ref.to_owned(), // SAME ref as live → identity would collide
+            },
+            &lc,
+        )
+        .await;
+
+        assert!(
+            matches!(reply, Reply::Ok),
+            "resolve-failure on the SAME live ref must no-op (avoid tap collision), got {reply:?}"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &lc.active.load()),
+            "same-ref no-op must NOT rebuild/swap the active runtime"
+        );
+    }
+
+    /// Same-ref + UNKNOWN current digest (`None`, e.g. post-respawn): even when
+    /// the resolve SUCCEEDS, there is no recorded digest to disprove sameness, so
+    /// a rebuild onto the identical identity must be avoided → no-op.
+    #[tokio::test]
+    async fn deploy_same_ref_unknown_current_digest_is_noop() {
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        lc.digest_resolver = Some(fake_digest_runner(
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        ));
+        // No recorded digest (post-respawn): cannot disprove sameness.
+        *lc.current_digest.lock().await = None;
+        let live_ref = "[fd5a::1]:5000/acme/app:6457e5c";
+        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        let before = lc.active.load();
 
         let reply = dispatch(
             Cmd::Deploy {
@@ -779,17 +892,14 @@ mod tests {
         )
         .await;
 
-        // Resolve failed → fail-open → rebuild attempted → FC build fails on the
-        // unreachable ref → Err (NOT a no-op Ok).
-        match reply {
-            Reply::Err { message } => assert!(
-                message.contains("deploy"),
-                "fail-open resolve must attempt a rebuild (Err), got: {message}"
-            ),
-            other => panic!(
-                "fail-open (resolve error) must rebuild, never no-op; got {other:?}"
-            ),
-        }
+        assert!(
+            matches!(reply, Reply::Ok),
+            "same-ref deploy with unknown current digest must no-op (avoid collision), got {reply:?}"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &lc.active.load()),
+            "same-ref/unknown-digest no-op must NOT rebuild/swap the active runtime"
+        );
     }
 
     /// The same-ref guard does NOT short-circuit when the active runtime is
