@@ -932,6 +932,13 @@ pub fn render_init(entry: &Entrypoint, cap_files: &[(String, String)]) -> Result
          mount -t proc proc /proc 2>/dev/null || true\n\
          mount -t sysfs sysfs /sys 2>/dev/null || true\n\
          mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null || true\n\
+         # devtmpfs can be unavailable (empty tmpfs fallback above); ensure the\n\
+         # core character devices exist so tools reading /dev/urandom (e.g. git\n\
+         # on repo create) don't fail with ENOENT.\n\
+         [ -e /dev/null ] || mknod -m 666 /dev/null c 1 3 2>/dev/null || true\n\
+         [ -e /dev/zero ] || mknod -m 666 /dev/zero c 1 5 2>/dev/null || true\n\
+         [ -e /dev/random ] || mknod -m 666 /dev/random c 1 8 2>/dev/null || true\n\
+         [ -e /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true\n\
          # eth0 is configured by the kernel ip= boot-arg; verify it came up.\n\
          if [ ! -e /sys/class/net/eth0 ]; then\n\
          \techo 'tabbify-init: eth0 missing (kernel ip= boot-arg did not configure it)' >&2\n\

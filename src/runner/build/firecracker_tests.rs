@@ -159,6 +159,12 @@ fn render_init_exec_form_mounts_env_workdir_and_execs() {
     assert!(init.contains("mount -t proc"), "mounts /proc; got:\n{init}");
     assert!(init.contains("mount -t sysfs"), "mounts /sys; got:\n{init}");
     assert!(init.contains("/dev"), "mounts /dev; got:\n{init}");
+    // Core device nodes are created if devtmpfs is unavailable, so git (repo
+    // create) can read /dev/urandom instead of failing with ENOENT.
+    assert!(
+        init.contains("mknod -m 666 /dev/urandom c 1 9"),
+        "creates /dev/urandom fallback; got:\n{init}"
+    );
     // eth0 is configured by the kernel ip= boot-arg; init only verifies it.
     assert!(
         init.contains("ip link show eth0") || init.contains("/sys/class/net/eth0"),
