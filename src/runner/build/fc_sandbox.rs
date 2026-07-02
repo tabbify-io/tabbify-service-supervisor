@@ -44,7 +44,7 @@ const CACHE_MIB: u64 = 20 * 1024;
 /// ref is `<registry_ula>/<this>` — the registry host comes per-job, so no
 /// address is baked here. Override the repo path via
 /// `SUPERVISOR_BUILD_TOOLCHAIN` (e.g. to pin a digest while testing).
-pub const TOOLCHAIN_REPO: &str = "tabbify/buildkit-toolchain:v1";
+pub const TOOLCHAIN_REPO: &str = "platform/buildkit-toolchain:v1";
 
 /// `true` when this supervisor should build inside Firecracker sandboxes.
 ///
@@ -602,7 +602,7 @@ mod tests {
     fn toolchain_ref_composes_registry_and_repo() {
         // NB: do not set SUPERVISOR_BUILD_TOOLCHAIN in the test env.
         let r = toolchain_ref("[fd5a:1f00:0:3::1]:5000");
-        assert_eq!(r, "[fd5a:1f00:0:3::1]:5000/tabbify/buildkit-toolchain:v1");
+        assert_eq!(r, "[fd5a:1f00:0:3::1]:5000/platform/buildkit-toolchain:v1");
     }
 
     /// `tree_size` must NOT follow symlinks (a symlink to a huge/forbidden
