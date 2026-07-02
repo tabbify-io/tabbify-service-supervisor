@@ -899,6 +899,22 @@ pub fn render_init(entry: &Entrypoint, cap_files: &[(String, String)]) -> Result
         .collect::<Vec<_>>()
         .join(" ");
 
+    // The generic wrapper this function renders is itself injected at /init (see
+    // `inject_init`). If the image's own entrypoint ALSO resolves to /init, the
+    // `exec {exec_line}` at the tail re-execs THIS wrapper forever — a silent
+    // PID-1 recursion that never starts the app: readiness times out at 30s and
+    // the FC respawns in a loop, with ZERO userspace console output. Fail LOUD at
+    // conversion time instead of shipping a workspace that hangs invisibly.
+    if argv.first().map(String::as_str) == Some("/init") {
+        bail!(
+            "image ENTRYPOINT/CMD resolves to '/init', which collides with the \
+             reserved generic-FC init slot: the supervisor injects its PID-1 \
+             wrapper at /init and execs the entrypoint, so '/init' would exec the \
+             wrapper itself and loop forever. Rename the image's init to a \
+             distinct path, e.g. /usr/local/bin/<name>."
+        );
+    }
+
     // `export KEY=<single-quoted value>`: split only on the FIRST `=` so values
     // containing `=` stay intact, and single-quote the value so a space / glob /
     // `$` does not get re-interpreted by the shell. A malformed entry without an

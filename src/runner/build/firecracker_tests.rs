@@ -331,6 +331,45 @@ fn render_init_shell_form_returns_clear_error() {
     );
 }
 
+/// The generic wrapper `render_init` produces is itself injected at `/init`
+/// (`inject_init`). An image whose OWN entrypoint is `/init` makes the wrapper
+/// `exec /init` re-exec itself forever — a silent boot recursion that never
+/// readies (observed live: the workspace image hung invisibly in a 30s respawn
+/// loop with zero console output). `render_init` must reject `/init` LOUDLY at
+/// conversion time instead of shipping a workspace that hangs.
+#[test]
+fn render_init_rejects_reserved_init_entrypoint() {
+    let exec = OciExec {
+        entrypoint: vec!["/init".to_owned()],
+        cmd: vec![],
+        env: vec![],
+        workdir: "/".to_owned(),
+    };
+    let err = render_init(&Entrypoint::Exec(exec), &[]).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("/init") && msg.contains("collide"),
+        "must clearly flag the /init collision; got: {err}"
+    );
+}
+
+/// A distinct init path (the fix the workspace + devbox images use) must NOT
+/// trip the `/init` collision guard and must exec that path as PID 1.
+#[test]
+fn render_init_allows_distinct_init_path() {
+    let exec = OciExec {
+        entrypoint: vec!["/usr/local/bin/tabbify-workspace-init".to_owned()],
+        cmd: vec![],
+        env: vec![],
+        workdir: "/".to_owned(),
+    };
+    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    assert!(
+        init.contains("exec '/usr/local/bin/tabbify-workspace-init'"),
+        "must exec the distinct init path; got:\n{init}"
+    );
+}
+
 // ── extra_env: deploy-time vars baked into the guest /init ───────────────
 
 /// `merge_extra_env` — the EXACT primitive `resolve_rootfs` calls before
