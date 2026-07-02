@@ -4,7 +4,7 @@
 //!
 //! Flow (host side):
 //! 1. ensure the buildkit TOOLCHAIN rootfs (digest-cached conversion of the
-//!    `tabbify/buildkit-toolchain` image from the mesh registry);
+//!    `platform/buildkit-toolchain` image from the mesh registry);
 //! 2. stage a per-build SCRATCH ext4: the HOST-cloned source rides IN under
 //!    `src/` (the clone token never enters the guest), `out/` rides the
 //!    result OUT (`mkfs.ext4 -d` populates without a mount);
