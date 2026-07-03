@@ -200,6 +200,17 @@ pub struct Orchestrator {
     /// same per-uuid lock. Entries are never removed — an empty mutex per app
     /// ever deployed is negligible and removal would race a waiting deployer.
     deploy_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-uuid image-pull progress observed by the monitor (bytes landed in the
+    /// runner's `.pull` layout dir + when they last GREW). Drives the
+    /// PROGRESS-BASED reap deferral in [`monitor`]: a pull that keeps making
+    /// byte-progress is deferred indefinitely (a 400+ MB base image over a
+    /// few-Mbit home link legitimately needs 20+ min — killing it mid-flight
+    /// forces a from-scratch re-pull that can NEVER converge, the livelock that
+    /// took MSI's control plane down), while a pull with ZERO progress for a
+    /// full stall window is genuinely wedged and reaped. Same sharing model as
+    /// `deploying` (std Mutex, never held across an await); entries are cleared
+    /// when the monitor observes the pull gone.
+    pull_progress: Arc<Mutex<HashMap<String, monitor::PullProgress>>>,
 }
 
 /// RAII guard that removes a uuid from the orchestrator's in-flight-deploy set
@@ -229,6 +240,7 @@ impl Orchestrator {
             runner_dir,
             deploying: Arc::new(Mutex::new(HashSet::new())),
             deploy_locks: Arc::new(Mutex::new(HashMap::new())),
+            pull_progress: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

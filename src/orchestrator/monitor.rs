@@ -196,13 +196,20 @@ pub(crate) fn decide_pid_grace(
 /// per tick past the backoff window rather than per raw spawn attempt.
 pub const CRASH_LOOP_PARK_THRESHOLD: u32 = 10;
 
-/// Generous upper bound (seconds since spawn) for deferring the reap of a
-/// runner whose control socket is not healthy YET because it is still PULLING
-/// its image. A dev/FC image pull goes over the relay-only mesh, which on a
-/// slow home-NAT worker can take minutes; without this the monitor kills the
-/// runner mid-pull, the replacement re-pulls from scratch, and the runner never
-/// converges (an endless respawn loop). Bounded so a genuinely wedged pull is
-/// still eventually reaped via the normal path.
+/// STALL window (seconds of ZERO byte-progress) after which an in-flight image
+/// pull is considered wedged and the runner is reaped via the normal path.
+///
+/// The deferral is PROGRESS-based, not age-based: a pull whose `.pull` layout
+/// dir keeps GROWING is deferred indefinitely — a 400+ MB base image over a
+/// few-Mbit home link legitimately needs 20+ minutes, and the old fixed
+/// 600-seconds-since-spawn cap killed exactly those pulls mid-flight. Each kill
+/// orphaned the live `oras` child (reparented to PID 1, still downloading) and
+/// the respawned runner started ANOTHER from-scratch pull beside it — piling up
+/// concurrent pulls that divided the link until none could ever finish, while
+/// the saturated link black-holed the host's whole mesh control plane (the MSI
+/// outage of 2026-07-03). Progress ⇒ defer; a full window with zero new bytes ⇒
+/// genuinely wedged ⇒ reap (and the reap now also kills the pull process — see
+/// [`kill_fc_child_for_uuid`]).
 pub const PULL_GRACE_SECS: u64 = 600;
 
 /// Send `SIGKILL` to `pid`. Best-effort: logs on failure (e.g. permission
@@ -337,6 +344,14 @@ fn fc_tap_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
 /// Exposed as `pub(crate)` so `purge_app` / `stop_app` reuse the same reaping
 /// logic (FIX C: purge must also reap the FC orphan).
 pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Option<&str>) {
+    // Reap any in-flight/orphaned image pull FIRST: a SIGKILLed runner does not
+    // take its `oras` child with it (it reparents to PID 1 and keeps
+    // downloading), and a respawn would start a SECOND from-scratch pull beside
+    // it — on a slow link the accumulated orphans divide the bandwidth until no
+    // pull can finish while saturating the host's mesh (the 2026-07-03 MSI
+    // outage). Every per-uuid teardown (park / respawn / stop / purge / hung
+    // reap) funnels through here, so this is the single choke point.
+    kill_pull_procs_for_uuid(data_dir, uuid);
     if let Some(fc_pid) = pidfile::take(data_dir, uuid) {
         tracing::info!(
             uuid,
@@ -395,28 +410,145 @@ fn cmdline_matches_pull(cmdline: &[u8], needle: &str) -> bool {
 /// genuinely hung). Linux-only (scans `/proc`); returns `false` elsewhere,
 /// which is fine — FC runners only run on Linux.
 fn pull_in_progress(data_dir: &Path, uuid: &str) -> bool {
+    !pull_pids_for_uuid(data_dir, uuid).is_empty()
+}
+
+/// The pids of every live process whose cmdline references `uuid`'s `.pull`
+/// OCI-layout path — i.e. the in-flight `oras copy` for this runner (plus any
+/// orphan a prior runner death left behind). Linux-only (`/proc` scan); empty
+/// elsewhere. Never includes the supervisor itself (its argv carries no
+/// per-uuid pull path).
+fn pull_pids_for_uuid(data_dir: &Path, uuid: &str) -> Vec<u32> {
     let Some(needle) = pull_path_needle(data_dir, uuid) else {
-        return false;
+        return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
+        return Vec::new();
     };
+    let mut pids = Vec::new();
     for entry in entries.flatten() {
         // Only numeric `/proc/<pid>` entries carry a `cmdline`.
-        if !entry
+        let Some(pid) = entry
             .file_name()
             .to_str()
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        {
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
-        }
+        };
         if let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) {
             if cmdline_matches_pull(&bytes, &needle) {
-                return true;
+                pids.push(pid);
             }
         }
     }
-    false
+    pids
+}
+
+/// SIGKILL every live pull process for `uuid` (the in-flight `oras copy` and
+/// any orphan a prior runner death reparented to PID 1). Returns the count
+/// killed.
+///
+/// A SIGKILLed runner does NOT take its `oras` child with it: the child
+/// reparents to PID 1 and keeps downloading at full tilt for tens of minutes —
+/// and the respawned runner then starts ANOTHER from-scratch pull beside it.
+/// On a slow home link the accumulated orphans divide the bandwidth until no
+/// pull can ever finish, and the saturated link black-holes the host's whole
+/// mesh control plane (the MSI outage of 2026-07-03: three concurrent 420 MB
+/// pulls of the same digest). Every per-uuid teardown must therefore reap the
+/// pull processes alongside the FC child.
+fn kill_pull_procs_for_uuid(data_dir: &Path, uuid: &str) -> usize {
+    let pids = pull_pids_for_uuid(data_dir, uuid);
+    for &pid in &pids {
+        tracing::info!(
+            uuid,
+            pid,
+            "killing in-flight/orphaned image pull before teardown/respawn"
+        );
+        kill_pid(pid);
+    }
+    pids.len()
+}
+
+/// Byte-progress snapshot of one runner's in-flight image pull: how many bytes
+/// its `.pull` layout dir held when last observed, and the monotonic second at
+/// which that number last GREW. Drives the progress-based reap deferral
+/// ([`pull_stall_update`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullProgress {
+    /// Bytes under `<data_dir>/apps/<uuid>/fc/.pull` at the last observation.
+    pub bytes: u64,
+    /// `now_secs` of the last observation at which `bytes` CHANGED (or the
+    /// first observation). The stall clock: `now - last_progress_secs`
+    /// compares against [`PULL_GRACE_SECS`].
+    pub last_progress_secs: u64,
+}
+
+/// Pure progress-vs-stall decision for one monitor tick (testable).
+///
+/// Given the previous snapshot (if any), the layout dir's CURRENT byte count,
+/// and the tick time, returns the snapshot to store plus `defer`:
+/// * first observation ⇒ start the stall clock, defer;
+/// * `cur_bytes` CHANGED (grew: blobs landing; shrank: the stage dir was wiped
+///   for a fresh attempt, or a stale snapshot lingering from a PRIOR pull
+///   episode meets a from-scratch re-pull) ⇒ activity — restamp the clock,
+///   defer. Progress defers INDEFINITELY by design: however slow the link, a
+///   growing pull converges, while killing it forces a from-scratch re-pull
+///   that may never converge (the livelock this replaces). Restamp-on-change
+///   cannot be gamed into infinite deferral by kill→re-pull cycling — that
+///   cycling advances the restart ladder and trips the
+///   [`CRASH_LOOP_PARK_THRESHOLD`] breaker like any other respawn loop;
+/// * byte count UNCHANGED within [`PULL_GRACE_SECS`] of the last change ⇒
+///   still defer (blob data arrives in bursts; a quiet spell is not a wedge);
+/// * unchanged for a full window ⇒ genuinely wedged ⇒ `defer = false` (reap).
+#[must_use]
+pub const fn pull_stall_update(
+    prev: Option<PullProgress>,
+    cur_bytes: u64,
+    now_secs: u64,
+    stall_secs: u64,
+) -> (PullProgress, bool) {
+    match prev {
+        Some(p) if cur_bytes == p.bytes => {
+            (p, now_secs.saturating_sub(p.last_progress_secs) < stall_secs)
+        }
+        // First observation, or the byte count MOVED since the last one.
+        _ => (
+            PullProgress {
+                bytes: cur_bytes,
+                last_progress_secs: now_secs,
+            },
+            true,
+        ),
+    }
+}
+
+/// Total bytes under `dir`, recursively. `0` for a missing/unreadable dir —
+/// indistinguishable from an empty pull, which is exactly the conservative
+/// reading the stall clock wants (no bytes ⇒ no progress). Symlinks are not
+/// followed (the pull layout contains none; not following is the safe default).
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path()));
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// The dir whose growth measures pull progress: the runner's whole `.pull`
+/// staging area (`<data_dir>/apps/<uuid>/fc/.pull` — the same token
+/// [`pull_path_needle`] matches in the puller's argv), so blobs land in it
+/// whatever the layout sub-dir is named.
+fn pull_stage_dir(data_dir: &Path, uuid: &str) -> std::path::PathBuf {
+    data_dir.join("apps").join(uuid).join("fc").join(".pull")
 }
 
 // ── F2.2 (audit #93) — record-less FC orphan sweep ───────────────────────────
@@ -649,6 +781,34 @@ impl Orchestrator {
             .unwrap_or(true) // can't tell ⇒ assume yes (protect build socket)
     }
 
+    /// Progress-based reap deferral for a runner whose control socket is not
+    /// up because it is still PULLING its image (see [`PULL_GRACE_SECS`]).
+    ///
+    /// Returns `true` (defer the reap) while a pull process is live for `uuid`
+    /// AND it has made byte-progress within the stall window; `false` when no
+    /// pull is running (also clears the tracker entry) or the pull has stalled
+    /// for a full window (genuinely wedged — the normal reap path then also
+    /// kills the pull process via [`kill_fc_child_for_uuid`]).
+    fn pull_deferral_active(&self, uuid: &str, now_secs: u64) -> bool {
+        if !pull_in_progress(&self.shared.data_dir, uuid) {
+            if let Ok(mut map) = self.pull_progress.lock() {
+                map.remove(uuid);
+            }
+            return false;
+        }
+        let cur_bytes = dir_size_bytes(&pull_stage_dir(&self.shared.data_dir, uuid));
+        let Ok(mut map) = self.pull_progress.lock() else {
+            // Poisoned tracker (a panic elsewhere): fail toward DEFERRING — a
+            // spurious extra tick of grace is harmless, killing a live pull
+            // restarts a multi-minute download from scratch.
+            return true;
+        };
+        let prev = map.get(uuid).copied();
+        let (next, defer) = pull_stall_update(prev, cur_bytes, now_secs, PULL_GRACE_SECS);
+        map.insert(uuid.to_owned(), next);
+        defer
+    }
+
     /// Run ONE monitor pass over every recorded runner: probe liveness and
     /// respawn any that are dead (adopt the living ones untouched).
     ///
@@ -812,22 +972,23 @@ impl Orchestrator {
                         "deploy in progress; deferring reap (runner busy mid-deploy)"
                     );
                     RecordOutcome::Adopted
-                } else if pull_in_progress(&self.shared.data_dir, &record.uuid)
-                    && now_secs.saturating_sub(record.spawned_at) < PULL_GRACE_SECS
-                {
+                } else if self.pull_deferral_active(&record.uuid, now_secs) {
                     // The control socket is not up yet because the runner is
                     // STILL PULLING its image over the (slow, relay-only) mesh —
                     // not hung. Reaping now kills the in-flight `oras` pull; the
                     // replacement re-pulls from scratch and the runner never
                     // converges (an endless respawn loop on a slow link). Defer
-                    // until the pull finishes (socket comes up) or the generous
-                    // PULL_GRACE_SECS cap elapses (a genuinely wedged pull is
-                    // then reaped via the normal path).
+                    // for as long as the pull keeps making BYTE-PROGRESS —
+                    // however slow the link, a growing pull converges — and
+                    // reap only once it has stalled for a full
+                    // [`PULL_GRACE_SECS`] window (genuinely wedged; the reap
+                    // then also kills the pull process so no orphan keeps
+                    // eating the link).
                     tracing::info!(
                         uuid = %record.uuid,
                         pid = record.pid,
                         age_secs = now_secs.saturating_sub(record.spawned_at),
-                        "image pull in progress over slow relay — deferring reap"
+                        "image pull in progress and making progress — deferring reap"
                     );
                     RecordOutcome::Adopted
                 } else {
@@ -1023,6 +1184,95 @@ mod tests {
     #[test]
     fn cmdline_matches_pull_is_false_for_empty_needle() {
         assert!(!cmdline_matches_pull(b"anything", ""));
+    }
+
+    // ── progress-based pull-stall clock (slow-link livelock fix) ──────────────
+
+    /// First observation and every byte-count CHANGE defer and (re)stamp the
+    /// stall clock — a growing pull on an arbitrarily slow link is never
+    /// reaped (killing it forces a from-scratch re-pull that may never
+    /// converge; the 2026-07-03 MSI livelock).
+    #[test]
+    fn pull_stall_update_defers_on_first_observation_and_growth() {
+        // First observation: clock starts, defer.
+        let (s1, defer) = pull_stall_update(None, 1_000, 100, PULL_GRACE_SECS);
+        assert!(defer, "first observation must defer");
+        assert_eq!(s1, PullProgress { bytes: 1_000, last_progress_secs: 100 });
+        // Growth: restamp, defer — even if the previous stamp is ancient.
+        let old = PullProgress { bytes: 1_000, last_progress_secs: 100 };
+        let (s2, defer) =
+            pull_stall_update(Some(old), 2_000, 100 + 10 * PULL_GRACE_SECS, PULL_GRACE_SECS);
+        assert!(defer, "byte growth must defer regardless of elapsed time");
+        assert_eq!(s2.bytes, 2_000);
+        assert_eq!(s2.last_progress_secs, 100 + 10 * PULL_GRACE_SECS);
+    }
+
+    /// An UNCHANGED byte count within the stall window still defers (blobs
+    /// arrive in bursts; a quiet spell is not a wedge) and keeps the ORIGINAL
+    /// stamp so the window is not self-extending.
+    #[test]
+    fn pull_stall_update_defers_within_stall_window_without_growth() {
+        let prev = PullProgress { bytes: 5_000, last_progress_secs: 100 };
+        let (s, defer) =
+            pull_stall_update(Some(prev), 5_000, 100 + PULL_GRACE_SECS - 1, PULL_GRACE_SECS);
+        assert!(defer, "quiet spell inside the window must defer");
+        assert_eq!(s, prev, "no-change must keep the original stamp (no self-extension)");
+    }
+
+    /// A full stall window with ZERO byte change is a genuinely wedged pull —
+    /// `defer = false` hands the runner to the normal reap path (which also
+    /// kills the pull process via `kill_fc_child_for_uuid`).
+    #[test]
+    fn pull_stall_update_reaps_after_full_stall_window() {
+        let prev = PullProgress { bytes: 5_000, last_progress_secs: 100 };
+        let (_, defer) =
+            pull_stall_update(Some(prev), 5_000, 100 + PULL_GRACE_SECS, PULL_GRACE_SECS);
+        assert!(!defer, "a full window of zero progress must stop deferring");
+    }
+
+    /// A SHRINK (stage dir wiped for a fresh attempt, or a stale snapshot from
+    /// a PRIOR pull episode meeting a from-scratch re-pull) counts as activity:
+    /// restamp + defer, so a fresh pull never inherits a long-expired clock and
+    /// gets reaped on its very first tick.
+    #[test]
+    fn pull_stall_update_restamps_on_shrink_fresh_attempt() {
+        let stale = PullProgress { bytes: 400_000_000, last_progress_secs: 100 };
+        let (s, defer) =
+            pull_stall_update(Some(stale), 64, 100 + 10 * PULL_GRACE_SECS, PULL_GRACE_SECS);
+        assert!(defer, "a fresh from-scratch pull must get its own stall window");
+        assert_eq!(s.bytes, 64);
+        assert_eq!(s.last_progress_secs, 100 + 10 * PULL_GRACE_SECS);
+    }
+
+    /// `dir_size_bytes` sums files recursively and reads a missing dir as `0`
+    /// (no bytes ⇒ no progress — the conservative reading the stall clock
+    /// wants).
+    #[test]
+    fn dir_size_bytes_sums_nested_files_and_zero_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("blobs/sha256")).unwrap();
+        std::fs::write(tmp.path().join("index.json"), vec![0u8; 10]).unwrap();
+        std::fs::write(tmp.path().join("blobs/sha256/aa"), vec![0u8; 90]).unwrap();
+        assert_eq!(dir_size_bytes(tmp.path()), 100, "nested files must sum");
+        assert_eq!(
+            dir_size_bytes(&tmp.path().join("does-not-exist")),
+            0,
+            "missing dir reads as zero bytes"
+        );
+    }
+
+    /// The dir measured for PROGRESS and the argv token matched for LIVENESS
+    /// must be the same path — if they drift apart, the stall clock measures a
+    /// dir no pull writes to and every slow pull reads as wedged again.
+    #[test]
+    fn pull_stage_dir_is_the_needle_path() {
+        let data_dir = Path::new("/opt/tabbify/data");
+        let needle = pull_path_needle(data_dir, "abc-123").unwrap();
+        assert_eq!(
+            pull_stage_dir(data_dir, "abc-123").to_str().unwrap(),
+            needle,
+            "progress dir and liveness needle must be the same path"
+        );
     }
 
     // ── F2.2 record-less FC orphan sweep (audit #93) — SAFETY-CRITICAL gate ────
