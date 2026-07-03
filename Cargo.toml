@@ -1,6 +1,6 @@
 [package]
 name = "tabbify-service-supervisor"
-version = "1.4.87"
+version = "1.4.88"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -29,7 +29,7 @@ all = { level = "warn", priority = -1 }
 [dependencies]
 # Mesh membership (joiner-side library), pinned to the mesh release rev.
 # Public mesh repo → keyless https fetch (CI + local), no deploy key needed.
-mesh-joiner = { git = "https://github.com/tabbify-io/tabbify-service-mesh.git", package = "tabbify-mesh-joiner", rev = "3ec1b2581c3402b838add557c4ceb796a89ebf8e" }
+mesh-joiner = { git = "https://github.com/tabbify-io/tabbify-service-mesh.git", package = "tabbify-mesh-joiner", rev = "40e6dcd14646b5d61a50f7494a342230f832d4de" }
 
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }
