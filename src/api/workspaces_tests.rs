@@ -19,6 +19,68 @@
         );
     }
 
+    /// `insert_forge_env` injects EXACTLY the two keys the in-FC broker's
+    /// `ForgeCfg::from_env` requires — and omits each when `None` (an older node
+    /// / no forge), so forge ops report an honest "forge not configured" instead
+    /// of dialing a bogus endpoint. Neither key is snapshot-forbidden (they are
+    /// non-secret; the creds ride the cap-file channel).
+    #[test]
+    fn insert_forge_env_injects_url_and_org_and_omits_when_none() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        insert_forge_env(
+            &mut env,
+            &Some("http://[fd5a:1f02::1]:8730".to_owned()),
+            &Some("t_acme".to_owned()),
+        );
+        assert_eq!(
+            env.get("TABBIFY_FORGE_URL").unwrap(),
+            "http://[fd5a:1f02::1]:8730"
+        );
+        assert_eq!(env.get("TABBIFY_FORGE_ORG").unwrap(), "t_acme");
+        // The pair must survive the snapshot env-safety guard (it is baked into
+        // /init and frozen into the workspace's Full snapshot by design).
+        for key in crate::firecracker::snapshot_decision::snapshot_forbidden_env_keys() {
+            assert!(!env.contains_key(*key), "{key} must not be injected");
+        }
+
+        // None ⇒ omitted (never an empty-string env the broker would misread).
+        let mut empty: HashMap<String, String> = HashMap::new();
+        insert_forge_env(&mut empty, &None, &None);
+        assert!(!empty.contains_key("TABBIFY_FORGE_URL"));
+        assert!(!empty.contains_key("TABBIFY_FORGE_ORG"));
+    }
+
+    /// Rollout-order safety: a create body WITHOUT the forge_url/forge_org keys
+    /// (an older node) deserializes with both `None`, and one WITH them carries
+    /// the values — plain serde `#[serde(default)]`, no deny_unknown_fields.
+    #[test]
+    fn create_body_forge_fields_are_optional_and_carried() {
+        let legacy: CreateWorkspaceBody = serde_json::from_value(serde_json::json!({
+            "user_id": "acct_a",
+            "image_ref": "reg/ws:latest",
+            "repos": [],
+            "authorized_key": "ssh-ed25519 AAAA node",
+        }))
+        .unwrap();
+        assert!(legacy.forge_url.is_none());
+        assert!(legacy.forge_org.is_none());
+
+        let with_forge: CreateWorkspaceBody = serde_json::from_value(serde_json::json!({
+            "user_id": "acct_a",
+            "image_ref": "reg/ws:latest",
+            "repos": [],
+            "authorized_key": "ssh-ed25519 AAAA node",
+            "forge_url": "http://[fd5a:1f02::1]:8730",
+            "forge_org": "t_acme",
+        }))
+        .unwrap();
+        assert_eq!(
+            with_forge.forge_url.as_deref(),
+            Some("http://[fd5a:1f02::1]:8730")
+        );
+        assert_eq!(with_forge.forge_org.as_deref(), Some("t_acme"));
+    }
+
     /// The registry stores N caps for one workspace and returns them all.
     #[test]
     fn registry_holds_n_caps() {

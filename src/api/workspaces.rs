@@ -118,6 +118,29 @@ fn merge_cap_into_env(
     );
 }
 
+/// Insert the broker's forge ENDPOINT config into the workspace boot env:
+/// `TABBIFY_FORGE_URL` + `TABBIFY_FORGE_ORG` (§12 S1/S2). These two keys are
+/// exactly what the in-FC broker's `ForgeCfg::from_env` requires; without them
+/// every forge op fails "forge not configured" even when the creds cap-file is
+/// present. Both are NON-secret (a mesh address + the tenant slug — the CREDS
+/// ride the 0600 cap-file channel instead), so the env channel is safe: neither
+/// key is in
+/// [`crate::firecracker::snapshot_decision::snapshot_forbidden_env_keys`].
+/// `None` ⇒ the key is omitted (no forge / an older node) — forge ops then
+/// honestly report unconfigured rather than dialing a bogus endpoint.
+fn insert_forge_env(
+    extra_env: &mut HashMap<String, String>,
+    forge_url: &Option<String>,
+    forge_org: &Option<String>,
+) {
+    if let Some(url) = forge_url {
+        extra_env.insert("TABBIFY_FORGE_URL".to_owned(), url.clone());
+    }
+    if let Some(org) = forge_org {
+        extra_env.insert("TABBIFY_FORGE_ORG".to_owned(), org.clone());
+    }
+}
+
 /// The reserved cap-file name for the §12-S6 authorized-keys cap (the `:8732`
 /// add-key bearer token). Written by the runner as a 0600 broker-uid file under
 /// `/run/tabbify/caps/` (same off-env channel as the git caps / forge-admin
@@ -181,6 +204,21 @@ pub struct CreateWorkspaceBody {
     /// in-mesh forge org yet (the common MVP case). NEVER in agent env.
     #[serde(default)]
     pub forge_admin_token: Option<String>,
+    /// Mesh-internal Forgejo base URL — injected into the FC env as
+    /// `TABBIFY_FORGE_URL` so the broker's `ForgeCfg::from_env` resolves.
+    /// NON-secret (a mesh address), so the env channel is safe (not in
+    /// [`crate::firecracker::snapshot_decision::snapshot_forbidden_env_keys`]).
+    /// `None` (an older node / no forge configured) ⇒ no env key — forge ops
+    /// honestly report unconfigured.
+    #[schema(example = "http://[fd5a:1f02::1]:8730")]
+    #[serde(default)]
+    pub forge_url: Option<String>,
+    /// The account's forge org slug — injected as `TABBIFY_FORGE_ORG` (the org
+    /// the broker provisions/lists repos under; never agent-supplied). NON-secret
+    /// (the tenant slug).
+    #[schema(example = "t_acme")]
+    #[serde(default)]
+    pub forge_org: Option<String>,
     /// Tenant network slug (optional).
     #[serde(default)]
     pub network: Option<String>,
@@ -427,6 +465,9 @@ pub async fn create_workspace(
         "TABBIFY_DEVBOX_AUTHORIZED_KEY".to_owned(),
         body.authorized_key.clone(),
     );
+    // The broker's forge ENDPOINT config (§12 S1/S2): URL + org slug ride the
+    // env channel (non-secret; the CREDS ride the cap-file above).
+    insert_forge_env(&mut extra_env, &body.forge_url, &body.forge_org);
     if !cap_files.is_empty() {
         // serde_json::to_string of a Map never fails (all values are strings).
         extra_env.insert(
