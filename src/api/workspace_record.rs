@@ -23,7 +23,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::{GitSessionEntry, GitSessions};
+use crate::api::dev_session_record::unix_to_instant;
+use crate::api::{GitSessionEntry, GitSessions, Workspace, WorkspaceRegistry};
 use crate::orchestrator::handle::RunnerHandle;
 
 /// `extra_env` key that marks a [`RunnerHandle`] as a WORKSPACE FC (distinct
@@ -156,14 +157,23 @@ pub struct ReadoptWorkspaceSummary {
 ///
 /// For every on-disk [`WorkspaceRecord`] whose workspace VM is still alive (a
 /// [`RunnerHandle`] carrying [`WORKSPACE_MARKER_ENV`], keyed by the
-/// `workspace_uuid` == the runner uuid), re-register EVERY cap into
-/// `git_sessions` with an already-expired placeholder token (the node's token
-/// sweep restores them). A record whose VM is gone is GC'd.
+/// `workspace_uuid` == the runner uuid):
+/// - re-register EVERY cap into `git_sessions` with an already-expired
+///   placeholder token (the node's token sweep restores them), AND
+/// - re-insert the [`Workspace`] into the in-memory [`WorkspaceRegistry`] with
+///   the SAME caps, so the re-adopt is SYMMETRIC with `create_workspace`.
+///
+/// Without the registry re-insert, after a restart `caps_of(uuid)` would be
+/// `None` for every live workspace, so `add_workspace_repo` / `snapshot` /
+/// `delete` would 404 even though the FC is alive (the re-adopt desync #109).
+///
+/// A record whose VM is gone is GC'd.
 ///
 /// Infallible: all I/O errors are logged and treated as "nothing to adopt".
 pub fn readopt_workspaces(
     runner_dir: &Path,
     git_sessions: &GitSessions,
+    workspaces: &WorkspaceRegistry,
 ) -> ReadoptWorkspaceSummary {
     let mut summary = ReadoptWorkspaceSummary::default();
 
@@ -205,6 +215,19 @@ pub fn readopt_workspaces(
                 },
             );
         }
+        // SYMMETRIC with create_workspace: re-populate the in-memory registry so
+        // `caps_of(uuid)` is Some again → add_repo/snapshot/delete resolve the
+        // live workspace WITHOUT a re-create. Caps are the SAME set persisted in
+        // the record (already carries prior add_repo caps), so a later add_repo
+        // MERGES onto the correct base. Timestamps reconstructed from the record's
+        // unix seconds (cosmetic age only; a workspace is never idle-reaped).
+        workspaces.insert(Workspace {
+            workspace_uuid: rec.workspace_uuid.clone(),
+            user_id: rec.user_id.clone(),
+            caps: rec.caps.iter().map(|c| c.cap.clone()).collect(),
+            created_at: unix_to_instant(rec.created_at_unix),
+            last_activity: unix_to_instant(rec.last_activity_unix),
+        });
         summary.adopted += 1;
     }
 
@@ -314,7 +337,8 @@ mod tests {
         .unwrap();
 
         let git = GitSessions::default();
-        let summary = readopt_workspaces(dir.path(), &git);
+        let ws_reg = WorkspaceRegistry::default();
+        let summary = readopt_workspaces(dir.path(), &git, &ws_reg);
 
         assert_eq!(summary.adopted, 1);
         assert_eq!(summary.gc, 0);
@@ -338,11 +362,39 @@ mod tests {
         record("ws-gone", &[("c", "u")]).save(dir.path()).unwrap();
 
         let git = GitSessions::default();
-        let summary = readopt_workspaces(dir.path(), &git);
+        let ws_reg = WorkspaceRegistry::default();
+        let summary = readopt_workspaces(dir.path(), &git, &ws_reg);
 
         assert_eq!(summary.adopted, 0);
         assert_eq!(summary.gc, 1);
         assert!(WorkspaceRecord::list(dir.path()).unwrap().is_empty());
         assert!(git.registered_caps().is_empty());
+        assert!(ws_reg.is_empty(), "orphan record must not enter the registry");
+    }
+
+    /// Re-adopt is SYMMETRIC with create: a live workspace re-enters the
+    /// in-memory registry with its caps → `caps_of(uuid)` is Some, so the
+    /// `add_workspace_repo` gate passes without a re-create (the #109 desync).
+    #[test]
+    fn readopt_repopulates_workspace_registry() {
+        let dir = TempDir::new().unwrap();
+        workspace_runner("ws-1", true).save(dir.path()).unwrap();
+        record(
+            "ws-1",
+            &[("capA", "https://github.com/a/a.git"), ("capB", "https://github.com/a/b.git")],
+        )
+        .save(dir.path())
+        .unwrap();
+
+        let git = GitSessions::default();
+        let ws_reg = WorkspaceRegistry::default();
+        readopt_workspaces(dir.path(), &git, &ws_reg);
+
+        let caps = ws_reg
+            .caps_of("ws-1")
+            .expect("live workspace must be in the registry after readopt (add_repo gate)");
+        assert_eq!(caps.len(), 2, "every persisted repo cap must land in the registry");
+        assert!(caps.contains(&"capA".to_owned()));
+        assert!(caps.contains(&"capB".to_owned()));
     }
 }

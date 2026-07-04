@@ -263,10 +263,13 @@ async fn main() -> anyhow::Result<()> {
     // Re-adopt persisted WORKSPACES on the same principle: the workspace VMs
     // survive a restart/OTA but the in-memory registries do not. Re-register
     // every repo cap from each on-disk WorkspaceRecord so `git push` keeps
-    // working; the node's token sweep mints fresh tokens.
+    // working (node's token sweep mints fresh tokens), AND re-populate the
+    // in-memory WorkspaceRegistry so add_repo/snapshot/delete resolve the live
+    // workspace without a re-create (the re-adopt desync #109).
     tabbify_supervisor::api::readopt_workspaces(
         state.orchestrator.runner_dir(),
         &state.git_sessions,
+        &state.workspaces,
     );
 
     // Spawn the dev-session idle reaper now that `state` (and its Arc) exists.

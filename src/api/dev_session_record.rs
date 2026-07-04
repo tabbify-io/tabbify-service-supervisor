@@ -182,7 +182,7 @@ pub struct ReadoptDevSummary {
 /// `Instant - Duration` is `checked_sub`bed and falls back to `now` on underflow
 /// (the value only drives the cosmetic `idle_secs`/`created_age` — reaping is
 /// effectively disabled, so an approximation is fine).
-fn unix_to_instant(unix_secs: u64) -> Instant {
+pub(crate) fn unix_to_instant(unix_secs: u64) -> Instant {
     let now = Instant::now();
     let elapsed = now_unix().saturating_sub(unix_secs);
     now.checked_sub(Duration::from_secs(elapsed)).unwrap_or(now)
