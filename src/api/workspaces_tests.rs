@@ -266,3 +266,106 @@
             "a fresh map holds exactly the new entry"
         );
     }
+
+    /// BUG-1 regression: `create_workspace` rebuilds `cap_files` FROM SCRATCH every
+    /// call, so a repo added via `add_workspace_repo` (its `<repo>.url` lives ONLY
+    /// in the prior persisted env, not in this request) would be CLOBBERED and the
+    /// runner's cold re-bake would drop its clone. `preserve_prior_repo_caps` must
+    /// carry every prior `*.url` entry forward, WITHOUT overwriting a fresh same-stem
+    /// entry the request just produced, and WITHOUT resurrecting the re-minted
+    /// authkeys/forge secrets.
+    #[test]
+    fn preserve_prior_repo_caps_carries_add_repo_url_alongside_fresh_caps() {
+        // Freshly-built cap_files for THIS create: one request repo + freshly-minted
+        // authkeys/forge secrets (exactly what create_workspace builds before the
+        // preservation step).
+        let mut cap_files = serde_json::Map::new();
+        cap_files.insert(
+            "app.url".to_owned(),
+            serde_json::Value::String("http://h/git/FRESH_A".to_owned()),
+        );
+        cap_files.insert(
+            AUTHKEYS_CAP_FILE.to_owned(),
+            serde_json::Value::String("fresh-authkeys".to_owned()),
+        );
+        cap_files.insert(
+            "forge-admin.token".to_owned(),
+            serde_json::Value::String("fresh-forge".to_owned()),
+        );
+
+        // Prior persisted runner env: the SAME app repo (STALE cap), a tetris repo
+        // added later via add_repo, and a STALE authkeys secret.
+        let mut prior: HashMap<String, String> = HashMap::new();
+        prior.insert(crate::api::WORKSPACE_MARKER_ENV.to_owned(), "ws-1".to_owned());
+        prior.insert(
+            CAP_FILES_ENV.to_owned(),
+            serde_json::json!({
+                "app.url": "http://h/git/STALE_A",
+                "tetris.url": "http://h/git/TETRIS",
+                "authkeys.cap": "stale-authkeys",
+            })
+            .to_string(),
+        );
+
+        preserve_prior_repo_caps(&mut cap_files, Some(&prior));
+
+        // The add_repo URL is carried forward — the whole point of the fix.
+        assert_eq!(
+            cap_files["tetris.url"], "http://h/git/TETRIS",
+            "add_repo cap-URL must survive a create re-provision"
+        );
+        // The request's fresh same-stem entry WINS over the stale prior.
+        assert_eq!(
+            cap_files["app.url"], "http://h/git/FRESH_A",
+            "the request's fresh repo cap must win over the prior stale one"
+        );
+        // The re-minted secrets are NEVER resurrected from the prior.
+        assert_eq!(
+            cap_files[AUTHKEYS_CAP_FILE], "fresh-authkeys",
+            "authkeys stays freshly minted (never carried from the prior)"
+        );
+        assert_eq!(
+            cap_files["forge-admin.token"], "fresh-forge",
+            "forge-admin token stays freshly minted (never carried from the prior)"
+        );
+        assert_eq!(
+            cap_files.len(),
+            4,
+            "exactly: app.url + tetris.url + authkeys.cap + forge-admin.token"
+        );
+    }
+
+    /// No prior record / no `CAP_FILES_ENV` ⇒ preservation is a no-op (create
+    /// behaves exactly as before the fix).
+    #[test]
+    fn preserve_prior_repo_caps_noop_without_prior() {
+        let mut cap_files = serde_json::Map::new();
+        cap_files.insert(
+            "app.url".to_owned(),
+            serde_json::Value::String("http://h/git/A".to_owned()),
+        );
+        preserve_prior_repo_caps(&mut cap_files, None);
+        assert_eq!(cap_files.len(), 1);
+        assert_eq!(cap_files["app.url"], "http://h/git/A");
+
+        // A prior env WITHOUT a CAP_FILES_ENV key is also a no-op.
+        let mut prior: HashMap<String, String> = HashMap::new();
+        prior.insert("TABBIFY_USER_ID".to_owned(), "acct".to_owned());
+        preserve_prior_repo_caps(&mut cap_files, Some(&prior));
+        assert_eq!(cap_files.len(), 1);
+    }
+
+    /// A malformed prior `CAP_FILES_ENV` (not a JSON object) carries NOTHING —
+    /// corruption is never propagated into the freshly-built map.
+    #[test]
+    fn preserve_prior_repo_caps_ignores_malformed_prior() {
+        let mut cap_files = serde_json::Map::new();
+        cap_files.insert(
+            "app.url".to_owned(),
+            serde_json::Value::String("http://h/git/A".to_owned()),
+        );
+        let mut prior: HashMap<String, String> = HashMap::new();
+        prior.insert(CAP_FILES_ENV.to_owned(), "not-json".to_owned());
+        preserve_prior_repo_caps(&mut cap_files, Some(&prior));
+        assert_eq!(cap_files.len(), 1, "a malformed prior contributes nothing");
+    }

@@ -472,21 +472,33 @@ fn entrypoint_from_oci_classifies_exec_vs_shell_form() {
     assert!(matches!(Entrypoint::from_oci(&cfg2), Entrypoint::ShellForm));
 }
 
+/// The rootfs cache env-fingerprint for a NO-env / no-cap build — the common test
+/// case (`resolve_rootfs` / `run_firecracker_build` called with `extra_env = None`,
+/// no cap-files). The per-uuid cache path nests this fingerprint UNDER the digest
+/// dir (#106), so any test that stages or asserts a per-uuid cache path must key it
+/// by the SAME value `resolve_rootfs` computes internally for a no-env build.
+fn no_env_hash() -> String {
+    super::rootfs_env_fingerprint(None, &[])
+}
+
 /// The cache path is keyed by the IMMUTABLE digest (sha256:…), not the tag,
-/// and sanitizes the `:` so it's a valid single path segment.
+/// sanitizes the `:` so it's a valid single path segment, and nests the
+/// deploy-env fingerprint UNDER the digest dir (#106).
 #[test]
 fn cached_rootfs_path_is_keyed_by_digest_under_data_dir() {
     let data_dir = Path::new("/var/lib/tabbify");
+    let eh = no_env_hash();
     let p = cached_rootfs_path(
         data_dir,
         "0191e7c2-1111-7222-8333-444455556666",
         "sha256:deadbeefcafe",
+        &eh,
     );
     assert_eq!(
         p,
-        Path::new(
-            "/var/lib/tabbify/apps/0191e7c2-1111-7222-8333-444455556666/fc/sha256-deadbeefcafe/rootfs.ext4"
-        )
+        Path::new(&format!(
+            "/var/lib/tabbify/apps/0191e7c2-1111-7222-8333-444455556666/fc/sha256-deadbeefcafe/{eh}/rootfs.ext4"
+        ))
     );
 }
 
@@ -495,22 +507,84 @@ fn cached_rootfs_path_is_keyed_by_digest_under_data_dir() {
 #[test]
 fn cached_rootfs_path_differs_per_digest() {
     let d = Path::new("/data");
-    let a = cached_rootfs_path(d, "app", "sha256:aaaa");
-    let b = cached_rootfs_path(d, "app", "sha256:bbbb");
+    let eh = no_env_hash();
+    let a = cached_rootfs_path(d, "app", "sha256:aaaa", &eh);
+    let b = cached_rootfs_path(d, "app", "sha256:bbbb", &eh);
     assert_ne!(a, b);
-    assert!(a.parent().unwrap().ends_with("sha256-aaaa"));
+    // `<digest-sanitized>` is the GRANDPARENT now — the env fingerprint nests
+    // under it (`…/fc/<digest>/<env_hash>/rootfs.ext4`).
+    assert!(
+        a.parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .ends_with("sha256-aaaa")
+    );
 }
 
-/// `rootfs_is_cached` is true iff the digest-keyed rootfs.ext4 exists.
+/// A CHANGED deploy env on the SAME uuid+digest lands at a DIFFERENT cache path
+/// (#106) so the rootfs is re-baked instead of served stale; an identical env
+/// yields the SAME path (a cache HIT). This is the core of the workspace add_repo
+/// / forge-rewrite fix.
+#[test]
+fn cached_rootfs_path_differs_per_env_hash() {
+    let d = Path::new("/data");
+    let (uuid, digest) = ("ws-stable", "sha256:cafe");
+
+    let empty = super::rootfs_env_fingerprint(None, &[]);
+    let with_forge = super::rootfs_env_fingerprint(
+        Some(&std::collections::HashMap::from([(
+            "TABBIFY_FORGE_URL".to_owned(),
+            "http://forge".to_owned(),
+        )])),
+        &[],
+    );
+    // Adding a cap-file (an add_repo `<repo>.url`) must ALSO change the fingerprint
+    // even though the effective env is unchanged — the add_repo case lives in the
+    // cap-file NAME set, not in `extra_env`.
+    let with_repo =
+        super::rootfs_env_fingerprint(None, &[("tetris.url".to_owned(), "http://g".to_owned())]);
+
+    assert_ne!(empty, with_forge, "an env change must change the fingerprint");
+    assert_ne!(
+        empty, with_repo,
+        "an add_repo cap-file must change the fingerprint (its NAME set changed)"
+    );
+    assert_ne!(with_forge, with_repo);
+
+    // Same uuid+digest, different env_hash ⇒ different cache path (miss → re-bake).
+    assert_ne!(
+        cached_rootfs_path(d, uuid, digest, &empty),
+        cached_rootfs_path(d, uuid, digest, &with_repo),
+    );
+    // Identical env ⇒ identical path (hit). A cap-file VALUE change with the SAME
+    // name set does NOT churn the fingerprint (values are excluded).
+    assert_eq!(
+        cached_rootfs_path(d, uuid, digest, &with_repo),
+        cached_rootfs_path(
+            d,
+            uuid,
+            digest,
+            &super::rootfs_env_fingerprint(
+                None,
+                &[("tetris.url".to_owned(), "http://DIFFERENT".to_owned())]
+            )
+        ),
+        "same cap-file NAME set (only the value rotated) must stay a cache HIT"
+    );
+}
+
+/// `rootfs_is_cached` is true iff the digest+env-keyed rootfs.ext4 exists.
 #[test]
 fn rootfs_is_cached_reflects_presence() {
     let tmp = tempfile::tempdir().unwrap();
     let digest = "sha256:abc123";
-    assert!(!super::rootfs_is_cached(tmp.path(), "app", digest));
-    let p = cached_rootfs_path(tmp.path(), "app", digest);
+    let eh = no_env_hash();
+    assert!(!super::rootfs_is_cached(tmp.path(), "app", digest, &eh));
+    let p = cached_rootfs_path(tmp.path(), "app", digest, &eh);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, b"\0").unwrap();
-    assert!(super::rootfs_is_cached(tmp.path(), "app", digest));
+    assert!(super::rootfs_is_cached(tmp.path(), "app", digest, &eh));
 }
 
 // ── GLOBAL digest-shared rootfs cache ───────────────────────────────────────────
@@ -544,8 +618,9 @@ async fn global_cache_publish_then_link_shares_one_inode() {
     let data = tmp.path();
     let digest = "sha256:deadbeef";
 
-    // uuid-A "built" its per-uuid rootfs.
-    let a = cached_rootfs_path(data, "uuid-a", digest);
+    // uuid-A "built" its per-uuid rootfs (env-free → nested under the no-env hash).
+    let eh = no_env_hash();
+    let a = cached_rootfs_path(data, "uuid-a", digest, &eh);
     std::fs::create_dir_all(a.parent().unwrap()).unwrap();
     std::fs::write(&a, b"ROOTFS-CONTENT").unwrap();
 
@@ -556,8 +631,8 @@ async fn global_cache_publish_then_link_shares_one_inode() {
     );
 
     // uuid-B (fresh) gets it WITHOUT a build, via hard link.
-    assert!(!super::rootfs_is_cached(data, "uuid-b", digest));
-    let linked = super::link_global_rootfs_to_uuid(data, "uuid-b", digest)
+    assert!(!super::rootfs_is_cached(data, "uuid-b", digest, &eh));
+    let linked = super::link_global_rootfs_to_uuid(data, "uuid-b", digest, &eh)
         .await
         .expect("global hit must materialize B's per-uuid rootfs");
     assert_eq!(std::fs::read(&linked).unwrap(), b"ROOTFS-CONTENT");
@@ -579,7 +654,7 @@ async fn global_cache_publish_then_link_shares_one_inode() {
 async fn global_cache_link_misses_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(
-        super::link_global_rootfs_to_uuid(tmp.path(), "uuid-x", "sha256:absent")
+        super::link_global_rootfs_to_uuid(tmp.path(), "uuid-x", "sha256:absent", &no_env_hash())
             .await
             .is_none()
     );
@@ -786,7 +861,7 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
     let fetched = fc_fetched(digest);
 
     // Pre-seed the digest-keyed cache so conversion is unnecessary.
-    let cached = super::cached_rootfs_path(tmp.path(), "uuid-cache", digest);
+    let cached = super::cached_rootfs_path(tmp.path(), "uuid-cache", digest, &no_env_hash());
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(&cached, b"\0").unwrap();
 
@@ -852,7 +927,7 @@ async fn resolve_rootfs_rejects_arch_mismatch_before_conversion() {
     let tmp = tempfile::tempdir().unwrap();
     let digest = "sha256:archmism";
     let fetched = fc_fetched(digest);
-    let target = super::cached_rootfs_path(tmp.path(), "uuid-arch", digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-arch", digest, &no_env_hash());
 
     let (_host, other) = host_and_other_arch();
     // An image built for the "other" (non-host) architecture must be rejected.
@@ -931,7 +1006,7 @@ async fn resolve_rootfs_allows_matching_host_arch() {
     let tmp = tempfile::tempdir().unwrap();
     let digest = "sha256:archok01";
     let fetched = fc_fetched(digest);
-    let target = super::cached_rootfs_path(tmp.path(), "uuid-archok", digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-archok", digest, &no_env_hash());
 
     let (host, _other) = host_and_other_arch();
     let l0 = make_tar(&[("bin/server", b"elf")]);
@@ -988,7 +1063,7 @@ async fn run_fc_build_converts_on_cache_miss() {
     let tmp = tempfile::tempdir().unwrap();
     let digest = "sha256:fresh01";
     let fetched = fc_fetched(digest);
-    let target = super::cached_rootfs_path(tmp.path(), "uuid-miss", digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-miss", digest, &no_env_hash());
 
     // Stage a real OCI layout where `pull_oci_layout` would have left it. The
     // image is built for the HOST arch so the architecture guard lets it
@@ -1050,7 +1125,7 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
     // Every FcConfig field carries a clap default, so an arg-less parse yields a
     // usable config without standing up a real Firecracker host.
     let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
-    let target = super::cached_rootfs_path(tmp.path(), "uuid-nodocker", digest);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-nodocker", digest, &no_env_hash());
 
     // Stage a real OCI layout where `pull_oci_layout` would have left it, so the
     // (faked, no-op) `oras copy` is satisfied and the real host `tar` unpacks it.
@@ -1833,7 +1908,7 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
 
     // The immutable digest the build MUST derive + key the cache by.
     let expected_digest = super::read_manifest_digest_from_layout(&pull_layout_dir).unwrap();
-    let target = super::cached_rootfs_path(tmp.path(), uuid, &expected_digest);
+    let target = super::cached_rootfs_path(tmp.path(), uuid, &expected_digest, &no_env_hash());
 
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let calls2 = calls.clone();
@@ -2078,14 +2153,14 @@ async fn global_cache_skipped_for_env_baked_rootfs() {
 
     // NOT globally cacheable (this uuid bakes its OWN env) → must MISS the global.
     assert!(
-        super::lookup_cached_rootfs(data, "uuid-B", digest, false)
+        super::lookup_cached_rootfs(data, "uuid-B", digest, false, &no_env_hash())
             .await
             .is_none(),
         "an env-baked rootfs must not be served from the global cache"
     );
     // Env-free (globally cacheable) → may use the global cache.
     assert!(
-        super::lookup_cached_rootfs(data, "uuid-C", digest, true)
+        super::lookup_cached_rootfs(data, "uuid-C", digest, true, &no_env_hash())
             .await
             .is_some(),
         "an env-free rootfs may use the global cache"

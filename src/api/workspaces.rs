@@ -118,6 +118,49 @@ fn merge_cap_into_env(
     );
 }
 
+/// PRESERVE the durable `<repo>.url` cap-file entries from a workspace's PRIOR
+/// persisted env across a re-provision. [`create_workspace`] rebuilds its
+/// `cap_files` map FROM SCRATCH on every call (fresh authkeys/forge caps + the
+/// request `repos`), so a repo that was added LATER via [`add_workspace_repo`] —
+/// whose `<repo>.url` cap lives ONLY in the prior [`CAP_FILES_ENV`] map, never in
+/// the create request — would be WIPED, and the runner's cold re-bake would then
+/// drop that repo's clone (an in-house forge repo never lands in `~/projects`).
+///
+/// `prior_extra_env` is the previously-persisted runner env (from
+/// [`crate::orchestrator::handle::RunnerHandle::extra_env`], the SAME map
+/// `add_workspace_repo` merges into). Every prior `*.url` entry (the tokenless
+/// git-remote URLs) is carried into the freshly-built `cap_files` WITHOUT
+/// overwriting a same-stem entry the request already produced (the request is the
+/// current source of truth for its own repos, with freshly-minted caps).
+///
+/// ONLY `*.url` keys are carried: `authkeys.cap` and `forge-admin.token` are
+/// re-minted on every create (fresh secrets), so preserving a stale one would
+/// resurrect a revoked token — the repo cap-URLs are the durable ones to carry.
+/// No prior record / no `CAP_FILES_ENV` / a malformed prior map ⇒ a no-op (create
+/// behaves exactly as before).
+fn preserve_prior_repo_caps(
+    cap_files: &mut serde_json::Map<String, serde_json::Value>,
+    prior_extra_env: Option<&HashMap<String, String>>,
+) {
+    let Some(prior_json) = prior_extra_env.and_then(|e| e.get(CAP_FILES_ENV)) else {
+        return; // no prior record / no CAP_FILES_ENV → behavior unchanged
+    };
+    let Some(prior_map) = serde_json::from_str::<serde_json::Value>(prior_json)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+    else {
+        return; // malformed prior map → carry nothing (never propagate corruption)
+    };
+    for (name, value) in prior_map {
+        // Carry ONLY durable repo cap-URLs (`<stem>.url`): skip the re-minted
+        // secrets (authkeys.cap / forge-admin.token) and never clobber a fresh
+        // same-stem entry the create request already produced above.
+        if name.ends_with(".url") && value.is_string() && !cap_files.contains_key(&name) {
+            cap_files.insert(name, value);
+        }
+    }
+}
+
 /// Insert the broker's forge ENDPOINT config into the workspace boot env:
 /// `TABBIFY_FORGE_URL` + `TABBIFY_FORGE_ORG` (§12 S1/S2). These two keys are
 /// exactly what the in-FC broker's `ForgeCfg::from_env` requires; without them
@@ -458,6 +501,23 @@ pub async fn create_workspace(
             serde_json::Value::String(tok.clone()),
         );
     }
+
+    // PRESERVE add_repo cap-URLs across a re-provision. `cap_files` was just
+    // rebuilt FROM SCRATCH (request repos + fresh forge/authkeys caps), so a repo
+    // added later via `add_workspace_repo` — whose `<repo>.url` lives ONLY in the
+    // prior persisted runner env, not in THIS request — would be clobbered and the
+    // cold re-bake would drop its clone (the in-house forge repo never lands in
+    // `~/projects`). Load the previously-persisted runner env (the SAME
+    // CAP_FILES_ENV map add_workspace_repo merges into) and carry every prior
+    // `*.url` entry forward. Best-effort: a load error / no prior record leaves
+    // create unchanged. The warm git-session cap stays registered (add_repo never
+    // revoked it); a cold supervisor re-registers it from the durable record on
+    // readopt, so the preserved URL still resolves.
+    let prior_extra_env = RunnerHandle::load(state.orchestrator.runner_dir(), &ws_uuid)
+        .ok()
+        .flatten()
+        .and_then(|h| h.extra_env);
+    preserve_prior_repo_caps(&mut cap_files, prior_extra_env.as_ref());
 
     // §12 S6: the authorized-keys cap. Generate a fresh unguessable token, write
     // it into the FC as the off-env cap-file `authkeys.cap` (the runner writes it

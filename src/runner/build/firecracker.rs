@@ -354,30 +354,90 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stable fingerprint of the deploy-time inputs BAKED into the guest `/init`
+/// BEYOND the image content itself, so the per-uuid rootfs cache key can tell
+/// apart two builds of the SAME image digest whose `/init` differs (#106).
+///
+/// `(uuid, digest)` alone is NOT enough for a WORKSPACE: its uuid is STABLE
+/// (derived from the account), yet its `/init` changes when the effective env
+/// changes (a forge-url/org rewrite) OR when a cap-file is added (a
+/// `workspace_add_repo` clone cap). Both must force a fresh conversion, or the
+/// cached rootfs keeps the OLD exported env + cap-writes — e.g. the added repo
+/// never clones.
+///
+/// Hashed inputs (SORTED — `HashMap` iteration is random-seeded):
+///   - the effective `extra_env` map (each `k=v` baked as an `export` line), and
+///   - the cap-file NAMES (each written as a `/run/tabbify/caps/<name>` file).
+///
+/// Cap-file VALUES are DELIBERATELY EXCLUDED: they are freshly-random tokens
+/// re-minted on every create (`generate_cap`), so hashing them would force a
+/// re-conversion on EVERY `workspace_ensure`. The NAME SET is the deterministic
+/// STRUCTURAL fingerprint — it changes exactly when the repo/forge layout does
+/// (add a repo → a new `<repo>.url` name; add a forge → `forge-admin.token`),
+/// which is precisely when the rootfs must be rebaked. Empty env + no caps
+/// (a normal deploy) yields a fixed fingerprint, so those paths stay stable.
+#[must_use]
+pub fn rootfs_env_fingerprint(
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+    cap_files: &[(String, String)],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    // Effective env, sorted by key (the SAME order `merge_extra_env` bakes it).
+    let mut env: Vec<(&str, &str)> = extra_env
+        .map(|m| m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+        .unwrap_or_default();
+    env.sort_unstable();
+    hasher.update(b"env\0");
+    for (k, v) in env {
+        hasher.update(k.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.as_bytes());
+        hasher.update(b"\0");
+    }
+    // Cap-file NAMES, sorted (values excluded — random per mint; see above).
+    let mut names: Vec<&str> = cap_files.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    hasher.update(b"caps\0");
+    for n in names {
+        hasher.update(n.as_bytes());
+        hasher.update(b"\0");
+    }
+    // 16 hex chars (64 bits) — ample against collision for a per-uuid cache key,
+    // and a compact single path segment.
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
 /// On-disk cache path for an app's converted rootfs, keyed by the IMMUTABLE
-/// image digest (`sha256:…`) — NOT the tag. The same digest always maps to the
-/// same path, so a redeploy of an unchanged image skips the (slow) OCI→ext4
-/// conversion entirely. A new digest gets a fresh dir, never clobbering the old
-/// rootfs (immutable-by-content).
+/// image digest (`sha256:…`) — NOT the tag — AND an `env_hash` fingerprint of the
+/// deploy-time env/cap-files baked into its `/init` (see [`rootfs_env_fingerprint`],
+/// #106). The same digest+env always maps to the same path (a redeploy of an
+/// unchanged image+env skips the slow OCI→ext4 conversion), while a CHANGED env on
+/// the SAME (stable) uuid+digest — a workspace's `add_repo`/forge rewrite — lands
+/// at a DIFFERENT path so the rootfs is re-baked instead of served stale. A new
+/// digest or env gets a fresh dir, never clobbering the old rootfs.
 ///
 /// Layout mirrors the fc snapshot cache:
-/// `<data_dir>/apps/<uuid>/fc/<digest-sanitized>/rootfs.ext4`.
-/// The `:` in the digest is replaced with `-` so it's a single path segment.
+/// `<data_dir>/apps/<uuid>/fc/<digest-sanitized>/<env_hash>/rootfs.ext4`.
+/// The `:` in the digest is replaced with `-` so it's a single path segment; the
+/// env variants nest UNDER the digest dir (env-free image content — the pulled
+/// OCI layout — is shared across env variants of a digest via the global layout
+/// cache, so nesting costs no extra WAN pull).
 #[must_use]
-pub fn cached_rootfs_path(data_dir: &Path, uuid: &str, digest: &str) -> PathBuf {
+pub fn cached_rootfs_path(data_dir: &Path, uuid: &str, digest: &str, env_hash: &str) -> PathBuf {
     let sanitized = digest.replace(':', "-");
     data_dir
         .join("apps")
         .join(uuid)
         .join("fc")
         .join(sanitized)
+        .join(env_hash)
         .join(ROOTFS_NAME)
 }
 
-/// Is the digest-keyed rootfs already converted + on disk?
+/// Is the digest+env-keyed rootfs already converted + on disk?
 #[must_use]
-pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str) -> bool {
-    cached_rootfs_path(data_dir, uuid, digest).is_file()
+pub fn rootfs_is_cached(data_dir: &Path, uuid: &str, digest: &str, env_hash: &str) -> bool {
+    cached_rootfs_path(data_dir, uuid, digest, env_hash).is_file()
 }
 
 // ── GLOBAL digest-shared rootfs cache ───────────────────────────────────────────
@@ -448,12 +508,17 @@ pub(crate) async fn resolve_oci_digest(
 /// link only decrements the link count, never touching the cache. Returns the
 /// per-uuid path on success, or `None` (no hit / link failed) so the caller
 /// falls back to a normal pull + build — correctness over the optimization.
-async fn link_global_rootfs_to_uuid(data_dir: &Path, uuid: &str, digest: &str) -> Option<PathBuf> {
+async fn link_global_rootfs_to_uuid(
+    data_dir: &Path,
+    uuid: &str,
+    digest: &str,
+    env_hash: &str,
+) -> Option<PathBuf> {
     let global = global_rootfs_path(data_dir, digest);
     if !global.is_file() {
         return None;
     }
-    let per_uuid = cached_rootfs_path(data_dir, uuid, digest);
+    let per_uuid = cached_rootfs_path(data_dir, uuid, digest, env_hash);
     if per_uuid.is_file() {
         return Some(per_uuid); // already materialized for this uuid
     }
@@ -547,14 +612,18 @@ async fn lookup_cached_rootfs(
     uuid: &str,
     digest: &str,
     globally_cacheable: bool,
+    env_hash: &str,
 ) -> Option<PathBuf> {
-    if rootfs_is_cached(data_dir, uuid, digest) {
-        return Some(cached_rootfs_path(data_dir, uuid, digest));
+    if rootfs_is_cached(data_dir, uuid, digest, env_hash) {
+        return Some(cached_rootfs_path(data_dir, uuid, digest, env_hash));
     }
     if !globally_cacheable {
         return None;
     }
-    link_global_rootfs_to_uuid(data_dir, uuid, digest).await
+    // Global hits are env-FREE by construction (`globally_cacheable` ⇒ empty env),
+    // so `env_hash` here is the fixed empty-env fingerprint — the materialized
+    // per-uuid link lands at that same stable path.
+    link_global_rootfs_to_uuid(data_dir, uuid, digest, env_hash).await
 }
 
 /// The per-app TAG-ref pull work dir (`<data_dir>/apps/<uuid>/fc/.pull`), CLEARED
@@ -716,13 +785,13 @@ async fn evict_global_layout_cache(data_dir: &Path) {
     }
 }
 
-/// The digest-keyed work dir for a digest `registry_ref` — the parent of
+/// The digest+env-keyed work dir for a digest `registry_ref` — the parent of
 /// [`cached_rootfs_path`], i.e. where the OCI layout is pulled and the converted
 /// `rootfs.ext4` lands. Only valid once the digest is known (digest refs); a TAG
 /// ref pulls into a digest-INDEPENDENT `.pull` dir first (see
 /// [`run_firecracker_build`]).
-fn digest_work_dir(data_dir: &Path, uuid: &str, digest: &str) -> Result<PathBuf> {
-    Ok(cached_rootfs_path(data_dir, uuid, digest)
+fn digest_work_dir(data_dir: &Path, uuid: &str, digest: &str, env_hash: &str) -> Result<PathBuf> {
+    Ok(cached_rootfs_path(data_dir, uuid, digest, env_hash)
         .parent()
         .ok_or_else(|| anyhow::anyhow!("cached rootfs path has no parent"))?
         .to_path_buf())
@@ -1000,16 +1069,21 @@ pub fn merge_extra_env(
 /// values win on key collision (POSIX: last `export KEY=…` wins in the init
 /// script). When `None` the guest gets exactly the OCI image's env.
 ///
-/// CACHE CONSTRAINT: the PER-UUID rootfs cache is keyed by `(uuid, digest)` —
-/// `cached_rootfs_path(data_dir, uuid, digest)`. Because `extra_env` is baked
-/// into the rootfs, changing env on the SAME uuid+digest would NOT rebuild the
-/// cache. In practice this is acceptable: a devbox always gets a fresh uuid on
-/// creation, and a dev-session also creates a fresh uuid, so the uuid+digest
-/// pair is always unique per deploy-time env configuration.
+/// CACHE CONSTRAINT (#106): the PER-UUID rootfs cache is keyed by
+/// `(uuid, digest, env_hash)` — `cached_rootfs_path(data_dir, uuid, digest,
+/// env_hash)`, where `env_hash` = [`rootfs_env_fingerprint`] of the effective
+/// `extra_env` + cap-file NAMES that get baked into `/init`. This makes a CHANGED
+/// env on the SAME uuid+digest land at a fresh path so the rootfs is re-baked —
+/// essential for a WORKSPACE, whose uuid is STABLE (account-derived) yet whose
+/// `/init` changes on `add_repo` / forge rewrite. A devbox/dev-session still gets
+/// a fresh uuid per creation, so its key is unique regardless. `env_hash` is
+/// computed HERE from `extra_env`+`cap_files` so it always matches what
+/// `render_init` bakes (the caller computes the same value for the pre-conversion
+/// cache probes).
 ///
-/// The GLOBAL digest-shared cache (#57), keyed by DIGEST ALONE, is therefore
-/// UNSAFE for an `extra_env`-baked rootfs (it would share one uuid's env with
-/// another uuid of the same digest — the #68 dev-cap mismatch + a secrets leak).
+/// The GLOBAL digest-shared cache (#57), keyed by DIGEST ALONE, remains UNSAFE
+/// for an `extra_env`-baked rootfs (it would share one uuid's env with another
+/// uuid of the same digest — the #68 dev-cap mismatch + a secrets leak).
 /// `run_firecracker_build` gates global publish/link on `globally_cacheable`
 /// (true IFF `extra_env` is empty); see [`lookup_cached_rootfs`].
 ///
@@ -1027,8 +1101,12 @@ pub async fn resolve_rootfs(
     extra_env: Option<&std::collections::HashMap<String, String>>,
     cap_files: &[(String, String)],
 ) -> Result<PathBuf> {
-    let cached = cached_rootfs_path(data_dir, uuid, digest);
-    if rootfs_is_cached(data_dir, uuid, digest) {
+    // Fingerprint the /init-baked env + cap-file names so a changed env on the
+    // SAME uuid+digest (a workspace add_repo / forge rewrite) misses the cache and
+    // re-bakes, instead of serving a stale rootfs (#106).
+    let env_hash = rootfs_env_fingerprint(extra_env, cap_files);
+    let cached = cached_rootfs_path(data_dir, uuid, digest, &env_hash);
+    if rootfs_is_cached(data_dir, uuid, digest, &env_hash) {
         tracing::info!(
             uuid,
             digest,
@@ -1754,6 +1832,14 @@ pub async fn run_firecracker_build(
     // (uuid+digest+env are aligned). So: globally cacheable IFF no deploy env.
     let globally_cacheable = extra_env.is_none_or(|m| m.is_empty());
 
+    // Fingerprint the /init-baked env + cap-file NAMES (#106) so the PER-UUID
+    // rootfs cache key includes it: a CHANGED env on a STABLE uuid (a workspace's
+    // add_repo / forge rewrite) then misses the cache and RE-BAKES instead of
+    // serving a stale `/init`. `resolve_rootfs` recomputes the SAME value from the
+    // same `(extra_env, cap_files)`; these pre-conversion probes must agree with
+    // it, so compute it ONCE here and thread it to every per-uuid cache call.
+    let env_hash = rootfs_env_fingerprint(extra_env, &cap_files);
+
     let reff = fetched
         .manifest
         .runtime
@@ -1820,7 +1906,9 @@ pub async fn run_firecracker_build(
         },
     };
     if let Some(digest) = pre_digest.as_deref() {
-        if let Some(rootfs) = lookup_cached_rootfs(data_dir, uuid, digest, globally_cacheable).await {
+        if let Some(rootfs) =
+            lookup_cached_rootfs(data_dir, uuid, digest, globally_cacheable, &env_hash).await
+        {
             tracing::info!(
                 uuid,
                 digest,
@@ -1886,7 +1974,7 @@ pub async fn run_firecracker_build(
     // DOCKER-LESS throughout: pull = `oras copy --to-oci-layout`, config read FROM
     // the layout. No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
     let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
-        let work = digest_work_dir(data_dir, uuid, digest)?;
+        let work = digest_work_dir(data_dir, uuid, digest, &env_hash)?;
         let layout = pull_oci_layout(reff, &work, runner, oras_cfg).await?;
         // Seed the global layout cache so the NEXT uuid with this digest skips
         // the pull (env-free → always safe; keyed by the immutable ref digest).
@@ -1910,13 +1998,13 @@ pub async fn run_firecracker_build(
         // makes a future hit always serve the right image; a stale `pre_digest`
         // then yields a harmless lookup MISS + re-pull, never wrong bytes.
         publish_layout_to_global(data_dir, &digest, uuid, &layout).await;
-        if rootfs_is_cached(data_dir, uuid, &digest) {
-            cached_rootfs_path(data_dir, uuid, &digest)
+        if rootfs_is_cached(data_dir, uuid, &digest, &env_hash) {
+            cached_rootfs_path(data_dir, uuid, &digest, &env_hash)
         } else {
             // Global hit found only AFTER the pull (the pre-pull resolve failed):
             // still skip the conversion — but ONLY for a globally-cacheable rootfs.
             let global_hit = if globally_cacheable {
-                link_global_rootfs_to_uuid(data_dir, uuid, &digest).await
+                link_global_rootfs_to_uuid(data_dir, uuid, &digest, &env_hash).await
             } else {
                 None
             };
