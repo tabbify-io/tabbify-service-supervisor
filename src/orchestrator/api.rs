@@ -33,7 +33,7 @@ use crate::{
         MONITOR_INTERVAL, Orchestrator,
         client::ControlClient,
         handle::RunnerHandle,
-        monitor::kill_fc_child_for_uuid,
+        monitor::{kill_fc_child_for_uuid, kill_pid},
         restart::{self, BackoffParams, RestartStatus},
         spawn::{SpawnSpec, spawn_runner},
     },
@@ -307,9 +307,14 @@ impl Orchestrator {
         // can `systemctl stop` the right CPU scope (`uuid:reff`) — the pidfile pid
         // is only the `systemd-run` wrapper, so the scoped FC leaks without it.
         let mut image_ref: Option<String> = None;
+        let mut live_pid: u32 = 0;
         match RunnerHandle::load(self.runner_dir(), uuid) {
             Ok(Some(mut record)) => {
                 image_ref = record.image_ref.clone();
+                // Capture the live pid BEFORE zeroing it: if the Shutdown
+                // round-trip below cannot reach the runner, this is the only
+                // handle left to force-kill it.
+                live_pid = record.pid;
                 record.stopped = true;
                 // Clear the live pid: pid 0 reads as DEAD to the monitor's
                 // liveness probe, and the `stopped` gate short-circuits the
@@ -333,7 +338,27 @@ impl Orchestrator {
         match self.client_for(uuid).shutdown().await {
             Ok(Reply::Ok) => {}
             Ok(other) => tracing::warn!(uuid, ?other, "unexpected reply to Shutdown"),
-            Err(e) => tracing::warn!(uuid, error = %e, "Shutdown failed (runner may be gone)"),
+            Err(e) => {
+                tracing::warn!(uuid, error = %e, "Shutdown failed (runner may be gone)");
+                // A runner still mid-IMAGE-PULL has no control socket yet, so
+                // the Shutdown can never reach it — and the monitor's
+                // stopped-record gate skips reaping, so the surviving runner
+                // keeps (re)spawning `oras` pulls for a STOPPED app
+                // indefinitely (observed live on MSI, 2026-07-04: stop_app
+                // returned 200 yet fresh pulls appeared seconds later).
+                // Force-kill the captured pid: the record is already marked
+                // stopped, so nothing respawns it, and the pull reap in
+                // `kill_fc_child_for_uuid` below sweeps its `oras` children.
+                // `live_pid == 0` = no live pid was recorded — nothing to kill.
+                if live_pid != 0 {
+                    tracing::warn!(
+                        uuid,
+                        pid = live_pid,
+                        "stop_app: force-killing unreachable runner (no control socket — likely mid-pull)"
+                    );
+                    kill_pid(live_pid);
+                }
+            }
         }
 
         // Reap any FC child the runner left behind (the FC process is not a

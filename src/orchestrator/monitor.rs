@@ -214,7 +214,7 @@ pub const PULL_GRACE_SECS: u64 = 600;
 
 /// Send `SIGKILL` to `pid`. Best-effort: logs on failure (e.g. permission
 /// error or already-reaped pid).
-fn kill_pid(pid: u32) {
+pub(crate) fn kill_pid(pid: u32) {
     // pid 0 means "the caller's own process group" to kill(2): SIGKILLing it
     // would take down the supervisor (and, in tests, the test binary + cargo +
     // shell). A corrupted record/pidfile with pid 0 must be a no-op here.
