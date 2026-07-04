@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use tabbify_supervisor::api::{
-    GIT_PROXY_IPV4_PORT, SupervisorState, git_proxy_ipv4_router, router,
+    FORGE_PROXY_IPV4_PORT, GIT_PROXY_IPV4_PORT, SupervisorState, git_proxy_ipv4_router, router,
 };
 use tabbify_supervisor::config::Config;
 use tabbify_supervisor::docker::docker_available;
@@ -237,7 +237,10 @@ async fn main() -> anyhow::Result<()> {
         .with_version(tabbify_supervisor::version::binary_version().to_owned())
         .with_firecracker(kvm)
         .with_docker(docker)
-        .with_tap_subnet(config.firecracker.tap_subnet.clone());
+        .with_tap_subnet(config.firecracker.tap_subnet.clone())
+        // Forge-proxy enabled iff a forge mesh target is configured — this drives
+        // the `TABBIFY_FORGE_URL` rewrite in `create_workspace` (see below).
+        .with_forge_proxy(config.forge_mesh_addr().is_some());
 
     // Re-adopt persisted dev-sessions before serving: the dev-VM runners survive
     // a restart/OTA (KillMode=process) but the in-memory dev_sessions/git_sessions
@@ -341,6 +344,58 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // ── IPv4 forge-proxy L4 forwarder (last demo blocker) ────────────────────
+    // The twin of the git-proxy for FORGE traffic: a workspace FC guest is
+    // IPv4-only on its /30 tap and cannot route the forge's raw v6 mesh ULA the
+    // node passes as `TABBIFY_FORGE_URL`. When `--forge-mesh-url` is configured,
+    // bind a transparent L4 forwarder on `0.0.0.0:FORGE_PROXY_IPV4_PORT` (reached
+    // by each guest via its tap gateway = host_ip) that proxies to the forge's
+    // v6 ULA:8730 over the mesh. Unlike git, the forge path needs NO app-layer
+    // work — the in-FC broker already holds the forge-admin token (off-env
+    // cap-file) and speaks plain HTTP — so a `tcp_forward` L4 forward suffices.
+    // `create_workspace` rewrites the guest's `TABBIFY_FORGE_URL` to this
+    // gateway (via `with_forge_proxy` above). Unset ⇒ not started (today's
+    // behavior; the node URL passes through unchanged). The handle is held for
+    // the process lifetime (dropping it would abort the accept loop).
+    //
+    // ORDERING: unlike the git-proxy (bind → firewall → serve), `spawn_forwarder`
+    // couples bind + accept, so we install the firewall FIRST — a STRICTER
+    // ordering (the port is not even bound during the install window). The mesh
+    // ACL on the forge is the real gate; the firewall is depth-in-defence.
+    let _forge_proxy_forwarder = if let Some(forge_target) = config.forge_mesh_addr() {
+        let ipv4_bind = SocketAddr::from(([0, 0, 0, 0], FORGE_PROXY_IPV4_PORT));
+        #[cfg(target_os = "linux")]
+        tabbify_supervisor::firecracker::setup_forge_proxy_firewall(
+            &config.firecracker.tap_subnet,
+            FORGE_PROXY_IPV4_PORT,
+        )
+        .await;
+        match tabbify_supervisor::tcp_forward::spawn_forwarder(ipv4_bind, forge_target).await {
+            Ok(fwd) => {
+                tracing::info!(
+                    port = FORGE_PROXY_IPV4_PORT,
+                    forge_target = %forge_target,
+                    "forge proxy IPv4 forwarder bound (FC guest gateway → in-mesh forge)"
+                );
+                Some(fwd)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    port = FORGE_PROXY_IPV4_PORT,
+                    error = %e,
+                    "forge proxy IPv4 bind failed; FC guest forge ops will not route"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!(
+            "forge proxy disabled (no --forge-mesh-url / TABBIFY_FORGE_MESH_URL); \
+             FC forge ops use the node-supplied URL unchanged"
+        );
+        None
+    };
 
     let listener = TcpListener::bind(bind_addr)
         .await

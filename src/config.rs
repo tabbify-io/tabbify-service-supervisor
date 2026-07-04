@@ -153,6 +153,20 @@ pub struct Config {
     #[arg(long = "app", value_name = "UUID")]
     pub apps: Vec<Uuid>,
 
+    /// In-mesh Forgejo base URL the FORGE-PROXY forwards to. When set, the
+    /// supervisor starts an IPv4 L4 forwarder on
+    /// `0.0.0.0:`[`crate::api::FORGE_PROXY_IPV4_PORT`] that transparently proxies
+    /// to THIS forge's v6 mesh ULA, and REWRITES each workspace FC's
+    /// `TABBIFY_FORGE_URL` to the guest's own tap gateway
+    /// (`http://{host_ip}:8789`) — a workspace FC is IPv4-only on its /30 tap and
+    /// cannot route the raw v6 ULA. Accepts either a URL
+    /// (`http://[fd5a:1f02:e3ca:25c7:1171::1]:8730`) or a bare host:port
+    /// (`[fd5a:1f02:e3ca:25c7:1171::1]:8730`). When unset the forwarder is not
+    /// started and the node-supplied URL is passed through unchanged (today's
+    /// behavior). Mirrors the git-proxy's IPv4 listener (contract §12).
+    #[arg(long = "forge-mesh-url", env = "TABBIFY_FORGE_MESH_URL")]
+    pub forge_mesh_url: Option<String>,
+
     /// Firecracker microVM runtime configuration (only consulted when hosting a
     /// `firecracker` app on a KVM-capable Linux host).
     #[command(flatten)]
@@ -426,6 +440,37 @@ impl Config {
             (self.coordinator_url == DEFAULT_COORDINATOR_URL).then(|| DEFAULT_RELAY_URL.to_owned())
         })
     }
+
+    /// The [`SocketAddr`] the forge-proxy L4 forwarder targets, parsed from
+    /// [`Self::forge_mesh_url`]. `None` when the flag is unset (forge-proxy
+    /// disabled) OR the value is unparseable — the caller logs the latter so a
+    /// typo does not silently start a black-hole listener. See
+    /// [`parse_forge_mesh_addr`].
+    #[must_use]
+    pub fn forge_mesh_addr(&self) -> Option<SocketAddr> {
+        parse_forge_mesh_addr(self.forge_mesh_url.as_deref()?)
+    }
+}
+
+/// Parse a forge-mesh endpoint (`--forge-mesh-url` / `TABBIFY_FORGE_MESH_URL`)
+/// into the [`SocketAddr`] the forge-proxy L4 forwarder targets.
+///
+/// Accepts either a URL (`http://[fd5a:…]:8730`) or a bare host:port
+/// (`[fd5a:…]:8730`): an optional `http://` / `https://` scheme and a trailing
+/// `/` are stripped, and the remainder parses directly as a `SocketAddr` (IPv6
+/// bracketed or IPv4). The forward is L4 (the broker speaks plain HTTP over it),
+/// so only the address is needed — the scheme is cosmetic. Returns `None` for an
+/// unparseable value (a bare hostname with no port, a DNS name, garbage) rather
+/// than panicking; the caller treats `None` as "forge-proxy off".
+#[must_use]
+pub fn parse_forge_mesh_addr(raw: &str) -> Option<SocketAddr> {
+    raw.trim()
+        .strip_prefix("http://")
+        .or_else(|| raw.trim().strip_prefix("https://"))
+        .unwrap_or_else(|| raw.trim())
+        .trim_end_matches('/')
+        .parse::<SocketAddr>()
+        .ok()
 }
 
 /// Pure decision for [`Config::node_name_env_bridge`] (FIX 5): given the current
@@ -755,6 +800,69 @@ mod tests {
         // endpoint, and how the supervisor forwards it to runners.
         let cfg = Config::try_parse_from(["supervisord", "--mesh-relay-only"]).unwrap();
         assert!(cfg.relay_only);
+    }
+
+    // ── forge-proxy: --forge-mesh-url parsing ───────────────────────────────
+
+    #[test]
+    fn forge_mesh_url_defaults_to_none_and_addr_is_none() {
+        // Unset ⇒ forge-proxy disabled: no forwarder, node URL passed through.
+        let cfg = Config::try_parse_from(["supervisord"]).unwrap();
+        assert!(cfg.forge_mesh_url.is_none());
+        assert!(cfg.forge_mesh_addr().is_none());
+    }
+
+    #[test]
+    fn forge_mesh_url_parses_v6_url_form() {
+        // The value on MSI: the forge's v6 mesh ULA as an http URL.
+        let cfg = Config::try_parse_from([
+            "supervisord",
+            "--forge-mesh-url",
+            "http://[fd5a:1f02:e3ca:25c7:1171::1]:8730",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.forge_mesh_addr().unwrap().to_string(),
+            "[fd5a:1f02:e3ca:25c7:1171::1]:8730",
+        );
+    }
+
+    #[test]
+    fn parse_forge_mesh_addr_accepts_url_and_bare_and_ipv4_forms() {
+        // http:// scheme + trailing slash stripped; IPv6 bracket form preserved.
+        assert_eq!(
+            parse_forge_mesh_addr("http://[fd5a::1]:8730/")
+                .unwrap()
+                .to_string(),
+            "[fd5a::1]:8730",
+        );
+        // Bare host:port (no scheme) parses too.
+        assert_eq!(
+            parse_forge_mesh_addr("[fd5a::1]:8730").unwrap().to_string(),
+            "[fd5a::1]:8730",
+        );
+        // https:// scheme also accepted.
+        assert_eq!(
+            parse_forge_mesh_addr("https://[fd5a::1]:8730")
+                .unwrap()
+                .to_string(),
+            "[fd5a::1]:8730",
+        );
+        // IPv4 host:port is valid too (a non-mesh/local forge for tests).
+        assert_eq!(
+            parse_forge_mesh_addr("127.0.0.1:8730").unwrap().to_string(),
+            "127.0.0.1:8730",
+        );
+    }
+
+    #[test]
+    fn parse_forge_mesh_addr_rejects_portless_and_garbage() {
+        // A DNS name or a portless host is not a SocketAddr → None (forge-proxy
+        // stays off rather than starting a black-hole listener on a bad value).
+        assert!(parse_forge_mesh_addr("http://forge.tabbify.io").is_none());
+        assert!(parse_forge_mesh_addr("fd5a::1").is_none());
+        assert!(parse_forge_mesh_addr("not a url").is_none());
+        assert!(parse_forge_mesh_addr("").is_none());
     }
 
     #[test]

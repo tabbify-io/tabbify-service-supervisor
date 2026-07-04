@@ -128,14 +128,35 @@ fn merge_cap_into_env(
 /// [`crate::firecracker::snapshot_decision::snapshot_forbidden_env_keys`].
 /// `None` ⇒ the key is omitted (no forge / an older node) — forge ops then
 /// honestly report unconfigured rather than dialing a bogus endpoint.
+///
+/// FORGE-PROXY REWRITE: the node passes `forge_url` as the forge's RAW v6 mesh
+/// ULA (`http://[fd5a:…]:8730`). A workspace FC guest is IPv4-only on its /30 tap
+/// and cannot route v6, so when the host-side forge-proxy is enabled the caller
+/// passes `forge_proxy_gateway` = the guest's OWN tap-gateway proxy URL
+/// (`http://{host_ip}:FORGE_PROXY_IPV4_PORT`, from
+/// [`crate::api::forge_proxy_gateway_url`]) and we inject THAT instead — the L4
+/// forward relays it to the forge over the mesh. With no proxy configured
+/// (`forge_proxy_gateway == None`) the node value is passed through unchanged
+/// (today's behavior). The ORG slug is NEVER rewritten — only the URL host:port.
 fn insert_forge_env(
     extra_env: &mut HashMap<String, String>,
     forge_url: &Option<String>,
     forge_org: &Option<String>,
+    forge_proxy_gateway: Option<&str>,
 ) {
-    if let Some(url) = forge_url {
-        extra_env.insert("TABBIFY_FORGE_URL".to_owned(), url.clone());
+    // The URL: when the host-side forge-proxy is enabled, the guest-facing value
+    // is the tap-gateway proxy (the raw v6 ULA is unreachable from the IPv4-only
+    // FC); otherwise the node value passes through unchanged. Only injected when
+    // the node supplied a forge_url (no forge → no key → honest "unconfigured").
+    if forge_url.is_some() {
+        let url = match forge_proxy_gateway {
+            Some(gw) => gw.to_owned(),
+            // Safe: guarded by `forge_url.is_some()` above.
+            None => forge_url.clone().unwrap_or_default(),
+        };
+        extra_env.insert("TABBIFY_FORGE_URL".to_owned(), url);
     }
+    // The ORG slug rides the env channel untouched (never rewritten).
     if let Some(org) = forge_org {
         extra_env.insert("TABBIFY_FORGE_ORG".to_owned(), org.clone());
     }
@@ -466,8 +487,20 @@ pub async fn create_workspace(
         body.authorized_key.clone(),
     );
     // The broker's forge ENDPOINT config (§12 S1/S2): URL + org slug ride the
-    // env channel (non-secret; the CREDS ride the cap-file above).
-    insert_forge_env(&mut extra_env, &body.forge_url, &body.forge_org);
+    // env channel (non-secret; the CREDS ride the cap-file above). When the
+    // host-side forge-proxy is enabled, REWRITE the guest-facing URL to the FC's
+    // own tap gateway (`http://{host_ip}:FORGE_PROXY_IPV4_PORT`) — the IPv4-only
+    // guest cannot route the raw v6 mesh ULA the node supplies. `host_ip` here is
+    // the SAME tap gateway the git remotes already point at (derived above).
+    let forge_gateway = state
+        .forge_proxy_enabled
+        .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
+    insert_forge_env(
+        &mut extra_env,
+        &body.forge_url,
+        &body.forge_org,
+        forge_gateway.as_deref(),
+    );
     if !cap_files.is_empty() {
         // serde_json::to_string of a Map never fails (all values are strings).
         extra_env.insert(

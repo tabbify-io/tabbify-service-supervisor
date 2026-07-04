@@ -26,11 +26,14 @@
     /// non-secret; the creds ride the cap-file channel).
     #[test]
     fn insert_forge_env_injects_url_and_org_and_omits_when_none() {
+        // No forge-proxy configured (gateway None) ⇒ the node URL passes through
+        // unchanged (today's behavior).
         let mut env: HashMap<String, String> = HashMap::new();
         insert_forge_env(
             &mut env,
             &Some("http://[fd5a:1f02::1]:8730".to_owned()),
             &Some("t_acme".to_owned()),
+            None,
         );
         assert_eq!(
             env.get("TABBIFY_FORGE_URL").unwrap(),
@@ -45,9 +48,48 @@
 
         // None ⇒ omitted (never an empty-string env the broker would misread).
         let mut empty: HashMap<String, String> = HashMap::new();
-        insert_forge_env(&mut empty, &None, &None);
+        insert_forge_env(&mut empty, &None, &None, None);
         assert!(!empty.contains_key("TABBIFY_FORGE_URL"));
         assert!(!empty.contains_key("TABBIFY_FORGE_ORG"));
+    }
+
+    /// FORGE-PROXY REWRITE: when the host-side forge-proxy is enabled the caller
+    /// passes the guest's tap-gateway proxy URL, which REPLACES the node's raw v6
+    /// mesh ULA in `TABBIFY_FORGE_URL` (the IPv4-only FC cannot route the ULA) —
+    /// while `TABBIFY_FORGE_ORG` is passed through UNTOUCHED.
+    #[test]
+    fn insert_forge_env_rewrites_url_to_gateway_and_keeps_org() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        let gateway = crate::api::forge_proxy_gateway_url("172.31.14.61");
+        insert_forge_env(
+            &mut env,
+            // The RAW v6 ULA the node supplies — must NOT reach the guest.
+            &Some("http://[fd5a:1f02:e3ca:25c7:1171::1]:8730".to_owned()),
+            &Some("t_acme".to_owned()),
+            Some(gateway.as_str()),
+        );
+        assert_eq!(
+            env.get("TABBIFY_FORGE_URL").unwrap(),
+            "http://172.31.14.61:8789",
+            "the guest URL must be the tap-gateway proxy, not the raw v6 ULA",
+        );
+        assert_eq!(
+            env.get("TABBIFY_FORGE_ORG").unwrap(),
+            "t_acme",
+            "the org slug must be passed through untouched (only the URL is rewritten)",
+        );
+    }
+
+    /// Guard: a gateway is only meaningful WITH a node forge_url. No forge_url ⇒
+    /// no `TABBIFY_FORGE_URL` even when a gateway is passed (no forge for this
+    /// workspace → honest "unconfigured").
+    #[test]
+    fn insert_forge_env_no_url_means_no_key_even_with_gateway() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        let gateway = crate::api::forge_proxy_gateway_url("172.31.14.61");
+        insert_forge_env(&mut env, &None, &Some("t_acme".to_owned()), Some(&gateway));
+        assert!(!env.contains_key("TABBIFY_FORGE_URL"));
+        assert_eq!(env.get("TABBIFY_FORGE_ORG").unwrap(), "t_acme");
     }
 
     /// Rollout-order safety: a create body WITHOUT the forge_url/forge_org keys

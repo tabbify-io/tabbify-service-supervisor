@@ -38,6 +38,7 @@ use crate::orchestrator::Orchestrator;
 mod dev_session_record;
 mod dev_sessions;
 mod dto;
+mod forge_proxy;
 mod git_proxy;
 mod handlers;
 mod ssh_jump;
@@ -61,6 +62,7 @@ pub use dev_sessions::{
     DevSessionPurged, DevSessionRegistry, DevSessionRow, GitTokenRefreshed, RefreshGitTokenBody,
     sweep_expired,
 };
+pub use forge_proxy::{FORGE_PROXY_IPV4_PORT, forge_proxy_gateway_url};
 pub use git_proxy::{GIT_PROXY_IPV4_PORT, GitSessionEntry, GitSessions, git_proxy_ipv4_router};
 pub use ssh_jump::SshJump;
 
@@ -132,6 +134,13 @@ pub struct SupervisorState {
     /// to derive the IPv4 `host_ip` for a dev-FC's tap link so the `git_remote`
     /// URL points at the tap gateway the guest will see as its default route.
     pub tap_subnet: String,
+    /// Whether the host-side forge-proxy is running (set iff `--forge-mesh-url`
+    /// is configured). When true, `create_workspace` REWRITES each workspace FC's
+    /// `TABBIFY_FORGE_URL` from the node's raw v6 mesh ULA to the guest's own tap
+    /// gateway proxy (`http://{host_ip}:FORGE_PROXY_IPV4_PORT`) — the IPv4-only FC
+    /// cannot route the v6 ULA. False ⇒ the node value is passed through unchanged
+    /// (today's behavior; forge ops from the FC won't route, but nothing regresses).
+    pub forge_proxy_enabled: bool,
 }
 
 impl SupervisorState {
@@ -158,6 +167,7 @@ impl SupervisorState {
             dev_sessions: std::sync::Arc::new(DevSessionRegistry::default()),
             workspaces: std::sync::Arc::new(WorkspaceRegistry::default()),
             tap_subnet: crate::config::DEFAULT_FC_TAP_SUBNET.to_owned(),
+            forge_proxy_enabled: false,
         }
     }
 
@@ -188,6 +198,15 @@ impl SupervisorState {
     #[must_use]
     pub fn with_docker(mut self, docker: bool) -> Self {
         self.docker = docker;
+        self
+    }
+
+    /// Declare whether the host-side forge-proxy is running (`--forge-mesh-url`
+    /// configured). When true, `create_workspace` rewrites the workspace FC's
+    /// `TABBIFY_FORGE_URL` to the tap-gateway proxy (see the field docs).
+    #[must_use]
+    pub fn with_forge_proxy(mut self, enabled: bool) -> Self {
+        self.forge_proxy_enabled = enabled;
         self
     }
 }

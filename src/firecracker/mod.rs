@@ -57,6 +57,11 @@ pub mod snapshot_decision;
 // network ACL) — NO cfg gate so the rule LOGIC is unit-testable on macOS (the
 // `setup_guest_nat` enforcement that consumes it is behind the Linux gate).
 pub mod egress_filter;
+// Pure, host-agnostic iptables arg builder for the IPv4 tap-gateway proxy
+// firewalls (git-proxy :8788 + forge-proxy :8789) — NO cfg gate so the rule
+// LOGIC is unit-testable on macOS (the `iptables` shell-out that consumes it,
+// `setup_proxy_ipv4_firewall`, is behind the Linux gate in `linux.rs`).
+pub mod proxy_firewall;
 #[cfg(not(target_os = "linux"))]
 mod stub;
 
@@ -69,9 +74,10 @@ pub use linux::FirecrackerRuntime;
 pub use stub::FirecrackerRuntime;
 
 // Re-exported `pub` (the `linux` module itself is only `pub(crate)`) so the
-// `supervisord` binary can install the git-proxy IPv4 firewall at startup.
+// `supervisord` binary can install the git-proxy + forge-proxy IPv4 firewalls at
+// startup.
 #[cfg(target_os = "linux")]
-pub use linux::setup_git_proxy_firewall;
+pub use linux::{setup_forge_proxy_firewall, setup_git_proxy_firewall};
 
 /// The fixed build-VM tap name (`fc-bld0`). Cross-platform const so the F2.2
 /// orphan sweep can compute the build api-socket WITHOUT pulling in the
