@@ -369,3 +369,91 @@
         preserve_prior_repo_caps(&mut cap_files, Some(&prior));
         assert_eq!(cap_files.len(), 1, "a malformed prior contributes nothing");
     }
+
+    /// BUG-1 COLD-safety: `create_workspace` rebuilds `record_caps`/`branches` from
+    /// the request, so a repo added via `add_workspace_repo` (its cap row lives ONLY
+    /// in the prior durable record) would be dropped — and a COLD readopt would then
+    /// re-register only the request caps, ORPHANING the preserved `<repo>.url`.
+    /// `preserve_prior_record_caps` must carry the prior non-request cap+branch rows
+    /// forward, with the fresh request cap winning on a repo_url collision, keeping
+    /// caps/branches index-parallel.
+    #[test]
+    fn preserve_prior_record_caps_carries_add_repo_rows() {
+        // Fresh request record: one repo "app" with a FRESH cap.
+        let mut record_caps = vec![crate::api::WorkspaceCap {
+            cap: "fresh-app-cap".to_owned(),
+            repo_url: "https://github.com/acme/app.git".to_owned(),
+        }];
+        let mut branches = vec!["main".to_owned()];
+
+        // Prior durable record: the SAME app repo (STALE cap) + a tetris repo added
+        // later via add_repo (branch "dev").
+        let prior = crate::api::WorkspaceRecord {
+            workspace_uuid: "ws-1".to_owned(),
+            user_id: "acct".to_owned(),
+            caps: vec![
+                crate::api::WorkspaceCap {
+                    cap: "stale-app-cap".to_owned(),
+                    repo_url: "https://github.com/acme/app.git".to_owned(),
+                },
+                crate::api::WorkspaceCap {
+                    cap: "tetris-cap".to_owned(),
+                    repo_url: "https://forge/acme/tetris.git".to_owned(),
+                },
+            ],
+            branches: vec!["main".to_owned(), "dev".to_owned()],
+            created_at_unix: 0,
+            last_activity_unix: 0,
+        };
+
+        preserve_prior_record_caps(&mut record_caps, &mut branches, Some(&prior));
+
+        // The add_repo cap row is carried forward — the cold-safety fix.
+        assert!(
+            record_caps
+                .iter()
+                .any(|c| c.cap == "tetris-cap" && c.repo_url == "https://forge/acme/tetris.git"),
+            "the add_repo WorkspaceCap must survive in the durable record"
+        );
+        // The request's fresh app cap WINS; the stale prior one is NOT carried.
+        assert_eq!(
+            record_caps
+                .iter()
+                .filter(|c| c.repo_url == "https://github.com/acme/app.git")
+                .count(),
+            1,
+            "no duplicate row for a repo the request already carries"
+        );
+        assert!(record_caps.iter().any(|c| c.cap == "fresh-app-cap"));
+        assert!(
+            !record_caps.iter().any(|c| c.cap == "stale-app-cap"),
+            "the request cap wins over the prior stale one"
+        );
+        // caps/branches stay parallel-by-index; tetris carried its "dev" branch.
+        assert_eq!(
+            record_caps.len(),
+            branches.len(),
+            "caps/branches stay index-parallel"
+        );
+        let tetris_idx = record_caps
+            .iter()
+            .position(|c| c.cap == "tetris-cap")
+            .unwrap();
+        assert_eq!(
+            branches[tetris_idx], "dev",
+            "the carried cap keeps its parallel branch"
+        );
+    }
+
+    /// No prior record ⇒ record preservation is a no-op (create unchanged).
+    #[test]
+    fn preserve_prior_record_caps_noop_without_prior() {
+        let mut record_caps = vec![crate::api::WorkspaceCap {
+            cap: "c".to_owned(),
+            repo_url: "u".to_owned(),
+        }];
+        let mut branches = vec!["main".to_owned()];
+        preserve_prior_record_caps(&mut record_caps, &mut branches, None);
+        assert_eq!(record_caps.len(), 1);
+        assert_eq!(branches.len(), 1);
+    }

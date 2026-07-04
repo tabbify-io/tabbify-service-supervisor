@@ -161,6 +161,45 @@ fn preserve_prior_repo_caps(
     }
 }
 
+/// PRESERVE the durable add_repo `WorkspaceCap` + branch rows from a workspace's
+/// PRIOR record across a re-provision — the DURABLE-RECORD twin of
+/// [`preserve_prior_repo_caps`]. [`create_workspace`] rebuilds `record_caps` /
+/// `branches` FROM SCRATCH from the request `repos`, so a repo added later via
+/// [`add_workspace_repo`] (its cap row lives ONLY in the prior durable record,
+/// not in THIS request) would be DROPPED from the persisted record. On a COLD
+/// supervisor restart, readopt re-registers the git-proxy caps FROM this record —
+/// so dropping the add_repo cap would ORPHAN the `<repo>.url` cap-URL that
+/// [`preserve_prior_repo_caps`] just kept in `/init` (its cap would no longer be
+/// registered → git-proxy 403). Carrying the prior cap+branch forward keeps the
+/// two preservations SYMMETRIC so the preserved URL always resolves after a cold
+/// boot, not just warm.
+///
+/// A prior cap whose `repo_url` the request ALSO carries is skipped (the request
+/// is the current source of truth for its own repos, with a freshly-minted cap).
+/// The branch rides parallel-by-index in the prior record; a malformed record
+/// with a shorter `branches` vec defaults the carried branch to empty. No prior
+/// record ⇒ a no-op (create behaves exactly as before).
+fn preserve_prior_record_caps(
+    record_caps: &mut Vec<WorkspaceCap>,
+    branches: &mut Vec<String>,
+    prior_record: Option<&WorkspaceRecord>,
+) {
+    let Some(prior) = prior_record else {
+        return; // no prior record → behavior unchanged
+    };
+    // Owned (not borrowed from `record_caps`) so we can push to it in the loop.
+    let request_urls: std::collections::HashSet<String> =
+        record_caps.iter().map(|c| c.repo_url.clone()).collect();
+    for (i, cap) in prior.caps.iter().enumerate() {
+        // The request re-provisions its own repos with fresh caps — skip those.
+        if request_urls.contains(&cap.repo_url) {
+            continue;
+        }
+        record_caps.push(cap.clone());
+        branches.push(prior.branches.get(i).cloned().unwrap_or_default());
+    }
+}
+
 /// Insert the broker's forge ENDPOINT config into the workspace boot env:
 /// `TABBIFY_FORGE_URL` + `TABBIFY_FORGE_ORG` (§12 S1/S2). These two keys are
 /// exactly what the in-FC broker's `ForgeCfg::from_env` requires; without them
@@ -518,6 +557,17 @@ pub async fn create_workspace(
         .flatten()
         .and_then(|h| h.extra_env);
     preserve_prior_repo_caps(&mut cap_files, prior_extra_env.as_ref());
+
+    // SYMMETRIC cold-safety: also carry the prior DURABLE record's add_repo
+    // cap/branch rows forward. readopt re-registers git-proxy caps from THIS
+    // record after a supervisor restart, so dropping the add_repo cap would
+    // orphan the `<repo>.url` just preserved above (its /init cap-file would then
+    // reference an UNregistered cap → git-proxy 403 on a cold boot). Fresh request
+    // repos win on repo_url collision. Best-effort load (no prior record → no-op).
+    let prior_record = WorkspaceRecord::load(state.orchestrator.runner_dir(), &ws_uuid)
+        .ok()
+        .flatten();
+    preserve_prior_record_caps(&mut record_caps, &mut branches, prior_record.as_ref());
 
     // §12 S6: the authorized-keys cap. Generate a fresh unguessable token, write
     // it into the FC as the off-env cap-file `authkeys.cap` (the runner writes it
