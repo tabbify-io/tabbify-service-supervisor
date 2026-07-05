@@ -71,6 +71,53 @@ pub fn ref_matches(cache_dir: &Path, image_ref: &str) -> bool {
     }
 }
 
+/// Path to the companion `.snapshot_env` file in `cache_dir`. It records the
+/// #106 env/cap FINGERPRINT (`rootfs_env_fingerprint`) the snapshot's guest
+/// `/init` was baked with, so a warm restore can be REJECTED when the deploy's
+/// effective env/cap set changed even though the image ref/digest did NOT — e.g.
+/// a workspace `add_repo` adds a new clone cap (SAME image, NEW `/init`). Without
+/// this the env-blind `.snapshot_ref` gate would warm-restore the STALE guest and
+/// the broker's boot-clone would never run for the new repo (#108).
+pub fn env_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(".snapshot_env")
+}
+
+/// Record the env/cap fingerprint a freshly-created snapshot was baked with.
+/// Best-effort (logs on failure): a missing/garbled `.snapshot_env` is treated
+/// by [`restore_matches`] as "no usable snapshot" → cold boot (the safe path).
+pub fn write_env(cache_dir: &Path, env_hash: &str) {
+    let p = env_path(cache_dir);
+    if let Err(e) = std::fs::write(&p, env_hash.as_bytes()) {
+        tracing::warn!(path = %p.display(), error = %e, "failed to write .snapshot_env");
+    }
+}
+
+/// Does the snapshot's stamped env fingerprint match `env_hash`? A missing or
+/// unreadable `.snapshot_env` returns `false` (safe default: cold boot). Kept
+/// private — callers use [`restore_matches`], which ANDs this with the image-ref
+/// check so a warm restore requires BOTH the image AND the env to be unchanged.
+fn env_matches(cache_dir: &Path, env_hash: &str) -> bool {
+    match std::fs::read_to_string(env_path(cache_dir)) {
+        Ok(stored) => stored == env_hash,
+        Err(_) => false,
+    }
+}
+
+/// Is the snapshot in `cache_dir` a valid warm-restore candidate for BOTH
+/// `image_ref` AND `env_hash`?
+///
+/// A warm restore resurrects the FULL guest (rootfs + frozen RAM), so it is
+/// sound ONLY when neither the image NOR the `/init`-baked env/cap set changed.
+/// [`ref_matches`] guards the image; [`env_matches`] guards the env (the #106
+/// `rootfs_env_fingerprint`). Any mismatch, a missing companion (a snapshot from
+/// before this check existed), or a read error returns `false` so the caller
+/// COLD-boots — which re-runs `/init` (a workspace's broker then re-clones the
+/// new cap set, #108) and re-stamps fresh `.snapshot_ref` + `.snapshot_env`
+/// companions. Safe-by-default: on ANY doubt we cold boot (slower, never stale).
+pub fn restore_matches(cache_dir: &Path, image_ref: &str, env_hash: &str) -> bool {
+    ref_matches(cache_dir, image_ref) && env_matches(cache_dir, env_hash)
+}
+
 /// Remove any snapshot files in `cache_dir` (best-effort). Called on a deploy:
 /// the snapshot is keyed per-uuid (not per-image), so a stale snapshot from the
 /// PREVIOUS image must NOT be warm-restored over the newly-deployed one. After
@@ -82,6 +129,10 @@ pub fn clear(cache_dir: &Path) {
     // Drop the companion ref too so a later `ref_matches` never reads a stale
     // ref against orphaned/recreated snapshot files.
     let _ = std::fs::remove_file(ref_path(cache_dir));
+    // Drop the env companion for the SAME reason: a stale `.snapshot_env` must
+    // not outlive the snapshot files it described (else a later `restore_matches`
+    // could read a fingerprint that no longer matches any on-disk snapshot).
+    let _ = std::fs::remove_file(env_path(cache_dir));
 }
 
 /// The per-app snapshot/cache directory: `<data_dir>/apps/<uuid>/cache`. Single
@@ -214,6 +265,83 @@ mod tests {
         clear(dir.path());
         assert!(!ref_path(dir.path()).exists(), "clear must drop .snapshot_ref");
         assert!(!files_present(dir.path()));
+    }
+
+    /// Helper: lay down a complete warm-restore candidate (both snapshot files +
+    /// matching ref + matching env companion).
+    fn seed_snapshot(dir: &Path, image_ref: &str, env_hash: &str) {
+        std::fs::write(vmstate_path(dir), b"vmstate").unwrap();
+        std::fs::write(mem_path(dir), b"mem").unwrap();
+        write_ref(dir, image_ref);
+        write_env(dir, env_hash);
+    }
+
+    /// A snapshot whose BOTH image_ref AND env-hash match is a valid warm-restore
+    /// candidate (#108: the env-aware gate must still permit an unchanged
+    /// workspace to warm-restore, preserving the warm-LSP index).
+    #[test]
+    fn restore_matches_true_when_ref_and_env_match() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_snapshot(dir.path(), "reg:5000/a/b@sha256:abc", "envhash-1");
+        assert!(restore_matches(
+            dir.path(),
+            "reg:5000/a/b@sha256:abc",
+            "envhash-1"
+        ));
+    }
+
+    /// #108 CORE: same image_ref but a CHANGED env-hash (a workspace `add_repo`
+    /// added a new clone cap — same image, new `/init`) must NOT warm-restore.
+    /// Cold boot instead so the broker re-runs its boot-clone for the new repo.
+    #[test]
+    fn restore_matches_false_when_env_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_snapshot(dir.path(), "reg:5000/a/b@sha256:abc", "envhash-OLD");
+        assert!(
+            !restore_matches(dir.path(), "reg:5000/a/b@sha256:abc", "envhash-NEW"),
+            "a changed env/cap fingerprint must invalidate the snapshot → cold boot"
+        );
+    }
+
+    /// A snapshot from before `.snapshot_env` existed (files + ref present, no env
+    /// companion) is treated as "no usable snapshot" → cold boot (safe default).
+    /// This is the one-time cost of rolling out the env gate over old snapshots.
+    #[test]
+    fn restore_matches_false_when_env_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(vmstate_path(dir.path()), b"vmstate").unwrap();
+        std::fs::write(mem_path(dir.path()), b"mem").unwrap();
+        write_ref(dir.path(), "reg:5000/a/b@sha256:abc");
+        assert!(
+            !restore_matches(dir.path(), "reg:5000/a/b@sha256:abc", "envhash-1"),
+            "a missing .snapshot_env must force cold boot"
+        );
+    }
+
+    /// A changed image_ref invalidates the snapshot even when the env matches
+    /// (the ref guard still applies under `restore_matches`).
+    #[test]
+    fn restore_matches_false_when_ref_differs_even_if_env_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_snapshot(dir.path(), "reg:5000/a/b@sha256:OLD", "envhash-1");
+        assert!(!restore_matches(
+            dir.path(),
+            "reg:5000/a/b@sha256:NEW",
+            "envhash-1"
+        ));
+    }
+
+    /// `clear` drops the `.snapshot_env` companion too so no stale env fingerprint
+    /// outlives the snapshot files it described.
+    #[test]
+    fn clear_removes_env_file_too() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_snapshot(dir.path(), "reg:5000/a/b@sha256:abc", "envhash-1");
+        clear(dir.path());
+        assert!(
+            !env_path(dir.path()).exists(),
+            "clear must drop .snapshot_env"
+        );
     }
 
     /// No `.no-snapshot` marker ⇒ snapshots are NOT suppressed (regular apps).

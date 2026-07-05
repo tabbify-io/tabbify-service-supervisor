@@ -199,6 +199,14 @@ pub struct FirecrackerRuntime {
     /// deployed image changes (cache is keyed by uuid only — see
     /// `snapshot::ref_matches`). `None` mirrors `snapshot_cache_dir`.
     image_ref: Option<String>,
+    /// The #106 env/cap fingerprint this VM's `/init` was baked with, stamped into
+    /// `.snapshot_env` alongside `.snapshot_ref` after a successful `snapshot()`.
+    /// A later warm restore is invalidated when the effective env/cap set changes
+    /// even though the image did NOT — e.g. a workspace `add_repo` adds a clone
+    /// cap (same image, new `/init`), so the guest MUST cold-boot to re-run its
+    /// broker's boot-clone (#108; see `snapshot::restore_matches`). `None` mirrors
+    /// `snapshot_cache_dir` (the bare `launch` / build VM never restores).
+    env_hash: Option<String>,
     /// Is this a WORKSPACE VM (vs a regular app / dev-FC)? Set true only on the
     /// workspace spawn path (detected via the workspace marker env). Gates the
     /// GAP#4 pre-snapshot scrub: a workspace holds provider creds in the broker's
@@ -236,8 +244,21 @@ impl FirecrackerRuntime {
         // single-VM callers): a fixed identity is fine. The per-uuid production
         // path is `launch_with_uuid`.
         // The bare entry carries no deploy egress allow-list → `None` keeps the
-        // legacy unrestricted egress. Never a workspace (no creds to scrub).
-        Self::cold_boot(rootfs, rt, cfg, None, None, "fc-launch-default", None, None, false).await
+        // legacy unrestricted egress. Never a workspace (no creds to scrub). No
+        // cache dir ⇒ never snapshots ⇒ no env fingerprint to stamp (`None`).
+        Self::cold_boot(
+            rootfs,
+            rt,
+            cfg,
+            None,
+            None,
+            "fc-launch-default",
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
     }
 
     /// Cold-boot a microVM. `cache_dir` — when `Some`, a snapshot is taken
@@ -249,6 +270,10 @@ impl FirecrackerRuntime {
     /// in `<cache_dir>/.snapshot_ref` so a later warm restore can be invalidated
     /// if the deployed image_ref changes (the snapshot cache is keyed by UUID
     /// only — see [`snapshot::ref_matches`]).
+    /// `env_hash` — when `Some` AND a snapshot is created, the #106 env/cap
+    /// fingerprint is recorded in `<cache_dir>/.snapshot_env` alongside the ref so
+    /// a later warm restore is ALSO invalidated when the env/cap set changes on
+    /// an unchanged image (a workspace `add_repo`; see [`snapshot::restore_matches`]).
     #[allow(clippy::too_many_arguments)]
     async fn cold_boot(
         rootfs: &Path,
@@ -260,6 +285,7 @@ impl FirecrackerRuntime {
         image_ref: Option<&str>,
         egress_allow: Option<&[String]>,
         is_workspace: bool,
+        env_hash: Option<&str>,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -337,6 +363,7 @@ impl FirecrackerRuntime {
             client: reqwest::Client::new(),
             snapshot_cache_dir: cache_dir.map(Path::to_path_buf),
             image_ref: image_ref.map(str::to_owned),
+            env_hash: env_hash.map(str::to_owned),
             is_workspace,
             #[cfg(test)]
             probe: None,
@@ -368,6 +395,13 @@ impl FirecrackerRuntime {
                 me.try_create_snapshot(dir).await;
                 if let (Some(reff), true) = (image_ref, snapshot::files_present(dir)) {
                     snapshot::write_ref(dir, reff);
+                    // Stamp the env/cap fingerprint alongside the ref so a later
+                    // restore is gated on BOTH (a workspace `add_repo` changes the
+                    // env, not the image — #108). Paired with the ref write so a
+                    // restore never sees one companion without the other.
+                    if let Some(eh) = env_hash {
+                        snapshot::write_env(dir, eh);
+                    }
                 }
             }
         }
@@ -396,7 +430,6 @@ impl FirecrackerRuntime {
     /// # Errors
     /// See [`Self::launch`].
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn launch_with_uuid(
         rootfs: &Path,
         rt: &Runtime,
@@ -407,6 +440,7 @@ impl FirecrackerRuntime {
         is_swap: bool,
         egress_allow: Option<&[String]>,
         is_workspace: bool,
+        env_hash: &str,
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
         // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
@@ -439,6 +473,7 @@ impl FirecrackerRuntime {
                 Some(reff),
                 egress_allow,
                 is_workspace,
+                Some(env_hash),
             )
             .await?
         } else {
@@ -449,11 +484,15 @@ impl FirecrackerRuntime {
             if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
                 pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
             }
-            // Invalidate the snapshot when the image_ref has changed: the cache
-            // is keyed by UUID only, so a respawn after a redeploy of a NEW image
-            // would otherwise warm-restore the STALE image. `ref_matches` is
-            // safe-by-default (mismatch / missing ref / read error → cold boot).
-            if snapshot::ref_matches(&cache_dir, reff) {
+            // Invalidate the snapshot when the image_ref OR the #106 env/cap
+            // fingerprint has changed: the cache is keyed by UUID only, so a
+            // respawn after a redeploy of a NEW image — OR a workspace `add_repo`
+            // that changed the `/init`-baked cap set on the SAME image (#108) —
+            // would otherwise warm-restore the STALE guest (and the broker's
+            // boot-clone would never run for the new repo). `restore_matches` is
+            // safe-by-default (any mismatch / missing companion / read error →
+            // cold boot, which re-runs `/init` + re-stamps fresh companions).
+            if snapshot::restore_matches(&cache_dir, reff, env_hash) {
                 match Self::launch_from_snapshot(
                     &cache_dir,
                     cfg,
@@ -482,19 +521,20 @@ impl FirecrackerRuntime {
                             Some(reff),
                             egress_allow,
                             is_workspace,
+                            Some(env_hash),
                         )
                         .await?
                     }
                 }
             } else {
-                // No usable snapshot for THIS image (absent, or taken from a
-                // different image_ref): cold boot. If a stale snapshot from a
-                // prior image is on disk, clear it first so the fresh cold-boot
-                // snapshot + its `.snapshot_ref` replace it cleanly.
+                // No usable snapshot for THIS image+env (absent, or taken from a
+                // different image_ref / env-cap set): cold boot. If a now-stale
+                // snapshot is on disk, clear it first so the fresh cold-boot
+                // snapshot + its `.snapshot_ref`/`.snapshot_env` replace it cleanly.
                 if snapshot::files_present(&cache_dir) {
                     tracing::info!(
                         uuid,
-                        "snapshot present but image_ref changed; clearing + cold boot"
+                        "snapshot present but image_ref or env/cap set changed; clearing + cold boot"
                     );
                     snapshot::clear(&cache_dir);
                 }
@@ -508,6 +548,7 @@ impl FirecrackerRuntime {
                     Some(reff),
                     egress_allow,
                     is_workspace,
+                    Some(env_hash),
                 )
                 .await?
             }
@@ -632,6 +673,11 @@ impl FirecrackerRuntime {
             // Cmd::Snapshot re-stamps the same ref (best-effort read; None on
             // any error → the snapshot() path simply skips the ref write).
             image_ref: std::fs::read_to_string(snapshot::ref_path(cache_dir)).ok(),
+            // Likewise carry the env/cap fingerprint the snapshot was stamped with
+            // so a Cmd::Snapshot re-stamp keeps `.snapshot_env` in sync (the guest
+            // we restored has the SAME env). Best-effort read; `None` → the
+            // snapshot() path skips the env write (restore then falls back to cold).
+            env_hash: std::fs::read_to_string(snapshot::env_path(cache_dir)).ok(),
             is_workspace,
             #[cfg(test)]
             probe: None,
@@ -958,6 +1004,7 @@ impl FirecrackerRuntime {
             client: reqwest::Client::new(),
             snapshot_cache_dir: None,
             image_ref: None,
+            env_hash: None,
             is_workspace: false,
             probe: Some(probe),
             scrub_base_override: None,
@@ -1147,6 +1194,16 @@ impl AppRuntime for FirecrackerRuntime {
             if snapshot::files_present(&cache_dir) {
                 if let Some(reff) = self.image_ref.as_deref() {
                     snapshot::write_ref(&cache_dir, reff);
+                }
+                // Stamp the env/cap fingerprint alongside the ref (#108). A
+                // workspace's warm snapshot is created HERE (post-index), NOT in
+                // `cold_boot` (which is `.no-snapshot`-suppressed for workspaces),
+                // so without this the workspace's warm snapshot would carry a ref
+                // but no `.snapshot_env` and `restore_matches` would ALWAYS cold
+                // boot it — defeating the warm-LSP index. With it, an UNCHANGED
+                // workspace warm-restores; only an `add_repo` (changed env) cold-boots.
+                if let Some(eh) = self.env_hash.as_deref() {
+                    snapshot::write_env(&cache_dir, eh);
                 }
                 tracing::info!(
                     cache_dir = %cache_dir.display(),

@@ -43,6 +43,7 @@ impl FirecrackerRuntime {
         _is_swap: bool,
         _egress_allow: Option<&[String]>,
         _is_workspace: bool,
+        _env_hash: &str,
     ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }

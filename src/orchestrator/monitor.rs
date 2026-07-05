@@ -883,6 +883,24 @@ impl Orchestrator {
 
         match decide_pid_grace(record.pid, record.spawned_at, now_secs, runner_is_alive) {
             PidDecision::RespawnDead => {
+                // A deploy is in flight for this uuid: `deploy_app` OWNS the
+                // (re)spawn while its `begin_deploy` guard is held. It may have
+                // just REAPED the runner mid-op — the force-cold-on-env-change
+                // path (#108) reaps a live runner so a fresh one can cold-boot the
+                // new env — so a dead runner here is EXPECTED, not a crash. Racing
+                // in with our own respawn would collide with the deploy's cold
+                // spawn on the identical `uuid:reff` tap/socket, and would boot the
+                // STALE record env (add_repo's new cap is applied by the deploy's
+                // spawn, not yet persisted). Defer: if the deploy fails, its guard
+                // drops and the next tick respawns from the record as usual.
+                if self.is_deploying(&record.uuid) {
+                    tracing::info!(
+                        uuid = %record.uuid,
+                        "deploy in progress; deferring respawn of dead runner (deploy owns the respawn)"
+                    );
+                    return RecordOutcome::Adopted;
+                }
+
                 // Gate the actual respawn behind the backoff policy.
                 if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
                     tracing::debug!(
@@ -1808,6 +1826,31 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A DEAD runner (non-existent pid, past grace) is normally respawned by the
+    /// monitor. With a deploy in flight for its uuid, the monitor must instead
+    /// DEFER (#108): `deploy_app` OWNS the (re)spawn — its force-cold-on-env-change
+    /// path reaps the runner so the deploy can cold-boot the NEW env — so a dead
+    /// runner here is EXPECTED. Racing in a respawn would collide on the identical
+    /// `uuid:reff` tap/socket AND boot the STALE record env.
+    #[tokio::test]
+    async fn reconcile_defers_dead_respawn_while_deploying() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+
+        // Dead runner pid (non-existent, past grace) → normally RespawnDead.
+        let dead_record = unhealthy_record(uuid, 99_999_999, dir.path());
+
+        // Hold the deploy guard for the uuid across the reconcile.
+        let _guard = orch.begin_deploy(uuid);
+        let outcome = orch.reconcile_record(&dead_record).await;
+        assert_eq!(
+            outcome,
+            RecordOutcome::Adopted,
+            "a dead runner with a deploy in flight must be deferred (deploy owns the respawn), not respawned"
+        );
     }
 
     // ── FC child reaping via pidfile (Fix 2) ──────────────────────────────────

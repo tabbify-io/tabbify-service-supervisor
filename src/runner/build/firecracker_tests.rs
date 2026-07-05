@@ -574,6 +574,100 @@ fn cached_rootfs_path_differs_per_env_hash() {
     );
 }
 
+/// `split_env_and_caps` REMOVES the reserved `CAP_FILES_ENV` key from the
+/// effective env and decodes it into `(name, value)` cap-files, leaving the other
+/// vars intact. Traversal-unsafe cap names are dropped.
+#[test]
+fn split_env_and_caps_extracts_cap_files() {
+    use std::collections::HashMap;
+    let caps_json = r#"{"apartami.url":"http://g/a","../evil":"nope","forge-admin.token":"s"}"#;
+    let env = HashMap::from([
+        ("TABBIFY_FORGE_URL".to_owned(), "http://forge".to_owned()),
+        (crate::api::CAP_FILES_ENV.to_owned(), caps_json.to_owned()),
+    ]);
+    let (eff, mut caps) = super::split_env_and_caps(Some(&env));
+    // The reserved key is stripped; the ordinary var survives.
+    assert!(!eff.contains_key(crate::api::CAP_FILES_ENV));
+    assert_eq!(eff.get("TABBIFY_FORGE_URL").map(String::as_str), Some("http://forge"));
+    // The unsafe `../evil` name is dropped; the two safe caps remain.
+    caps.sort();
+    let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["apartami.url", "forge-admin.token"]);
+}
+
+/// `effective_env_hash` derives the SAME #106 fingerprint the rootfs bake uses:
+/// it splits out `CAP_FILES_ENV` first, so its value equals
+/// `rootfs_env_fingerprint(effective_env, cap_files)`. This is the tie that makes
+/// the orchestrator's force-cold-on-env-change comparison agree with what the
+/// runner actually bakes into `/init` (else a warm/cold decision could diverge
+/// from the rootfs cache key).
+#[test]
+fn effective_env_hash_matches_the_split_fingerprint() {
+    use std::collections::HashMap;
+    let caps_json = r#"{"apartami.url":"http://g/a","forge-admin.token":"secret"}"#;
+    let env = HashMap::from([
+        ("TABBIFY_FORGE_URL".to_owned(), "http://forge".to_owned()),
+        (crate::api::CAP_FILES_ENV.to_owned(), caps_json.to_owned()),
+    ]);
+    let (eff, caps) = super::split_env_and_caps(Some(&env));
+    let manual = super::rootfs_env_fingerprint(Some(&eff), &caps);
+    assert_eq!(super::effective_env_hash(Some(&env)), manual);
+
+    // An env-less deploy hashes to the same fixed constant either way.
+    assert_eq!(super::effective_env_hash(None), no_env_hash());
+    assert_eq!(
+        super::effective_env_hash(Some(&HashMap::new())),
+        no_env_hash(),
+        "an empty map must hash identically to None (the empty constant)"
+    );
+}
+
+/// #108 CORE: adding a repo cap to `CAP_FILES_ENV` (a workspace `add_repo`)
+/// CHANGES `effective_env_hash` even though every other var — and the image — is
+/// unchanged. This is exactly the signal the orchestrator uses to force a cold
+/// respawn instead of a stale warm swap. A cap VALUE rotation with the SAME name
+/// set does NOT change it (values are excluded from the fingerprint).
+#[test]
+fn effective_env_hash_changes_when_add_repo_appends_a_cap() {
+    use std::collections::HashMap;
+    let base_var = ("TABBIFY_WORKSPACE_UUID".to_owned(), "ws-1".to_owned());
+
+    let before = HashMap::from([
+        base_var.clone(),
+        (
+            crate::api::CAP_FILES_ENV.to_owned(),
+            r#"{"apartami.url":"http://g/a"}"#.to_owned(),
+        ),
+    ]);
+    // add_repo merges a NEW `<repo>.url` cap into the CAP_FILES_ENV map.
+    let after = HashMap::from([
+        base_var.clone(),
+        (
+            crate::api::CAP_FILES_ENV.to_owned(),
+            r#"{"apartami.url":"http://g/a","tetris.url":"http://g/t"}"#.to_owned(),
+        ),
+    ]);
+    assert_ne!(
+        super::effective_env_hash(Some(&before)),
+        super::effective_env_hash(Some(&after)),
+        "add_repo appending a new clone cap MUST change the env fingerprint (→ force cold)"
+    );
+
+    // Same cap NAME set, rotated VALUE ⇒ unchanged fingerprint (no needless cold).
+    let after_value_rotated = HashMap::from([
+        base_var,
+        (
+            crate::api::CAP_FILES_ENV.to_owned(),
+            r#"{"apartami.url":"http://g/a-ROTATED"}"#.to_owned(),
+        ),
+    ]);
+    assert_eq!(
+        super::effective_env_hash(Some(&before)),
+        super::effective_env_hash(Some(&after_value_rotated)),
+        "a cap VALUE rotation (same NAME set) must NOT force a cold respawn"
+    );
+}
+
 /// `rootfs_is_cached` is true iff the digest+env-keyed rootfs.ext4 exists.
 #[test]
 fn rootfs_is_cached_reflects_presence() {

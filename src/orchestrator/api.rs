@@ -74,6 +74,17 @@ const SWAP_MAX_ATTEMPTS: usize = 3;
 /// finish whatever wedged its control socket before the next `Cmd::Deploy`.
 const SWAP_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
+/// How long the force-cold-on-env-change reap ([`Orchestrator::reap_runner_for_cold_respawn`])
+/// waits for a shut-down runner's control socket to STOP answering before it
+/// proceeds to the cold spawn. Bounded so a wedged socket can't hang the deploy;
+/// the cold spawn re-derives the SAME `uuid:reff` tap/socket, so the old runner
+/// should be gone first, but proceeding after the bound is safe (the cold-boot
+/// path reconciles any stale FC via the per-uuid pidfile).
+const COLD_REAP_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for the reaped runner's socket to go dead.
+const COLD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Externally-visible lifecycle state of an app, mirrored onto the control-API
 /// JSON `state` field. In the orchestrator model an app is `running` iff its
 /// runner answers a control-socket health probe; otherwise it is `stopped`
@@ -370,6 +381,49 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Reap a LIVE runner so a following COLD spawn of the SAME `uuid` boots clean.
+    ///
+    /// Used ONLY by the force-cold-on-env-change deploy path (#108): a warm swap
+    /// cannot re-bake a changed `/init` env, so the running runner must exit and
+    /// its firecracker child be reaped BEFORE the cold spawn re-derives the
+    /// identical `uuid:reff` tap / api-socket (which would otherwise collide with
+    /// the still-live VM). Unlike [`stop_app`] this does NOT mark the record
+    /// stopped — the cold spawn immediately follows and writes a fresh
+    /// `stopped: false` record.
+    ///
+    /// Best-effort throughout; bounded wait for the control socket to go dead.
+    /// MUST be called under the [`begin_deploy`](Orchestrator::begin_deploy) guard
+    /// so the monitor does not respawn the runner mid-reap.
+    async fn reap_runner_for_cold_respawn(&self, uuid: &str, image_ref: Option<&str>) {
+        // Ask the runner to exit (best-effort — it may already be mid-shutdown
+        // from add_repo's prior `stop_app`, or unreachable mid-pull).
+        match self.client_for(uuid).shutdown().await {
+            Ok(_) => {}
+            Err(e) => tracing::debug!(
+                uuid,
+                error = %e,
+                "force-cold reap: Shutdown round-trip failed (runner may already be exiting)"
+            ),
+        }
+        // Reap the firecracker child the runner leaves behind (it is not a
+        // supervisor child — it busy-spins until reaped), stopping the scoped
+        // `uuid:reff` FC too (same primitive the monitor uses before a respawn).
+        kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref);
+        // Wait (bounded) for the control socket to stop answering so the cold
+        // spawn does not race a still-live socket / pidfile on the same path.
+        let deadline = std::time::Instant::now() + COLD_REAP_MAX_WAIT;
+        while std::time::Instant::now() < deadline {
+            if self.client_for(uuid).health().await.is_err() {
+                return;
+            }
+            tokio::time::sleep(COLD_REAP_POLL_INTERVAL).await;
+        }
+        tracing::warn!(
+            uuid,
+            "force-cold reap: runner still answered its socket after the wait; proceeding with cold spawn (cold boot reconciles any stale FC via the pidfile)"
+        );
+    }
+
     /// Purge `uuid`: tell the runner to clear its on-disk cache + remove its
     /// docker image, then shut it down, forget its record, and reclaim the cache
     /// from the orchestrator side too (belt-and-suspenders). Idempotent.
@@ -648,18 +702,49 @@ impl Orchestrator {
         // abort the swap and orphan the half-built VM.
         let _deploy_guard = self.begin_deploy(uuid);
 
-        if self.client_for(uuid).health().await.is_ok() {
-            // Live runner: send the Deploy message, retrying transient transport
-            // failures. On a persistent failure this returns Err BEFORE the
-            // persist block below — so `image_ref` is left at its current value
-            // and the app stays on its last-known-good build (never stranded on a
-            // half-deployed / broken image; the failed swap kept the OLD VM
-            // serving). The error names the dropped ref so a re-deploy is obvious.
+        // Load the persisted record up front: needed both to compare the LIVE
+        // env-hash against this deploy's requested env (the force-cold gate below)
+        // and, on the warm path, to persist the new ref/env after the swap.
+        let existing = RunnerHandle::load(self.runner_dir(), uuid)
+            .with_context(|| format!("load runner record for {uuid} before deploy"))?;
+
+        // Force-cold-on-env-change (#108). A live runner's `/init`-baked env is
+        // FIXED at spawn: a warm zero-downtime swap rebuilds the VM with the
+        // runner's SPAWN-TIME env and CANNOT apply a newly-supplied env/cap set
+        // (a workspace `add_repo`'s new clone cap, a rotated secret). Worse, the
+        // same-digest guard turns such a swap into a "digest already live" no-op
+        // — the change is silently dropped and the guest never re-runs `/init`
+        // (its broker never clones the new repo). So compare the #106 fingerprint
+        // of THIS deploy's env against what the live runtime was built with (the
+        // persisted record's env); if they DIFFER, a warm swap is wrong — force
+        // the COLD respawn path so the new env is baked into a fresh `/init` (the
+        // cold spawn's snapshot warm-restore is ALSO env-gated, so the guest
+        // genuinely re-runs `/init` + boot-clone). A `None` deploy env means
+        // "keep the existing env" → never force-cold. A first deploy (no record)
+        // has no live runtime to differ from → also never force-cold.
+        let env_changed = match (extra_env, existing.as_ref()) {
+            (Some(_), Some(rec)) => {
+                crate::runner::build::firecracker::effective_env_hash(extra_env)
+                    != crate::runner::build::firecracker::effective_env_hash(
+                        rec.extra_env.as_ref(),
+                    )
+            }
+            _ => false,
+        };
+
+        let live = self.client_for(uuid).health().await.is_ok();
+        if live && !env_changed {
+            // Live runner, env UNCHANGED: send the Deploy message, retrying
+            // transient transport failures. On a persistent failure this returns
+            // Err BEFORE the persist block below — so `image_ref` is left at its
+            // current value and the app stays on its last-known-good build (never
+            // stranded on a half-deployed / broken image; the failed swap kept the
+            // OLD VM serving). The error names the dropped ref so a re-deploy is
+            // obvious.
             self.swap_with_retry(uuid, reff).await?;
 
             // Persist the new ref so a future respawn comes up on this version.
-            let mut record = RunnerHandle::load(self.runner_dir(), uuid)
-                .with_context(|| format!("load runner record for {uuid} after deploy"))?
+            let mut record = existing
                 .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
             record.image_ref = Some(reff.to_owned());
             // Persist this deploy's managed `tabbify.toml` so the durable record
@@ -719,8 +804,29 @@ impl Orchestrator {
                 requested_runtime: runtime_override.map(str::to_owned),
             })
         } else {
-            // No live runner: spawn one pinned to reff. The runtime is fixed to
-            // Firecracker, so the override is not threaded into the spec.
+            if live {
+                // env_changed but a runner IS live (add_repo's prior `stop_app`
+                // hadn't fully exited, or a monitor tick respawned it in the gap
+                // before this deploy took its `begin_deploy` guard). A warm swap
+                // can't apply the new `/init` env, so REAP the live runner first:
+                // the cold spawn below re-derives the IDENTICAL `uuid:reff` tap /
+                // api-socket, which must be free, or the new VM collides with the
+                // still-live one ("socket never appeared"). Held under the
+                // `begin_deploy` guard so the monitor won't respawn it mid-reap.
+                tracing::info!(
+                    uuid,
+                    reff,
+                    "deploy: env/cap set changed vs the live runtime — forcing a cold respawn (a warm swap cannot re-bake /init env)"
+                );
+                self.reap_runner_for_cold_respawn(
+                    uuid,
+                    existing.as_ref().and_then(|r| r.image_ref.as_deref()),
+                )
+                .await;
+            }
+            // No live runner (never started, or just reaped for an env change):
+            // spawn one pinned to reff. The runtime is fixed to Firecracker, so
+            // the override is not threaded into the spec.
             let mut spec = self.spawn_spec_for_uuid(uuid);
             spec.image_ref = Some(reff.to_owned());
             // Apply the managed `tabbify.toml` (when supplied) so a BUILD-pipeline
@@ -922,6 +1028,7 @@ async fn read_last_lines(path: &std::path::Path, lines: usize) -> std::io::Resul
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -1322,6 +1429,172 @@ mod tests {
             updated.image_ref.as_deref(),
             Some(reff),
             "image_ref must be persisted after a live deploy"
+        );
+    }
+
+    /// Spawn a fake runner control server on `sock_path` that answers the first
+    /// `max_conns` connections with `{"reply":"ok"}` (a health probe, a Deploy /
+    /// Shutdown round-trip, …), then UNLINKS the socket so any further connect
+    /// fails fast — so a force-cold reap's post-shutdown health probe returns
+    /// promptly instead of waiting out the whole reap timeout.
+    fn spawn_fake_ok_server(sock_path: PathBuf, max_conns: usize) {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            for _ in 0..max_conns {
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok((stream, _))) => {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line).await;
+                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                    }
+                    _ => break,
+                }
+            }
+            // Unbind + unlink so a later connect gets ENOENT (fast reap exit).
+            let _ = std::fs::remove_file(&sock_path);
+        });
+    }
+
+    /// Build a live-runner record whose control socket is `sock_path`, image is
+    /// `reff`, and baked env is `extra_env`.
+    fn live_record(sock_path: &std::path::Path, reff: &str, extra_env: Option<HashMap<String, String>>) -> RunnerHandle {
+        RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.to_path_buf(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: Some(reff.to_owned()),
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: None,
+            extra_env,
+            egress_allow: None,
+            crash_looped: false,
+            stopped: false,
+        }
+    }
+
+    /// (b) A live runner + the SAME env-hash as the record does NOT force a cold
+    /// respawn — it takes the warm zero-downtime swap (the existing
+    /// no-op-preserving behavior). Proven by the deploy SUCCEEDING through the
+    /// fake live socket (a forced cold path would try to spawn the missing runner
+    /// binary and Err).
+    #[tokio::test]
+    async fn deploy_app_same_env_takes_warm_swap() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        spawn_fake_ok_server(sock_path.clone(), 5);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let reff = "[fd5a::1]:5000/acme/app:sha256abc";
+        let env = HashMap::from([("K".to_owned(), "v".to_owned())]);
+        live_record(&sock_path, reff, Some(env.clone()))
+            .save(dir.path())
+            .unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        // Same reff (⇒ same digest) AND same env ⇒ warm swap, not cold.
+        let result = o
+            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), Some(&env), None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "same-env deploy must warm-swap (succeed), not force a cold respawn: {result:?}"
+        );
+        let updated = RunnerHandle::load(dir.path(), APP_UUID).unwrap().unwrap();
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some(reff),
+            "the warm path must persist the ref"
+        );
+    }
+
+    /// (a) A live runner + a DIFFERENT env-hash must NOT warm-swap (a warm swap
+    /// can't re-bake `/init`, so the same-digest no-op would silently drop the
+    /// change). It force-COLD-respawns: reap the live runner, then spawn a fresh
+    /// one. With no runner binary the cold spawn Errs — which is exactly how we
+    /// prove the deploy diverted AWAY from the (would-succeed) warm swap.
+    #[tokio::test]
+    async fn deploy_app_changed_env_forces_cold_respawn() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        // health probe + Shutdown = 2 conns, then the socket is unlinked.
+        spawn_fake_ok_server(sock_path.clone(), 2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let reff = "[fd5a::1]:5000/acme/app:sha256abc";
+        let old_env = HashMap::from([("K".to_owned(), "OLD".to_owned())]);
+        live_record(&sock_path, reff, Some(old_env))
+            .save(dir.path())
+            .unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        let new_env = HashMap::from([("K".to_owned(), "NEW".to_owned())]);
+        // SAME reff (same digest), DIFFERENT env ⇒ forced cold respawn ⇒ the
+        // (binary-less) spawn Errs.
+        let result = o
+            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), Some(&new_env), None)
+            .await;
+        assert!(
+            result.is_err(),
+            "a changed-env deploy must force a cold respawn (which Errs with no runner binary), not a warm swap"
+        );
+    }
+
+    /// (c) `add_repo`'s respawn: appending a repo cap to `CAP_FILES_ENV` changes
+    /// the env-hash even though the image is unchanged, so deploy_app (the path
+    /// `add_workspace_repo` drives) force-COLD-boots rather than warm-swapping the
+    /// stale env — the ONLY way the guest's broker re-runs its boot-clone for the
+    /// new repo (#108). The forced cold spawn Errs without a runner binary,
+    /// proving the divert.
+    #[tokio::test]
+    async fn deploy_app_add_repo_cap_change_forces_cold_respawn() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
+        spawn_fake_ok_server(sock_path.clone(), 2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let reff = "[fd5a::1]:5000/acme/ws:sha256deadbeef";
+        let cap_key = crate::api::CAP_FILES_ENV;
+        // Create-time env: one repo cap.
+        let before = HashMap::from([
+            ("TABBIFY_WORKSPACE_UUID".to_owned(), APP_UUID.to_owned()),
+            (cap_key.to_owned(), r#"{"apartami.url":"http://g/a"}"#.to_owned()),
+        ]);
+        live_record(&sock_path, reff, Some(before))
+            .save(dir.path())
+            .unwrap();
+
+        let o = orch(dir.path().to_path_buf());
+        // add_repo merges a NEW `tetris.url` cap into CAP_FILES_ENV (same image).
+        let after = HashMap::from([
+            ("TABBIFY_WORKSPACE_UUID".to_owned(), APP_UUID.to_owned()),
+            (
+                cap_key.to_owned(),
+                r#"{"apartami.url":"http://g/a","tetris.url":"http://g/t"}"#.to_owned(),
+            ),
+        ]);
+        let result = o
+            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), Some(&after), None)
+            .await;
+        assert!(
+            result.is_err(),
+            "add_repo's new cap must force a cold respawn (Errs with no runner binary), not a stale warm swap"
         );
     }
 

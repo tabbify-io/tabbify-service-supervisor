@@ -407,6 +407,72 @@ pub fn rootfs_env_fingerprint(
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+/// Split a raw deploy `extra_env` into its `(effective_env, cap_files)` parts
+/// EXACTLY as the rootfs bake does: pop the reserved [`crate::api::CAP_FILES_ENV`]
+/// JSON map, decode it into `(name, value)` cap-files (dropping traversal-unsafe
+/// names via [`safe_cap_name`]), and leave the remaining vars as the env that
+/// gets `export`ed into the guest `/init`.
+///
+/// Shared so the deploy-time env-hash comparison (the orchestrator's
+/// force-cold-on-env-change gate) and the actual bake ([`run_firecracker_build`])
+/// derive the SAME split — and therefore the SAME [`rootfs_env_fingerprint`] —
+/// from the SAME input. A malformed cap-file JSON yields no cap-files (logged).
+#[must_use]
+pub fn split_env_and_caps(
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+) -> (
+    std::collections::HashMap<String, String>,
+    Vec<(String, String)>,
+) {
+    let mut effective_env = extra_env.cloned().unwrap_or_default();
+    let cap_files: Vec<(String, String)> = match effective_env.remove(crate::api::CAP_FILES_ENV) {
+        Some(json) => match serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
+        {
+            Ok(map) => map
+                .into_iter()
+                .filter(|(name, _)| {
+                    let ok = safe_cap_name(name);
+                    if !ok {
+                        tracing::warn!(name = %name, "dropping unsafe cap-file name (would escape /run/tabbify/caps)");
+                    }
+                    ok
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "malformed CAP_FILES_ENV; no cap-files written");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    (effective_env, cap_files)
+}
+
+/// The `/init`-baked env fingerprint (#106) for a raw deploy `extra_env`, derived
+/// through the SAME [`split_env_and_caps`] the rootfs bake uses. This is the
+/// value that (a) the per-uuid rootfs cache key nests under, (b) the snapshot
+/// warm-restore gate stamps + checks (`snapshot::restore_matches`), and (c) the
+/// orchestrator compares to force a COLD rebuild when a deploy changes the
+/// env/cap set even though the image digest did not (a workspace `add_repo` /
+/// secret rotation, #108). Empty env + no caps yields a fixed constant, so an
+/// ordinary env-less deploy is stable across redeploys.
+#[must_use]
+pub fn effective_env_hash(
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    let (effective_env, cap_files) = split_env_and_caps(extra_env);
+    // `rootfs_env_fingerprint` treats `None` and an EMPTY map identically, so an
+    // env-less deploy (`effective_env.is_empty()`) hashes the same either way —
+    // matching what `run_firecracker_build` computes after it re-binds an empty
+    // effective env to `None`.
+    let env_ref = if effective_env.is_empty() {
+        None
+    } else {
+        Some(&effective_env)
+    };
+    rootfs_env_fingerprint(env_ref, &cap_files)
+}
+
 /// On-disk cache path for an app's converted rootfs, keyed by the IMMUTABLE
 /// image digest (`sha256:…`) — NOT the tag — AND an `env_hash` fingerprint of the
 /// deploy-time env/cap-files baked into its `/init` (see [`rootfs_env_fingerprint`],
@@ -1779,27 +1845,7 @@ pub async fn run_firecracker_build(
     // leak would actually freeze). Build the EFFECTIVE env: pop the reserved
     // CAP_FILES_ENV key so its cap content is NEVER `export`ed nor snapshot-frozen,
     // decode it into cap-files, then assert NO forbidden key remains.
-    let mut effective_env = extra_env.cloned().unwrap_or_default();
-    let cap_files: Vec<(String, String)> = match effective_env.remove(crate::api::CAP_FILES_ENV) {
-        Some(json) => match serde_json::from_str::<std::collections::HashMap<String, String>>(&json)
-        {
-            Ok(map) => map
-                .into_iter()
-                .filter(|(name, _)| {
-                    let ok = safe_cap_name(name);
-                    if !ok {
-                        tracing::warn!(name = %name, "dropping unsafe cap-file name (would escape /run/tabbify/caps)");
-                    }
-                    ok
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, "malformed CAP_FILES_ENV; no cap-files written");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
+    let (effective_env, cap_files) = split_env_and_caps(extra_env);
     // §4: with the cap-file key removed, the remaining env must carry NO
     // snapshot-forbidden key. A workspace bakes a Full snapshot, so a leaked
     // cap/token here would survive into every warm restore. FAIL the build loudly
@@ -1916,6 +1962,7 @@ pub async fn run_firecracker_build(
             );
             return launch_firecracker(
                 &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
+                &env_hash,
             )
             .await;
         }
@@ -1955,6 +2002,7 @@ pub async fn run_firecracker_build(
                 }
                 return launch_firecracker(
                     &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
+                    &env_hash,
                 )
                 .await;
             }
@@ -2026,7 +2074,7 @@ pub async fn run_firecracker_build(
     };
 
     launch_firecracker(
-        &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
+        &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace, &env_hash,
     )
     .await
 }
@@ -2045,6 +2093,7 @@ async fn launch_firecracker(
     is_swap: bool,
     egress_allow: Option<&[String]>,
     is_workspace: bool,
+    env_hash: &str,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         rootfs,
@@ -2056,6 +2105,7 @@ async fn launch_firecracker(
         is_swap,
         egress_allow,
         is_workspace,
+        env_hash,
     )
     .await?;
     Ok(std::sync::Arc::new(vm))
