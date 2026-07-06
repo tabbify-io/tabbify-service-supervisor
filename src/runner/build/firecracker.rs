@@ -8,22 +8,22 @@
 //!
 //! ## OCI → ext4 contract (CURRENT — docker-less)
 //! The conversion path no longer shells the LOCAL docker daemon: a bare-metal
-//! FC node needs only `oras` + `tar` + `mkfs.ext4`. On a cache miss
-//! `run_firecracker_build` pulls the layout (`pull_oci_layout`) and reads its
-//! config (`read_oci_config_from_layout`), then hands `layout`/`config` to
-//! `resolve_rootfs` for the conversion.
-//! 1. PULL: `pull_oci_layout` pulls the deployed image from the mesh OCI
-//!    registry into `<out_dir>/oci` as a spec-compliant OCI LAYOUT via the
-//!    `oras copy --from-plain-http <ref> --to-oci-layout <dir>` argv form
-//!    (`--from-plain-http` is the SOURCE flag for the plain-HTTP mesh registry,
-//!    NOT `--plain-http`). This is the form the fc-dl-1 step-0a probe PROVED:
-//!    `oras pull -o <dir>` (the now-removed `oras pull` form) does NOT
-//!    produce a layout for a normal container image — `oras` skips layers
-//!    lacking an `org.opencontainers.image.title` annotation (all docker-built
-//!    layers) and leaves the dir EMPTY. The `--to-oci-layout` form yields the
-//!    full layout: `oci-layout` + `index.json` + `blobs/<alg>/<hex>` for
-//!    manifest+config+layers. See the "fc-dl-1 probe outcome" section below for
-//!    the recorded evidence. Skipped iff the rootfs is already cached by digest.
+//! FC node needs only a plain-HTTP registry pull + `tar` + `mkfs.ext4`. On a
+//! cache miss `run_firecracker_build` pulls the layout (`pull_oci_layout`) and
+//! reads its config (`read_oci_config_from_layout`), then hands `layout`/`config`
+//! to `resolve_rootfs` for the conversion.
+//! 1. PULL: `pull_oci_layout` pulls the deployed image from the plain-HTTP mesh
+//!    OCI registry into `<out_dir>/oci` as a spec-compliant OCI LAYOUT
+//!    (`oci-layout` + `index.json` + `blobs/<alg>/<hex>` for
+//!    manifest+config+layers) via the RESUMABLE `crate::oci_pull` puller. Each
+//!    blob is downloaded with an HTTP `Range` header that resumes from the bytes
+//!    already on disk after a mid-stream break. This REPLACED
+//!    `oras copy --to-oci-layout`, which restarts a broken blob from byte 0: over
+//!    the mesh relay a WireGuard rekey (~every 120s) breaks the TCP stream
+//!    mid-blob, so a large layer that outlasts a rekey interval never completed
+//!    (break → restart → break). Range-resume accumulates progress across the
+//!    breaks and always converges. Skipped iff the rootfs is already cached by
+//!    digest. (`oras resolve` is still used for the digest FAST-PATH.)
 //! 2. CONFIG: `read_oci_config_from_layout` reads `index.json` → first image
 //!    manifest descriptor → manifest blob → config-blob under
 //!    `blobs/<alg>/<hex>` → typed [`oci_spec::image::ImageConfiguration`]. No
@@ -1639,45 +1639,6 @@ pub fn production_fc_build_runner() -> FcBuildRunner {
     })
 }
 
-/// Pull the deployed OCI image from the mesh registry into `<out_dir>/oci` as a
-/// spec-compliant OCI LAYOUT (`oci-layout` + `index.json` + `blobs/<alg>/<hex>`),
-/// DOCKER-LESS, via the existing `oras` seam. Replaces the old `docker pull` +
-/// `docker tag`.
-///
-/// CRITICAL — argv contract: [`FcBuildRunner`] spawns `Command::new(argv[0])`,
-/// so the program MUST be argv[0]. `crate::oras::oras_copy_to_oci_layout_args`
-/// returns argv WITHOUT the binary
-/// (`["copy", "--from-plain-http", reff, "--to-oci-layout", dir]`), so we
-/// prepend `"oras"`.
-///
-/// CRITICAL — why `oras copy --to-oci-layout`, NOT `oras pull -o`: the fc-dl-1
-/// probe (recorded in this file's header) PROVED that `oras pull -o <dir>` (the
-/// now-removed `oras pull` form) does NOT produce a layout for a normal
-/// docker-built container image — `oras` skips every layer lacking an
-/// `org.opencontainers.image.title` annotation and leaves `<dir>` EMPTY
-/// (`"Skipped pulling layers without file name ... Use 'oras copy ...
-/// --to-oci-layout'"`). An empty layout would silently break the downstream
-/// `read_oci_config_from_layout` / `unpack_oci_layers`. The `oras copy
-/// --to-oci-layout` form yields the full layout. For the plain-HTTP mesh
-/// registry the SOURCE flag is `--from-plain-http`, NOT `--plain-http`.
-///
-/// Returns the layout directory (`<out_dir>/oci`) for the config-read + unpack.
-///
-/// Max `oras copy` attempts for ONE image pull. Each retry resumes (skips
-/// blobs already in the content-addressed layout), so a flaky relay that EOFs
-/// a multi-MB layer mid-stream converges over a few attempts instead of
-/// failing the whole pull (the home-NAT worker over a wss relay).
-pub(crate) const PULL_MAX_ATTEMPTS: usize = 8;
-/// Resume retries (Phase A) before falling back to wipe-and-retry-fresh. The
-/// first `PULL_RESUME_ATTEMPTS` tries re-`oras copy` into the SAME layout (cheap
-/// blob-level resume for a relay EOF mid-blob); after that the partial is treated
-/// as un-resumable (truncated blob / corrupt index / a dirty dir oras keeps
-/// erroring on) and the layout is wiped for a clean re-pull. Must stay well below
-/// [`PULL_MAX_ATTEMPTS`] so a normal relay EOF still gets several resume tries.
-const PULL_RESUME_ATTEMPTS: usize = 3;
-/// Backoff between pull retries.
-const PULL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Remove an OCI layout dir, tolerating a missing dir (idempotent) but SURFACING
 /// any real error. A silently-swallowed wipe failure (EBUSY / EIO / permissions /
 /// a half-removed tree) leaves a DIRTY layout that makes every subsequent
@@ -1693,83 +1654,53 @@ async fn wipe_oci_layout(layout: &Path) -> Result<()> {
     }
 }
 
+/// Pull the deployed OCI image from the plain-HTTP mesh registry into
+/// `<out_dir>/oci` as a spec-compliant OCI LAYOUT (`oci-layout` + `index.json` +
+/// `blobs/<alg>/<hex>` for manifest+config+layers), DOCKER-LESS.
+///
+/// The pull is RESUMABLE (`crate::oci_pull`): each blob (manifest, config, every
+/// layer) is downloaded with an HTTP `Range` header that resumes from the bytes
+/// already on disk after a mid-stream break. This is the crux of the fix — over
+/// the mesh relay a WireGuard rekey (~every 120s) breaks the TCP stream mid-blob,
+/// and `oras copy` does NOT resume (it restarts the broken blob from byte 0), so
+/// a large layer that outlasts a rekey interval NEVER completes. A Range-resume
+/// download accumulates progress across the breaks and always converges.
+///
+/// Returns the layout directory (`<out_dir>/oci`) for the config-read + unpack.
+///
 /// # Errors
-/// A failing `oras copy`.
+/// A blob that never converges within its budget, or one that fails sha256
+/// verification after the bounded re-pulls (see `crate::oci_pull`).
 async fn pull_oci_layout(
     reff: &str,
     out_dir: &Path,
-    runner: &FcBuildRunner,
-    registry_config_dir: Option<&str>,
+    registry_config_file: Option<&str>,
 ) -> Result<PathBuf> {
-    let layout = out_dir.join("oci");
+    let layout = crate::oci_pull::layout_subdir(out_dir);
     // SPEED + CORRECTNESS: for a MUTABLE tag ref (no `@sha256`), wipe the layout
-    // dir first so `oras copy --to-oci-layout` resolves the tag to its CURRENT
-    // digest. `oras copy` into a DIRTY layout ACCUMULATES manifests in
-    // `index.json`, and the readers take `manifests[0]` (the OLDEST) — so a
-    // re-published tag would otherwise resolve to a STALE manifest and the app
-    // would serve its original version forever. A digest-pinned ref
-    // (`…@sha256:…`) is immutable and content-addressed, so leave its (possibly
-    // already-cached) layout intact — no re-pull churn. `remove_dir_all` is
-    // idempotent (a missing dir is fine).
-    // The wipe error is SURFACED (not swallowed): a failed wipe leaves a dirty
-    // dir that would otherwise poison every attempt with "Error from destination
-    // oci-layout" (the #64 doom-loop).
+    // dir first so the derived digest (`manifests[0].digest`) tracks the tag's
+    // CURRENT image. A stale layout could otherwise leave an OLD manifest whose
+    // digest the readers take, so a re-published tag would serve its original
+    // version forever. A digest-pinned ref (`…@sha256:…`) is immutable and
+    // content-addressed, so leave its (already-verified) blobs intact — that is
+    // exactly what enables cross-invocation blob-level resume for a big layer.
+    // The wipe error is SURFACED (not swallowed): a half-removed dir would leave
+    // a corrupt layout that poisons the readers.
     if !reff.contains("@sha256") {
         wipe_oci_layout(&layout).await?;
     }
     tokio::fs::create_dir_all(&layout)
         .await
         .with_context(|| format!("create oci layout dir {}", layout.display()))?;
-    let mut argv = vec!["oras".to_owned()];
-    argv.extend(crate::oras::oras_copy_to_oci_layout_args(
-        reff,
-        &layout.to_string_lossy(),
-        registry_config_dir,
-    ));
-    // TWO-PHASE retry. Phase A (the first PULL_RESUME_ATTEMPTS tries) re-`oras
-    // copy`s into the SAME content-addressed layout: blobs already present are
-    // SKIPPED, so a flaky relay that EOFs a multi-MB layer mid-stream converges
-    // cheaply at blob granularity. Phase B is the ESCAPE HATCH: once the resume
-    // budget is spent the partial is treated as un-resumable (a truncated blob /
-    // corrupt index / a destination oras keeps erroring on — the #64 flap), so
-    // WIPE the layout ONCE and re-pull from scratch for the remaining attempts
-    // (which themselves resume). The partial is consumed by NOTHING until this fn
-    // returns `Ok`, so discarding it loses no committed work — and frees the bytes
-    // it held, relieving a transient disk-margin.
-    let mut wiped_fresh = false;
-    for attempt in 1..=PULL_MAX_ATTEMPTS {
-        let (ok, _) = (runner)(argv.clone()).await;
-        if ok {
-            return Ok(layout);
-        }
-        if attempt >= PULL_MAX_ATTEMPTS {
-            break;
-        }
-        if attempt >= PULL_RESUME_ATTEMPTS && !wiped_fresh {
-            // Cross from blob-resume to wipe-and-retry-fresh, exactly once.
-            wiped_fresh = true;
-            if let Err(e) = wipe_oci_layout(&layout).await {
-                tracing::warn!(reff, attempt, error = %e, "oras pull: wipe-and-retry-fresh wipe failed (continuing)");
-            }
-            tokio::fs::create_dir_all(&layout).await.ok();
-            tracing::warn!(
-                reff,
-                attempt,
-                max = PULL_MAX_ATTEMPTS,
-                "oras copy still failing after resume retries — wiped layout, re-pulling from scratch"
-            );
-        } else {
-            tracing::warn!(
-                reff,
-                attempt,
-                max = PULL_MAX_ATTEMPTS,
-                "oras copy failed (relay may have broken a large blob mid-stream); \
-                 retrying — already-pulled blobs are skipped (blob-level resume)"
-            );
-        }
-        tokio::time::sleep(PULL_RETRY_BACKOFF).await;
-    }
-    bail!("oras copy of registry_ref {reff:?} into OCI layout failed after {PULL_MAX_ATTEMPTS} attempts");
+    crate::oci_pull::pull_image_http(reff, &layout, registry_config_file)
+        .await
+        .with_context(|| {
+            format!(
+                "resumable OCI pull of {reff:?} into layout {}",
+                layout.display()
+            )
+        })?;
+    Ok(layout)
 }
 
 /// Ensure the buildkit TOOLCHAIN rootfs for SANDBOXED builds (phase 2 of
@@ -1790,7 +1721,7 @@ pub(crate) async fn ensure_toolchain_rootfs(
     let root = data_dir.join("build-toolchain");
     let pull = root.join(".pull");
     // Toolchain pulls are not part of Phase-A auth scope; pass None (anonymous).
-    let layout = pull_oci_layout(reff, &pull, runner, None).await?;
+    let layout = pull_oci_layout(reff, &pull, None).await?;
     let digest = read_manifest_digest_from_layout(&layout)?;
     let dir = root.join(digest.replace(':', "-"));
     let cached = dir.join("rootfs.ext4");
@@ -2023,7 +1954,7 @@ pub async fn run_firecracker_build(
     // the layout. No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
     let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
         let work = digest_work_dir(data_dir, uuid, digest, &env_hash)?;
-        let layout = pull_oci_layout(reff, &work, runner, oras_cfg).await?;
+        let layout = pull_oci_layout(reff, &work, oras_cfg).await?;
         // Seed the global layout cache so the NEXT uuid with this digest skips
         // the pull (env-free → always safe; keyed by the immutable ref digest).
         publish_layout_to_global(data_dir, digest, uuid, &layout).await;
@@ -2038,7 +1969,7 @@ pub async fn run_firecracker_build(
         built
     } else {
         let work = fresh_tag_pull_dir(data_dir, uuid).await?;
-        let layout = pull_oci_layout(reff, &work, runner, oras_cfg).await?;
+        let layout = pull_oci_layout(reff, &work, oras_cfg).await?;
         let digest = read_manifest_digest_from_layout(&layout)?;
         // Seed the global layout cache keyed by the AUTHORITATIVE manifest digest
         // derived FROM the pulled layout — NOT the pre-pull `oras resolve` guess,

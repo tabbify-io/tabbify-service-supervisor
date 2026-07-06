@@ -1213,26 +1213,55 @@ async fn run_fc_build_converts_on_cache_miss() {
 /// FC hot path after the conversion stopped consuming the local daemon image.
 #[tokio::test]
 async fn run_fc_build_issues_no_docker_on_cache_miss() {
-    let tmp = tempfile::tempdir().unwrap();
-    let digest = "sha256:fresh02";
-    let fetched = fc_fetched(digest);
-    // Every FcConfig field carries a clap default, so an arg-less parse yields a
-    // usable config without standing up a real Firecracker host.
-    let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
-    let target = super::cached_rootfs_path(tmp.path(), "uuid-nodocker", digest, &no_env_hash());
+    use sha2::{Digest as _, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Stage a real OCI layout where `pull_oci_layout` would have left it, so the
-    // (faked, no-op) `oras copy` is satisfied and the real host `tar` unpacks it.
-    // Built for the HOST arch so the architecture guard lets it through.
+    let tmp = tempfile::tempdir().unwrap();
+    let hexf = |b: &[u8]| format!("{:x}", Sha256::digest(b));
+
+    // The image the mock registry serves, built for the HOST arch so the
+    // architecture guard lets it through. The real host `tar` unpacks the layer.
     let l0 = make_tar(&[("bin/server", b"elf")]);
     let cfg = serde_json::json!({
         "architecture": super::host_oci_arch(),"os":"linux",
         "config":{"Entrypoint":["/app/server"],"Env":["PATH=/usr/bin"],"WorkingDir":"/app"},
         "rootfs":{"type":"layers","diff_ids":["sha256:l0"]}
     });
-    let layout_dir = target.parent().unwrap().join("oci");
-    std::fs::create_dir_all(&layout_dir).unwrap();
-    write_min_oci_layout(&layout_dir, &cfg, &[("sha256:l0", &l0)]);
+    let config_bytes = serde_json::to_vec(&cfg).unwrap();
+    let (config_hex, layer_hex) = (hexf(&config_bytes), hexf(&l0));
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": format!("sha256:{config_hex}"), "size": config_bytes.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": format!("sha256:{layer_hex}"), "size": l0.len()}],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_hex = hexf(&manifest_bytes);
+    let digest = format!("sha256:{manifest_hex}");
+
+    let server = MockServer::start().await;
+    for (p, body) in [
+        (format!("/v2/acme/vm/manifests/{digest}"), manifest_bytes.clone()),
+        (format!("/v2/acme/vm/blobs/sha256:{config_hex}"), config_bytes.clone()),
+        (format!("/v2/acme/vm/blobs/sha256:{layer_hex}"), l0.clone()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+    }
+
+    // A DIGEST ref whose host is the mock registry.
+    let host = server.uri().strip_prefix("http://").unwrap().to_owned();
+    let fetched = fc_fetched_ref(&format!("{host}/acme/vm@{digest}"));
+    // Every FcConfig field carries a clap default, so an arg-less parse yields a
+    // usable config without standing up a real Firecracker host.
+    let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
+    let target = super::cached_rootfs_path(tmp.path(), "uuid-nodocker", &digest, &no_env_hash());
 
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let calls2 = calls.clone();
@@ -1278,81 +1307,85 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
             .any(|c| c.first().map(String::as_str) == Some("docker")),
         "FC conversion is docker-less; no argv may start with `docker`; got {recorded:?}"
     );
+    // The docker-less pull+convert actually ran (mkfs happened on the cache miss).
+    assert!(
+        recorded
+            .iter()
+            .any(|c| c.first().map(String::as_str) == Some("mkfs.ext4")),
+        "the cache-miss conversion must reach mkfs.ext4; got {recorded:?}"
+    );
 }
 
-/// `pull_oci_layout` pulls the ref into `<out>/oci` via the oras seam: argv[0]
-/// is the `oras` binary, and the argv is the probe-proven layout-producing form
-/// `oras copy --from-plain-http <ref> --to-oci-layout <out>/oci` — NOT the
-/// empty-layout `oras pull -o` form and NOT the `--plain-http` flag. It does NOT
-/// shell docker.
+/// `pull_oci_layout` pulls the image over plain HTTP (the resumable
+/// `crate::oci_pull` puller) into `<out>/oci`, producing the spec-compliant OCI
+/// LAYOUT the downstream readers consume: `oci-layout` + `index.json` +
+/// `blobs/sha256/<hex>` for the manifest, config, and every layer. The registry
+/// is a local mock HTTP server; the ref host points at it.
 #[tokio::test]
-async fn pull_oci_layout_uses_oras_copy_to_oci_layout() {
+async fn pull_oci_layout_produces_layout_over_http() {
+    use sha2::{Digest as _, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let hex = |b: &[u8]| format!("{:x}", Sha256::digest(b));
+
+    // A tiny single-platform image: config blob + one layer blob.
+    let config = b"opaque-config".to_vec();
+    let layer = b"opaque-layer-bytes".to_vec();
+    let (config_hex, layer_hex) = (hex(&config), hex(&layer));
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": format!("sha256:{config_hex}"), "size": config.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": format!("sha256:{layer_hex}"), "size": layer.len()}],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_hex = hex(&manifest_bytes);
+
+    for (p, body) in [
+        (format!("/v2/acme/app/manifests/sha256:{manifest_hex}"), manifest_bytes.clone()),
+        (format!("/v2/acme/app/blobs/sha256:{config_hex}"), config.clone()),
+        (format!("/v2/acme/app/blobs/sha256:{layer_hex}"), layer.clone()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+    }
+
+    let host = server.uri().strip_prefix("http://").unwrap().to_owned();
+    let reff = format!("{host}/acme/app@sha256:{manifest_hex}");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("work");
-    let reff = "[fd5a::1]:5000/acme/vm@sha256:fresh01";
 
-    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-    let calls2 = calls.clone();
-    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
-        calls2.lock().unwrap().push(argv);
-        Box::pin(async { (true, Vec::new()) })
-    });
-
-    let layout = super::pull_oci_layout(reff, &out, &runner, None)
+    let layout = super::pull_oci_layout(&reff, &out, None)
         .await
-        .expect("pull must succeed");
+        .expect("resumable http pull must succeed");
     assert_eq!(layout, out.join("oci"), "layout dir is <out>/oci");
-
-    let recorded = calls.lock().unwrap().clone();
-    let pull = recorded.first().expect("must issue one oras copy");
-    assert_eq!(
-        pull.first().map(String::as_str),
-        Some("oras"),
-        "argv[0] must be the oras binary (FcBuildRunner spawns argv[0]); got {pull:?}"
-    );
-    assert!(
-        pull.contains(&"copy".to_owned()),
-        "must be an `oras copy` (probe-proven layout form), not `oras pull`; got {pull:?}"
-    );
-    assert!(
-        pull.contains(&"--to-oci-layout".to_owned()),
-        "must copy into an OCI layout; got {pull:?}"
-    );
-    assert!(
-        pull.contains(&"--from-plain-http".to_owned()),
-        "mesh registry source is plain http; must use --from-plain-http; got {pull:?}"
-    );
-    assert!(
-        !pull.contains(&"--plain-http".to_owned()),
-        "--plain-http is not the copy SOURCE flag; got {pull:?}"
-    );
-    assert!(
-        !pull.contains(&"pull".to_owned()) && !pull.contains(&"-o".to_owned()),
-        "must NOT be the empty-layout `oras pull -o` form; got {pull:?}"
-    );
-    assert!(
-        pull.contains(&reff.to_owned()),
-        "must carry the ref; got {pull:?}"
-    );
-    assert!(
-        pull.iter().any(|a| a.ends_with("oci")),
-        "must target the layout dir <out>/oci; got {pull:?}"
-    );
+    assert!(layout.join("oci-layout").is_file(), "oci-layout marker present");
+    assert!(layout.join("index.json").is_file(), "index.json present");
+    let blobs = layout.join("blobs").join("sha256");
+    for h in [&manifest_hex, &config_hex, &layer_hex] {
+        assert!(blobs.join(h).is_file(), "blob {h} must be present");
+    }
 }
 
-/// A failing oras copy surfaces a clear error naming the pull step.
-// `start_paused` so the bounded pull-retry backoff sleeps auto-advance (the
-// always-failing runner now retries PULL_MAX_ATTEMPTS times before bailing).
+/// An UNREACHABLE registry (connection refused) makes the resumable pull error
+/// out after its bounded no-progress budget, with a message naming the pull step.
 #[tokio::test(start_paused = true)]
-async fn pull_oci_layout_errors_when_oras_fails() {
+async fn pull_oci_layout_errors_when_registry_unreachable() {
     let tmp = tempfile::tempdir().unwrap();
-    let runner: super::FcBuildRunner = Arc::new(|_| Box::pin(async { (false, Vec::new()) }));
-    let err = super::pull_oci_layout("reg/img@sha256:x", tmp.path(), &runner, None)
+    // Port 1 is never listening → every GET is refused → no blob ever converges.
+    let err = super::pull_oci_layout("127.0.0.1:1/acme/app@sha256:abc", tmp.path(), None)
         .await
-        .expect_err("must error when oras pull fails");
+        .expect_err("an unreachable registry must error");
     assert!(
-        err.to_string().to_lowercase().contains("oras"),
-        "error must name the oras pull step; got: {err}"
+        err.to_string().to_lowercase().contains("pull"),
+        "error must name the pull step; got: {err}"
     );
 }
 
@@ -1968,60 +2001,72 @@ fn read_manifest_digest_from_layout_errors_on_empty_index() {
 /// the cache key — the produced rootfs must land at the digest-keyed path
 /// (fc-3 invariant), not at any tag-derived path.
 ///
-/// The fake `oras copy` is a no-op success; we pre-stage a real layout where the
-/// tag-path pull lands it, use the real host `tar` for the unpack, and fake only
-/// `mkfs.ext4` to touch the digest-keyed output. The final VM boot has no
+/// The registry is a local mock HTTP server (the resumable `crate::oci_pull`
+/// puller talks plain HTTP), the ref host points at it, the `oras resolve` is a
+/// no-op failure so the digest is DERIVED from the pulled layout, the real host
+/// `tar` does the unpack, and only `mkfs.ext4` is faked. The final VM boot has no
 /// Firecracker/KVM here so it errors, but conversion (incl. the digest-keyed
 /// `mkfs.ext4` argv) runs BEFORE the boot and is asserted on the recorded argv.
 #[tokio::test]
 async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
+    use sha2::{Digest as _, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     let tmp = tempfile::tempdir().unwrap();
     let uuid = "uuid-tagref";
-    // A TAG ref — no `@sha256:…`. The old code bailed here.
-    let fetched = fc_fetched_ref("[fd5a::1]:5000/acme/vm:latest");
-    let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
+    let hexf = |b: &[u8]| format!("{:x}", Sha256::digest(b));
 
-    // Stage the layout where the tag-path pull writes it: a digest-INDEPENDENT
-    // work dir (`<data_dir>/apps/<uuid>/fc/.pull/oci`), since the digest is not
-    // yet known for a tag ref.
+    // The image the mock registry serves: config blob + one layer blob.
     let l0 = make_tar(&[("bin/server", b"elf")]);
     let cfg = serde_json::json!({
         "architecture": super::host_oci_arch(), "os": "linux",
         "config": {"Entrypoint": ["/app/server"], "Env": ["PATH=/usr/bin"], "WorkingDir": "/app"},
         "rootfs": {"type": "layers", "diff_ids": ["sha256:l0"]}
     });
-    let pull_layout_dir = tmp
-        .path()
-        .join("apps")
-        .join(uuid)
-        .join("fc")
-        .join(".pull")
-        .join("oci");
-    std::fs::create_dir_all(&pull_layout_dir).unwrap();
-    write_min_oci_layout(&pull_layout_dir, &cfg, &[("sha256:l0", &l0)]);
+    let config_bytes = serde_json::to_vec(&cfg).unwrap();
+    let (config_hex, layer_hex) = (hexf(&config_bytes), hexf(&l0));
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": format!("sha256:{config_hex}"), "size": config_bytes.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": format!("sha256:{layer_hex}"), "size": l0.len()}],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_hex = hexf(&manifest_bytes);
 
-    // The immutable digest the build MUST derive + key the cache by.
-    let expected_digest = super::read_manifest_digest_from_layout(&pull_layout_dir).unwrap();
+    let server = MockServer::start().await;
+    for (p, body) in [
+        ("/v2/acme/vm/manifests/latest".to_owned(), manifest_bytes.clone()),
+        (format!("/v2/acme/vm/blobs/sha256:{config_hex}"), config_bytes.clone()),
+        (format!("/v2/acme/vm/blobs/sha256:{layer_hex}"), l0.clone()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+    }
+
+    // A TAG ref (no `@sha256:…`) whose host is the mock registry.
+    let host = server.uri().strip_prefix("http://").unwrap().to_owned();
+    let fetched = fc_fetched_ref(&format!("{host}/acme/vm:latest"));
+    let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
+
+    // The immutable digest the build MUST derive from the layout + key the cache by.
+    let expected_digest = format!("sha256:{manifest_hex}");
     let target = super::cached_rootfs_path(tmp.path(), uuid, &expected_digest, &no_env_hash());
 
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let calls2 = calls.clone();
     let target2 = target.clone();
-    // The tag-path now CLEARS `.pull` before pulling (so manifests[0] is the
-    // tag's current image, not a stale accumulated one). So the mock `oras` must
-    // (re)WRITE the layout like real `oras copy --to-oci-layout` does, rather than
-    // relying on a pre-staged dir that the clear removes.
-    let cfg_c = cfg.clone();
-    let l0_c = l0.clone();
-    let pull_c = pull_layout_dir.clone();
     let real = super::production_fc_build_runner();
     let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
         calls2.lock().unwrap().push(argv.clone());
         let target3 = target2.clone();
         let real = real.clone();
-        let cfg_c = cfg_c.clone();
-        let l0_c = l0_c.clone();
-        let pull_c = pull_c.clone();
         Box::pin(async move {
             match argv.first().map(String::as_str) {
                 Some("mkfs.ext4") => {
@@ -2031,17 +2076,9 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
                     }
                     (true, Vec::new())
                 }
-                // Simulate real `oras copy --to-oci-layout`: write the layout into
-                // the (freshly-cleared) `.pull/oci` dir.
-                Some("oras") => {
-                    std::fs::create_dir_all(&pull_c).unwrap();
-                    super::oci_fixtures::write_min_oci_layout(
-                        &pull_c,
-                        &cfg_c,
-                        &[("sha256:l0", &l0_c)],
-                    );
-                    (true, Vec::new())
-                }
+                // `oras resolve` for the tag returns NO digest, so the build
+                // DERIVES the immutable digest from the freshly-pulled layout.
+                Some("oras") => (false, Vec::new()),
                 _ => (real)(argv).await, // real host tar for the unpack
             }
         })
@@ -2054,13 +2091,6 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
             .await;
 
     let recorded = calls.lock().unwrap().clone();
-    // It pulled the layout (oras) for the tag ref instead of bailing.
-    assert!(
-        recorded
-            .iter()
-            .any(|c| c.first().map(String::as_str) == Some("oras")),
-        "tag ref must trigger an oras layout pull; got {recorded:?}"
-    );
     // The conversion ran and wrote the rootfs to the DIGEST-keyed path.
     let mkfs = recorded
         .iter()
@@ -2115,115 +2145,6 @@ async fn fresh_tag_pull_dir_clears_a_stale_pull_layout() {
 // ── resumable image pull (survive a relay EOF on a large blob) ───────────────
 
 /// A flaky relay that EOFs `oras copy` a few times must NOT fail the whole
-/// pull: `pull_oci_layout` retries into the SAME content-addressed layout
-/// (blob-level resume), so a runner that fails twice then succeeds yields Ok.
-#[tokio::test(start_paused = true)]
-async fn pull_oci_layout_resumes_until_success() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let tmp = tempfile::tempdir().unwrap();
-    let out_dir = tmp.path().to_path_buf();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls2 = calls.clone();
-    // Fail the first 2 attempts (relay broke a blob mid-stream), succeed on #3.
-    let runner: super::FcBuildRunner = Arc::new(move |_argv: Vec<String>| {
-        let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
-        Box::pin(async move { (n >= 3, Vec::new()) })
-    });
-    let layout = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
-        .await
-        .expect("pull must converge after the relay-flaky attempts");
-    assert_eq!(layout, out_dir.join("oci"));
-    assert_eq!(calls.load(Ordering::SeqCst), 3, "retried until success");
-}
-
-/// A pull that never succeeds bails AFTER the bounded number of attempts (so a
-/// genuinely broken pull can't retry forever), having tried exactly
-/// `PULL_MAX_ATTEMPTS` times.
-#[tokio::test(start_paused = true)]
-async fn pull_oci_layout_bails_after_max_attempts() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let tmp = tempfile::tempdir().unwrap();
-    let out_dir = tmp.path().to_path_buf();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls2 = calls.clone();
-    let runner: super::FcBuildRunner = Arc::new(move |_argv: Vec<String>| {
-        calls2.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { (false, Vec::new()) })
-    });
-    let err = super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
-        .await
-        .expect_err("an always-failing pull must error out");
-    assert!(
-        err.to_string().contains("after"),
-        "error mentions the attempt cap: {err}"
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        super::PULL_MAX_ATTEMPTS,
-        "tried exactly PULL_MAX_ATTEMPTS times then gave up"
-    );
-}
-
-/// ESCAPE HATCH (#64): an UN-resumable partial (oras keeps erroring on the same
-/// dirty destination) must not doom all attempts. After `PULL_RESUME_ATTEMPTS`
-/// resume tries, `pull_oci_layout` WIPES the layout and re-pulls fresh. We detect
-/// the wipe via a sentinel the mock "oras" leaves each call: once wiped, the next
-/// call sees no sentinel.
-#[tokio::test(start_paused = true)]
-async fn pull_oci_layout_wipes_and_retries_fresh_after_resume_budget() {
-    let tmp = tempfile::tempdir().unwrap();
-    let out_dir = tmp.path().to_path_buf();
-    let saw_sentinel: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
-    let saw = saw_sentinel.clone();
-    let runner: super::FcBuildRunner = Arc::new(move |argv: Vec<String>| {
-        let saw = saw.clone();
-        Box::pin(async move {
-            // Last argv element is the layout dir (oras_copy_to_oci_layout_args).
-            let layout = std::path::PathBuf::from(argv.last().cloned().unwrap_or_default());
-            let sentinel = layout.join("partial.blob");
-            saw.lock().unwrap().push(sentinel.exists());
-            // Simulate oras leaving a partial blob, then failing.
-            let _ = std::fs::create_dir_all(&layout);
-            let _ = std::fs::write(&sentinel, b"x");
-            (false, Vec::new())
-        })
-    });
-
-    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
-        .await
-        .expect_err("all attempts fail → pull bails");
-
-    let obs = saw_sentinel.lock().unwrap();
-    assert_eq!(obs.len(), super::PULL_MAX_ATTEMPTS, "every attempt ran");
-    assert!(
-        obs[1],
-        "resume phase keeps the partial (attempt 2 sees attempt 1's sentinel — no wipe)"
-    );
-    assert!(
-        !obs[super::PULL_RESUME_ATTEMPTS],
-        "after the resume budget the layout is wiped → the fresh re-pull sees no partial"
-    );
-}
-
-/// The escape hatch RECOVERS: a pull that only succeeds AFTER the resume budget
-/// (i.e. on a fresh post-wipe attempt) still yields Ok.
-#[tokio::test(start_paused = true)]
-async fn pull_oci_layout_recovers_when_fresh_pull_succeeds() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let tmp = tempfile::tempdir().unwrap();
-    let out_dir = tmp.path().to_path_buf();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls2 = calls.clone();
-    let runner: super::FcBuildRunner = Arc::new(move |_argv: Vec<String>| {
-        let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
-        // Fail through the resume budget; succeed on the first fresh attempt.
-        Box::pin(async move { (n > super::PULL_RESUME_ATTEMPTS, Vec::new()) })
-    });
-    super::pull_oci_layout("reg:5000/x/app:tag", &out_dir, &runner, None)
-        .await
-        .expect("a fresh re-pull after the resume budget must recover");
-}
-
 /// #68: the GLOBAL digest-shared rootfs cache must NOT serve an env-baked rootfs
 /// to a different uuid. A rootfs published globally for digest D (carrying
 /// uuid-A's baked env — its git cap / secrets) must NOT be linked into a

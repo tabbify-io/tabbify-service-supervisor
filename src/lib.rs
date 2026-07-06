@@ -52,6 +52,7 @@ pub mod host;
 pub mod manifest;
 pub mod mesh;
 pub mod mesh_command;
+pub mod oci_pull;
 pub mod openapi;
 pub mod oras;
 pub mod orchestrator;
