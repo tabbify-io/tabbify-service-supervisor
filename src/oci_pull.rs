@@ -23,9 +23,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 
+#[path = "oci_pull_auth.rs"]
+mod auth;
 #[path = "oci_pull_transport.rs"]
 mod transport;
 
+use auth::BearerCache;
 pub use transport::{ByteStream, GetResponse, HttpGet, ReqwestTransport};
 use transport::{download_resumable, sha256_hex, verify_file_sha256};
 
@@ -181,14 +184,20 @@ pub async fn pull_image(
         .await
         .with_context(|| format!("create blobs dir {}", blobs.display()))?;
 
+    // Per-pull bearer cache: the OCI token-exchange (if the registry challenges
+    // with Bearer) runs at most once, and the resulting token is reused across
+    // the manifest, config, every layer, and every ranged resume.
+    let cache = BearerCache::new();
+
     // 1. MANIFEST — fetch by ref (tag or digest). Descend a multi-arch INDEX to
     //    the host-arch child so `index.json` always points at an image manifest.
     let man_url = format!("{base}/v2/{}/manifests/{}", parsed.repo, parsed.reference);
-    let top = fetch_manifest(transport, &man_url, auth, parsed.expected_digest(), &blobs).await?;
+    let top =
+        fetch_manifest(transport, &man_url, auth, parsed.expected_digest(), &blobs, &cache).await?;
     let manifest = match maybe_select_index_child(&top.bytes)? {
         Some(child_digest) => {
             let child_url = format!("{base}/v2/{}/manifests/{}", parsed.repo, child_digest);
-            fetch_manifest(transport, &child_url, auth, Some(&child_digest), &blobs).await?
+            fetch_manifest(transport, &child_url, auth, Some(&child_digest), &blobs, &cache).await?
         }
         None => top,
     };
@@ -202,7 +211,7 @@ pub async fn pull_image(
         .to_owned();
 
     // 3. CONFIG blob (resumable; verified).
-    pull_blob(transport, &base, &parsed.repo, &config_digest, &blobs, auth).await?;
+    pull_blob(transport, &base, &parsed.repo, &config_digest, &blobs, auth, &cache).await?;
 
     // 4. LAYER blobs (resumable; verified; skipped if already complete on disk).
     if let Some(layers) = man["layers"].as_array() {
@@ -210,7 +219,7 @@ pub async fn pull_image(
             let dig = layer["digest"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("layer descriptor has no digest"))?;
-            pull_blob(transport, &base, &parsed.repo, dig, &blobs, auth).await?;
+            pull_blob(transport, &base, &parsed.repo, dig, &blobs, auth, &cache).await?;
         }
     }
 
@@ -245,9 +254,10 @@ async fn fetch_manifest(
     auth: Option<&str>,
     expected_digest: Option<&str>,
     blobs_dir: &Path,
+    cache: &BearerCache,
 ) -> Result<FetchedManifest> {
     let tmp = blobs_dir.join(".manifest.tmp");
-    download_resumable(transport, url, &tmp, Some(MANIFEST_ACCEPT), auth)
+    download_resumable(transport, url, &tmp, Some(MANIFEST_ACCEPT), auth, cache)
         .await
         .with_context(|| format!("download manifest {url}"))?;
     let bytes = tokio::fs::read(&tmp)
@@ -322,6 +332,7 @@ async fn pull_blob(
     digest: &str,
     blobs_dir: &Path,
     auth: Option<&str>,
+    cache: &BearerCache,
 ) -> Result<()> {
     let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
         anyhow::anyhow!("unsupported digest {digest:?} (only sha256 is supported)")
@@ -332,7 +343,7 @@ async fn pull_blob(
     }
     let url = format!("{base}/v2/{repo}/blobs/{digest}");
     for attempt in 1..=VERIFY_REPULL_ATTEMPTS {
-        download_resumable(transport, &url, &dest, None, auth)
+        download_resumable(transport, &url, &dest, None, auth, cache)
             .await
             .with_context(|| format!("download blob {digest}"))?;
         if verify_file_sha256(&dest, hex).await? {
@@ -389,3 +400,7 @@ async fn write_index_json(
 #[cfg(test)]
 #[path = "oci_pull_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "oci_pull_bearer_tests.rs"]
+mod bearer_tests;

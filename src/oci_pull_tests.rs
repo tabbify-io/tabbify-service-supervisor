@@ -72,6 +72,7 @@ impl HttpGet for FakeTransport {
         Box::pin(async move {
             Ok(GetResponse {
                 status: resp.status,
+                www_authenticate: None,
                 body: Box::new(FakeBody {
                     chunks: resp.chunks.into(),
                     break_after: resp.break_after,

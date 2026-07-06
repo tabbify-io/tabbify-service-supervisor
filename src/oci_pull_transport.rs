@@ -15,6 +15,7 @@ use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use super::auth::{BearerCache, get_authed};
 use crate::runtime::BoxFut;
 
 /// Overall wall-clock budget for a SINGLE blob. A 243 MB layer over a lossy
@@ -37,6 +38,10 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(2);
 pub struct GetResponse {
     /// HTTP status code.
     pub status: u16,
+    /// The `WWW-Authenticate` header value, if the response carried one. Present
+    /// on a `401` from a registry that wants OCI Bearer token-exchange; parsed by
+    /// the auth layer to drive the exchange.
+    pub www_authenticate: Option<String>,
     /// The streaming response body.
     pub body: Box<dyn ByteStream>,
 }
@@ -54,13 +59,16 @@ pub trait ByteStream: Send {
 /// tests inject a transport that simulates a lossy relay.
 pub trait HttpGet: Send + Sync {
     /// `GET url` with an optional `Range: bytes=<from>-`, an `Accept` header, and
-    /// (when present) `Authorization: Basic <auth>`.
+    /// (when present) the VERBATIM `Authorization` header value — either
+    /// `Basic <b64>` (the oras-config credential) or `Bearer <jwt>` (an OCI
+    /// token-exchange bearer). The transport attaches it as-is; the Basic-vs-Bearer
+    /// decision and the exchange live in the auth layer.
     fn get<'a>(
         &'a self,
         url: &'a str,
         range_from: Option<u64>,
         accept: Option<&'a str>,
-        auth: Option<&'a str>,
+        authorization: Option<&'a str>,
     ) -> BoxFut<'a, Result<GetResponse, String>>;
 }
 
@@ -103,12 +111,12 @@ impl HttpGet for ReqwestTransport {
         url: &'a str,
         range_from: Option<u64>,
         accept: Option<&'a str>,
-        auth: Option<&'a str>,
+        authorization: Option<&'a str>,
     ) -> BoxFut<'a, Result<GetResponse, String>> {
         let client = self.client.clone();
         let url = url.to_owned();
         let accept = accept.map(str::to_owned);
-        let auth = auth.map(str::to_owned);
+        let authorization = authorization.map(str::to_owned);
         Box::pin(async move {
             let mut req = client.get(&url);
             if let Some(from) = range_from {
@@ -117,13 +125,20 @@ impl HttpGet for ReqwestTransport {
             if let Some(a) = accept {
                 req = req.header(reqwest::header::ACCEPT, a);
             }
-            if let Some(a) = auth {
-                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {a}"));
+            if let Some(a) = authorization {
+                req = req.header(reqwest::header::AUTHORIZATION, a);
             }
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
+            // Read the challenge header BEFORE moving `resp` into the body stream.
+            let www_authenticate = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             Ok(GetResponse {
                 status,
+                www_authenticate,
                 body: Box::new(ReqwestBody { resp }),
             })
         })
@@ -139,6 +154,12 @@ impl HttpGet for ReqwestTransport {
 /// stall counter, so a transfer that keeps advancing across rekey breaks always
 /// completes.
 ///
+/// Auth is transparent: each GET (initial AND every ranged resume) goes through
+/// [`get_authed`], which attaches the cached bearer / performs the OCI
+/// token-exchange with `basic` on a `401` Bearer challenge. `cache` is shared
+/// across the whole pull so a long blob that outlives a short-lived bearer simply
+/// re-exchanges once and continues its Range resume with the refreshed token.
+///
 /// # Errors
 /// The per-blob deadline elapses, or the stall cap is hit with no progress.
 pub(crate) async fn download_resumable(
@@ -146,7 +167,8 @@ pub(crate) async fn download_resumable(
     url: &str,
     dest: &Path,
     accept: Option<&str>,
-    auth: Option<&str>,
+    basic: Option<&str>,
+    cache: &BearerCache,
 ) -> Result<()> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
@@ -158,7 +180,7 @@ pub(crate) async fn download_resumable(
     loop {
         let have = file_len(dest).await;
         let range_from = if have > 0 { Some(have) } else { None };
-        let resp = match transport.get(url, range_from, accept, auth).await {
+        let resp = match get_authed(transport, cache, basic, url, range_from, accept).await {
             Ok(r) => r,
             Err(e) => {
                 stall = bump_stall(stall, started, url, &e)?;
