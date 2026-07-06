@@ -154,7 +154,7 @@ mod tests {
         boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
         kvm_available_with, machine_config_body, network_iface_body, parse_status_line, pause_body,
         read_http_status, resolve_port, resolve_vcpus, resume_body, rootfs_drive_body,
-        snapshot_create_body, snapshot_load_body,
+        snapshot_create_body, snapshot_load_body, workspace_or_resolved_port,
     };
     use crate::config::FcConfig;
     use crate::manifest::Runtime;
@@ -252,6 +252,41 @@ mod tests {
         let cfg = FcConfig::default(); // 8080
         let rt = fc_runtime(None); // port: None
         assert_eq!(resolve_port(&rt, None, &cfg), 8080);
+    }
+
+    /// WORKSPACE — the fixed workspace-init port (`FcConfig::app_port`, 8080) is
+    /// FORCED regardless of the image's `ExposedPorts` (the workspace base image
+    /// declares `EXPOSE 2222` for devbox SSH, which is NOT its readiness port) AND
+    /// regardless of any manifest `[runtime].port`. Regression for 9bb169a, where
+    /// the image-derived port made the readiness probe target `:2222` and the
+    /// workspace hung in `provisioning` forever.
+    #[test]
+    fn workspace_or_resolved_port_forces_fixed_app_port_for_workspace() {
+        let cfg = FcConfig::default(); // cfg.app_port == 8080
+        let mut rt = fc_runtime(None);
+        rt.port = Some(9999); // even an explicit manifest override is ignored
+        // image_exposed_port = Some(2222) (the base image's EXPOSE 2222) is ignored.
+        assert_eq!(
+            workspace_or_resolved_port(true, &rt, Some(2222), &cfg),
+            8080
+        );
+    }
+
+    /// APP — a non-workspace launch preserves the full [`resolve_port`] precedence:
+    /// manifest override wins, else the image's lowest `ExposedPorts` TCP, else the
+    /// 8080 default. Proves the fix does NOT alter app port resolution.
+    #[test]
+    fn workspace_or_resolved_port_preserves_app_precedence() {
+        let cfg = FcConfig::default(); // 8080
+        // Manifest override wins.
+        let mut rt = fc_runtime(None);
+        rt.port = Some(8788);
+        assert_eq!(workspace_or_resolved_port(false, &rt, Some(80), &cfg), 8788);
+        // No manifest override → image ExposedPort wins.
+        let rt = fc_runtime(None); // port: None
+        assert_eq!(workspace_or_resolved_port(false, &rt, Some(80), &cfg), 80);
+        // Neither manifest nor image port → 8080 default.
+        assert_eq!(workspace_or_resolved_port(false, &rt, None, &cfg), 8080);
     }
 
     #[test]

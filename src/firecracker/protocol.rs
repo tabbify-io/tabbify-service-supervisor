@@ -46,6 +46,34 @@ pub fn resolve_port(rt: &Runtime, image_port: Option<u16>, cfg: &FcConfig) -> u1
     rt.port.or(image_port).unwrap_or(cfg.app_port)
 }
 
+/// Resolve the guest port for a launch, FORCING the fixed workspace port when
+/// this is a WORKSPACE launch.
+///
+/// A deployed APP follows the full [`resolve_port`] precedence (manifest
+/// `[runtime].port` → image `ExposedPorts` → `FcConfig::app_port`), so an image
+/// that serves a non-8080 port runs unchanged.
+///
+/// A WORKSPACE is different: воркспейс всегда отдаёт свой readiness/health
+/// endpoint на ФИКСИРОВАННОМ порту (`FcConfig::app_port`, 8080 — сервис
+/// workspace-init). Базовый образ воркспейса объявляет `EXPOSE 2222` (SSH-порт
+/// devbox'а), и это НЕ его порт готовности. Если бы порт резолвился из образа,
+/// readiness-проба била бы в `:2222` и воркспейс навсегда завис бы в
+/// `provisioning` (регрессия из 9bb169a). Поэтому для воркспейса образный
+/// `image_port` И любой manifest-override ИГНОРИРУЮТСЯ, и порт всегда 8080.
+#[must_use]
+pub fn workspace_or_resolved_port(
+    is_workspace: bool,
+    rt: &Runtime,
+    image_port: Option<u16>,
+    cfg: &FcConfig,
+) -> u16 {
+    if is_workspace {
+        cfg.app_port
+    } else {
+        resolve_port(rt, image_port, cfg)
+    }
+}
+
 /// Hop-by-hop headers (RFC 7230 §6.1) that MUST NOT be forwarded when
 /// proxying between the inbound request and the guest, nor copied back from
 /// the guest response. Lower-cased for case-insensitive match.

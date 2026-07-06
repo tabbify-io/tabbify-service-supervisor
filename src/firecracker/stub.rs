@@ -9,6 +9,7 @@ use bytes::Bytes;
 use http::{Request, Response};
 
 use super::FcConfig;
+use super::protocol::workspace_or_resolved_port;
 use crate::manifest::Runtime;
 use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, RuntimeHealth};
 
@@ -35,18 +36,25 @@ impl FirecrackerRuntime {
     #[allow(clippy::unused_async, clippy::too_many_arguments)]
     pub async fn launch_with_uuid(
         _rootfs: &Path,
-        _rt: &Runtime,
-        _cfg: &FcConfig,
+        rt: &Runtime,
+        cfg: &FcConfig,
         _uuid: &str,
         _reff: &str,
         _data_dir: &std::path::Path,
         _is_swap: bool,
         _egress_allow: Option<&[String]>,
-        _is_workspace: bool,
+        is_workspace: bool,
         _env_hash: &str,
-        _image_exposed_port: Option<u16>,
+        image_exposed_port: Option<u16>,
     ) -> Result<Self> {
-        bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
+        // Никогда не бутит VM на не-Linux, но резолвим порт тем же helper'ом,
+        // что и Linux-путь — сигнатуры/логика воркспейс-порта остаются
+        // выровненными между платформами (helper компилируется на macOS).
+        let port = workspace_or_resolved_port(is_workspace, rt, image_exposed_port, cfg);
+        bail!(
+            "firecracker runtime requires Linux + /dev/kvm (host is not Linux; \
+             would target guest port {port})"
+        )
     }
 }
 

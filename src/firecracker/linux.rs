@@ -21,8 +21,8 @@ use tokio::process::{Child, Command};
 use super::pidfile;
 use super::protocol::{
     boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
-    proxy_request, read_http_status, resolve_port, resolve_vcpus, resume_body, rootfs_drive_body,
-    snapshot_create_body, snapshot_load_body,
+    proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
+    snapshot_create_body, snapshot_load_body, workspace_or_resolved_port,
 };
 use super::snapshot;
 use super::{FcConfig, kvm_available};
@@ -311,9 +311,14 @@ impl FirecrackerRuntime {
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_mac = derive_guest_mac(link_idx);
         // Single source of the app port for BOTH the readiness probe + the
-        // reverse proxy (they share `guest_base`): manifest `[runtime].port` →
-        // the image's own `ExposedPorts` (`image_port`) → 8080 (see `resolve_port`).
-        let guest_base = format!("http://{guest_ip}:{}", resolve_port(rt, image_port, cfg));
+        // reverse proxy (they share `guest_base`): for an APP manifest
+        // `[runtime].port` → the image's own `ExposedPorts` (`image_port`) → 8080;
+        // for a WORKSPACE the image port is IGNORED and the fixed 8080
+        // workspace-init port is forced (see `workspace_or_resolved_port`).
+        let guest_base = format!(
+            "http://{guest_ip}:{}",
+            workspace_or_resolved_port(is_workspace, rt, image_port, cfg)
+        );
         tracing::debug!(
             link_idx,
             %host_ip,
@@ -531,7 +536,7 @@ impl FirecrackerRuntime {
                     cfg,
                     Some(&console_log),
                     &vm_key,
-                    resolve_port(rt, image_port, cfg),
+                    workspace_or_resolved_port(is_workspace, rt, image_port, cfg),
                     data_dir,
                     uuid,
                     is_workspace,
