@@ -135,6 +135,44 @@ pub fn clear(cache_dir: &Path) {
     let _ = std::fs::remove_file(env_path(cache_dir));
 }
 
+/// Path to the companion `.app_port` file in `cache_dir`. It records the IMAGE's
+/// own declared port (the lowest `ExposedPorts` TCP entry — see
+/// `resolve_port`'s tier 2) that this app was launched with, so a LATER launch
+/// that SKIPS the OCI-config read — a cold respawn or a warm restore that hits the
+/// per-uuid rootfs/snapshot cache without re-pulling the image — can still target
+/// the app's OWN port instead of falling back to 8080. Written by the production
+/// `launch_with_uuid` path when the image port is known, read back when it is not.
+pub fn app_port_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(".app_port")
+}
+
+/// Persist the IMAGE's exposed port for this uuid so a later config-read-less
+/// launch (cache-hit respawn / warm restore) recovers it. Best-effort: a write
+/// failure just means the next such launch falls back to the 8080 default (the
+/// pre-existing behaviour, never worse). Creates `cache_dir` if absent so the
+/// write does not fail on a first cold boot that has not yet made the dir.
+pub fn write_app_port(cache_dir: &Path, port: u16) {
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        tracing::warn!(path = %cache_dir.display(), error = %e, "app-port persist: mkdir failed");
+        return;
+    }
+    let p = app_port_path(cache_dir);
+    if let Err(e) = std::fs::write(&p, port.to_string().as_bytes()) {
+        tracing::warn!(path = %p.display(), error = %e, "failed to write .app_port");
+    }
+}
+
+/// Read the IMAGE's exposed port persisted by [`write_app_port`], or `None` if
+/// absent/garbled (a snapshot from before this companion existed, or a first
+/// launch). `None` makes `resolve_port` fall through to its 8080 default — the
+/// safe, unchanged behaviour.
+#[must_use]
+pub fn read_app_port(cache_dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(app_port_path(cache_dir))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+}
+
 /// The per-app snapshot/cache directory: `<data_dir>/apps/<uuid>/cache`. Single
 /// source of the convention shared by the firecracker launcher (`launch_with_uuid`)
 /// and the dev-session snapshot-suppression below.
@@ -342,6 +380,39 @@ mod tests {
             !env_path(dir.path()).exists(),
             "clear must drop .snapshot_env"
         );
+    }
+
+    /// The image's exposed port round-trips through the `.app_port` companion so a
+    /// later config-read-less launch (cache-hit respawn / warm restore) recovers it.
+    #[test]
+    fn app_port_round_trips_through_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_app_port(dir.path()), None, "absent ⇒ None");
+        write_app_port(dir.path(), 80);
+        assert_eq!(read_app_port(dir.path()), Some(80));
+        // Overwrite (e.g. a redeploy to an image exposing a different port).
+        write_app_port(dir.path(), 3000);
+        assert_eq!(read_app_port(dir.path()), Some(3000));
+    }
+
+    /// `write_app_port` creates the cache dir if it does not yet exist (a first
+    /// cold boot may persist the port before the snapshot dir is otherwise made).
+    #[test]
+    fn write_app_port_creates_missing_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("apps").join("u").join("cache"); // not yet created
+        assert!(!dir.exists());
+        write_app_port(&dir, 8788);
+        assert_eq!(read_app_port(&dir), Some(8788));
+    }
+
+    /// A garbled `.app_port` reads back as `None` (safe: `resolve_port` then falls
+    /// through to its 8080 default rather than probing a bogus port).
+    #[test]
+    fn read_app_port_none_on_garbled_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(app_port_path(dir.path()), b"not-a-port").unwrap();
+        assert_eq!(read_app_port(dir.path()), None);
     }
 
     /// No `.no-snapshot` marker ⇒ snapshots are NOT suppressed (regular apps).

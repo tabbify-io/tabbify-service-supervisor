@@ -27,13 +27,23 @@ pub fn resolve_vcpus(rt: &Runtime, cfg: &FcConfig) -> u32 {
 
 /// Resolve the guest port the supervisor probes + reverse-proxies for this app.
 ///
-/// Mirrors [`resolve_vcpus`]: the manifest's `[runtime].port` override wins, and
-/// `None` falls back to the supervisor's configured default (`FcConfig::app_port`,
-/// 8080). This is the single source of truth so an image that serves a non-8080
-/// port (e.g. www's `8788`/`3000`) runs as an FC app without being forced onto 8080.
+/// This is the SINGLE source of truth for the app port used by BOTH the
+/// post-boot readiness probe and the request routing/forwarding (they share
+/// `guest_base`), so an image that serves a non-8080 port (a static site
+/// `FROM nginx` on `:80`, www's `8788`/`3000`, …) runs as an FC app without
+/// being force-probed on 8080. Precedence (highest → lowest):
+///
+/// 1. **Manifest override** — `[runtime].port` (`rt.port`). An explicit user
+///    override always wins (mirrors how `[runtime].vcpus` overrides the default).
+/// 2. **Image `ExposedPorts`** — `image_port` = the LOWEST TCP port the OCI image
+///    itself declares (`config.ExposedPorts`, resolved by the build path). This
+///    makes `FROM nginx` (`EXPOSE 80`) work with ZERO user action.
+/// 3. **Fallback** — the supervisor's configured default (`FcConfig::app_port`,
+///    8080). Backward-compat: an app that serves on 8080 and declares neither a
+///    manifest port nor an ExposedPort keeps working unchanged.
 #[must_use]
-pub fn resolve_port(rt: &Runtime, cfg: &FcConfig) -> u16 {
-    rt.port.unwrap_or(cfg.app_port)
+pub fn resolve_port(rt: &Runtime, image_port: Option<u16>, cfg: &FcConfig) -> u16 {
+    rt.port.or(image_port).unwrap_or(cfg.app_port)
 }
 
 /// Hop-by-hop headers (RFC 7230 §6.1) that MUST NOT be forwarded when

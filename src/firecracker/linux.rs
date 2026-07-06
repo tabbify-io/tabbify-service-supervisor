@@ -245,7 +245,9 @@ impl FirecrackerRuntime {
         // path is `launch_with_uuid`.
         // The bare entry carries no deploy egress allow-list → `None` keeps the
         // legacy unrestricted egress. Never a workspace (no creds to scrub). No
-        // cache dir ⇒ never snapshots ⇒ no env fingerprint to stamp (`None`).
+        // cache dir ⇒ never snapshots ⇒ no env fingerprint to stamp (`None`). No
+        // OCI config in scope ⇒ no image port (`None`); `resolve_port` uses the
+        // manifest `[runtime].port` if set, else the 8080 default.
         Self::cold_boot(
             rootfs,
             rt,
@@ -256,6 +258,7 @@ impl FirecrackerRuntime {
             None,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -274,6 +277,10 @@ impl FirecrackerRuntime {
     /// fingerprint is recorded in `<cache_dir>/.snapshot_env` alongside the ref so
     /// a later warm restore is ALSO invalidated when the env/cap set changes on
     /// an unchanged image (a workspace `add_repo`; see [`snapshot::restore_matches`]).
+    /// `image_port` — the app's OWN declared port (lowest OCI `ExposedPorts` TCP,
+    /// tier 2 of [`resolve_port`]) when known, so the readiness probe + proxy
+    /// `guest_base` target it (a static site `FROM nginx` on `:80`) instead of the
+    /// 8080 fallback. `None` ⇒ the manifest `[runtime].port` or the 8080 default.
     #[allow(clippy::too_many_arguments)]
     async fn cold_boot(
         rootfs: &Path,
@@ -286,6 +293,7 @@ impl FirecrackerRuntime {
         egress_allow: Option<&[String]>,
         is_workspace: bool,
         env_hash: Option<&str>,
+        image_port: Option<u16>,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -302,7 +310,10 @@ impl FirecrackerRuntime {
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_mac = derive_guest_mac(link_idx);
-        let guest_base = format!("http://{guest_ip}:{}", resolve_port(rt, cfg));
+        // Single source of the app port for BOTH the readiness probe + the
+        // reverse proxy (they share `guest_base`): manifest `[runtime].port` →
+        // the image's own `ExposedPorts` (`image_port`) → 8080 (see `resolve_port`).
+        let guest_base = format!("http://{guest_ip}:{}", resolve_port(rt, image_port, cfg));
         tracing::debug!(
             link_idx,
             %host_ip,
@@ -422,6 +433,12 @@ impl FirecrackerRuntime {
     /// 2. Clear the (old-image) snapshot and COLD-boot `reff`; the host tap is
     ///    `uuid:reff`-derived, distinct from the old VM's, so they coexist.
     ///
+    /// `image_exposed_port` — the app's OWN declared port (lowest OCI
+    /// `ExposedPorts` TCP, tier 2 of [`resolve_port`]) when THIS launch read the
+    /// image config; `None` on a config-read-less cache-hit launch, where it is
+    /// recovered from the `.app_port` companion an earlier launch persisted. Threads
+    /// into `guest_base` so the readiness probe + proxy target the app's real port.
+    ///
     /// # Notes
     /// Snapshots are host-kernel + CPU-template specific. This supervisor
     /// creates and consumes them on the same host, so they are always
@@ -441,6 +458,7 @@ impl FirecrackerRuntime {
         egress_allow: Option<&[String]>,
         is_workspace: bool,
         env_hash: &str,
+        image_exposed_port: Option<u16>,
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
         // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
@@ -449,6 +467,20 @@ impl FirecrackerRuntime {
         // during the zero-downtime swap.
         let vm_key = format!("{uuid}:{reff}");
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
+
+        // Resolve the IMAGE's own port (tier 2 of `resolve_port`): the freshly-read
+        // `ExposedPorts` value when this launch read the OCI config, else the value
+        // an earlier launch of this uuid persisted (a cache-hit respawn / warm
+        // restore does NOT re-read the config). Persist it whenever known so those
+        // config-read-less launches keep targeting the app's OWN port (e.g. an
+        // nginx image on `:80`) instead of the 8080 fallback. On a redeploy that
+        // read a new image's config, the freshly-read value overwrites the stale
+        // companion. `None` (never known, no companion) ⇒ `resolve_port`'s 8080
+        // default — the unchanged status quo.
+        let image_port = image_exposed_port.or_else(|| snapshot::read_app_port(&cache_dir));
+        if let Some(port) = image_port {
+            snapshot::write_app_port(&cache_dir, port);
+        }
         // Per-app console log: <data_dir>/fc/<uuid>.console.log (only written
         // when SUPERVISOR_FC_DEBUG is truthy — see `console_stdio`).
         let console_log = pidfile::console_log_path(data_dir, uuid);
@@ -474,6 +506,7 @@ impl FirecrackerRuntime {
                 egress_allow,
                 is_workspace,
                 Some(env_hash),
+                image_port,
             )
             .await?
         } else {
@@ -498,7 +531,7 @@ impl FirecrackerRuntime {
                     cfg,
                     Some(&console_log),
                     &vm_key,
-                    resolve_port(rt, cfg),
+                    resolve_port(rt, image_port, cfg),
                     data_dir,
                     uuid,
                     is_workspace,
@@ -522,6 +555,7 @@ impl FirecrackerRuntime {
                             egress_allow,
                             is_workspace,
                             Some(env_hash),
+                            image_port,
                         )
                         .await?
                     }
@@ -549,6 +583,7 @@ impl FirecrackerRuntime {
                     egress_allow,
                     is_workspace,
                     Some(env_hash),
+                    image_port,
                 )
                 .await?
             }

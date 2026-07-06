@@ -44,6 +44,7 @@ impl FirecrackerRuntime {
         _egress_allow: Option<&[String]>,
         _is_workspace: bool,
         _env_hash: &str,
+        _image_exposed_port: Option<u16>,
     ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }

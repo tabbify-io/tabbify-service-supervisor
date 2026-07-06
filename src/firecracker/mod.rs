@@ -220,24 +220,38 @@ mod tests {
         assert_eq!(b["mem_size_mib"], 1536);
     }
 
-    /// The managed `[runtime].port` override drives the readiness-probe / proxy
-    /// target: `Some(8788)` (e.g. www-backend) must win over the configured
-    /// default (8080), so a non-8080 image runs as an FC app unchanged.
+    /// TIER 1 — the managed `[runtime].port` override drives the readiness-probe /
+    /// proxy target: `Some(8788)` (e.g. www-backend) must win over BOTH the image's
+    /// `ExposedPorts` AND the configured default (8080), so an explicit user
+    /// override is always honoured.
     #[test]
-    fn resolve_port_prefers_manifest_override_over_config_default() {
+    fn resolve_port_prefers_manifest_override_over_all() {
         let cfg = FcConfig::default(); // cfg.app_port == 8080
         let mut rt = fc_runtime(None);
         rt.port = Some(8788);
-        assert_eq!(resolve_port(&rt, &cfg), 8788);
+        // Even with an image ExposedPort of 80, the manifest override wins.
+        assert_eq!(resolve_port(&rt, Some(80), &cfg), 8788);
     }
 
-    /// When the manifest omits `port`, the supervisor's configured default
-    /// (`FcConfig::app_port`) is used — preserves the 8080 status quo.
+    /// TIER 2 — with no manifest `port`, the image's OWN declared port (the lowest
+    /// `ExposedPorts` TCP entry, resolved by the build path) is used: this is what
+    /// makes a static site `FROM nginx` (`EXPOSE 80`) work with zero user action
+    /// instead of being force-probed on 8080.
+    #[test]
+    fn resolve_port_uses_image_exposed_port_when_no_manifest_override() {
+        let cfg = FcConfig::default(); // 8080
+        let rt = fc_runtime(None); // port: None
+        assert_eq!(resolve_port(&rt, Some(80), &cfg), 80);
+    }
+
+    /// TIER 3 — when the manifest omits `port` AND the image declares no
+    /// `ExposedPorts` (`image_port == None`), the supervisor's configured default
+    /// (`FcConfig::app_port`) is used — preserves the 8080 status quo unchanged.
     #[test]
     fn resolve_port_falls_back_to_config_default_when_absent() {
         let cfg = FcConfig::default(); // 8080
         let rt = fc_runtime(None); // port: None
-        assert_eq!(resolve_port(&rt, &cfg), 8080);
+        assert_eq!(resolve_port(&rt, None, &cfg), 8080);
     }
 
     #[test]
