@@ -736,6 +736,61 @@ fn resolve_build_spec_custom_context_is_not_default_layout() {
     assert_eq!(spec.raw_context, "service");
 }
 
+// ── Stable moving-tag resolution (base-image auto-retarget) ────────────────
+
+/// No `[build].stable_tag` → `resolve_build_spec` leaves `stable_tag = None`
+/// and `build_stable_reff` yields `None`: an ordinary app publishes ONLY the
+/// immutable `:<sha>` tag (today's behaviour, unchanged).
+#[test]
+fn resolve_build_spec_absent_stable_tag_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let toml_path = src.join("tabbify.toml");
+    std::fs::write(&toml_path, "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\n").unwrap();
+    let spec = resolve_build_spec(&src, &toml_path).unwrap();
+    assert_eq!(spec.stable_tag, None);
+    assert_eq!(
+        build_stable_reff("[fd5a::1]:5000", "platform", "u", spec.stable_tag.as_deref()),
+        None,
+        "no stable tag ⇒ no extra ref"
+    );
+}
+
+/// A `[build].stable_tag` → `resolve_build_spec` carries it, and
+/// `build_stable_reff` renders the SAME `<reg>/<tenant>/<uuid>:<tag>` scheme as
+/// the primary artifact ref, only the tag component differs. This is the ref a
+/// BASE-image consumer (the node) references to auto-pick-up every rebuild.
+#[test]
+fn resolve_build_spec_stable_tag_builds_moving_reff() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let toml_path = src.join("tabbify.toml");
+    std::fs::write(
+        &toml_path,
+        "[app]\nname = \"x\"\n[build]\nkind = \"docker\"\nstable_tag = \"current\"\n",
+    )
+    .unwrap();
+    let spec = resolve_build_spec(&src, &toml_path).unwrap();
+    assert_eq!(spec.stable_tag.as_deref(), Some("current"));
+    assert_eq!(
+        build_stable_reff("[fd5a:1f00:0:3::1]:5000", "platform", "base-uuid", spec.stable_tag.as_deref()),
+        Some("[fd5a:1f00:0:3::1]:5000/platform/base-uuid:current".to_owned()),
+    );
+}
+
+/// `build_stable_reff` lowercases the tenant (OCI repository names are lowercase)
+/// exactly as the primary `reff` does — so a mixed-case GitHub owner still yields
+/// a pushable ref and the two tags land in the SAME repository.
+#[test]
+fn build_stable_reff_lowercases_tenant() {
+    assert_eq!(
+        build_stable_reff("[fd5a::1]:5000", "Lsneg", "u", Some("current")),
+        Some("[fd5a::1]:5000/lsneg/u:current".to_owned()),
+    );
+}
+
 /// END-TO-END host thread of a NON-default layout: `resolve_build_spec` reads a
 /// subdir `[build]`, and those raw paths flow into the fc-sandbox job.json v2
 /// with NO rejection in between (the old `is_default_layout()` bail is gone).

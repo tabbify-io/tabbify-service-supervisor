@@ -141,6 +141,31 @@ pub async fn push_to_registry(
     registry_config_dir: Option<&str>,
 ) -> Result<(), String> {
     (runner)(skopeo_to_layout_args(skopeo_bin, local_tag, layout_dir)).await?;
+    push_layout_tag(oras_bin, reff, layout_dir, runner, registry_config_dir).await
+}
+
+/// Publish ONE additional registry tag from an ALREADY-materialized OCI layout
+/// (the `oras` leg ONLY — no `skopeo` daemon→layout step). Used to move a stable
+/// tag (`[build].stable_tag`, e.g. `platform/<uuid>:current`) onto the just-built
+/// image after the immutable `:<sha>` push: the layout at `layout_dir` is reused,
+/// so the second `oras copy` only re-registers the manifest under the new tag
+/// (the content-addressed blobs already exist in the registry → cheap). Both the
+/// primary [`push_to_registry`] and this share [`oras_push_args`], so the push
+/// argv has ONE source of truth.
+///
+/// `registry_config_dir`: `Some(dir)` threads `--to-registry-config <dir>` (the
+/// SAME push credential the primary tag used — a moving tag targets the same repo
+/// as the artifact, so the push token's `repository:<slug>/*` scope covers it).
+///
+/// # Errors
+/// The captured `oras` diagnostic when the tag push fails.
+pub async fn push_layout_tag(
+    oras_bin: &str,
+    reff: &str,
+    layout_dir: &str,
+    runner: &CommandRunner,
+    registry_config_dir: Option<&str>,
+) -> Result<(), String> {
     (runner)(oras_push_args(oras_bin, layout_dir, reff, registry_config_dir)).await
 }
 
@@ -368,6 +393,35 @@ mod tests {
         let res =
             push_to_registry("skopeo", "oras", "t", "reg/app:v1", "/w/oci", &runner, None).await;
         assert!(res.unwrap_err().contains("name unknown"));
+    }
+
+    /// `push_layout_tag` runs the `oras` leg ONLY (no `skopeo` daemon→layout
+    /// step): exactly ONE runner call, carrying the additional tag's reff. This
+    /// is the stable-tag ("moving" `:current`) publish that reuses the layout the
+    /// primary `:<sha>` push already materialized.
+    #[tokio::test]
+    async fn push_layout_tag_runs_oras_only() {
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap2 = captured.clone();
+        let runner: CommandRunner = Arc::new(move |args: Vec<String>| {
+            cap2.lock().unwrap().push(args);
+            Box::pin(async { Ok(()) })
+        });
+
+        let stable = "[fd5a::1]:5000/platform/base:current";
+        let res = push_layout_tag("oras", stable, "/w/oci", &runner, None).await;
+        assert!(res.is_ok(), "oras Ok → tag push Ok; got {res:?}");
+
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly ONE (oras) call, no skopeo");
+        assert_eq!(calls[0][0], "oras");
+        assert!(calls[0].contains(&stable.to_owned()), "carries the stable reff");
+        assert!(
+            calls[0].contains(&format!("/w/oci:{LAYOUT_TAG}")),
+            "reuses the already-materialized layout"
+        );
     }
 
     /// The production tool runner treats `args[0]` as the binary: an empty

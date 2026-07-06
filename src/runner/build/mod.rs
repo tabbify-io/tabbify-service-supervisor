@@ -200,6 +200,20 @@ pub async fn run_build(
         commit_sha
     );
 
+    // OPTIONAL stable "moving" tag published ALONGSIDE `:<sha>` when the repo's
+    // `[build].stable_tag` is set (a BASE image, e.g. the workspace/devbox root).
+    // Same ref scheme, only the tag differs. A consumer that references this
+    // stable tag (the node's workspace base ref) then auto-picks-up EVERY rebuild
+    // — the supervisor resolves the tag → the current digest at provision time,
+    // and the rootfs cache is keyed by the IMMUTABLE digest, so a moved tag forces
+    // a fresh convert (never a stale rootfs). `None` ⇒ only `:<sha>` (today).
+    let stable_reff = build_stable_reff(
+        &job.registry_ula,
+        &job.tenant,
+        &job.app_uuid,
+        build_spec.stable_tag.as_deref(),
+    );
+
     match job.build_kind {
         BuildKind::Docker => {
             // Phase-2 sandbox: build inside an ephemeral Firecracker VM
@@ -244,6 +258,24 @@ pub async fn run_build(
                 {
                     anyhow::bail!("push to registry failed: {reff}: {e}");
                 }
+                // Move the stable tag onto the just-pushed image (reuses the same
+                // sandbox-built layout — oras leg only). FAIL-CLOSED: a base image
+                // asked for a stable pointer; if it can't be moved, the deploy
+                // FAILS so the consumer never silently keeps pulling the OLD base.
+                if let Some(stable) = stable_reff.as_deref() {
+                    if let Err(e) = crate::skopeo::push_layout_tag(
+                        oras_bin,
+                        stable,
+                        &layout.to_string_lossy(),
+                        tool_runner,
+                        oras_cfg_owned.as_deref(),
+                    )
+                    .await
+                    {
+                        anyhow::bail!("push stable tag failed: {stable}: {e}");
+                    }
+                    tracing::info!(%reff, stable_tag = %stable, "published stable moving tag");
+                }
                 return Ok(ArtifactRef {
                     reff,
                     digest: None,
@@ -258,6 +290,7 @@ pub async fn run_build(
                 oras_bin,
                 &build_spec,
                 reff,
+                stable_reff,
                 commit_sha,
             )
             .await
@@ -316,6 +349,13 @@ pub(crate) struct BuildSpec {
     /// [`Self::raw_context`]; the guest splits it into a dockerfile DIR +
     /// `--opt filename=` basename for buildkit.
     pub raw_dockerfile: String,
+    /// OPTIONAL stable "moving" tag (`[build].stable_tag`, e.g. `"current"`) the
+    /// build publishes ALONGSIDE the immutable `:<commit_sha>` artifact tag. When
+    /// `Some`, the push ALSO registers `<registry>/<tenant>/<uuid>:<stable_tag>`
+    /// re-pointed at the freshly-built digest — the mechanism that makes a BASE
+    /// image rebuild auto-take-effect for a consumer that references the stable
+    /// tag (the node's workspace/devbox base ref). `None` ⇒ only `:<sha>` (today).
+    pub stable_tag: Option<String>,
 }
 
 #[cfg(test)]
@@ -349,6 +389,7 @@ fn resolve_build_spec(src: &Path, toml_path: &Path) -> anyhow::Result<BuildSpec>
             dockerfile: None,
             raw_context: ".".to_owned(),
             raw_dockerfile: "Dockerfile".to_owned(),
+            stable_tag: None,
         });
     }
     let text = std::fs::read_to_string(toml_path)
@@ -361,6 +402,35 @@ fn resolve_build_spec(src: &Path, toml_path: &Path) -> anyhow::Result<BuildSpec>
         dockerfile: Some(src.join(manifest.dockerfile())),
         raw_context: manifest.context().to_owned(),
         raw_dockerfile: manifest.dockerfile().to_owned(),
+        stable_tag: manifest.stable_tag().map(str::to_owned),
+    })
+}
+
+/// Reconstruct the STABLE "moving"-tag registry ref
+/// (`<registry_ula>/<tenant>/<app_uuid>:<stable_tag>`) the build publishes
+/// alongside the immutable `:<commit_sha>` artifact when `[build].stable_tag` is
+/// set — byte-for-byte the same scheme as the primary [`run_build`] `reff`, only
+/// the tag component differs. `stable_tag == None` ⇒ `None` (no extra tag).
+///
+/// Kept as a pure fn (mirrors the node's `deterministic_reff`) so the ref shape
+/// is unit-testable without a live build. The tenant is lowercased for the SAME
+/// reason the primary ref lowercases it (OCI repository names are lowercase; a
+/// mixed-case GitHub owner would otherwise be rejected by oras/skopeo).
+#[must_use]
+fn build_stable_reff(
+    registry_ula: &str,
+    tenant: &str,
+    app_uuid: &str,
+    stable_tag: Option<&str>,
+) -> Option<String> {
+    stable_tag.map(|tag| {
+        format!(
+            "{}/{}/{}:{}",
+            registry_ula,
+            tenant.to_lowercase(),
+            app_uuid,
+            tag
+        )
     })
 }
 

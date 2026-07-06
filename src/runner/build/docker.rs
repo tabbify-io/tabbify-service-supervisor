@@ -33,6 +33,7 @@ pub(super) async fn run_docker_build(
     oras_bin: &str,
     spec: &BuildSpec,
     reff: String,
+    stable_reff: Option<String>,
     commit_sha: String,
 ) -> anyhow::Result<ArtifactRef> {
     // Resolve the Dockerfile to require + pass to the build: the
@@ -111,6 +112,27 @@ pub(super) async fn run_docker_build(
     .await
     {
         anyhow::bail!("push to registry failed: {reff}: {e}");
+    }
+
+    // Move the stable "moving" tag (`[build].stable_tag`, e.g. `:current`) onto
+    // the image just pushed — reuses the OCI layout the primary push already
+    // materialized (oras leg only, no re-run of skopeo daemon→layout). This is
+    // what makes a BASE-image rebuild auto-take-effect for the node's stable-tag
+    // ref. FAIL-CLOSED: a declared stable tag that can't be moved FAILS the
+    // deploy, so a consumer never silently keeps pulling the OLD base.
+    if let Some(stable) = stable_reff.as_deref() {
+        if let Err(e) = crate::skopeo::push_layout_tag(
+            oras_bin,
+            stable,
+            &layout_dir,
+            tool_runner,
+            oras_cfg_owned.as_deref(),
+        )
+        .await
+        {
+            anyhow::bail!("push stable tag failed: {stable}: {e}");
+        }
+        tracing::info!(%reff, stable_tag = %stable, "published stable moving tag");
     }
 
     Ok(ArtifactRef {

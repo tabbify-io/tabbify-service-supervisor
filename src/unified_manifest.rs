@@ -95,6 +95,21 @@ pub struct BuildSection {
     /// Supervisor (`display_name` | ULA) that builds + pushes the artifact.
     #[serde(default)]
     pub builder: Option<String>,
+    /// OPTIONAL stable "moving" tag published ALONGSIDE the immutable
+    /// `:<commit_sha>` artifact tag (e.g. `"current"`). When set, the build
+    /// ALSO pushes `<registry>/<tenant>/<uuid>:<stable_tag>` re-pointed at the
+    /// freshly-built digest, so a downstream consumer that references the image
+    /// by this stable tag auto-picks-up EVERY rebuild without a digest hunt.
+    /// This is how a BASE image (the per-user workspace / devbox root) makes a
+    /// rebuild "just take effect": the node references `platform/<uuid>:current`
+    /// and the supervisor resolves that tag → the current digest at provision
+    /// time (the rootfs cache is keyed by the IMMUTABLE digest, so a moved tag
+    /// forces a fresh convert — never a stale rootfs). Trust: the tag lives in
+    /// the SAME write-gated namespace as the artifact (`platform/*` is writable
+    /// only by the platform token), so a moving `platform/` tag is trusted.
+    /// Absent / empty ⇒ today's behaviour exactly (only the `:<sha>` tag).
+    #[serde(default)]
+    pub stable_tag: Option<String>,
 }
 fn default_context() -> String {
     ".".to_owned()
@@ -200,6 +215,19 @@ impl UnifiedManifest {
     #[must_use]
     pub fn dockerfile(&self) -> &str {
         self.build.dockerfile.as_deref().unwrap_or("Dockerfile")
+    }
+
+    /// The OPTIONAL stable "moving" tag (`[build].stable_tag`) the build
+    /// publishes alongside the immutable `:<sha>` artifact tag. Trimmed;
+    /// empty / whitespace-only ⇒ `None` (treated as unset, so a blank value can
+    /// never push a `:""` tag).
+    #[must_use]
+    pub fn stable_tag(&self) -> Option<&str> {
+        self.build
+            .stable_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// The resolved build context dir (`[build].context`, default `.`).
@@ -421,6 +449,45 @@ dockerfile = "deploy/Dockerfile"
         .unwrap();
         assert_eq!(custom.dockerfile(), "deploy/Dockerfile");
         assert_eq!(custom.context(), "service");
+    }
+
+    /// `[build].stable_tag` parses to `Some` when set, `None` when absent, and
+    /// collapses a blank / whitespace-only value to `None` (never a `:""` tag).
+    #[test]
+    fn build_stable_tag_resolves() {
+        let none: UnifiedManifest = toml::from_str(
+            r#"
+[app]
+name = "x"
+[build]
+kind = "docker"
+"#,
+        )
+        .unwrap();
+        assert_eq!(none.stable_tag(), None, "absent ⇒ None (unchanged)");
+
+        let set: UnifiedManifest = toml::from_str(
+            r#"
+[app]
+name = "x"
+[build]
+kind = "docker"
+stable_tag = "current"
+"#,
+        )
+        .unwrap();
+        assert_eq!(set.stable_tag(), Some("current"));
+
+        let blank: UnifiedManifest = toml::from_str(
+            r#"
+[app]
+name = "x"
+[build]
+stable_tag = "   "
+"#,
+        )
+        .unwrap();
+        assert_eq!(blank.stable_tag(), None, "whitespace ⇒ None (no :\"\" tag)");
     }
 }
 
