@@ -387,6 +387,23 @@ pub async fn deploy_app(
         Ok(s) => running_json(&s).into_response(),
         Err(e) => {
             let tail = state.orchestrator.runner_log_tail(&uuid, 20).await;
+            // Cold-spawn crash-loop verdict (option B): a DISTINCT 503 + a
+            // machine-readable `restart_status:"crashloop"` body marker so the
+            // node classifies it as AppCrashLoop and flips its async deploy_status
+            // off eternal "pending" (the node treats any 2xx as success, so the
+            // verdict MUST be non-2xx). All other errors keep today's 404/500
+            // mapping. The monitor still self-heals the runner in the background.
+            if let Some(cs) = e.downcast_ref::<crate::orchestrator::api::ColdStartUnhealthy>() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({
+                        "error": cs.to_string(),
+                        "restart_status": "crashloop",
+                        "runner_log_tail": tail,
+                    })),
+                )
+                    .into_response();
+            }
             anyhow_to_not_found_or_error_with_tail(&e, tail.as_deref())
         }
     }

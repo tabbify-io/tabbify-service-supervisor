@@ -59,6 +59,19 @@ use crate::{
 /// pragmatic bound until then.)
 const START_HEALTHY_TIMEOUT: Duration = Duration::from_secs(360);
 
+/// Terminal cold-spawn verdict: a freshly cold-spawned runner never reached
+/// `app_health = "serving"` and its process EXITED (or the deadline elapsed).
+///
+/// The cold-spawn analog of [`crate::runner::active::SwapError::Unhealthy`]:
+/// carried as an `anyhow` error so the `deploy_app` HTTP handler can `downcast`
+/// it to a DISTINCT 503 (an app crash-loop is the app's own fault — wrong port,
+/// PID-1 exits — NOT a platform build/upstream fault). CRITICAL: the monitor
+/// keeps respawning the runner in the background; this is only the deploy
+/// RESULT, never a stop signal.
+#[derive(Debug, thiserror::Error)]
+#[error("app crash-looping: {0}")]
+pub struct ColdStartUnhealthy(pub String);
+
 /// How many times a live zero-downtime swap re-sends `Cmd::Deploy` when the
 /// control round-trip fails at the TRANSPORT layer (connect/write/read error or
 /// the 5s round-trip timeout — the "deploy control message failed" symptom a
@@ -856,9 +869,19 @@ impl Orchestrator {
                 .with_context(|| format!("spawn runner for {uuid}"))?;
 
             let client = ControlClient::new(&handle.control_sock);
-            wait_healthy(&client, START_HEALTHY_TIMEOUT)
-                .await
-                .with_context(|| format!("runner for {uuid} never became healthy"))?;
+            // Cold-spawn health gate (option B). A terminal CrashLoop verdict is
+            // surfaced as `ColdStartUnhealthy` WITHOUT `.context` so the handler
+            // can downcast it to a distinct 503 (an app crash-loop is the app's
+            // own fault, not a platform fault) — this is what flips the node's
+            // async `deploy_status` off eternal "pending". The monitor keeps
+            // respawning the runner in the background (self-heal preserved).
+            if let ColdStart::CrashLoop(reason) =
+                wait_cold_serving(&client, handle.pid, START_HEALTHY_TIMEOUT).await
+            {
+                return Err(anyhow::Error::new(ColdStartUnhealthy(format!(
+                    "runner for {uuid} never became healthy: {reason}"
+                ))));
+            }
 
             Ok(AppSummary {
                 uuid: uuid.to_owned(),
@@ -998,6 +1021,61 @@ async fn wait_healthy(client: &ControlClient, timeout: Duration) -> Result<Reply
     }
     Err(anyhow::anyhow!(
         "control socket never became healthy within {timeout:?}: {last_err:?}"
+    ))
+}
+
+/// Cold-spawn readiness verdict (option B). `Serving` = the runner reports
+/// `app_health = "serving"`. `CrashLoop` = a TERMINAL failure: the runner
+/// process exited before serving (unambiguous crash — the common wrong-port /
+/// PID-1-exits case, caught in ~30s), or the deadline elapsed on an
+/// alive-but-never-serving runner.
+enum ColdStart {
+    Serving,
+    CrashLoop(String),
+}
+
+/// Bounded cold-spawn health gate. Unlike [`wait_healthy`], this checks the REAL
+/// app-level health (`app_health == "serving"`), so a reachable-socket-but-app-
+/// down runner does NOT count as ready; and it resolves a terminal `CrashLoop`
+/// the instant the runner PROCESS dies (via `runner_is_alive` — the exact
+/// liveness probe the monitor uses), so a wrong-port cold start fails fast
+/// (~30s) instead of polling a dead socket for the full 360s timeout. A
+/// genuinely slow-but-ALIVE cold boot keeps its process alive and is polled
+/// through to `Serving` — the death path never mislabels it. Does NOT touch the
+/// monitor: the background respawn ladder is untouched.
+async fn wait_cold_serving(client: &ControlClient, pid: u32, timeout: Duration) -> ColdStart {
+    let deadline = std::time::Instant::now() + timeout;
+    let poll = (MONITOR_INTERVAL / 100).max(Duration::from_millis(50));
+    let mut last_reason: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        match client.health().await {
+            Ok(Reply::Health {
+                app_health,
+                app_health_reason,
+                ..
+            }) => {
+                if app_health == "serving" {
+                    return ColdStart::Serving;
+                }
+                last_reason =
+                    app_health_reason.or_else(|| Some(format!("app_health={app_health}")));
+            }
+            Ok(Reply::Err { message }) => last_reason = Some(message),
+            Ok(_) => {}
+            Err(e) => last_reason = Some(format!("control socket unreachable: {e}")),
+        }
+        // Unambiguous crash: the runner process is gone before it ever served.
+        if !crate::orchestrator::monitor::runner_is_alive(pid) {
+            return ColdStart::CrashLoop(format!(
+                "runner process exited before serving (last: {})",
+                last_reason.as_deref().unwrap_or("no health reply")
+            ));
+        }
+        tokio::time::sleep(poll).await;
+    }
+    ColdStart::CrashLoop(format!(
+        "never reached app_health=serving within {timeout:?} (last: {})",
+        last_reason.as_deref().unwrap_or("no health reply")
     ))
 }
 

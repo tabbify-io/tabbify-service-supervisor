@@ -59,7 +59,7 @@ use crate::{
 /// Falls back to `kill(pid, 0)` for non-child processes (e.g. pre-existing
 /// runners discovered via readopt after a supervisor restart — those are NOT
 /// children of the current supervisor process, so `waitpid` returns `ECHILD`).
-fn runner_is_alive(pid: u32) -> bool {
+pub(crate) fn runner_is_alive(pid: u32) -> bool {
     // pid 0 has process-GROUP semantics for waitpid(2)/kill(2): `waitpid(0)`
     // waits on the caller's own process group and `kill(0, 0)` probes it —
     // both would report pid 0 as "alive" (it is OUR group). A corrupted
