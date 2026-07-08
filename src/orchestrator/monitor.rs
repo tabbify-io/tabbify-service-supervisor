@@ -905,7 +905,10 @@ impl Orchestrator {
                 if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
                     tracing::debug!(
                         uuid = %record.uuid,
+                        restart_count = record.restart.consecutive_failures,
                         next_retry_at = record.restart.next_retry_at,
+                        wait_secs = record.restart.next_retry_at.saturating_sub(now_secs),
+                        reason = "backoff-window-open",
                         "runner dead but backoff window not elapsed — skipping this tick"
                     );
                     return RecordOutcome::Backoff;
@@ -918,8 +921,10 @@ impl Orchestrator {
                     tracing::error!(
                         uuid = %record.uuid,
                         pid = record.pid,
+                        restart_count = new_restart.consecutive_failures,
                         consecutive_failures = new_restart.consecutive_failures,
                         threshold = CRASH_LOOP_PARK_THRESHOLD,
+                        reason = "crash-loop-threshold-exceeded",
                         "runner exceeded crash-loop threshold — parking (no further respawns until re-deployed)"
                     );
                     // Kill the FC orphan (best-effort) even when parking: the
@@ -936,6 +941,9 @@ impl Orchestrator {
                     uuid = %record.uuid,
                     pid = record.pid,
                     control_sock = %record.control_sock.display(),
+                    restart_count = new_restart.consecutive_failures,
+                    next_retry_at = new_restart.next_retry_at,
+                    reason = "dead-pid-past-grace",
                     "runner is dead — respawning"
                 );
                 // Kill any lingering FC child left by the dead runner before
@@ -1014,7 +1022,10 @@ impl Orchestrator {
                     if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
                         tracing::debug!(
                             uuid = %record.uuid,
+                            restart_count = record.restart.consecutive_failures,
                             next_retry_at = record.restart.next_retry_at,
+                            wait_secs = record.restart.next_retry_at.saturating_sub(now_secs),
+                            reason = "backoff-window-open",
                             "hung runner socket unhealthy but backoff window not elapsed — skipping"
                         );
                         return RecordOutcome::Backoff;
@@ -1027,8 +1038,10 @@ impl Orchestrator {
                         tracing::error!(
                             uuid = %record.uuid,
                             pid = record.pid,
+                            restart_count = new_restart.consecutive_failures,
                             consecutive_failures = new_restart.consecutive_failures,
                             threshold = CRASH_LOOP_PARK_THRESHOLD,
+                            reason = "crash-loop-threshold-exceeded",
                             "runner exceeded crash-loop threshold — parking (no further respawns until re-deployed)"
                         );
                         kill_pid(record.pid);
@@ -1044,6 +1057,9 @@ impl Orchestrator {
                         uuid = %record.uuid,
                         pid = record.pid,
                         control_sock = %record.control_sock.display(),
+                        restart_count = new_restart.consecutive_failures,
+                        next_retry_at = new_restart.next_retry_at,
+                        reason = "hung-socket-past-grace",
                         "runner alive but socket unhealthy past grace window — killing before respawn"
                     );
                     kill_pid(record.pid);

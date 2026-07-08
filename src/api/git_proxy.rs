@@ -64,22 +64,56 @@ pub struct GitSessions(Mutex<HashMap<String, GitSessionEntry>>);
 impl GitSessions {
     /// Register a new capability with its session entry. Overwrites any existing entry for the same cap.
     pub fn register(&self, cap: String, entry: GitSessionEntry) {
+        // Diagnostic (never the token — secret): which cap (prefix), which repo,
+        // and how long the injected token is valid. This is the counterpart to
+        // the git-proxy 403 log — a "cap unknown" 403 whose register never
+        // appeared means the cap was never threaded; an "expired" one whose
+        // register shows a tiny TTL explains the incident.
+        let cap_prefix = cap.get(..8).unwrap_or(&cap);
+        let ttl_secs = entry
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        tracing::debug!(
+            cap = %cap_prefix,
+            upstream = %entry.upstream_url,
+            ttl_secs,
+            "git session register: cap → upstream (token never logged)"
+        );
         self.0.lock().expect("git sessions lock").insert(cap, entry);
     }
 
     /// Remove the capability from the registry (revoke access immediately).
     pub fn revoke(&self, cap: &str) {
+        let cap_prefix = cap.get(..8).unwrap_or(cap);
+        tracing::debug!(cap = %cap_prefix, "git session revoke: cap removed from registry");
         self.0.lock().expect("git sessions lock").remove(cap);
     }
 
     /// Replace the token (mint refresh); returns false if cap unknown.
     pub fn refresh_token(&self, cap: &str, token: String, expires_at: Instant) -> bool {
+        let cap_prefix = cap.get(..8).unwrap_or(cap);
+        let ttl_secs = expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
         let mut guard = self.0.lock().expect("git sessions lock");
         if let Some(entry) = guard.get_mut(cap) {
             entry.token = token;
             entry.expires_at = expires_at;
+            // New expiry (delta only — never the token). A refresh that lands on
+            // an already-expired cap (ttl 0) is the "expired git session"
+            // incident's earliest visible symptom.
+            tracing::debug!(
+                cap = %cap_prefix,
+                new_ttl_secs = ttl_secs,
+                "git session refresh_token: cap re-armed with fresh token (token never logged)"
+            );
             true
         } else {
+            tracing::warn!(
+                cap = %cap_prefix,
+                "git session refresh_token: cap UNKNOWN (never registered or already revoked) — refresh is a no-op"
+            );
             false
         }
     }
@@ -106,6 +140,31 @@ impl GitSessions {
             return None;
         }
         Some((entry.upstream_url.clone(), entry.token.clone()))
+    }
+
+    /// Classify WHY a [`lookup`](Self::lookup) returned `None`, for the git-proxy
+    /// 403 path's structured log + message. Returns a short, secret-free reason
+    /// (the token is NEVER touched): `"unknown cap …"` when the cap was never
+    /// registered / was revoked, or `"expired N s ago …"` with the exact overdue
+    /// delta. Re-acquires the lock (rare error path only), so `lookup`'s hot path
+    /// stays untouched. A racy still-valid entry (expired between `lookup` and
+    /// here) reports a transient reason rather than lying about the cause.
+    fn lookup_failure_reason(&self, cap: &str) -> String {
+        let guard = self.0.lock().expect("git sessions lock");
+        match guard.get(cap) {
+            None => "unknown cap (never registered, or its dev-session/workspace was closed → revoked)".to_owned(),
+            Some(entry) => {
+                let now = Instant::now();
+                if entry.expires_at < now {
+                    let overdue = now.saturating_duration_since(entry.expires_at).as_secs();
+                    format!(
+                        "git session expired {overdue}s ago (the provider token TTL lapsed — the node must refresh_token this cap)"
+                    )
+                } else {
+                    "cap present and unexpired (transient race — retry)".to_owned()
+                }
+            }
+        }
     }
 }
 
@@ -160,8 +219,30 @@ pub async fn git_proxy(
     tracing::debug!(cap = %cap_prefix, tail = %tail, "git proxy request");
 
     let Some((upstream, token)) = state.git_sessions.lookup(&cap) else {
-        return (StatusCode::FORBIDDEN, "unknown or expired git session").into_response();
+        // Root-cause the "unknown or expired git session" 403: WHICH cap (prefix
+        // only — the caller already holds it, and the token is never touched) and
+        // WHY (unknown vs expired-by-N-seconds). Blind 403s were the whole
+        // incident — the reason string names the exact failure so the node can
+        // tell "cap was never threaded" from "TTL lapsed, refresh it".
+        let reason = state.git_sessions.lookup_failure_reason(&cap);
+        tracing::warn!(
+            cap = %cap_prefix,
+            tail = %tail,
+            %reason,
+            "git proxy 403: cap lookup failed"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            format!("unknown or expired git session (cap {cap_prefix}…): {reason}"),
+        )
+            .into_response();
     };
+    tracing::debug!(
+        cap = %cap_prefix,
+        tail = %tail,
+        upstream = %upstream,
+        "git proxy: cap resolved to upstream (token never logged)"
+    );
 
     // STRICT allow-list — exactly the three smart-HTTP endpoints:
     //   GET  info/refs?service=git-upload-pack|git-receive-pack

@@ -264,6 +264,7 @@ impl Orchestrator {
 
         // Idempotent: a live runner answering its socket → return it untouched.
         if self.client_for(uuid).health().await.is_ok() {
+            tracing::info!(uuid, branch = "idempotent-live", "start_app: live runner already healthy — returning existing summary (no spawn)");
             return Ok(AppSummary {
                 uuid: uuid.to_owned(),
                 app_ula: app_ula.to_string(),
@@ -277,6 +278,7 @@ impl Orchestrator {
 
         // No live runner. Spawn one DETACHED (it persists its own record). The
         // runtime is fixed to Firecracker, so the override is not threaded in.
+        tracing::info!(uuid, branch = "cold-spawn", "start_app: no live runner — spawning detached runner");
         let spec = self.spawn_spec_for_uuid(uuid);
         let (handle, _child) = spawn_runner(&spec, self.runner_dir())
             .await
@@ -290,6 +292,7 @@ impl Orchestrator {
         wait_healthy(&client, START_HEALTHY_TIMEOUT)
             .await
             .with_context(|| format!("runner for {uuid} never became healthy"))?;
+        tracing::info!(uuid, pid = handle.pid, "start_app: runner became healthy (cold-spawn complete)");
 
         Ok(AppSummary {
             uuid: uuid.to_owned(),
@@ -746,6 +749,23 @@ impl Orchestrator {
         };
 
         let live = self.client_for(uuid).health().await.is_ok();
+        // Branch decision trace: which of the three deploy paths this deploy took
+        // and WHY (live? env changed vs the running runtime?). The blind spot was
+        // "did this deploy warm-swap or cold-respawn?" — now it is one grep.
+        tracing::info!(
+            uuid,
+            reff,
+            live,
+            env_changed,
+            branch = if live && !env_changed {
+                "warm-swap"
+            } else if live {
+                "cold-respawn (env changed on live runner)"
+            } else {
+                "cold-spawn (no live runner)"
+            },
+            "deploy: branch selected"
+        );
         if live && !env_changed {
             // Live runner, env UNCHANGED: send the Deploy message, retrying
             // transient transport failures. On a persistent failure this returns
@@ -878,10 +898,23 @@ impl Orchestrator {
             if let ColdStart::CrashLoop(reason) =
                 wait_cold_serving(&client, handle.pid, START_HEALTHY_TIMEOUT).await
             {
+                tracing::warn!(
+                    uuid,
+                    reff,
+                    pid = handle.pid,
+                    %reason,
+                    "deploy: cold-spawn gate returned CrashLoop → 503 ColdStartUnhealthy (monitor keeps respawning in the background)"
+                );
                 return Err(anyhow::Error::new(ColdStartUnhealthy(format!(
                     "runner for {uuid} never became healthy: {reason}"
                 ))));
             }
+            tracing::info!(
+                uuid,
+                reff,
+                pid = handle.pid,
+                "deploy: cold-spawn healthy (app_health=serving)"
+            );
 
             Ok(AppSummary {
                 uuid: uuid.to_owned(),
@@ -1047,36 +1080,78 @@ async fn wait_cold_serving(client: &ControlClient, pid: u32, timeout: Duration) 
     let deadline = std::time::Instant::now() + timeout;
     let poll = (MONITOR_INTERVAL / 100).max(Duration::from_millis(50));
     let mut last_reason: Option<String> = None;
+    let mut polls: u32 = 0;
     while std::time::Instant::now() < deadline {
+        polls += 1;
         match client.health().await {
             Ok(Reply::Health {
                 app_health,
                 app_health_reason,
                 ..
             }) => {
+                // Per-poll app-level health so a "never became ready" verdict is
+                // backed by the exact health values seen along the way (e.g. a
+                // guest stuck at `booting`/`unhealthy` vs one that never answered).
+                tracing::debug!(
+                    pid,
+                    poll = polls,
+                    %app_health,
+                    app_health_reason = app_health_reason.as_deref().unwrap_or(""),
+                    "cold-spawn gate: health poll"
+                );
                 if app_health == "serving" {
+                    tracing::info!(
+                        pid,
+                        polls,
+                        "cold-spawn gate verdict: Serving (app_health=serving)"
+                    );
                     return ColdStart::Serving;
                 }
                 last_reason =
                     app_health_reason.or_else(|| Some(format!("app_health={app_health}")));
             }
-            Ok(Reply::Err { message }) => last_reason = Some(message),
+            Ok(Reply::Err { message }) => {
+                tracing::debug!(pid, poll = polls, %message, "cold-spawn gate: runner Err reply");
+                last_reason = Some(message);
+            }
             Ok(_) => {}
-            Err(e) => last_reason = Some(format!("control socket unreachable: {e}")),
+            Err(e) => {
+                tracing::debug!(pid, poll = polls, error = %e, "cold-spawn gate: control socket unreachable this poll");
+                last_reason = Some(format!("control socket unreachable: {e}"));
+            }
         }
         // Unambiguous crash: the runner process is gone before it ever served.
         if !crate::orchestrator::monitor::runner_is_alive(pid) {
-            return ColdStart::CrashLoop(format!(
+            let reason = format!(
                 "runner process exited before serving (last: {})",
                 last_reason.as_deref().unwrap_or("no health reply")
-            ));
+            );
+            tracing::warn!(
+                pid,
+                polls,
+                verdict = "crashloop",
+                cause = "process-death",
+                %reason,
+                "cold-spawn gate verdict: CrashLoop — runner process died before serving"
+            );
+            return ColdStart::CrashLoop(reason);
         }
         tokio::time::sleep(poll).await;
     }
-    ColdStart::CrashLoop(format!(
+    let reason = format!(
         "never reached app_health=serving within {timeout:?} (last: {})",
         last_reason.as_deref().unwrap_or("no health reply")
-    ))
+    );
+    tracing::warn!(
+        pid,
+        polls,
+        verdict = "crashloop",
+        cause = "deadline",
+        timeout_secs = timeout.as_secs(),
+        %reason,
+        "cold-spawn gate verdict: CrashLoop — deadline elapsed, runner alive but never served"
+    );
+    ColdStart::CrashLoop(reason)
 }
 
 /// Bounded tail: reads at most the last `CHUNK` bytes of `path`, then keeps the

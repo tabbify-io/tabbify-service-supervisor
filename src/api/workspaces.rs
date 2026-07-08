@@ -82,10 +82,12 @@ pub fn cap_repo_basename(repo_url: &str) -> String {
     if cleaned.is_empty() { "repo".to_owned() } else { cleaned }
 }
 
-/// MERGE a new `<repo>.url` cap-file entry into the persisted [`CAP_FILES_ENV`]
-/// JSON map in an existing workspace's `extra_env`, PRESERVING every other
-/// cap-file entry already baked in (the other repos' URLs, `forge-admin.token`,
-/// `authkeys.cap`). This is the additive `add_repo` respawn channel: the
+/// MERGE one cap-file entry (a repo's `<repo>.url`, or the reserved
+/// `forge-admin.token` on a backfilling add_repo) into the persisted
+/// [`CAP_FILES_ENV`] JSON map in an existing workspace's `extra_env`, PRESERVING
+/// every other cap-file entry already baked in (the other repos' URLs, the
+/// forge-admin token, `authkeys.cap`). This is the additive `add_repo` respawn
+/// channel: the
 /// supervisor never persists the authorized-key / forge-admin token in the
 /// durable [`WorkspaceRecord`], but they DO live in the runner's persisted
 /// `extra_env` (the create-time `CAP_FILES_ENV` map) — so merging into that map
@@ -94,14 +96,16 @@ pub fn cap_repo_basename(repo_url: &str) -> String {
 /// prior `CAP_FILES_ENV` starts a fresh single-entry map. All non-cap env keys
 /// (the workspace marker, user-id, authorized-key) are untouched.
 ///
-/// `repo_file` is the cap-file name (`"<stem>.url"`, from [`cap_repo_basename`]);
-/// `git_remote` is the TOKENLESS git-proxy URL (no secret — the token stays
-/// host-side in `GitSessions`). A malformed prior value (not a JSON object) is
-/// replaced by a fresh single-entry map rather than propagating corruption.
+/// `cap_file` is the cap-file NAME (a repo's `"<stem>.url"` from
+/// [`cap_repo_basename`], or the reserved `"forge-admin.token"` on a backfilling
+/// add_repo); `value` is that file's content (a TOKENLESS git-proxy URL — no
+/// secret, the token stays host-side in `GitSessions` — or the forge-admin creds
+/// JSON). A malformed prior value (not a JSON object) is replaced by a fresh
+/// single-entry map rather than propagating corruption.
 fn merge_cap_into_env(
     extra_env: &mut HashMap<String, String>,
-    repo_file: &str,
-    git_remote: &str,
+    cap_file: &str,
+    value: &str,
 ) {
     let mut cap_files: serde_json::Map<String, serde_json::Value> = extra_env
         .get(CAP_FILES_ENV)
@@ -109,8 +113,8 @@ fn merge_cap_into_env(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
     cap_files.insert(
-        repo_file.to_owned(),
-        serde_json::Value::String(git_remote.to_owned()),
+        cap_file.to_owned(),
+        serde_json::Value::String(value.to_owned()),
     );
     extra_env.insert(
         CAP_FILES_ENV.to_owned(),
@@ -350,7 +354,13 @@ pub struct WorkspaceCreated {
 
 /// `POST /v1/workspaces/{uuid}/repos` request body — ADD one repo to an existing
 /// workspace. Mirrors [`RepoSpec`] field-for-field (the node mints the token +
-/// resolves the repo exactly like create, then sends this single-repo body).
+/// resolves the repo exactly like create, then sends this single-repo body), plus
+/// the optional forge fields the create body carries (§12 S1/S2). When the node
+/// threads them, the handler MERGES `forge-admin.token` into the persisted
+/// `CAP_FILES_ENV` map + sets `TABBIFY_FORGE_URL`/`TABBIFY_FORGE_ORG`, so the cold
+/// respawn re-bakes the forge cap-file — backfilling a workspace whose forge org
+/// did not exist at provision time. All three are `#[serde(default)]`: a pre-fix
+/// node omits them and the body deserializes exactly as before.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AddRepoBody {
     /// Provider clone URL WITHOUT credentials.
@@ -364,6 +374,24 @@ pub struct AddRepoBody {
     /// Token TTL in seconds.
     #[schema(example = "3600")]
     pub git_token_ttl_secs: u64,
+    /// Optional forge-admin creds JSON (§12 S1/S2): merged into the persisted
+    /// `CAP_FILES_ENV` as `forge-admin.token` so the cold respawn writes it to
+    /// `/run/tabbify/caps/forge-admin.token` (0600, broker-uid). `None` when the
+    /// account has no in-mesh forge org (or a pre-fix node). NEVER in agent env.
+    #[serde(default)]
+    pub forge_admin_token: Option<String>,
+    /// Mesh-internal Forgejo base URL — injected into the FC env as
+    /// `TABBIFY_FORGE_URL` (rewritten to the tap-gateway proxy when the host-side
+    /// forge-proxy is enabled) so the broker's `ForgeCfg::from_env` resolves.
+    /// NON-secret. `None` ⇒ the env key is left untouched.
+    #[schema(example = "http://[fd5a:1f02::1]:8730")]
+    #[serde(default)]
+    pub forge_url: Option<String>,
+    /// The account's forge org slug — injected as `TABBIFY_FORGE_ORG`. NON-secret
+    /// (the tenant slug). `None` ⇒ the env key is left untouched.
+    #[schema(example = "t_acme")]
+    #[serde(default)]
+    pub forge_org: Option<String>,
 }
 
 /// `POST /v1/workspaces/{uuid}/repos` response body.
@@ -577,6 +605,24 @@ pub async fn create_workspace(
     // token; an unauthenticated (agent) request 401s. Cap-file channel ONLY —
     // never an env var, never the agent's reach.
     let authkeys_cap = insert_authkeys_cap(&ws_uuid, &mut cap_files);
+
+    // DIAGNOSTIC (keys/presence ONLY — a cap-file's VALUE is a git-proxy URL or a
+    // secret token and is NEVER logged): exactly which cap-files this create is
+    // threading into `/run/tabbify/caps/` (the repo `<stem>.url`s + the reserved
+    // `forge-admin.token`/`authkeys.cap`) and whether the forge ENDPOINT env is
+    // set or absent. A workspace that later reports "forge not provisioned" is
+    // explained by `forge_admin_token=false` HERE; a repo that never clones is
+    // explained by its `<stem>.url` missing from `cap_files`.
+    tracing::info!(
+        workspace_uuid = %ws_uuid,
+        repo_count = body.repos.len(),
+        cap_files = ?cap_files.keys().collect::<Vec<_>>(),
+        forge_admin_token = body.forge_admin_token.is_some(),
+        forge_url_set = body.forge_url.is_some(),
+        forge_org_set = body.forge_org.is_some(),
+        forge_proxy_enabled = state.forge_proxy_enabled,
+        "workspace create: threaded cap-files + forge endpoint env (keys/presence only; values never logged)"
+    );
 
     // RE-KEY #3 (persistence): the workspace marker env + a durable record. The
     // marker (a) makes a respawn re-bake the same identity, (b) drives the runner
@@ -912,6 +958,59 @@ pub async fn add_workspace_repo(
     // respawn re-bakes into `/run/tabbify/caps/`.
     let mut merged_env = runner.extra_env.clone().unwrap_or_default();
     merge_cap_into_env(&mut merged_env, &repo_file, &git_remote);
+
+    // BACKFILL the forge-admin creds + endpoint env (§12 S1/S2). A workspace
+    // provisioned BEFORE its account's forge org existed has NO `forge-admin.token`
+    // in its persisted `CAP_FILES_ENV`, so every forge op fails "forge not
+    // provisioned" forever (there is no other re-thread path). When the node
+    // threads the resolved creds on THIS add_repo, MERGE them into the cap-file map
+    // (the SAME off-env channel the create path uses) so the cold respawn below
+    // re-bakes the 0600 `forge-admin.token` cap-file, and set/refresh the forge
+    // endpoint env (`TABBIFY_FORGE_URL`/`TABBIFY_FORGE_ORG`) the broker's
+    // `ForgeCfg::from_env` also needs — proxy-rewriting the URL to the tap gateway
+    // exactly as create does (the IPv4-only guest cannot route the raw v6 ULA).
+    // Absent (an account with no forge org / a pre-fix node) ⇒ untouched (unchanged
+    // behavior). The creds are a credential and are NEVER logged.
+    if let Some(tok) = &body.forge_admin_token {
+        merge_cap_into_env(&mut merged_env, "forge-admin.token", tok);
+        // Fires ONLY on the backfill path (a workspace whose forge org did not
+        // exist at provision time). The token itself is a credential — NEVER
+        // logged; presence + destination workspace only.
+        tracing::info!(
+            workspace_uuid = %uuid,
+            "add_repo: backfilling forge-admin.token into workspace cap-files (value never logged)"
+        );
+    }
+    let forge_gateway = state
+        .forge_proxy_enabled
+        .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
+    insert_forge_env(
+        &mut merged_env,
+        &body.forge_url,
+        &body.forge_org,
+        forge_gateway.as_deref(),
+    );
+
+    // DIAGNOSTIC (keys/presence ONLY — cap-file VALUES are URLs/secrets, NEVER
+    // logged): the new repo cap-file being merged + the FULL post-merge cap-file
+    // key set (so a lost authkeys/forge cap after a respawn is visible), plus
+    // whether the forge endpoint env was set. This is the add_repo twin of the
+    // create-path diagnostic.
+    let merged_cap_keys: Vec<String> = merged_env
+        .get(CAP_FILES_ENV)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default();
+    tracing::info!(
+        workspace_uuid = %uuid,
+        repo_file = %repo_file,
+        cap_files = ?merged_cap_keys,
+        forge_admin_token = body.forge_admin_token.is_some(),
+        forge_url_set = body.forge_url.is_some(),
+        forge_org_set = body.forge_org.is_some(),
+        forge_proxy_enabled = state.forge_proxy_enabled,
+        "add_repo: merged repo cap into workspace env + set forge endpoint (keys/presence only; values never logged)"
+    );
 
     // ASYNC respawn (202): a workspace add_repo is a rare, human-initiated op.
     // STOP the live runner then COLD re-deploy with the merged env so the runner

@@ -1010,14 +1010,37 @@ impl FirecrackerRuntime {
                     backoff = (backoff * 2).min(READY_BACKOFF_CAP);
                 }
                 Err(e) => {
+                    // The exact port we PROBED (parsed from `guest_base` =
+                    // `http://<guest_ip>:<port>`) named as its own field so the
+                    // verdict says WHICH port had no listener — the image's lowest
+                    // EXPOSE / `[runtime].port`. `guest_base` here IS the last (and
+                    // only) health target this probe ever dialed; no app-level
+                    // health reply was seen (an HTTP answer of ANY status returns
+                    // `ready` above), so `error` below is the last-known probe result.
+                    let probe_port = self.guest_base.rsplit(':').next().unwrap_or("?");
                     tracing::error!(
                         guest_base = %self.guest_base,
+                        probe_port,
                         attempt,
+                        timeout_secs = READY_TIMEOUT.as_secs(),
                         elapsed_ms = start.elapsed().as_millis(),
                         error = %e,
-                        "fc boot: guest app never became ready (timeout); if tap setup hit EPERM the guest has no network — run the supervisor with CAP_NET_ADMIN/root"
+                        "fc boot: guest app never became ready (readiness timeout) — probed the \
+                         guest port with no response. MOST LIKELY the app is not LISTENING on \
+                         that port (the probe targets the image's lowest EXPOSE / [runtime].port): \
+                         make the server listen on it (nginx must `listen 80;` when `EXPOSE 80`) \
+                         and keep PID 1 in the foreground. Only an EARLIER tap-setup EPERM (logged \
+                         above) means the guest has no network at all (→ CAP_NET_ADMIN)."
                     );
-                    bail!("guest app at {} never became ready: {e}", self.guest_base)
+                    bail!(
+                        "guest app at {} never became ready: the readiness probe got no response. \
+                         Most likely your app is not listening on that exact port — make your \
+                         server's listen port MATCH the Dockerfile EXPOSE (e.g. nginx `listen 80;` \
+                         with `EXPOSE 80`, python `--bind :8000` with `EXPOSE 8000`), and keep the \
+                         container's main process in the FOREGROUND (it must not daemonize/exit). \
+                         Underlying probe error: {e}",
+                        self.guest_base
+                    )
                 }
             }
         }

@@ -252,6 +252,46 @@
         );
     }
 
+    /// BACKFILL: `merge_cap_into_env` ALSO merges the reserved `forge-admin.token`
+    /// entry (the add_repo forge-creds backfill), ADDING it to a workspace whose
+    /// prior `CAP_FILES_ENV` had none while PRESERVING every repo `<stem>.url` +
+    /// the authkeys cap. This is what lets the cold respawn re-bake the forge
+    /// cap-file for a workspace provisioned before its forge org existed.
+    #[test]
+    fn merge_cap_into_env_adds_forge_admin_token_preserving_repos() {
+        // Prior env: two repo caps + authkeys, but NO forge-admin.token (the bug).
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert(
+            CAP_FILES_ENV.to_owned(),
+            serde_json::json!({
+                "app.url": "http://h:8788/git/capA",
+                "tetris.url": "http://h:8788/git/capB",
+                "authkeys.cap": "deadbeef",
+            })
+            .to_string(),
+        );
+
+        let creds = r#"{"org_slug":"t_a","owner_user":"t_a-bot","admin_token":"adm"}"#;
+        merge_cap_into_env(&mut env, "forge-admin.token", creds);
+
+        let cap_files: serde_json::Value =
+            serde_json::from_str(env.get(CAP_FILES_ENV).unwrap()).unwrap();
+        // The forge-admin token was ADDED (backfill) ...
+        assert_eq!(
+            cap_files["forge-admin.token"], creds,
+            "the forge-admin creds must be merged in verbatim"
+        );
+        // ... while every prior repo cap + the authkeys cap survive untouched.
+        assert_eq!(cap_files["app.url"], "http://h:8788/git/capA");
+        assert_eq!(cap_files["tetris.url"], "http://h:8788/git/capB");
+        assert_eq!(cap_files["authkeys.cap"], "deadbeef");
+        assert_eq!(
+            cap_files.as_object().unwrap().len(),
+            4,
+            "exactly: app.url + tetris.url + authkeys.cap + forge-admin.token"
+        );
+    }
+
     /// With no prior `CAP_FILES_ENV`, the merge creates a single-entry map.
     #[test]
     fn merge_cap_into_env_starts_fresh_map_when_absent() {
