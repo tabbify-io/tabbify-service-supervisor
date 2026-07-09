@@ -53,9 +53,10 @@ pub use workspace_record::{
     readopt_workspaces, workspaces_dir,
 };
 pub use workspaces::{
-    AddRepoBody, AddRepoResult, CAP_FILES_ENV, CreateWorkspaceBody, RepoSpec, WORKSPACE_MAX_TTL,
-    Workspace, WorkspaceCreated, WorkspaceRegistry, add_workspace_repo, cap_repo_basename,
-    create_workspace, delete_workspace, list_workspaces, snapshot_workspace, stop_workspace,
+    AddRepoBody, AddRepoResult, CAP_FILES_ENV, CreateWorkspaceBody, ForgeCredsBody, RepoSpec,
+    WORKSPACE_MAX_TTL, Workspace, WorkspaceCreated, WorkspaceRegistry, add_workspace_repo,
+    cap_repo_basename, create_workspace, delete_workspace, forge_creds_backfill, list_workspaces,
+    snapshot_workspace, stop_workspace,
 };
 pub use dev_sessions::{
     CreateDevSessionBody, DEV_SESSION_IDLE_TTL, DEV_SESSION_MAX_TTL, DevSessionCreated,
@@ -73,8 +74,8 @@ pub use dto::{
     AppStopResponse, ErrorResponse, HealthResponse,
 };
 pub use handlers::{
-    BuildBody, DeployBody, about, build_app, deploy_app, get_app, health, list_apps, purge_app,
-    reset_app, start_app, stop_app,
+    BuildBody, DeployBody, about, build_app, build_progress, deploy_app, get_app, health,
+    list_apps, purge_app, reset_app, start_app, stop_app,
 };
 
 // utoipa's `#[utoipa::path]` macro generates `__path_<fn>` types in the SAME
@@ -230,6 +231,9 @@ pub fn router(state: SupervisorState) -> Router {
         .route("/v1/apps/:uuid/reset", post(reset_app))
         .route("/v1/apps/:uuid/deploy", post(deploy_app))
         .route("/v1/build", post(build_app))
+        // Build progress poll (P1-3): mesh-internal, not in OpenAPI (like the git
+        // proxy). The node polls this while its blocking `POST /v1/build` runs.
+        .route("/v1/build/:uuid/progress", get(build_progress))
         // Dev-session lifecycle endpoints.
         .route(
             "/v1/dev-sessions",
@@ -259,6 +263,13 @@ pub fn router(state: SupervisorState) -> Router {
         .route(
             "/v1/workspaces/:uuid/repos",
             post(workspaces::add_workspace_repo),
+        )
+        // Forge-cred auto-heal (P1-4): creds-only backfill + cold respawn for a
+        // workspace provisioned before its forge org existed. Mesh-internal (not
+        // in OpenAPI); the node calls it on a `forge_workspace` NeedsCredential.
+        .route(
+            "/v1/workspaces/:uuid/forge-creds",
+            post(workspaces::forge_creds_backfill),
         )
         .route("/v1/workspaces/:uuid/stop", post(workspaces::stop_workspace))
         // Git smart-HTTP proxy — tokenless in-VM remote (dev sessions).

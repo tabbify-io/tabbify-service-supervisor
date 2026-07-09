@@ -517,6 +517,27 @@ pub async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildB
     }
 }
 
+/// `GET /v1/build/{uuid}/progress` — current build progress (P1-3).
+///
+/// Returns the derived build `stage` (`starting`/`pulling`/`building`/
+/// `converting`/`booting`) + a tail of the LIVE build log + the log's byte
+/// length, so the node can poll
+/// this WHILE its (blocking) `POST /v1/build` request is in flight and surface
+/// forward progress to the agent (distinguishing a slow build from a hung one).
+/// 404 when no build log exists yet for `uuid`.
+///
+/// Not in OpenAPI: a mesh-internal node↔supervisor polling endpoint (like the
+/// git smart-HTTP proxy), so it is registered as a plain route.
+pub async fn build_progress(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+    match state.orchestrator.build_progress(&uuid, 40).await {
+        Some(p) => (StatusCode::OK, axum::Json(p)).into_response(),
+        None => error_json(
+            StatusCode::NOT_FOUND,
+            &format!("no build in progress for {uuid}"),
+        ),
+    }
+}
+
 // ── Response helpers ─────────────────────────────────────────────────────────
 
 /// JSON row for `GET /v1/apps` (the live runner fleet).

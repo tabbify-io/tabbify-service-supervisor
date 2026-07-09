@@ -430,6 +430,14 @@ pub(crate) fn runner_log_path(data_dir: &Path, uuid: &str) -> PathBuf {
     data_dir.join("runners").join(format!("{uuid}.log"))
 }
 
+/// Size threshold (bytes) at which a per-app runner log is rotated aside before
+/// the next (re)spawn appends to it. A crash-looping or long-lived runner —
+/// especially with mesh-joiner reconciliation chatter bleeding into its captured
+/// stdout (see the `tabbify_mesh_joiner=warn` filter in `bin/runner.rs`) — can
+/// grow this log to hundreds of MB, eating disk and drowning the app's own
+/// diagnostics. 50 MiB keeps plenty of recent history while bounding growth.
+const RUNNER_LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Open (creating as needed) the per-app runner log at
 /// `<data_dir>/runners/<uuid>.log` for APPEND, returning the file handle.
 ///
@@ -438,13 +446,48 @@ pub(crate) fn runner_log_path(data_dir: &Path, uuid: &str) -> PathBuf {
 /// second fd), so each (re)spawn's output is retained across restarts rather
 /// than discarded to `/dev/null`. Append mode means a respawn does not clobber
 /// the previous run's log.
+///
+/// Before opening, an oversized log is rotated aside ([`rotate_if_oversized`])
+/// so growth is bounded across the process/app lifetime (P2-2).
 fn open_runner_log(data_dir: &Path, uuid: &str) -> std::io::Result<std::fs::File> {
     let log_path = runner_log_path(data_dir, uuid);
     std::fs::create_dir_all(log_path.parent().expect("runners/ dir always has a parent"))?;
+    rotate_if_oversized(&log_path, RUNNER_LOG_ROTATE_BYTES);
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
+}
+
+/// If `log_path` already exceeds `max_bytes`, move it aside to `<path>.1`
+/// (keeping exactly one prior generation) so the freshly-opened append log
+/// restarts small. Best-effort: any metadata/remove/rename error is logged and
+/// swallowed — a rotation failure must NEVER block a runner (re)spawn (the
+/// append below simply continues the large file). One rotated generation is
+/// enough for post-mortem: a crash-looping runner that keeps rotating still
+/// leaves the most-recent full run in `.log.1` plus the live tail in `.log`.
+fn rotate_if_oversized(log_path: &Path, max_bytes: u64) {
+    let oversized = std::fs::metadata(log_path)
+        .map(|m| m.len() >= max_bytes)
+        .unwrap_or(false);
+    if !oversized {
+        return;
+    }
+    // `<uuid>.log` → `<uuid>.log.1` (append `.1` to the WHOLE name so a uuid
+    // containing dots is handled unambiguously).
+    let mut rotated = log_path.as_os_str().to_owned();
+    rotated.push(".1");
+    let rotated = PathBuf::from(rotated);
+    // Drop the previous generation first (rename won't clobber across some
+    // platforms cleanly, and we only keep one), then move the oversized log.
+    let _ = std::fs::remove_file(&rotated);
+    if let Err(e) = std::fs::rename(log_path, &rotated) {
+        tracing::warn!(
+            path = %log_path.display(),
+            error = %e,
+            "runner log rotation failed; continuing to append to the oversized log"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1215,6 +1258,77 @@ mod tests {
             .await
             .expect("spawn must succeed even when log dir cannot be created");
         child.wait().await.unwrap();
+    }
+
+    /// An oversized runner log is rotated to `<path>.1` (P2-2) so the live log
+    /// restarts small, and the prior content is preserved for post-mortem.
+    #[test]
+    fn oversized_runner_log_is_rotated_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, b"OLD_RUN_CONTENT").unwrap();
+
+        // Threshold below the file's size ⇒ rotate.
+        rotate_if_oversized(&log, 4);
+
+        let rotated = dir.path().join("app.log.1");
+        assert!(rotated.exists(), "oversized log must be rotated to <path>.1");
+        assert!(!log.exists(), "the oversized log must be moved aside");
+        assert_eq!(
+            std::fs::read(&rotated).unwrap(),
+            b"OLD_RUN_CONTENT",
+            "rotated file must preserve the prior run's bytes"
+        );
+    }
+
+    /// A log under the threshold is left untouched (no `.1` created).
+    #[test]
+    fn small_runner_log_is_not_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, b"tiny").unwrap();
+
+        rotate_if_oversized(&log, 1024);
+
+        assert!(log.exists(), "a small log must not be rotated");
+        assert!(
+            !dir.path().join("app.log.1").exists(),
+            "no rotated generation should be created for a small log"
+        );
+    }
+
+    /// Rotation keeps exactly ONE prior generation: a second rotation overwrites
+    /// `<path>.1` rather than piling up `.2`, `.3`, ….
+    #[test]
+    fn rotation_keeps_one_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+
+        std::fs::write(&log, b"GEN_ONE").unwrap();
+        rotate_if_oversized(&log, 1);
+        std::fs::write(&log, b"GEN_TWO").unwrap();
+        rotate_if_oversized(&log, 1);
+
+        let rotated = dir.path().join("app.log.1");
+        assert_eq!(
+            std::fs::read(&rotated).unwrap(),
+            b"GEN_TWO",
+            ".1 must hold the MOST RECENT rotated generation"
+        );
+        assert!(
+            !dir.path().join("app.log.2").exists(),
+            "only one rotated generation is kept"
+        );
+    }
+
+    /// Rotating a missing log is a no-op (best-effort, never errors).
+    #[test]
+    fn rotate_missing_log_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("does-not-exist.log");
+        rotate_if_oversized(&log, 1);
+        assert!(!log.exists());
+        assert!(!dir.path().join("does-not-exist.log.1").exists());
     }
 
     /// The prod binary path resolves next to the current executable (not the

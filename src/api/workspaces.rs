@@ -1056,6 +1056,154 @@ pub async fn add_workspace_repo(
         .into_response()
 }
 
+/// `POST /v1/workspaces/{uuid}/forge-creds` request body (P1-4 forge auto-heal).
+///
+/// Backfills the forge-admin credential + endpoint env into an EXISTING
+/// workspace WITHOUT adding a repo. A workspace provisioned BEFORE its account's
+/// forge org existed has no `/run/tabbify/caps/forge-admin.token`, so its broker
+/// fails every forge op with "forge not provisioned" — and the ONLY existing
+/// re-thread path is `add_repo`, forcing an agent into a confusing add-a-dummy-
+/// repo dance. This creds-only channel lets the node (which resolved the org's
+/// admin creds) heal the workspace directly. Fields mirror the forge fields of
+/// [`AddRepoBody`]; `forge_admin_token` is REQUIRED (a creds-only heal without
+/// it is a no-op).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ForgeCredsBody {
+    /// Forge-admin token (§12 S1/S2): merged into the persisted `CAP_FILES_ENV`
+    /// as `forge-admin.token`, re-baked to `/run/tabbify/caps/forge-admin.token`
+    /// (0600, broker-uid) on the cold respawn. A credential — NEVER logged.
+    pub forge_admin_token: String,
+    /// Mesh-internal Forgejo base URL — injected as `TABBIFY_FORGE_URL` (rewritten
+    /// to the tap-gateway proxy when the host-side forge-proxy is enabled).
+    /// NON-secret. `None` ⇒ the env key is left untouched.
+    #[serde(default)]
+    pub forge_url: Option<String>,
+    /// The account's forge org slug — injected as `TABBIFY_FORGE_ORG`. NON-secret.
+    /// `None` ⇒ the env key is left untouched.
+    #[serde(default)]
+    pub forge_org: Option<String>,
+}
+
+/// `POST /v1/workspaces/{uuid}/forge-creds` — backfill forge-admin creds into an
+/// existing workspace + cold-respawn so the broker's next op finds them (P1-4).
+///
+/// The creds-only twin of [`add_workspace_repo`]'s forge-backfill block: NO repo
+/// is registered — the only effect is re-baking the `forge-admin.token` cap-file
+/// (via [`merge_cap_into_env`]) + setting the forge endpoint env (via
+/// [`insert_forge_env`]), then a cold respawn. Returns 202 (respawn is async);
+/// 404 when the workspace / its artifact is unknown. Not in OpenAPI (a
+/// mesh-internal node↔supervisor heal channel).
+#[tracing::instrument(skip(state, body), fields(workspace_uuid = %uuid))]
+pub async fn forge_creds_backfill(
+    State(state): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<ForgeCredsBody>,
+) -> Response {
+    // Registry gate: only a workspace this supervisor hosts can be healed
+    // (mirror add_repo/snapshot/delete) — a stray uuid is a 404.
+    if state.workspaces.caps_of(&uuid).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("workspace {uuid} not found") })),
+        )
+            .into_response();
+    }
+
+    // Need the durable RunnerHandle for the `image_ref` (to derive the SAME tap
+    // host_ip AND pin the respawn) and the persisted `extra_env` (the create-time
+    // CAP_FILES_ENV map that also holds the authkeys/repo caps we must preserve).
+    let runner = match RunnerHandle::load(state.orchestrator.runner_dir(), &uuid) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("workspace {uuid} has no runner record") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(workspace_uuid = %uuid, error = %e, "forge-creds: could not load runner record");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("could not load workspace {uuid}: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let Some(image_ref) = runner.image_ref.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("workspace {uuid} has no image_ref to respawn") })),
+        )
+            .into_response();
+    };
+
+    // MERGE the forge-admin cred into the persisted cap-file map + set the forge
+    // endpoint env — exactly like add_repo, minus any repo registration. The
+    // token is a credential and is NEVER logged (presence/destination only). The
+    // URL is proxy-rewritten to the tap gateway exactly as create/add_repo do
+    // (the IPv4-only guest cannot route the raw v6 mesh ULA the node supplies).
+    let host_ip = derive_dev_fc_host_ip(&uuid, &image_ref, &state.tap_subnet);
+    let mut merged_env = runner.extra_env.clone().unwrap_or_default();
+    merge_cap_into_env(&mut merged_env, "forge-admin.token", &body.forge_admin_token);
+    let forge_gateway = state
+        .forge_proxy_enabled
+        .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
+    insert_forge_env(
+        &mut merged_env,
+        &body.forge_url,
+        &body.forge_org,
+        forge_gateway.as_deref(),
+    );
+
+    // DIAGNOSTIC (keys/presence ONLY — values are secrets/URLs, NEVER logged):
+    // the full post-merge cap-file key set (so a lost authkeys/repo cap is
+    // visible) + whether the forge endpoint env was set.
+    let merged_cap_keys: Vec<String> = merged_env
+        .get(CAP_FILES_ENV)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default();
+    tracing::info!(
+        workspace_uuid = %uuid,
+        cap_files = ?merged_cap_keys,
+        forge_url_set = body.forge_url.is_some(),
+        forge_org_set = body.forge_org.is_some(),
+        forge_proxy_enabled = state.forge_proxy_enabled,
+        "forge-creds: backfilling forge-admin.token into workspace cap-files + forge endpoint env (values never logged)"
+    );
+
+    // ASYNC cold respawn (202): STOP the live runner then COLD re-deploy with the
+    // merged env so the runner re-bakes the FULL cap-file set (a warm swap would
+    // keep the OLD spawn-time env, missing the cred). `stop_app` preserves the
+    // record; `deploy_app`'s cold path reads the passed `extra_env`.
+    let net = DeployNetwork {
+        network: runner.network.clone(),
+        runner_join_token: runner.runner_join_token.clone(),
+    };
+    let bg = state.clone();
+    let app_uuid = uuid.clone();
+    tokio::spawn(async move {
+        if let Err(e) = bg.orchestrator.stop_app(&app_uuid).await {
+            tracing::warn!(workspace_uuid = %app_uuid, error = %e, "forge-creds: stop before respawn failed (continuing)");
+        }
+        match bg
+            .orchestrator
+            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&merged_env), None)
+            .await
+        {
+            Ok(_) => tracing::info!(workspace_uuid = %app_uuid, "forge-creds: workspace respawned with forge cred (async)"),
+            Err(e) => tracing::warn!(workspace_uuid = %app_uuid, error = %e, "forge-creds: respawn failed (cred recorded in env; will converge on next ensure)"),
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "workspace_uuid": uuid, "healed": "forge-admin.token" })),
+    )
+        .into_response()
+}
+
 /// `POST /v1/workspaces/{uuid}/stop` — PAUSE a workspace VM (the warm-restore
 /// twin of `delete`). Shuts the runner down while PRESERVING its durable record
 /// (`image_ref`/`extra_env`/`manifest_toml`/`runner_join_token`) so a later

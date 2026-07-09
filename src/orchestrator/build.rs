@@ -13,9 +13,12 @@
 //! drive the whole path with a canned stdout + exit-code without spawning a
 //! real `tabbify-runner` binary.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
+use serde::Serialize;
+use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
 use crate::runner::build::ArtifactRef;
@@ -86,7 +89,7 @@ impl BuildSpawner for ProcessBuildSpawner {
         let app_uuid = app_uuid.to_owned();
         let data_dir = self.data_dir.clone();
         Box::pin(async move {
-            let out = Command::new(&runner_bin)
+            let mut child = Command::new(&runner_bin)
                 .args([
                     "--uuid",
                     &app_uuid,
@@ -98,16 +101,174 @@ impl BuildSpawner for ProcessBuildSpawner {
                 .stderr(Stdio::piped())
                 // NOTE: no setsid, no kill_on_drop override — this is a captured
                 // child we await to completion.
-                .output()
-                .await
+                .spawn()
                 .with_context(|| format!("spawn build runner {:?}", runner_bin))?;
+
+            // P1-3 (progress visibility): tee the child's stdout+stderr to a LIVE
+            // progress log (`<data_dir>/build/<uuid>.progress.log`, truncated per
+            // build) AS the build runs, so a concurrent
+            // `GET /v1/build/{uuid}/progress` tail shows real-time forward
+            // progress (distinguishing a slow build from a hung one) instead of
+            // only the buffered-at-completion `<uuid>.log`. The bytes are ALSO
+            // accumulated in memory and returned unchanged, so the ArtifactRef
+            // parse + the canonical build-log write downstream are byte-identical
+            // to the previous `.output()` behaviour.
+            let progress_sink = open_progress_log(&data_dir, &app_uuid).await;
+            let stdout_pipe = child.stdout.take();
+            let stderr_pipe = child.stderr.take();
+
+            let out_sink = progress_sink.clone();
+            let out_task = tokio::spawn(async move {
+                match stdout_pipe {
+                    Some(pipe) => drain_tee(pipe, out_sink).await,
+                    None => Vec::new(),
+                }
+            });
+            let err_sink = progress_sink.clone();
+            let err_task = tokio::spawn(async move {
+                match stderr_pipe {
+                    Some(pipe) => drain_tee(pipe, err_sink).await,
+                    None => Vec::new(),
+                }
+            });
+
+            let status = child
+                .wait()
+                .await
+                .with_context(|| format!("await build runner {runner_bin:?}"))?;
+            // The drain tasks are driven to EOF (which the pipes reach at child
+            // exit); joining them can only fail if the task panicked, which the
+            // simple copy loop never does — default to empty on the impossible
+            // join error rather than propagate.
+            let stdout = out_task.await.unwrap_or_default();
+            let stderr = err_task.await.unwrap_or_default();
+
             Ok(BuildOutput {
-                stdout: out.stdout,
-                stderr: out.stderr,
-                success: out.status.success(),
+                stdout,
+                stderr,
+                success: status.success(),
             })
         })
     }
+}
+
+/// Live per-build progress log path: `<data_dir>/build/<app_uuid>.progress.log`.
+///
+/// Distinct from the canonical `<app_uuid>.log` (written ONCE, at completion, by
+/// [`write_build_log`]): this file is truncated at the start of each build and
+/// appended to as the build runs, so a poller sees progress in real time.
+pub(crate) fn build_progress_log_path(data_dir: &Path, app_uuid: &str) -> PathBuf {
+    data_dir
+        .join("build")
+        .join(format!("{app_uuid}.progress.log"))
+}
+
+/// Create (truncating) the live progress log for `app_uuid`, returning a shared
+/// handle the tee tasks append to. Best-effort: on any dir-create / open failure
+/// the sink is `None` and the build still runs (progress is simply unavailable
+/// for that build) — a progress-log problem must never fail a build.
+async fn open_progress_log(data_dir: &Path, app_uuid: &str) -> Arc<Mutex<Option<tokio::fs::File>>> {
+    let path = build_progress_log_path(data_dir, app_uuid);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!(app_uuid, error = %e, "could not create build progress dir; progress disabled for this build");
+            return Arc::new(Mutex::new(None));
+        }
+    }
+    match tokio::fs::File::create(&path).await {
+        Ok(f) => Arc::new(Mutex::new(Some(f))),
+        Err(e) => {
+            tracing::warn!(app_uuid, error = %e, "could not open build progress log; progress disabled for this build");
+            Arc::new(Mutex::new(None))
+        }
+    }
+}
+
+/// Drain `reader` to EOF, returning every byte read AND appending each chunk to
+/// `sink` (the live progress log) as it arrives. Best-effort on the sink: a
+/// write error is logged once and further writes skipped, but the returned bytes
+/// are always complete (the caller relies on them for the ArtifactRef parse).
+async fn drain_tee<R>(mut reader: R, sink: Arc<Mutex<Option<tokio::fs::File>>>) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut all = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,           // EOF
+            Err(_) => break,          // pipe error — stop; captured bytes so far
+            Ok(n) => {
+                all.extend_from_slice(&buf[..n]);
+                let mut guard = sink.lock().await;
+                if let Some(f) = guard.as_mut() {
+                    // `tokio::fs::File` batches writes internally, so flush each
+                    // chunk to the OS — otherwise the live progress tail (and a
+                    // drop) could miss in-flight bytes. Any error drops the sink
+                    // so we stop retrying a broken file; the captured bytes (and
+                    // the canonical build log) are unaffected.
+                    if f.write_all(&buf[..n]).await.is_err() || f.flush().await.is_err() {
+                        *guard = None;
+                    }
+                }
+            }
+        }
+    }
+    all
+}
+
+/// Coarse build stage inferred from the tail of the (live) build log, for
+/// agent-visible progress (P1-3). A cheap keyword heuristic — enough to tell
+/// "pulling" from "compiling" from "booting" so the agent distinguishes a slow
+/// build from a hung one, without parsing the buildkit/docker protocol. Latest
+/// stages are checked first so the newest signal in the tail wins.
+pub(crate) fn derive_build_stage(tail: &str) -> &'static str {
+    let l = tail.to_ascii_lowercase();
+    // Newest-stage-first: when the tail spans multiple stages the most ADVANCED
+    // signal wins (a clone line lingering above build output ⇒ still "building").
+    if l.contains("firecracker") || l.contains("microvm") || l.contains("snapshot") {
+        "booting"
+    } else if l.contains("rootfs")
+        || l.contains("convert")
+        || l.contains("export")
+        || l.contains("pushing")
+    {
+        "converting"
+    } else if l.contains("compiling")
+        || l.contains("cargo")
+        || l.contains("step ") // docker "Step 3/9 : ..."
+        || l.contains(" run ") // docker "RUN ..."
+        || l.contains("building")
+    {
+        "building"
+    } else if l.contains("cloning")
+        || l.contains("pulling")
+        || l.contains("fetching")
+        || l.contains("download")
+    {
+        "pulling"
+    } else if !tail.trim().is_empty() {
+        "building"
+    } else {
+        "starting"
+    }
+}
+
+/// A snapshot of an in-flight (or most-recent) build's progress, returned by
+/// `GET /v1/build/{uuid}/progress` for the node's deploy-progress poller.
+#[derive(Debug, Serialize)]
+pub struct BuildProgress {
+    /// Coarse stage: `starting` | `pulling` | `building` | `converting` |
+    /// `booting`. Derived from the log tail via [`derive_build_stage`].
+    pub stage: String,
+    /// Last N lines of the live build log. Mesh-internal (may echo raw build
+    /// output) — never expose unredacted to external callers.
+    pub log_tail: String,
+    /// Current byte length of the live progress log. A value that grows across
+    /// polls ⇒ the build is advancing; a static value over several polls ⇒ it may
+    /// be hung.
+    pub log_bytes: u64,
 }
 
 impl Orchestrator {
@@ -189,6 +350,26 @@ impl Orchestrator {
 
         serde_json::from_str(last_line)
             .with_context(|| format!("parse ArtifactRef from stdout line: {last_line:?}"))
+    }
+
+    /// Snapshot the current build's progress (P1-3): the last `lines` lines of
+    /// the live progress log plus a derived [`stage`](derive_build_stage) and the
+    /// log's byte length. Returns `None` when no progress log exists yet for
+    /// `app_uuid` (no build has started, or it was cleaned up) so the caller can
+    /// answer 404. The node polls this WHILE its (blocking) build request is in
+    /// flight to surface forward progress to the agent.
+    pub async fn build_progress(&self, app_uuid: &str, lines: usize) -> Option<BuildProgress> {
+        let path = build_progress_log_path(&self.shared().data_dir, app_uuid);
+        // A missing file ⇒ no build in progress (or none ever) ⇒ 404 upstream.
+        let log_bytes = tokio::fs::metadata(&path).await.ok()?.len();
+        let log_tail = crate::orchestrator::api::read_last_lines(&path, lines)
+            .await
+            .unwrap_or_default();
+        Some(BuildProgress {
+            stage: derive_build_stage(&log_tail).to_owned(),
+            log_tail,
+            log_bytes,
+        })
     }
 }
 
@@ -802,5 +983,79 @@ mod tests {
             read_job, expected_job,
             "spec file must contain the job JSON"
         );
+    }
+
+    // ── P1-3: build progress ──────────────────────────────────────────────────
+
+    /// `drain_tee` returns every byte read AND mirrors it to the sink file, so
+    /// the caller's captured bytes are byte-identical while the live progress log
+    /// is populated as the reader is drained.
+    #[tokio::test]
+    async fn drain_tee_captures_and_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("progress.log");
+        let file = tokio::fs::File::create(&sink_path).await.unwrap();
+        let sink = Arc::new(Mutex::new(Some(file)));
+
+        let input = b"step 1: pulling\nstep 2: building\n".to_vec();
+        let captured = drain_tee(std::io::Cursor::new(input.clone()), sink.clone()).await;
+
+        assert_eq!(captured, input, "captured bytes must equal the input");
+        // Drop the file handle so the OS flushes before we read it back.
+        drop(sink);
+        let on_disk = std::fs::read(&sink_path).unwrap();
+        assert_eq!(on_disk, input, "sink must mirror the drained bytes");
+    }
+
+    /// A `None` sink (progress-log open failed) must not lose the captured bytes.
+    #[tokio::test]
+    async fn drain_tee_tolerates_absent_sink() {
+        let sink = Arc::new(Mutex::new(None));
+        let input = b"no sink but still captured".to_vec();
+        let captured = drain_tee(std::io::Cursor::new(input.clone()), sink).await;
+        assert_eq!(captured, input);
+    }
+
+    /// The stage heuristic maps recent log content to a coarse stage; later
+    /// stages win when multiple markers are present (newest signal).
+    #[test]
+    fn derive_build_stage_maps_keywords() {
+        assert_eq!(derive_build_stage(""), "starting");
+        assert_eq!(derive_build_stage("Cloning into 'app'..."), "pulling");
+        assert_eq!(derive_build_stage("pulling base image layers"), "pulling");
+        assert_eq!(derive_build_stage("Compiling serde v1.0"), "building");
+        assert_eq!(derive_build_stage("exporting to oci image"), "converting");
+        assert_eq!(derive_build_stage("booting firecracker microVM"), "booting");
+        // Later stage wins when both a pull and a boot marker are in the tail.
+        assert_eq!(
+            derive_build_stage("pulling layers\n...\nbooting firecracker"),
+            "booting"
+        );
+    }
+
+    /// `build_progress` returns `None` when no progress log exists, and a
+    /// populated snapshot (stage + tail + byte length) once one does.
+    #[tokio::test]
+    async fn build_progress_reads_live_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = orch(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-9999-7222-8333-444455556666";
+
+        // No log yet ⇒ None (404 upstream).
+        assert!(o.build_progress(uuid, 40).await.is_none());
+
+        // Write a live progress log and read it back.
+        let path = build_progress_log_path(dir.path(), uuid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"Cloning into 'repo'...\nStep 3/9: RUN cargo build\n").unwrap();
+
+        let p = o.build_progress(uuid, 40).await.expect("progress present");
+        assert!(p.log_bytes > 0, "byte length must be reported");
+        assert!(
+            p.log_tail.contains("cargo build"),
+            "tail must surface recent build output; got: {}",
+            p.log_tail
+        );
+        assert_eq!(p.stage, "building", "the RUN/compile line ⇒ building stage");
     }
 }

@@ -1938,10 +1938,12 @@ pub async fn run_firecracker_build(
             );
             // Config NOT read on this fast path → `image_exposed_port` is still
             // `None`; `launch_with_uuid` recovers it from the `.app_port` companion
-            // an earlier launch persisted (else falls back to 8080).
+            // an earlier launch persisted (else falls back to 8080). `digest` is the
+            // resolved (immutable) image identity → the `.snapshot_ref` stamp/match
+            // key, so a moved tag (`…:current`) invalidates a stale warm snapshot.
             return launch_firecracker(
                 &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                &env_hash, image_exposed_port,
+                &env_hash, image_exposed_port, digest,
             )
             .await;
         }
@@ -1982,7 +1984,7 @@ pub async fn run_firecracker_build(
                 }
                 return launch_firecracker(
                     &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                    &env_hash, image_exposed_port,
+                    &env_hash, image_exposed_port, digest,
                 )
                 .await;
             }
@@ -2001,7 +2003,14 @@ pub async fn run_firecracker_build(
     //
     // DOCKER-LESS throughout: pull = `oras copy --to-oci-layout`, config read FROM
     // the layout. No `docker pull`/`tag`/`inspect`/`create`/`export` anywhere.
-    let rootfs = if let Some((_, digest)) = reff.rsplit_once('@') {
+    // Bind BOTH the built rootfs AND the RESOLVED digest: the digest is the
+    // immutable, content-addressed identity that stamps/matches the warm-start
+    // `.snapshot_ref` companion (NOT `reff`, which may be a MOVING tag like
+    // `…:current` — a base-image OTA advances the digest under the same tag string,
+    // and a tag-vs-tag match would resurrect the STALE guest). The digest-ref arm
+    // already carries it; the tag arm derives the AUTHORITATIVE digest from the
+    // pulled layout.
+    let (rootfs, resolved_digest) = if let Some((_, digest)) = reff.rsplit_once('@') {
         let work = digest_work_dir(data_dir, uuid, digest, &env_hash)?;
         let layout = pull_oci_layout(reff, &work, oras_cfg).await?;
         // Seed the global layout cache so the NEXT uuid with this digest skips
@@ -2016,7 +2025,7 @@ pub async fn run_firecracker_build(
         if globally_cacheable {
             publish_rootfs_to_global(data_dir, digest, &built).await;
         }
-        built
+        (built, digest.to_owned())
     } else {
         let work = fresh_tag_pull_dir(data_dir, uuid).await?;
         let layout = pull_oci_layout(reff, &work, oras_cfg).await?;
@@ -2027,7 +2036,7 @@ pub async fn run_firecracker_build(
         // makes a future hit always serve the right image; a stale `pre_digest`
         // then yields a harmless lookup MISS + re-pull, never wrong bytes.
         publish_layout_to_global(data_dir, &digest, uuid, &layout).await;
-        if rootfs_is_cached(data_dir, uuid, &digest, &env_hash) {
+        let built = if rootfs_is_cached(data_dir, uuid, &digest, &env_hash) {
             cached_rootfs_path(data_dir, uuid, &digest, &env_hash)
         } else {
             // Global hit found only AFTER the pull (the pre-pull resolve failed):
@@ -2052,12 +2061,13 @@ pub async fn run_firecracker_build(
                 }
                 built
             }
-        }
+        };
+        (built, digest)
     };
 
     launch_firecracker(
         &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace, &env_hash,
-        image_exposed_port,
+        image_exposed_port, &resolved_digest,
     )
     .await
 }
@@ -2065,6 +2075,13 @@ pub async fn run_firecracker_build(
 /// Launch the Firecracker microVM from a prepared rootfs and wrap it as an
 /// [`crate::runtime::AppRuntime`]. Shared by the cache-hit fast path and the
 /// pull+build path of [`run_firecracker_build`].
+///
+/// `snapshot_ref` is the RESOLVED image digest (`sha256:…`) this launch runs — the
+/// immutable, content-addressed identity used to stamp/match the warm-start
+/// `.snapshot_ref` companion. Every caller passes the DIGEST (not the possibly-
+/// moving `reff` tag) so a base-image OTA under a stable tag (`…:current`) is
+/// detected as a content change and invalidates the stale snapshot (see
+/// `FirecrackerRuntime::launch_with_uuid`).
 #[allow(clippy::too_many_arguments)]
 async fn launch_firecracker(
     rootfs: &Path,
@@ -2078,6 +2095,7 @@ async fn launch_firecracker(
     is_workspace: bool,
     env_hash: &str,
     image_exposed_port: Option<u16>,
+    snapshot_ref: &str,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         rootfs,
@@ -2091,6 +2109,7 @@ async fn launch_firecracker(
         is_workspace,
         env_hash,
         image_exposed_port,
+        snapshot_ref,
     )
     .await?;
     Ok(std::sync::Arc::new(vm))

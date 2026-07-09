@@ -444,6 +444,17 @@ impl FirecrackerRuntime {
     /// recovered from the `.app_port` companion an earlier launch persisted. Threads
     /// into `guest_base` so the readiness probe + proxy target the app's real port.
     ///
+    /// `snapshot_ref` — the IMMUTABLE, content-addressed identity (the resolved
+    /// image DIGEST `sha256:…`) this launch runs, used to STAMP and MATCH the
+    /// `.snapshot_ref` companion. It is DISTINCT from `reff` on purpose: `reff` may
+    /// be a MOVING tag (`…:current`) — the platform base images deploy under one —
+    /// and stamping the tag would make a warm restore match tag-vs-tag even after
+    /// `:current` moved to a NEW digest, resurrecting the STALE guest (the OLD
+    /// broker/binaries, so an image fix never lands). Comparing the RESOLVED digest
+    /// instead invalidates the snapshot the moment the tag's content changes → cold
+    /// boot the new rootfs. `reff` still keys the host identity (`vm_key`/tap) so a
+    /// deploy's new + old microVMs coexist during the zero-downtime swap.
+    ///
     /// # Notes
     /// Snapshots are host-kernel + CPU-template specific. This supervisor
     /// creates and consumes them on the same host, so they are always
@@ -464,12 +475,16 @@ impl FirecrackerRuntime {
         is_workspace: bool,
         env_hash: &str,
         image_exposed_port: Option<u16>,
+        snapshot_ref: &str,
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
         // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
         // /30 link), by contrast, is keyed on `uuid:reff` so a deploy's NEW
         // microVM and the OLD one it replaces get DISTINCT taps and can coexist
-        // during the zero-downtime swap.
+        // during the zero-downtime swap. `reff` (NOT `snapshot_ref`) keys this on
+        // purpose: the swap wants old/new coexistence keyed on the requested ref,
+        // while the snapshot INVALIDATION below keys on the immutable `snapshot_ref`
+        // digest so a moved tag is detected as a content change.
         let vm_key = format!("{uuid}:{reff}");
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
 
@@ -507,7 +522,7 @@ impl FirecrackerRuntime {
                 Some(&cache_dir),
                 Some(&console_log),
                 &vm_key,
-                Some(reff),
+                Some(snapshot_ref),
                 egress_allow,
                 is_workspace,
                 Some(env_hash),
@@ -522,15 +537,19 @@ impl FirecrackerRuntime {
             if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
                 pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
             }
-            // Invalidate the snapshot when the image_ref OR the #106 env/cap
-            // fingerprint has changed: the cache is keyed by UUID only, so a
-            // respawn after a redeploy of a NEW image — OR a workspace `add_repo`
-            // that changed the `/init`-baked cap set on the SAME image (#108) —
-            // would otherwise warm-restore the STALE guest (and the broker's
-            // boot-clone would never run for the new repo). `restore_matches` is
-            // safe-by-default (any mismatch / missing companion / read error →
-            // cold boot, which re-runs `/init` + re-stamps fresh companions).
-            if snapshot::restore_matches(&cache_dir, reff, env_hash) {
+            // Invalidate the snapshot when the resolved image DIGEST OR the #106
+            // env/cap fingerprint has changed: the cache is keyed by UUID only, so a
+            // respawn after a redeploy of a NEW image — INCLUDING a MOVING tag
+            // (`…:current`) whose content advanced to a new digest (a base-image OTA:
+            // the tag string is unchanged but `snapshot_ref` is the resolved digest,
+            // so it differs) — OR a workspace `add_repo` that changed the
+            // `/init`-baked cap set on the SAME image (#108) would otherwise
+            // warm-restore the STALE guest (the OLD broker/binaries, so the new
+            // image's fix never lands; and the broker's boot-clone would never run
+            // for the new repo). `restore_matches` is safe-by-default (any mismatch /
+            // missing companion / read error → cold boot, which re-runs `/init` +
+            // re-stamps fresh companions from `snapshot_ref` + `env_hash`).
+            if snapshot::restore_matches(&cache_dir, snapshot_ref, env_hash) {
                 match Self::launch_from_snapshot(
                     &cache_dir,
                     cfg,
@@ -556,7 +575,7 @@ impl FirecrackerRuntime {
                             Some(&cache_dir),
                             Some(&console_log),
                             &vm_key,
-                            Some(reff),
+                            Some(snapshot_ref),
                             egress_allow,
                             is_workspace,
                             Some(env_hash),
@@ -567,13 +586,15 @@ impl FirecrackerRuntime {
                 }
             } else {
                 // No usable snapshot for THIS image+env (absent, or taken from a
-                // different image_ref / env-cap set): cold boot. If a now-stale
-                // snapshot is on disk, clear it first so the fresh cold-boot
-                // snapshot + its `.snapshot_ref`/`.snapshot_env` replace it cleanly.
+                // different resolved digest / env-cap set — e.g. a moved `:current`):
+                // cold boot. If a now-stale snapshot is on disk, clear it first so
+                // the fresh cold-boot snapshot + its `.snapshot_ref`/`.snapshot_env`
+                // replace it cleanly.
                 if snapshot::files_present(&cache_dir) {
                     tracing::info!(
                         uuid,
-                        "snapshot present but image_ref or env/cap set changed; clearing + cold boot"
+                        snapshot_ref,
+                        "snapshot present but resolved image digest or env/cap set changed; clearing + cold boot"
                     );
                     snapshot::clear(&cache_dir);
                 }
@@ -584,7 +605,7 @@ impl FirecrackerRuntime {
                     Some(&cache_dir),
                     Some(&console_log),
                     &vm_key,
-                    Some(reff),
+                    Some(snapshot_ref),
                     egress_allow,
                     is_workspace,
                     Some(env_hash),

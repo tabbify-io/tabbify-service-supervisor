@@ -115,8 +115,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tabbify_supervisor=debug,tabbify_runner=debug"));
+    // `tabbify_mesh_joiner=warn` (P2-2): the runner joins the mesh in-process, so
+    // the joiner's per-heartbeat/peer_sync `info!` chatter (`heartbeat: pruning
+    // timed-out peer`, `peer-stream: applying upsert`) is emitted through THIS
+    // subscriber and captured into the detached runner's stdout log
+    // (`<data_dir>/runners/<uuid>.log`). At `info` with 100+ peers that spam
+    // balloons the per-app log to hundreds of MB and drowns the app's own
+    // diagnostics. Pin the joiner to `warn` so errors/warnings still surface
+    // while the routine reconciliation noise is dropped. `RUST_LOG` still wins
+    // (via `try_from_default_env`) for on-demand debugging.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,tabbify_mesh_joiner=warn,tabbify_supervisor=debug,tabbify_runner=debug")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)

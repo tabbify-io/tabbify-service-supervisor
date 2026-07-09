@@ -369,6 +369,33 @@ mod tests {
         ));
     }
 
+    /// DEEP-ROOT (P1-4) moving-tag snapshot invalidation. The per-uuid snapshot
+    /// cache is keyed by UUID; the platform base images (workspace/devbox) deploy
+    /// under a MOVING tag (`…:current`). The launcher now stamps/matches the
+    /// RESOLVED DIGEST (`sha256:…`) — NOT the tag string — into `.snapshot_ref`.
+    /// This test proves the fix: a snapshot taken when `:current` resolved to an
+    /// OLD digest must NOT warm-restore once `:current` has advanced to a NEW digest
+    /// (a base-image OTA carrying, e.g., the broker cred-reload fix), even though the
+    /// env fingerprint is unchanged. If the launcher had stamped the tag string, the
+    /// two would match (tag == tag) and resurrect the STALE broker — the exact bug.
+    #[test]
+    fn restore_matches_false_when_moving_tag_resolves_to_new_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Warm snapshot stamped when `:current` → OLD digest (env unchanged).
+        seed_snapshot(dir.path(), "sha256:OLDdigest", "envhash-1");
+        // Respawn after the base-image OTA: `:current` now resolves to a NEW digest.
+        assert!(
+            !restore_matches(dir.path(), "sha256:NEWdigest", "envhash-1"),
+            "a moved :current tag (new resolved digest) must invalidate the snapshot → cold boot the new image"
+        );
+        // Sanity: the SAME resolved digest still warm-restores — the fix must not
+        // force a needless cold boot when the tag's content did NOT change.
+        assert!(
+            restore_matches(dir.path(), "sha256:OLDdigest", "envhash-1"),
+            "an UNCHANGED resolved digest must still warm-restore (no spurious cold boot)"
+        );
+    }
+
     /// `clear` drops the `.snapshot_env` companion too so no stale env fingerprint
     /// outlives the snapshot files it described.
     #[test]

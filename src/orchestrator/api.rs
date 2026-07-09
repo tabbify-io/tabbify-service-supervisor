@@ -895,9 +895,30 @@ impl Orchestrator {
             // own fault, not a platform fault) — this is what flips the node's
             // async `deploy_status` off eternal "pending". The monitor keeps
             // respawning the runner in the background (self-heal preserved).
-            if let ColdStart::CrashLoop(reason) =
+            if let ColdStart::CrashLoop(gate_reason) =
                 wait_cold_serving(&client, handle.pid, START_HEALTHY_TIMEOUT).await
             {
+                // P1-2 (reason propagation): the gate's own reason is terse
+                // ("runner process exited before serving") because by the time it
+                // detects the crash the runner is already dead — its control
+                // socket answers nothing. The PRECISE, actionable diagnostic
+                // (app not LISTENING on its EXPOSE port / daemonized PID 1 /
+                // missing CAP_NET_ADMIN) was printed by the runner's cold-boot
+                // `firecracker::wait_until_ready` to its stderr, which lands in
+                // the per-app runner log. Recover it from the log tail and fold
+                // it into the verdict so the `ColdStartUnhealthy` → 503 → node
+                // `deploy_status` chain surfaces WHY the guest never served, not
+                // just that it didn't. Best-effort: no marker in the tail ⇒ keep
+                // the terse gate reason unchanged (backward compatible).
+                let boot_diag = self
+                    .runner_log_tail(uuid, 40)
+                    .await
+                    .as_deref()
+                    .and_then(boot_failure_diagnostic);
+                let reason = match boot_diag {
+                    Some(diag) => format!("{gate_reason}; app-boot diagnostic: {diag}"),
+                    None => gate_reason,
+                };
                 tracing::warn!(
                     uuid,
                     reff,
@@ -1154,15 +1175,41 @@ async fn wait_cold_serving(client: &ControlClient, pid: u32, timeout: Duration) 
     ColdStart::CrashLoop(reason)
 }
 
+/// Extract the cold-boot readiness diagnostic from a runner-log `tail` (P1-2).
+///
+/// The runner's `firecracker::wait_until_ready` prints a precise, actionable
+/// message on a readiness timeout — the app not LISTENING on its EXPOSE port, a
+/// daemonized (non-foreground) PID 1, or a missing `CAP_NET_ADMIN` — first via a
+/// `tracing::error!` then again as the `bail!` chain the failing runner's
+/// `main()` writes to stderr. Both land in the per-app runner log. The
+/// cold-spawn gate only ever sees the terse "process exited before serving"
+/// (the runner is already dead), so this recovers the real reason from the log.
+///
+/// Returns the LAST line matching a known readiness-failure marker (the newest
+/// boot attempt wins on a respawn ladder), trimmed. `None` when the tail holds
+/// no such marker — the caller then keeps the terse gate reason unchanged.
+fn boot_failure_diagnostic(tail: &str) -> Option<String> {
+    // Markers emitted by `wait_until_ready` (firecracker/linux.rs), matched
+    // case-insensitively so both the `tracing::error!` guidance and the `bail!`
+    // sentence are caught regardless of casing.
+    const MARKERS: [&str; 3] = ["never became ready", "not listening", "cap_net_admin"];
+    let line = tail.lines().rev().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        MARKERS.iter().any(|m| lower.contains(m))
+    })?;
+    let trimmed = line.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 /// Bounded tail: reads at most the last `CHUNK` bytes of `path`, then keeps the
-/// final `lines` lines. Runner logs are never rotated — a crash-looping runner
-/// grows them unbounded, so this must NEVER slurp the whole file (an
-/// error-path heap spike on a multi-hundred-MB log). The seek can land
-/// mid-UTF-8-codepoint, so the chunk decodes lossily rather than erroring.
+/// final `lines` lines. Runner logs are size-capped (rotated at ~50 MB by
+/// `spawn::rotate_if_oversized`) but can still be tens of MB, so this must NEVER
+/// slurp the whole file (an error-path heap spike on a large log). The seek can
+/// land mid-UTF-8-codepoint, so the chunk decodes lossily rather than erroring.
 ///
 /// NOTE: the tail surfaces whatever the runner printed — keep this API
 /// mesh-internal; do not propagate to external callers unredacted.
-async fn read_last_lines(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
+pub(crate) async fn read_last_lines(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     const CHUNK: u64 = 8192;
     let mut f = tokio::fs::File::open(path).await?;
@@ -2419,6 +2466,44 @@ mod tests {
             Some(NEW_TOML),
             "a respawn must reuse the refreshed (new) toml, not the stale one"
         );
+    }
+
+    // ── boot_failure_diagnostic (P1-2 reason propagation) ─────────────────────
+
+    /// The readiness diagnostic printed by the runner's cold boot is recovered
+    /// from a log tail so the deploy verdict carries WHY, not just THAT, it died.
+    #[test]
+    fn boot_failure_diagnostic_extracts_readiness_line() {
+        let tail = "2026-07-09T00:00:00Z  INFO tabbify_runner: starting tabbify-runner\n\
+             2026-07-09T00:00:30Z ERROR fc boot: guest app never became ready (readiness timeout)\n\
+             Error: guest app at http://172.31.0.2:80 never became ready: the readiness probe got \
+             no response. Most likely your app is not listening on that exact port";
+        let diag = boot_failure_diagnostic(tail).expect("marker present");
+        assert!(
+            diag.contains("never became ready"),
+            "must surface the readiness diagnostic; got: {diag}"
+        );
+        // The LAST matching line wins (newest boot attempt): the anyhow chain,
+        // not the earlier tracing line.
+        assert!(
+            diag.starts_with("Error: guest app at"),
+            "the most-recent matching line should be returned; got: {diag}"
+        );
+    }
+
+    /// The `not LISTENING` / `CAP_NET_ADMIN` markers are matched case-insensitively.
+    #[test]
+    fn boot_failure_diagnostic_matches_case_insensitively() {
+        let net = "boot: tap setup EPERM — the guest has no network (needs CAP_NET_ADMIN)";
+        assert_eq!(boot_failure_diagnostic(net).as_deref(), Some(net));
+    }
+
+    /// A tail with no readiness marker yields `None` so the terse gate reason is
+    /// kept unchanged (backward compatible).
+    #[test]
+    fn boot_failure_diagnostic_none_without_marker() {
+        let tail = "just some unrelated log line\nanother benign line\ndone";
+        assert!(boot_failure_diagnostic(tail).is_none());
     }
 
     // ── read_last_lines (bounded tail) ────────────────────────────────────────

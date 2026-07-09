@@ -980,8 +980,13 @@ fn is_boot_invocation(args: &[String]) -> bool {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tabbify_supervisor=debug,supervisord=debug"));
+    // `tabbify_mesh_joiner=warn` (P2-2): the supervisor embeds the mesh joiner,
+    // whose per-heartbeat/peer_sync `info!` reconciliation chatter is high-volume
+    // with a large peer set and adds little operational signal. Pin it to `warn`
+    // so errors/warnings still surface. `RUST_LOG` overrides for debugging.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,tabbify_mesh_joiner=warn,tabbify_supervisor=debug,supervisord=debug")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)

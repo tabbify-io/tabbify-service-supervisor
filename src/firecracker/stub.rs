@@ -46,6 +46,7 @@ impl FirecrackerRuntime {
         is_workspace: bool,
         _env_hash: &str,
         image_exposed_port: Option<u16>,
+        _snapshot_ref: &str,
     ) -> Result<Self> {
         // Никогда не бутит VM на не-Linux, но резолвим порт тем же helper'ом,
         // что и Linux-путь — сигнатуры/логика воркспейс-порта остаются
