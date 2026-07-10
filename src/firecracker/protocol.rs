@@ -35,9 +35,13 @@ pub fn resolve_vcpus(rt: &Runtime, cfg: &FcConfig) -> u32 {
 ///
 /// 1. **Manifest override** — `[runtime].port` (`rt.port`). An explicit user
 ///    override always wins (mirrors how `[runtime].vcpus` overrides the default).
-/// 2. **Image `ExposedPorts`** — `image_port` = the LOWEST TCP port the OCI image
-///    itself declares (`config.ExposedPorts`, resolved by the build path). This
-///    makes `FROM nginx` (`EXPOSE 80`) work with ZERO user action.
+/// 2. **Discovered image port** — `image_port` = the app's DISCOVERED serving port
+///    from its `config.ExposedPorts` (for a single-port image the lone port; for a
+///    multi-port image the WINNING port the readiness probe selected, persisted in
+///    `.app_port`). Makes `FROM nginx` (`EXPOSE 80`) work with ZERO user action.
+///    This helper is the single-port collapse used by the workspace guard + the
+///    warm-restore path; the COLD probe of multiple candidates is
+///    [`resolve_port_plan`] / [`probe_first_answering`].
 /// 3. **Fallback** — the supervisor's configured default (`FcConfig::app_port`,
 ///    8080). Backward-compat: an app that serves on 8080 and declares neither a
 ///    manifest port nor an ExposedPort keeps working unchanged.

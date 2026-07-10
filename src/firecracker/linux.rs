@@ -19,6 +19,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 use super::pidfile;
+use super::port_plan::{PortPlan, probe_first_answering, resolve_port_plan};
 use super::protocol::{
     boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
     proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
@@ -246,8 +247,9 @@ impl FirecrackerRuntime {
         // The bare entry carries no deploy egress allow-list → `None` keeps the
         // legacy unrestricted egress. Never a workspace (no creds to scrub). No
         // cache dir ⇒ never snapshots ⇒ no env fingerprint to stamp (`None`). No
-        // OCI config in scope ⇒ no image port (`None`); `resolve_port` uses the
-        // manifest `[runtime].port` if set, else the 8080 default.
+        // OCI config in scope ⇒ no exposed ports (empty) + no persisted companion;
+        // the plan uses the manifest `[runtime].port` if set, else the 8080 default.
+        let plan = resolve_port_plan(false, rt, &[], None, cfg);
         Self::cold_boot(
             rootfs,
             rt,
@@ -259,7 +261,7 @@ impl FirecrackerRuntime {
             None,
             false,
             None,
-            None,
+            plan,
         )
         .await
     }
@@ -277,10 +279,13 @@ impl FirecrackerRuntime {
     /// fingerprint is recorded in `<cache_dir>/.snapshot_env` alongside the ref so
     /// a later warm restore is ALSO invalidated when the env/cap set changes on
     /// an unchanged image (a workspace `add_repo`; see [`snapshot::restore_matches`]).
-    /// `image_port` — the app's OWN declared port (lowest OCI `ExposedPorts` TCP,
-    /// tier 2 of [`resolve_port`]) when known, so the readiness probe + proxy
-    /// `guest_base` target it (a static site `FROM nginx` on `:80`) instead of the
-    /// 8080 fallback. `None` ⇒ the manifest `[runtime].port` or the 8080 default.
+    /// `port_plan` — how to resolve the guest port the readiness probe + proxy
+    /// `guest_base` target ([`resolve_port_plan`]). [`PortPlan::Fixed`] probes one
+    /// known port (workspace 8080, a manifest `[runtime].port`, a persisted
+    /// `.app_port`, or the 8080 default). [`PortPlan::Probe`] probes ALL of a
+    /// non-workspace app's exposed candidate ports concurrently
+    /// (first-answering-wins) — for an image `FROM nginx` that inherits `EXPOSE 80`
+    /// while its real listener is elsewhere — then adopts + persists the winner.
     #[allow(clippy::too_many_arguments)]
     async fn cold_boot(
         rootfs: &Path,
@@ -293,7 +298,7 @@ impl FirecrackerRuntime {
         egress_allow: Option<&[String]>,
         is_workspace: bool,
         env_hash: Option<&str>,
-        image_port: Option<u16>,
+        port_plan: PortPlan,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -310,15 +315,16 @@ impl FirecrackerRuntime {
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_mac = derive_guest_mac(link_idx);
-        // Single source of the app port for BOTH the readiness probe + the
-        // reverse proxy (they share `guest_base`): for an APP manifest
-        // `[runtime].port` → the image's own `ExposedPorts` (`image_port`) → 8080;
-        // for a WORKSPACE the image port is IGNORED and the fixed 8080
-        // workspace-init port is forced (see `workspace_or_resolved_port`).
-        let guest_base = format!(
-            "http://{guest_ip}:{}",
-            workspace_or_resolved_port(is_workspace, rt, image_port, cfg)
-        );
+        // The guest port for BOTH the readiness probe + the reverse proxy (they
+        // share `guest_base`), from the `port_plan`. A `Fixed` plan is final. A
+        // `Probe` plan targets a PLACEHOLDER (the lowest candidate) up front; the
+        // post-boot multi-port probe below replaces `guest_base` with the WINNING
+        // port before the VM ever serves traffic.
+        let initial_port = match &port_plan {
+            PortPlan::Fixed(p) => *p,
+            PortPlan::Probe(ports) => ports.iter().copied().min().unwrap_or(cfg.app_port),
+        };
+        let guest_base = format!("http://{guest_ip}:{initial_port}");
         tracing::debug!(
             link_idx,
             %host_ip,
@@ -369,7 +375,7 @@ impl FirecrackerRuntime {
             stderr,
         )?;
 
-        let me = Self {
+        let mut me = Self {
             child: Some(child),
             tap_name,
             api_sock: api_sock.clone(),
@@ -391,7 +397,50 @@ impl FirecrackerRuntime {
         // failure `me` drops → child killed + tap deleted.
         me.configure_and_boot(rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac)
             .await?;
-        me.wait_until_ready().await?;
+        // Readiness. A `Fixed` plan probes the single known port. A `Probe` plan
+        // dials ALL exposed candidates concurrently, FIRST-ANSWERING-WINS, then
+        // adopts the winner as `guest_base` so the reverse proxy forwards to the
+        // port the app ACTUALLY listens on (not the base-inherited `EXPOSE 80`).
+        // Either way a guest that never answers HARD-FAILS the launch (no hang).
+        let resolved_port = match &port_plan {
+            PortPlan::Fixed(p) => {
+                me.wait_until_ready().await?;
+                *p
+            }
+            PortPlan::Probe(ports) => {
+                let winner = probe_first_answering(
+                    &me.client,
+                    guest_ip,
+                    ports,
+                    READY_TIMEOUT,
+                    READY_POLL,
+                    READY_BACKOFF_START,
+                    READY_BACKOFF_CAP,
+                )
+                .await?;
+                me.guest_base = format!("http://{guest_ip}:{winner}");
+                tracing::info!(
+                    guest_base = %me.guest_base,
+                    winner,
+                    candidates = ?ports,
+                    "fc cold boot: multi-port readiness — winning app port selected"
+                );
+                winner
+            }
+        };
+
+        // Persist the DISCOVERED guest port so a later config-read-less respawn /
+        // warm restore targets the SAME port (recovered via `.app_port`). Skip a
+        // WORKSPACE (8080 is forced, never discovered) and a manifest
+        // `[runtime].port` override (re-applied from the manifest every launch,
+        // never persisted — so a later manifest change that drops the port is not
+        // shadowed by a stale companion). This matches the pre-fix semantics where
+        // only the image-DISCOVERED port was persisted.
+        if let Some(dir) = cache_dir {
+            if !is_workspace && rt.port.is_none() {
+                snapshot::write_app_port(dir, resolved_port);
+            }
+        }
 
         // Best-effort snapshot after first boot. A failure is logged and
         // does NOT fail the launch — the VM continues to serve cold. On a
@@ -438,11 +487,13 @@ impl FirecrackerRuntime {
     /// 2. Clear the (old-image) snapshot and COLD-boot `reff`; the host tap is
     ///    `uuid:reff`-derived, distinct from the old VM's, so they coexist.
     ///
-    /// `image_exposed_port` — the app's OWN declared port (lowest OCI
-    /// `ExposedPorts` TCP, tier 2 of [`resolve_port`]) when THIS launch read the
-    /// image config; `None` on a config-read-less cache-hit launch, where it is
-    /// recovered from the `.app_port` companion an earlier launch persisted. Threads
-    /// into `guest_base` so the readiness probe + proxy target the app's real port.
+    /// `image_exposed_ports` — the app's OWN declared candidate ports (ALL OCI
+    /// `ExposedPorts` TCP, tier 2 of [`resolve_port_plan`]) when THIS launch read
+    /// the image config; EMPTY on a config-read-less cache-hit launch, where the
+    /// WINNING port is recovered from the `.app_port` companion a prior launch
+    /// persisted. When more than one candidate is present the cold boot probes them
+    /// ALL (first-answering-wins) and adopts the answering port for `guest_base` so
+    /// the readiness probe + proxy target the port the app really listens on.
     ///
     /// `snapshot_ref` — the IMMUTABLE, content-addressed identity (the resolved
     /// image DIGEST `sha256:…`) this launch runs, used to STAMP and MATCH the
@@ -474,7 +525,7 @@ impl FirecrackerRuntime {
         egress_allow: Option<&[String]>,
         is_workspace: bool,
         env_hash: &str,
-        image_exposed_port: Option<u16>,
+        image_exposed_ports: &[u16],
         snapshot_ref: &str,
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
@@ -488,19 +539,21 @@ impl FirecrackerRuntime {
         let vm_key = format!("{uuid}:{reff}");
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
 
-        // Resolve the IMAGE's own port (tier 2 of `resolve_port`): the freshly-read
-        // `ExposedPorts` value when this launch read the OCI config, else the value
-        // an earlier launch of this uuid persisted (a cache-hit respawn / warm
-        // restore does NOT re-read the config). Persist it whenever known so those
-        // config-read-less launches keep targeting the app's OWN port (e.g. an
-        // nginx image on `:80`) instead of the 8080 fallback. On a redeploy that
-        // read a new image's config, the freshly-read value overwrites the stale
-        // companion. `None` (never known, no companion) ⇒ `resolve_port`'s 8080
-        // default — the unchanged status quo.
-        let image_port = image_exposed_port.or_else(|| snapshot::read_app_port(&cache_dir));
-        if let Some(port) = image_port {
-            snapshot::write_app_port(&cache_dir, port);
-        }
+        // The port(s) a prior launch of this uuid PERSISTED as its winning app
+        // port — recovered on a config-read-less cache-hit respawn / warm restore
+        // (which do NOT re-read the OCI config, so `image_exposed_ports` is empty).
+        let persisted = snapshot::read_app_port(&cache_dir);
+        // COLD-BOOT plan: the freshly-read `ExposedPorts` (this launch) drive it;
+        // multiple candidates ⇒ probe them all (first-answering-wins). The cold
+        // boot persists the winner to `.app_port` (see `cold_boot`), so a later
+        // config-read-less respawn recovers it via `persisted`.
+        let plan = resolve_port_plan(is_workspace, rt, image_exposed_ports, persisted, cfg);
+        // WARM-RESTORE port: a single fixed port. The restored guest already ran +
+        // answered on its winning port, which the taking cold boot persisted, so
+        // prefer `persisted`; fall back to the lowest freshly-read candidate, then
+        // to the manifest `[runtime].port` / 8080 default via `resolve`.
+        let restore_image_port = persisted.or_else(|| image_exposed_ports.iter().copied().min());
+        let restore_port = workspace_or_resolved_port(is_workspace, rt, restore_image_port, cfg);
         // Per-app console log: <data_dir>/fc/<uuid>.console.log (only written
         // when SUPERVISOR_FC_DEBUG is truthy — see `console_stdio`).
         let console_log = pidfile::console_log_path(data_dir, uuid);
@@ -526,7 +579,7 @@ impl FirecrackerRuntime {
                 egress_allow,
                 is_workspace,
                 Some(env_hash),
-                image_port,
+                plan.clone(),
             )
             .await?
         } else {
@@ -555,7 +608,7 @@ impl FirecrackerRuntime {
                     cfg,
                     Some(&console_log),
                     &vm_key,
-                    workspace_or_resolved_port(is_workspace, rt, image_port, cfg),
+                    restore_port,
                     data_dir,
                     uuid,
                     is_workspace,
@@ -579,7 +632,7 @@ impl FirecrackerRuntime {
                             egress_allow,
                             is_workspace,
                             Some(env_hash),
-                            image_port,
+                            plan.clone(),
                         )
                         .await?
                     }
@@ -609,7 +662,7 @@ impl FirecrackerRuntime {
                     egress_allow,
                     is_workspace,
                     Some(env_hash),
-                    image_port,
+                    plan,
                 )
                 .await?
             }
@@ -1033,10 +1086,12 @@ impl FirecrackerRuntime {
                 Err(e) => {
                     // The exact port we PROBED (parsed from `guest_base` =
                     // `http://<guest_ip>:<port>`) named as its own field so the
-                    // verdict says WHICH port had no listener — the image's lowest
-                    // EXPOSE / `[runtime].port`. `guest_base` here IS the last (and
-                    // only) health target this probe ever dialed; no app-level
-                    // health reply was seen (an HTTP answer of ANY status returns
+                    // verdict says WHICH port had no listener — the resolved SINGLE
+                    // port for this Fixed plan (a manifest `[runtime].port`, the sole
+                    // image `ExposedPort`, a persisted winner, or the 8080 default; a
+                    // MULTI-port image takes the `probe_first_answering` path instead).
+                    // `guest_base` here IS the only health target this probe dialed;
+                    // no app-level reply was seen (an HTTP answer of ANY status returns
                     // `ready` above), so `error` below is the last-known probe result.
                     let probe_port = self.guest_base.rsplit(':').next().unwrap_or("?");
                     tracing::error!(
@@ -1047,10 +1102,10 @@ impl FirecrackerRuntime {
                         elapsed_ms = start.elapsed().as_millis(),
                         error = %e,
                         "fc boot: guest app never became ready (readiness timeout) — probed the \
-                         guest port with no response. MOST LIKELY the app is not LISTENING on \
-                         that port (the probe targets the image's lowest EXPOSE / [runtime].port): \
-                         make the server listen on it (nginx must `listen 80;` when `EXPOSE 80`) \
-                         and keep PID 1 in the foreground. Only an EARLIER tap-setup EPERM (logged \
+                         resolved guest port with no response. MOST LIKELY the app is not LISTENING \
+                         on that port: make the server listen on it (nginx must `listen 80;` when \
+                         `EXPOSE 80`) and keep PID 1 in the foreground; or set `[runtime].port` in \
+                         tabbify.toml to the port it serves. Only an EARLIER tap-setup EPERM (logged \
                          above) means the guest has no network at all (→ CAP_NET_ADMIN)."
                     );
                     bail!(

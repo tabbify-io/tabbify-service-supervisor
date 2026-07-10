@@ -82,6 +82,49 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
     next
 }
 
+/// A tolerant, `[runtime]` + `[routes]`-focused view of the Tabbify-MANAGED
+/// `tabbify.toml`, used to synthesize / override a connect-repo deploy's runtime.
+///
+/// The full [`crate::unified_manifest::UnifiedManifest`] REQUIRES `[app]` +
+/// `[build]`, so a deploy that threads only a PARTIAL managed toml — e.g. a bare
+/// `[runtime]\nport = 8730` override to steer the readiness probe — would FAIL to
+/// parse as a `UnifiedManifest` and be dropped SILENTLY, losing the port and
+/// crash-looping the app on the wrong guest port. This view parses ONLY the
+/// tables the synthesis consumes, so a partial `[runtime]` toml APPLIES instead of
+/// vanishing. Unknown tables (`[app]`, `[build]`, `[[deploy]]`, `[env]`) are
+/// ignored (no `deny_unknown_fields`), so a FULL managed toml parses here too.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct ManagedRuntimeView {
+    #[serde(default)]
+    runtime: crate::unified_manifest::RuntimeSection,
+    #[serde(default)]
+    routes: crate::unified_manifest::RoutesSection,
+}
+
+/// Parse the Tabbify-MANAGED `tabbify.toml` into a tolerant [`ManagedRuntimeView`].
+///
+/// Returns `None` when `manifest_toml` is absent OR genuinely MALFORMED (a TOML
+/// SYNTAX error) — and in the malformed case logs LOUDLY (`warn!`) so a
+/// supplied-but-unparseable toml is NEVER dropped silently (the caller then falls
+/// back to the FC-sane defaults / the S3 manifest — build-time validation is the
+/// real gate). A partial-but-valid toml (missing `[app]`/`[build]`) parses fine —
+/// that is the whole point of the focused view.
+fn parse_managed_view(manifest_toml: Option<&str>) -> Option<ManagedRuntimeView> {
+    let t = manifest_toml?;
+    match toml::from_str::<ManagedRuntimeView>(t) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "managed tabbify.toml failed to parse; ignoring it (FC-sane runtime \
+                 defaults / S3 manifest apply instead). A `[runtime].port` override in \
+                 this toml will NOT take effect until the toml parses — fix its syntax."
+            );
+            None
+        }
+    }
+}
+
 /// Synthesize a minimal [`FetchedApp`] from a deployed OCI image `reff`, for an
 /// app that was deployed via the BUILD pipeline (`POST /v1/deploy` with a
 /// `repo_url`): its image lives in the mesh OCI registry but there is NO app
@@ -107,11 +150,12 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
 pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> FetchedApp {
     use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
 
-    // Parse the managed toml when present; ignore a malformed one (fall back to
-    // the FC-sane defaults). Synthesis is infallible so a broken toml never
-    // wedges a deploy here (build-time validation is the gate).
-    let managed = manifest_toml
-        .and_then(|t| toml::from_str::<crate::unified_manifest::UnifiedManifest>(t).ok());
+    // Parse the managed toml when present via the TOLERANT `[runtime]`+`[routes]`
+    // view (a partial toml — e.g. a bare `[runtime].port` override, or one lacking
+    // `[app]`/`[build]` — must apply, NOT be dropped). A genuinely malformed toml
+    // logs loudly + falls back to the FC-sane defaults. Synthesis is infallible so
+    // a broken toml never wedges a deploy here (build-time validation is the gate).
+    let managed = parse_managed_view(manifest_toml);
 
     let (mode, idle_timeout_sec, memory_mb, vcpus, port, dynamic_prefixes) = match &managed {
         Some(m) => {
@@ -172,14 +216,46 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
     }
 }
 
+/// Overlay the MANAGED `tabbify.toml`'s `[runtime].port` + `[routes]` onto an
+/// already-resolved [`FetchedApp`] (the S3-fetch success path). Only fields with
+/// an unambiguous "unset" sentinel are overridden — `[runtime].port` when `Some`
+/// and `[routes].dynamic_prefixes` when non-empty — so the S3 manifest's resource
+/// limits (memory/vcpus/lifecycle, derived from the SAME toml) are NEVER clobbered
+/// by toml defaults. A `None`/malformed toml is a no-op (logged loudly by
+/// [`parse_managed_view`]). This is what makes an explicit `[runtime].port`
+/// override reach the runtime even when an S3 manifest exists.
+#[must_use]
+fn apply_managed_overlay(mut fetched: FetchedApp, manifest_toml: Option<&str>) -> FetchedApp {
+    let Some(view) = parse_managed_view(manifest_toml) else {
+        return fetched;
+    };
+    if let Some(port) = view.runtime.port {
+        if fetched.manifest.runtime.port != Some(port) {
+            tracing::info!(
+                port,
+                previous = ?fetched.manifest.runtime.port,
+                "applying managed [runtime].port override onto S3-fetched manifest"
+            );
+        }
+        fetched.manifest.runtime.port = Some(port);
+    }
+    if !view.routes.dynamic_prefixes.is_empty() {
+        fetched.manifest.routes.dynamic_prefixes = view.routes.dynamic_prefixes;
+    }
+    fetched
+}
+
 /// Decide the [`FetchedApp`] the runner should build its INITIAL runtime from,
 /// given the result of the S3 fetch, the app `uuid`, an optional deployed
 /// `image_ref` (the orchestrator's `--image-ref`), and the runner's `data_dir`.
 ///
-/// - S3 fetch **succeeds** → behaves byte-identically to today: when `image_ref`
-///   is `Some`, apply it via [`fetched_with_ref`] (the override the runner has
-///   always done for tcli-push docker / wasm / firecracker apps); when `None`,
-///   return the fetched app unchanged.
+/// - S3 fetch **succeeds** → when `image_ref` is `Some`, apply it via
+///   [`fetched_with_ref`] (the override the runner has always done for tcli-push
+///   docker / wasm / firecracker apps); when `None`, keep the fetched app. In
+///   BOTH cases the managed `manifest_toml`'s `[runtime].port` + `[routes]` are
+///   then overlaid via [`apply_managed_overlay`] so an explicit deploy override
+///   reaches the runtime regardless of the S3-fetch outcome (a `None`/malformed
+///   toml is a no-op — byte-identical to today).
 /// - S3 fetch **fails** with `image_ref` `Some` → synthesize a firecracker
 ///   [`FetchedApp`] from the ref via [`fetched_from_ref`] (the BUILD-pipeline
 ///   app: image in the registry, no S3 manifest). The managed `manifest_toml`
@@ -210,10 +286,21 @@ pub fn resolve_fetched(
     use anyhow::Context as _;
 
     match fetch_result {
-        Ok(fetched) => Ok(match image_ref {
-            Some(reff) => fetched_with_ref(&fetched, reff),
-            None => fetched,
-        }),
+        Ok(fetched) => {
+            let with_ref = match image_ref {
+                Some(reff) => fetched_with_ref(&fetched, reff),
+                None => fetched,
+            };
+            // Apply the MANAGED toml's `[runtime].port` + `[routes]` onto the
+            // S3-fetched manifest TOO (not only on the Err/synthesis branch), so an
+            // explicit deploy override reaches the runtime REGARDLESS of the
+            // S3-fetch outcome. The S3 manifest already carries the resource limits
+            // (it was derived from the SAME tabbify.toml), so the overlay only
+            // recovers the guest PORT + route prefixes — the fields whose loss
+            // crash-loops an app on the wrong port. Fields the toml does not carry
+            // (port `None` / empty routes) leave the fetched values intact.
+            Ok(apply_managed_overlay(with_ref, manifest_toml))
+        }
         Err(e) => match image_ref {
             Some(reff) => {
                 // BUILD-pipeline app: image in the mesh registry, no S3 manifest.
@@ -427,6 +514,31 @@ idle_timeout_sec = 120
         assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::AlwaysOn);
     }
 
+    /// REGRESSION: a PARTIAL managed toml carrying ONLY `[runtime]` (no `[app]` /
+    /// `[build]`) — e.g. a bare `[runtime].port` override — previously FAILED to
+    /// parse as a full `UnifiedManifest` and was dropped SILENTLY, losing the port
+    /// so the app crash-looped on the wrong guest port. The tolerant view now
+    /// APPLIES it: the port lands, the other `[runtime]` fields take the standard
+    /// `RuntimeSection` defaults (512 / 1 / on_request), NOT the no-toml FC defaults.
+    #[test]
+    fn fetched_from_ref_bare_runtime_toml_applies_port() {
+        let toml = "[runtime]\nport = 8730\n";
+        let f = fetched_from_ref("abc-uuid", "reg:5000/x:main", Some(toml));
+        assert_eq!(
+            f.manifest.runtime.port,
+            Some(8730),
+            "a bare [runtime].port must apply, not be dropped"
+        );
+        assert_eq!(f.manifest.runtime.memory_mb, 512);
+        assert_eq!(f.manifest.runtime.vcpus, Some(1));
+        assert_eq!(f.manifest.lifecycle.mode, LifecycleMode::OnRequest);
+        // The deployed image ref is still carried.
+        assert_eq!(
+            f.manifest.runtime.registry_ref.as_deref(),
+            Some("reg:5000/x:main")
+        );
+    }
+
     // ---- resolve_fetched: fallback decision when S3 fetch fails ---------------
 
     /// On a SUCCESSFUL S3 fetch, `resolve_fetched` returns the fetched app with
@@ -460,6 +572,57 @@ idle_timeout_sec = 120
             Some("kept/ref:v1")
         );
         assert_eq!(resolved.cached_path, base.cached_path);
+        // No managed toml ⇒ the overlay is a no-op: the fetched port is untouched.
+        assert_eq!(resolved.manifest.runtime.port, None);
+    }
+
+    /// On a SUCCESSFUL S3 fetch, the MANAGED toml's `[runtime].port` overlays onto
+    /// the fetched manifest TOO (not only the Err/synthesis branch), so an explicit
+    /// deploy override reaches the runtime regardless of the S3-fetch outcome.
+    #[test]
+    fn resolve_fetched_s3_ok_applies_managed_port_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = docker_fetched(None); // port None
+        let toml = "[runtime]\nport = 8730\n";
+        let resolved = resolve_fetched(Ok(base), "u", None, Some(toml), tmp.path()).unwrap();
+        assert_eq!(
+            resolved.manifest.runtime.port,
+            Some(8730),
+            "managed [runtime].port must overlay onto the S3-fetched manifest"
+        );
+    }
+
+    /// The Ok-branch overlay is SURGICAL: a PARTIAL managed toml (only `[runtime].
+    /// port`) overrides the port but must NOT clobber the S3 manifest's resource
+    /// limits (memory/vcpus) with the toml's defaults.
+    #[test]
+    fn resolve_fetched_s3_ok_overlay_preserves_s3_resources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut base = docker_fetched(None);
+        base.manifest.runtime.memory_mb = 4096; // the S3 manifest's real value
+        base.manifest.runtime.vcpus = Some(8);
+        let toml = "[runtime]\nport = 8730\n"; // partial — only the port
+        let resolved = resolve_fetched(Ok(base), "u", None, Some(toml), tmp.path()).unwrap();
+        assert_eq!(resolved.manifest.runtime.port, Some(8730));
+        assert_eq!(
+            resolved.manifest.runtime.memory_mb, 4096,
+            "S3 memory must NOT be clobbered by the partial toml's default"
+        );
+        assert_eq!(resolved.manifest.runtime.vcpus, Some(8));
+    }
+
+    /// The Ok-branch overlay also carries `[routes].dynamic_prefixes` (when the
+    /// toml sets them) onto the S3-fetched manifest.
+    #[test]
+    fn resolve_fetched_s3_ok_overlay_applies_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = docker_fetched(None);
+        let toml = "[routes]\ndynamic_prefixes = [\"/api\", \"/health\"]\n";
+        let resolved = resolve_fetched(Ok(base), "u", None, Some(toml), tmp.path()).unwrap();
+        assert_eq!(
+            resolved.manifest.routes.dynamic_prefixes,
+            vec!["/api".to_owned(), "/health".to_owned()]
+        );
     }
 
     /// On a FAILED S3 fetch WITH an image_ref, `resolve_fetched` synthesizes a

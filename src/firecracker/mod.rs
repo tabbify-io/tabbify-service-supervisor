@@ -49,6 +49,10 @@ pub(crate) mod pidfile;
 // spawn + `systemctl stop` reaping that consume it are behind the Linux gate).
 pub(crate) mod cpu_scope;
 mod protocol;
+// Pure, host-agnostic readiness-port PLANNING + multi-port first-answering PROBE
+// — NO cfg gate so the plan LOGIC + the probe are unit-testable on macOS (the
+// probe dials `host:port` over plain TCP against real localhost listeners).
+pub(crate) mod port_plan;
 pub(crate) mod snapshot;
 // Pure, host-agnostic snapshot DECISION logic — NO cfg gate so it is unit-
 // testable on macOS (the rest of the snapshot path is behind the Linux gate).

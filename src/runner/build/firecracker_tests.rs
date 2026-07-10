@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 use super::oci_fixtures::{make_tar, write_min_oci_layout};
 use super::{
     Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, ext4_geometry,
-    exposed_tcp_port_lowest, extract_layer_blob, measure_tree, merge_extra_env, render_init,
+    exposed_tcp_ports, extract_layer_blob, measure_tree, merge_extra_env, render_init,
 };
 
 /// Parse an OCI `ImageConfiguration` from a JSON `config` object body (the
 /// `{...}` that goes under `"config"`), so the ExposedPorts tests can assert
-/// `exposed_tcp_port_lowest` against realistic image configs concisely.
+/// `exposed_tcp_ports` against realistic image configs concisely.
 fn image_config_with(config_body: serde_json::Value) -> oci_spec::image::ImageConfiguration {
     let json = serde_json::json!({
         "architecture": "amd64",
@@ -24,22 +24,35 @@ fn image_config_with(config_body: serde_json::Value) -> oci_spec::image::ImageCo
     serde_json::from_value(json).unwrap()
 }
 
-/// TIER 2 parsing — a single `{"80/tcp": {}}` ExposedPort resolves to 80 (this is
-/// exactly the `FROM nginx` / `EXPOSE 80` case that used to fail the :8080 probe).
+/// TIER 2 parsing — a single `{"80/tcp": {}}` ExposedPort resolves to `[80]`
+/// (exactly the `FROM nginx` / `EXPOSE 80` case that used to fail the :8080 probe).
 #[test]
 fn exposed_port_single_tcp_resolves() {
     let cfg = image_config_with(serde_json::json!({ "ExposedPorts": { "80/tcp": {} } }));
-    assert_eq!(exposed_tcp_port_lowest(&cfg), Some(80));
+    assert_eq!(exposed_tcp_ports(&cfg), vec![80]);
 }
 
-/// Multiple ExposedPorts → the LOWEST TCP port wins (order-independent: in a
-/// non-test build the set is HashMap-backed / unordered, so `min` is mandatory).
+/// Multiple ExposedPorts → ALL TCP ports are returned, SORTED ascending
+/// (order-independent: in a non-test build the set is HashMap-backed / unordered).
+/// This REPLACES the old lowest-only heuristic: the launch probes them ALL
+/// (first-answering-wins) instead of hammering the dead lowest port.
 #[test]
-fn exposed_port_picks_lowest_of_several() {
+fn exposed_port_returns_all_sorted() {
     let cfg = image_config_with(
         serde_json::json!({ "ExposedPorts": { "8443/tcp": {}, "80/tcp": {}, "443/tcp": {} } }),
     );
-    assert_eq!(exposed_tcp_port_lowest(&cfg), Some(80));
+    assert_eq!(exposed_tcp_ports(&cfg), vec![80, 443, 8443]);
+}
+
+/// The nginx-base regression case: an image inherits `EXPOSE 80` from its base
+/// AND declares its real `EXPOSE 8730` — BOTH ports are returned so the launch
+/// probes the port the app actually listens on, not just the base-inherited 80.
+#[test]
+fn exposed_port_base_inherited_plus_app_port_both_returned() {
+    let cfg = image_config_with(
+        serde_json::json!({ "ExposedPorts": { "80/tcp": {}, "8730/tcp": {} } }),
+    );
+    assert_eq!(exposed_tcp_ports(&cfg), vec![80, 8730]);
 }
 
 /// An entry with NO protocol suffix defaults to TCP (per the OCI spec), so a bare
@@ -47,44 +60,44 @@ fn exposed_port_picks_lowest_of_several() {
 #[test]
 fn exposed_port_bare_number_defaults_to_tcp() {
     let cfg = image_config_with(serde_json::json!({ "ExposedPorts": { "3000": {} } }));
-    assert_eq!(exposed_tcp_port_lowest(&cfg), Some(3000));
+    assert_eq!(exposed_tcp_ports(&cfg), vec![3000]);
 }
 
-/// A UDP-only ExposedPort is NOT a serveable TCP/HTTP app port → `None` (the
+/// A UDP-only ExposedPort is NOT a serveable TCP/HTTP app port → EMPTY (the
 /// caller then falls back to the 8080 default rather than probing a UDP port).
 #[test]
-fn exposed_port_udp_only_is_none() {
+fn exposed_port_udp_only_is_empty() {
     let cfg = image_config_with(serde_json::json!({ "ExposedPorts": { "53/udp": {} } }));
-    assert_eq!(exposed_tcp_port_lowest(&cfg), None);
+    assert_eq!(exposed_tcp_ports(&cfg), Vec::<u16>::new());
 }
 
-/// Mixed TCP + UDP: the UDP entry is skipped and the lowest TCP wins — a UDP port
-/// numerically below the TCP one must NOT be chosen.
+/// Mixed TCP + UDP: the UDP entry is skipped, only the TCP port(s) are returned —
+/// a UDP port numerically below the TCP one must NOT appear.
 #[test]
 fn exposed_port_mixed_tcp_udp_ignores_udp() {
     let cfg = image_config_with(
         serde_json::json!({ "ExposedPorts": { "53/udp": {}, "8080/tcp": {} } }),
     );
-    assert_eq!(exposed_tcp_port_lowest(&cfg), Some(8080));
+    assert_eq!(exposed_tcp_ports(&cfg), vec![8080]);
 }
 
-/// No `ExposedPorts` key at all ⇒ `None` (tier-3 fallback to 8080 downstream).
+/// No `ExposedPorts` key at all ⇒ EMPTY (tier-3 fallback to 8080 downstream).
 #[test]
-fn exposed_port_absent_is_none() {
+fn exposed_port_absent_is_empty() {
     let cfg = image_config_with(serde_json::json!({ "Entrypoint": ["/app/server"] }));
-    assert_eq!(exposed_tcp_port_lowest(&cfg), None);
+    assert_eq!(exposed_tcp_ports(&cfg), Vec::<u16>::new());
 }
 
-/// An image with NO `config` block at all ⇒ `None`.
+/// An image with NO `config` block at all ⇒ EMPTY.
 #[test]
-fn exposed_port_no_config_block_is_none() {
+fn exposed_port_no_config_block_is_empty() {
     let json = serde_json::json!({
         "architecture": "amd64",
         "os": "linux",
         "rootfs": { "type": "layers", "diff_ids": [] },
     });
     let cfg: oci_spec::image::ImageConfiguration = serde_json::from_value(json).unwrap();
-    assert_eq!(exposed_tcp_port_lowest(&cfg), None);
+    assert_eq!(exposed_tcp_ports(&cfg), Vec::<u16>::new());
 }
 
 /// `oci-spec` links and parses an OCI image config's entrypoint/cmd/env/

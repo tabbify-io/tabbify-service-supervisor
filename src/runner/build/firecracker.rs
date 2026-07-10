@@ -915,28 +915,37 @@ impl Entrypoint {
     }
 }
 
-/// The LOWEST TCP port the OCI image itself declares in `config.ExposedPorts`,
-/// or `None` when the image declares none (or only UDP ports).
+/// ALL the TCP ports the OCI image declares in `config.ExposedPorts` — sorted
+/// ascending and de-duplicated — or an EMPTY vec when the image declares none
+/// (or only UDP ports).
 ///
-/// This is the app's OWN declared port — the middle tier of the port precedence
-/// (`crate::firecracker::protocol::resolve_port`): a static site `FROM nginx`
-/// inherits `EXPOSE 80`, so its config carries `ExposedPorts {"80/tcp": {}}` and
-/// this returns `Some(80)`, letting the readiness probe + reverse proxy target
-/// `:80` with ZERO user action instead of the hardcoded 8080.
+/// These are the app's OWN declared candidate ports (the middle tier of the port
+/// precedence, `crate::firecracker::protocol::resolve_port_plan`). This REPLACES
+/// the old lowest-only pick: an image `FROM nginx:alpine` inherits `EXPOSE 80`
+/// from its base AND may `EXPOSE 8730` for its real listener, so its config
+/// carries `ExposedPorts {"80/tcp":{}, "8730/tcp":{}}`. Probing ONLY the lowest
+/// (`80`) hammers the base-inherited port where NOTHING listens → the readiness
+/// probe times out → crash-loop. Returning BOTH lets the launch path probe them
+/// ALL (first-answering-wins) so the port the app truly LISTENS on is the one the
+/// readiness probe + reverse proxy target — with ZERO user action.
 ///
 /// `oci_spec` deserializes the JSON `ExposedPorts` MAP (`{"80/tcp":{}}`) into a
 /// `Vec<String>` of `"<port>[/<proto>]"` entries; in a non-test build that Vec
-/// comes from a `HashMap` (UNORDERED), so we must pick the MINIMUM rather than
-/// rely on iteration order. Entries without a protocol default to TCP (per the
-/// OCI spec). UDP-only ports are SKIPPED — the supervisor proxies HTTP/TCP into
-/// the guest, so a UDP `ExposedPort` is not a serveable app port; if an image
-/// exposes ONLY UDP ports this yields `None` and the caller falls back to 8080.
-/// Port `0` (never a real listen port) is ignored defensively.
+/// comes from a `HashMap` (UNORDERED), so the result is SORTED for a stable,
+/// order-independent candidate list. Entries without a protocol default to TCP
+/// (per the OCI spec). UDP ports are SKIPPED — the supervisor proxies HTTP/TCP
+/// into the guest, so a UDP `ExposedPort` is not a serveable app port; an image
+/// that exposes ONLY UDP ports yields an EMPTY vec and the caller falls back to
+/// 8080. Port `0` (never a real listen port) is ignored defensively.
 #[must_use]
-pub fn exposed_tcp_port_lowest(config: &oci_spec::image::ImageConfiguration) -> Option<u16> {
-    let inner = config.config().as_ref()?;
-    let ports = inner.exposed_ports().as_ref()?;
-    ports
+pub fn exposed_tcp_ports(config: &oci_spec::image::ImageConfiguration) -> Vec<u16> {
+    let Some(inner) = config.config().as_ref() else {
+        return Vec::new();
+    };
+    let Some(ports) = inner.exposed_ports().as_ref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<u16> = ports
         .iter()
         .filter_map(|spec| {
             // "<port>", "<port>/tcp", or "<port>/udp" — default proto is tcp.
@@ -949,7 +958,10 @@ pub fn exposed_tcp_port_lowest(config: &oci_spec::image::ImageConfiguration) -> 
             }
             port_str.trim().parse::<u16>().ok().filter(|p| *p != 0)
         })
-        .min()
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// POSIX single-quote a string so the `/bin/sh` running `/init` reads it back as
@@ -1901,13 +1913,15 @@ pub async fn run_firecracker_build(
     };
     let oras_cfg = oras_cfg_owned.as_deref();
 
-    // The app's OWN declared port (lowest `ExposedPorts` TCP, tier 2 of
-    // `resolve_port`), set whenever this launch READS the OCI config. On a
-    // config-read-LESS launch (a pre-pull rootfs cache hit) it stays `None`; the
-    // per-uuid `.app_port` companion persisted by an earlier launch recovers it so
-    // e.g. `FROM nginx` (`EXPOSE 80`) is probed on `:80` on every respawn, not
-    // just the first deploy. `None` + no companion ⇒ the 8080 fallback (unchanged).
-    let mut image_exposed_port: Option<u16> = None;
+    // The app's OWN declared candidate ports (ALL `ExposedPorts` TCP, tier 2 of
+    // `resolve_port_plan`), set whenever this launch READS the OCI config. On a
+    // config-read-LESS launch (a pre-pull rootfs cache hit) it stays EMPTY; the
+    // per-uuid `.app_port` companion persisted by an earlier launch's WINNING port
+    // recovers it so e.g. `FROM nginx` is probed on its real port on every respawn,
+    // not just the first deploy. Empty + no companion ⇒ the 8080 fallback
+    // (unchanged). Multiple candidates ⇒ the launch probes them all,
+    // first-answering-wins (see `resolve_port_plan` / `probe_first_answering`).
+    let mut image_exposed_ports: Vec<u16> = Vec::new();
 
     // FAST PATH (digest-shared cache): resolve the IMMUTABLE digest WITHOUT
     // pulling layer blobs, so the digest-keyed caches (per-uuid + the GLOBAL
@@ -1936,14 +1950,15 @@ pub async fn run_firecracker_build(
                 digest,
                 "firecracker rootfs cache hit (pre-pull); skipping pull + conversion"
             );
-            // Config NOT read on this fast path → `image_exposed_port` is still
-            // `None`; `launch_with_uuid` recovers it from the `.app_port` companion
-            // an earlier launch persisted (else falls back to 8080). `digest` is the
-            // resolved (immutable) image identity → the `.snapshot_ref` stamp/match
-            // key, so a moved tag (`…:current`) invalidates a stale warm snapshot.
+            // Config NOT read on this fast path → `image_exposed_ports` is still
+            // EMPTY; `launch_with_uuid` recovers the winning port from the
+            // `.app_port` companion an earlier launch persisted (else falls back to
+            // 8080). `digest` is the resolved (immutable) image identity → the
+            // `.snapshot_ref` stamp/match key, so a moved tag (`…:current`)
+            // invalidates a stale warm snapshot.
             return launch_firecracker(
                 &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                &env_hash, image_exposed_port, digest,
+                &env_hash, &image_exposed_ports, digest,
             )
             .await;
         }
@@ -1974,7 +1989,7 @@ pub async fn run_firecracker_build(
             {
                 tracing::info!(uuid, digest, "oci layout cache hit; skipping pull");
                 let config = read_oci_config_from_layout(&local)?;
-                image_exposed_port = exposed_tcp_port_lowest(&config);
+                image_exposed_ports = exposed_tcp_ports(&config);
                 let built = resolve_rootfs(
                     uuid, fetched, &local, &config, digest, data_dir, runner, extra_env, &cap_files,
                 )
@@ -1984,7 +1999,7 @@ pub async fn run_firecracker_build(
                 }
                 return launch_firecracker(
                     &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                    &env_hash, image_exposed_port, digest,
+                    &env_hash, &image_exposed_ports, digest,
                 )
                 .await;
             }
@@ -2017,7 +2032,7 @@ pub async fn run_firecracker_build(
         // the pull (env-free → always safe; keyed by the immutable ref digest).
         publish_layout_to_global(data_dir, digest, uuid, &layout).await;
         let config = read_oci_config_from_layout(&layout)?;
-        image_exposed_port = exposed_tcp_port_lowest(&config);
+        image_exposed_ports = exposed_tcp_ports(&config);
         let built = resolve_rootfs(
             uuid, fetched, &layout, &config, digest, data_dir, runner, extra_env, &cap_files,
         )
@@ -2051,7 +2066,7 @@ pub async fn run_firecracker_build(
                 linked
             } else {
                 let config = read_oci_config_from_layout(&layout)?;
-                image_exposed_port = exposed_tcp_port_lowest(&config);
+                image_exposed_ports = exposed_tcp_ports(&config);
                 let built = resolve_rootfs(
                     uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env, &cap_files,
                 )
@@ -2067,7 +2082,7 @@ pub async fn run_firecracker_build(
 
     launch_firecracker(
         &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace, &env_hash,
-        image_exposed_port, &resolved_digest,
+        &image_exposed_ports, &resolved_digest,
     )
     .await
 }
@@ -2094,7 +2109,7 @@ async fn launch_firecracker(
     egress_allow: Option<&[String]>,
     is_workspace: bool,
     env_hash: &str,
-    image_exposed_port: Option<u16>,
+    image_exposed_ports: &[u16],
     snapshot_ref: &str,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
@@ -2108,7 +2123,7 @@ async fn launch_firecracker(
         egress_allow,
         is_workspace,
         env_hash,
-        image_exposed_port,
+        image_exposed_ports,
         snapshot_ref,
     )
     .await?;
