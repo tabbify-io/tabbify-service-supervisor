@@ -403,14 +403,56 @@ fn cmdline_matches_pull(cmdline: &[u8], needle: &str) -> bool {
     !needle.is_empty() && String::from_utf8_lossy(cmdline).contains(needle)
 }
 
-/// `true` if an `oras` image pull is STILL running for `uuid` — i.e. a live
-/// process's cmdline references this runner's `.pull` OCI-layout path. The
-/// monitor uses this to AVOID reaping a runner whose control socket is merely
-/// "not up yet because it is still pulling its image" over the slow relay (vs
-/// genuinely hung). Linux-only (scans `/proc`); returns `false` elsewhere,
-/// which is fine — FC runners only run on Linux.
+/// `true` if an image pull is STILL in progress for `uuid`, by EITHER detection
+/// path — so the monitor does NOT reap a runner whose control socket is merely
+/// "not up yet because it is still pulling/converting its image" (vs genuinely
+/// hung):
+///
+/// 1. **NATIVE in-process pull** (`crate::oci_pull` — the CURRENT puller): the
+///    runner's Rust-native resumable puller writes the OCI layout DIRECTLY into
+///    `<data_dir>/apps/<uuid>/fc/.pull` — the SAME dir `pull_stage_dir` /
+///    `pull_path_needle` name and `pull_deferral_active` measures for byte
+///    progress — and spawns NO `oras` subprocess. There is therefore no `/proc`
+///    entry to find, so the OLD subprocess-only detection reported `false` and
+///    the monitor KILLED the runner mid-cold-boot-pull (~20 s after spawn), which
+///    crash-looped it into the parked state. The native pull is now detected
+///    STRUCTURALLY, by that `.pull` staging dir EXISTING for this uuid
+///    ([`native_pull_active`]). `pull_oci_layout` creates it up front (before the
+///    first manifest fetch), so this covers the entire socket-less first-boot
+///    window — manifest fetch, layer download, AND the post-pull convert/boot
+///    (the layout dir lingers off that same `.pull`). It can NOT wedge the reaper
+///    the other way: the byte-progress stall clock (`pull_stall_update`) reaps a
+///    `.pull` that stops GROWING for a full [`PULL_GRACE_SECS`] window, so a
+///    completed / stale / never-appearing / never-growing dir defers at most one
+///    window, never forever (see [`native_pull_active`] and `pull_deferral_active`).
+/// 2. **LEGACY `oras copy` subprocess** (belt-and-suspenders): a live process
+///    whose cmdline references the `.pull` path. Kept both for any host still on
+///    the subprocess puller AND as the orphan-`oras` cleanup signal
+///    ([`kill_pull_procs_for_uuid`]). Linux-only (`/proc` scan); empty elsewhere.
 fn pull_in_progress(data_dir: &Path, uuid: &str) -> bool {
-    !pull_pids_for_uuid(data_dir, uuid).is_empty()
+    native_pull_active(data_dir, uuid) || !pull_pids_for_uuid(data_dir, uuid).is_empty()
+}
+
+/// `true` when the NATIVE in-process pull's staging dir exists for `uuid`
+/// (`<data_dir>/apps/<uuid>/fc/.pull` — the [`pull_stage_dir`] path). The native
+/// puller (`pull_oci_layout` → `crate::oci_pull`) creates this dir before its
+/// first network op and lands every blob under it, so its existence marks an
+/// in-flight (or just-finished, pre-boot) pull that has NO `oras` subprocess for
+/// [`pull_pids_for_uuid`] to detect.
+///
+/// Deliberately COARSE — it stays true after the pull FINISHES (the dir lingers
+/// until the next deploy's `fresh_tag_pull_dir` wipes it), which is intentional:
+/// the runner is still busy converting the layout to ext4 + booting the FC off
+/// that same `.pull`, and must keep its grace across that socket-less window too.
+/// Mere existence can NOT defer forever, because the byte-progress stall clock is
+/// what BOUNDS the deferral: `pull_deferral_active` reaps once `dir_size_bytes`
+/// of this dir stops growing for a full [`PULL_GRACE_SECS`] window. So the two
+/// failure modes the reaper must survive are both bounded — a `.pull` that never
+/// appears ⇒ this returns `false` ⇒ the normal reap path runs; a `.pull` that
+/// appears but never grows (wedged manifest fetch, or a stale completed layout on
+/// a genuinely-hung post-boot runner) ⇒ reaped after exactly one stall window.
+fn native_pull_active(data_dir: &Path, uuid: &str) -> bool {
+    pull_stage_dir(data_dir, uuid).is_dir()
 }
 
 /// The pids of every live process whose cmdline references `uuid`'s `.pull`
@@ -1306,6 +1348,103 @@ mod tests {
             pull_stage_dir(data_dir, "abc-123").to_str().unwrap(),
             needle,
             "progress dir and liveness needle must be the same path"
+        );
+    }
+
+    // ── native (in-process) pull detection (PROD-DOWN grace fix) ──────────────
+    //
+    // The Rust-native puller (`crate::oci_pull`) spawns NO `oras` subprocess, so
+    // the subprocess-only `pull_pids_for_uuid` finds nothing and the OLD
+    // `pull_in_progress` reported `false` — the monitor then reaped the runner
+    // mid-cold-boot-pull. Detection is now STRUCTURAL: the `.pull` staging dir
+    // exists ⇒ a native pull is (or was just) in progress.
+
+    /// `.pull` present ⇒ `native_pull_active` / `pull_in_progress` true; absent ⇒
+    /// false (a runner that never started a native pull is NOT falsely deferred).
+    #[test]
+    fn native_pull_active_tracks_the_pull_stage_dir() {
+        let tmp = TempDir::new().unwrap();
+        let data = tmp.path();
+        let uuid = "abc-123";
+
+        // Absent: no `.pull` dir AND no oras subprocess ⇒ not in progress, so the
+        // normal reap path runs (the "never appears" bound).
+        assert!(!native_pull_active(data, uuid), "no .pull dir ⇒ not active");
+        assert!(
+            !pull_in_progress(data, uuid),
+            "no .pull dir + no oras ⇒ not in progress"
+        );
+
+        // The native puller creates `<data>/apps/<uuid>/fc/.pull` before its first
+        // network op; its mere existence signals an in-process pull.
+        std::fs::create_dir_all(pull_stage_dir(data, uuid)).unwrap();
+        assert!(native_pull_active(data, uuid), "native .pull dir ⇒ active");
+        assert!(
+            pull_in_progress(data, uuid),
+            "native .pull dir ⇒ pull in progress (no oras subprocess needed)"
+        );
+
+        // A DIFFERENT uuid's `.pull` must not leak into this one (per-uuid path).
+        assert!(
+            !native_pull_active(data, "zzz-999"),
+            "another uuid's pull must not read as active here"
+        );
+    }
+
+    /// End-to-end deferral over the native detection: a present-and-GROWING
+    /// `.pull` defers; once the byte count goes static for a full
+    /// [`PULL_GRACE_SECS`] window the deferral STOPS (reap) even though the dir
+    /// still exists — proving mere existence cannot wedge the reaper forever.
+    #[tokio::test]
+    async fn pull_deferral_defers_native_pull_then_reaps_on_stall() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = shared_for_test();
+        cfg.data_dir = dir.path().to_path_buf();
+        let orch = Orchestrator::new(cfg, dir.path().to_path_buf());
+        let uuid = "0191e7c2-pull-7222-8333-444455556666";
+
+        // No `.pull` dir ⇒ no deferral (normal reap path owns it).
+        assert!(
+            !orch.pull_deferral_active(uuid, 100),
+            "no native pull dir ⇒ no deferral"
+        );
+
+        // Native pull begins: the stage dir exists with some downloaded bytes.
+        let stage = pull_stage_dir(dir.path(), uuid);
+        std::fs::create_dir_all(stage.join("oci/blobs/sha256")).unwrap();
+        std::fs::write(stage.join("oci/blobs/sha256/aa"), vec![0u8; 4096]).unwrap();
+
+        // First observation ⇒ defer, stall clock starts at t=100.
+        assert!(
+            orch.pull_deferral_active(uuid, 100),
+            "an active native pull must defer the reap"
+        );
+
+        // A new blob lands (byte growth) ⇒ keep deferring, however far in the
+        // future — a growing pull on an arbitrarily slow link always converges.
+        std::fs::write(stage.join("oci/blobs/sha256/bb"), vec![0u8; 8192]).unwrap();
+        let t_grow = 100 + 10 * PULL_GRACE_SECS;
+        assert!(
+            orch.pull_deferral_active(uuid, t_grow),
+            "byte growth defers regardless of elapsed time"
+        );
+
+        // Bytes now go STATIC (pull finished, or wedged): within the window the
+        // reap is still deferred (convert/boot grace; bursty blobs) …
+        assert!(
+            orch.pull_deferral_active(uuid, t_grow + PULL_GRACE_SECS - 1),
+            "a quiet spell inside the stall window still defers"
+        );
+        // … but a FULL window of zero byte-progress stops deferring (reap), even
+        // though the `.pull` dir is STILL PRESENT — existence alone can never
+        // wedge the reaper past one [`PULL_GRACE_SECS`] window.
+        assert!(
+            !orch.pull_deferral_active(uuid, t_grow + PULL_GRACE_SECS),
+            "a full stall window with the pull dir present must stop deferring"
+        );
+        assert!(
+            stage.is_dir(),
+            "sanity: the stage dir still exists at the moment the reaper is released"
         );
     }
 
