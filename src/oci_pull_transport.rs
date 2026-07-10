@@ -79,10 +79,27 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     /// A transport backed by a fresh reqwest client.
+    ///
+    /// CRITICAL: static timeouts. The registry lives behind the boringtun mesh
+    /// tunnel; a WireGuard rekey under load drops the tunnel into a HALF-OPEN
+    /// state (no RST/FIN), so a timeout-less `send()`/`chunk()` await blocks
+    /// FOREVER on the dead socket — no bytes, no error, no log — and the whole
+    /// resumable-download engine below (`download_resumable`: `BLOB_DEADLINE`,
+    /// `MAX_STALL_RETRIES`, `Range` resume) is DEFEATED because its guards only
+    /// run AFTER an await returns. A per-read inactivity `read_timeout` turns a
+    /// wedged read into an `Err` so the `Range` resume + stall machinery can do
+    /// its job. It is `read_timeout` (resets on each received byte), NOT the
+    /// blanket `.timeout()` — a legit multi-hundred-MB layer streams for minutes
+    /// and must not be aborted while bytes flow. 30s > `RETRY_BACKOFF` (2s) and
+    /// well under a ~120s rekey interval, so a wedge is caught quickly.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(30))
+                .build()
+                .expect("reqwest client builds with static timeouts"),
         }
     }
 }
