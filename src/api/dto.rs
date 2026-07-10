@@ -71,6 +71,10 @@ pub struct AppPresence {
     pub restart_count: u32,
     /// Earliest Unix timestamp (seconds) at which a respawn is eligible.
     pub next_retry_at: u64,
+    /// Unix seconds of the runner's most recent exit (0 = never exited). Frozen
+    /// at park time once `restart_status == "crashloop"`, so `now - last_exit_at`
+    /// = how long it has been definitively dead (auto-reaper grace clock).
+    pub last_exit_at: u64,
 }
 
 /// Body of `GET /v1/apps`.
@@ -130,6 +134,22 @@ pub struct ErrorResponse {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_presence_serializes_last_exit_at() {
+        let p = AppPresence {
+            uuid: "u".to_owned(),
+            app_ula: "fd5a::1".to_owned(),
+            state: "running".to_owned(),
+            bound_addr: None,
+            restart_status: "crashloop".to_owned(),
+            restart_count: 10,
+            next_retry_at: 0,
+            last_exit_at: 1_700_000_123,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["last_exit_at"], 1_700_000_123u64);
+    }
 
     #[test]
     fn app_action_response_serializes_requested_runtime() {

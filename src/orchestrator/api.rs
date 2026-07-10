@@ -138,6 +138,11 @@ pub struct AppSummary {
     /// Earliest Unix timestamp (seconds) at which the runner is eligible to be
     /// respawned again. `0` means "immediately eligible" (no backoff pending).
     pub next_retry_at: u64,
+    /// Unix seconds of the runner's most recent exit (`0` = never exited). Once
+    /// `restart_status == "crashloop"` (parked) this is FROZEN at park time, so
+    /// `now - last_exit_at` measures how long it has been definitively dead — the
+    /// auto-reaper's grace clock.
+    pub last_exit_at: u64,
     /// Runtime the caller requested as an override (D4 wire string), echoed onto
     /// the action-response JSON. `None` ⇒ manifest default was used (D10).
     pub requested_runtime: Option<String>,
@@ -272,6 +277,7 @@ impl Orchestrator {
                 restart_status: restart_status_str(RestartStatus::Running),
                 restart_count: 0,
                 next_retry_at: 0,
+                last_exit_at: 0,
                 requested_runtime: runtime_override.map(str::to_owned),
             });
         }
@@ -301,6 +307,7 @@ impl Orchestrator {
             restart_status: restart_status_str(RestartStatus::Running),
             restart_count: 0,
             next_retry_at: 0,
+            last_exit_at: 0,
             requested_runtime: runtime_override.map(str::to_owned),
         })
     }
@@ -557,6 +564,7 @@ impl Orchestrator {
                 restart_status,
                 restart_count: rec.restart.consecutive_failures,
                 next_retry_at: rec.restart.next_retry_at,
+                last_exit_at: rec.restart.last_exit_at,
                 // Read path: no override travels on a snapshot.
                 requested_runtime: None,
             });
@@ -595,6 +603,7 @@ impl Orchestrator {
             restart_status,
             restart_count: rec.restart.consecutive_failures,
             next_retry_at: rec.restart.next_retry_at,
+            last_exit_at: rec.restart.last_exit_at,
             // Read path: no override travels on a snapshot.
             requested_runtime: None,
         }))
@@ -834,6 +843,7 @@ impl Orchestrator {
                 restart_status: restart_status_str(RestartStatus::Running),
                 restart_count: 0,
                 next_retry_at: 0,
+                last_exit_at: 0,
                 requested_runtime: runtime_override.map(str::to_owned),
             })
         } else {
@@ -944,6 +954,7 @@ impl Orchestrator {
                 restart_status: restart_status_str(RestartStatus::Running),
                 restart_count: 0,
                 next_retry_at: 0,
+                last_exit_at: 0,
                 requested_runtime: runtime_override.map(str::to_owned),
             })
         }
@@ -1013,6 +1024,7 @@ impl Orchestrator {
             restart_status: restart_status_str(rs),
             restart_count: record.restart.consecutive_failures,
             next_retry_at: record.restart.next_retry_at,
+            last_exit_at: record.restart.last_exit_at,
             // Reset is a read/respawn path with no override.
             requested_runtime: None,
         })
@@ -1372,6 +1384,7 @@ mod tests {
             restart_status: restart_status_str(rs),
             restart_count: loaded.restart.consecutive_failures,
             next_retry_at: loaded.restart.next_retry_at,
+            last_exit_at: loaded.restart.last_exit_at,
             requested_runtime: None,
         };
 

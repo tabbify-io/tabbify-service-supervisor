@@ -551,6 +551,7 @@ fn summary_json(s: &AppSummary) -> serde_json::Value {
         "restart_status": s.restart_status,
         "restart_count": s.restart_count,
         "next_retry_at": s.next_retry_at,
+        "last_exit_at": s.last_exit_at,
     })
 }
 
@@ -577,6 +578,7 @@ fn present_json(s: &AppSummary) -> axum::Json<serde_json::Value> {
         "restart_status": s.restart_status,
         "restart_count": s.restart_count,
         "next_retry_at": s.next_retry_at,
+        "last_exit_at": s.last_exit_at,
     }))
 }
 
