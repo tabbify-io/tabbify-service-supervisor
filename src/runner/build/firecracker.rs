@@ -1151,6 +1151,13 @@ pub fn render_init(
             //      The boot must NOT fail — some apps can run without the disk.
             format!(
                 "mkdir -p {qm}\n\
+                 # The shared /dev setup falls back to an EMPTY tmpfs when a second\n\
+                 # devtmpfs mount is refused (the kernel already auto-mounted one),\n\
+                 # which drops the kernel-created /dev/vdb node even though the\n\
+                 # virtio disk IS attached (root-caused live: `Can't open blockdev`).\n\
+                 # Recreate the block node from sysfs (authoritative major:minor);\n\
+                 # a no-op when /dev/vdb already exists (real devtmpfs on /dev).\n\
+                 if [ ! -b /dev/vdb ] && [ -r /sys/block/vdb/dev ]; then mknod /dev/vdb b $(cat /sys/block/vdb/dev | tr ':' ' ') 2>/dev/null || true; fi\n\
                  i=0; while [ ! -b /dev/vdb ] && [ \"$i\" -lt 20 ]; do sleep 0.25; i=$((i+1)); done\n\
                  mount -t ext4 /dev/vdb {qm} 2>/dev/null || mount /dev/vdb {qm} 2>/dev/null || echo \"tabbify-init: WARN data disk /dev/vdb failed to mount at {qm}\" 1>&2\n"
             )

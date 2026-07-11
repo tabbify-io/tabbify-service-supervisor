@@ -2391,6 +2391,14 @@ fn render_init_mounts_data_disk_when_some_skips_when_none() {
         init_some.contains(&format!("mkdir -p {quoted}")),
         "must emit mkdir -p for the (quoted) data mount path; got:\n{init_some}"
     );
+    // Recovery: when the /dev fallback lands on an empty tmpfs (a second
+    // devtmpfs mount is refused), the kernel-created /dev/vdb node is dropped;
+    // recreate it from sysfs (authoritative major:minor) before waiting/mounting.
+    assert!(
+        init_some.contains("[ -r /sys/block/vdb/dev ]")
+            && init_some.contains("mknod /dev/vdb b $(cat /sys/block/vdb/dev | tr ':' ' ')"),
+        "must recreate /dev/vdb from sysfs when the node is missing; got:\n{init_some}"
+    );
     // Wait loop: give /dev/vdb up to ~5s to appear before mounting.
     assert!(
         init_some.contains("[ ! -b /dev/vdb ]"),
