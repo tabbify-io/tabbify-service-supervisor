@@ -441,14 +441,23 @@ impl Config {
         })
     }
 
-    /// The [`SocketAddr`] the forge-proxy L4 forwarder targets, parsed from
-    /// [`Self::forge_mesh_url`]. `None` when the flag is unset (forge-proxy
-    /// disabled) OR the value is unparseable — the caller logs the latter so a
-    /// typo does not silently start a black-hole listener. See
-    /// [`parse_forge_mesh_addr`].
+    /// The [`SocketAddr`] the forge-proxy L4 forwarder targets.
+    ///
+    /// When [`Self::forge_mesh_url`] is set and non-empty it is parsed (see
+    /// [`parse_forge_mesh_addr`]); an unparseable override yields `None` so a
+    /// typo does not silently start a black-hole listener. When the flag is
+    /// unset (or empty) the target defaults to the fixed forge infra ULA
+    /// (`[FORGE_INFRA_ULA]:FORGE_PORT`) — the proxy is now mandatory whenever a
+    /// mesh is joined, so the address must never depend on per-host config.
     #[must_use]
     pub fn forge_mesh_addr(&self) -> Option<SocketAddr> {
-        parse_forge_mesh_addr(self.forge_mesh_url.as_deref()?)
+        match self.forge_mesh_url.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => parse_forge_mesh_addr(raw),
+            _ => Some(SocketAddr::new(
+                tabbify_workspace_contract::FORGE_INFRA_ULA.into(),
+                tabbify_workspace_contract::FORGE_PORT,
+            )),
+        }
     }
 }
 
@@ -805,11 +814,25 @@ mod tests {
     // ── forge-proxy: --forge-mesh-url parsing ───────────────────────────────
 
     #[test]
-    fn forge_mesh_url_defaults_to_none_and_addr_is_none() {
-        // Unset ⇒ forge-proxy disabled: no forwarder, node URL passed through.
+    fn forge_mesh_url_field_defaults_to_none() {
+        // The raw override flag is unset by default; the derived address still
+        // defaults to the platform forge infra ULA (see
+        // `forge_mesh_addr_defaults_to_forge_infra_ula_when_unset`).
         let cfg = Config::try_parse_from(["supervisord"]).unwrap();
         assert!(cfg.forge_mesh_url.is_none());
-        assert!(cfg.forge_mesh_addr().is_none());
+    }
+
+    #[test]
+    fn forge_mesh_addr_defaults_to_forge_infra_ula_when_unset() {
+        let cfg = Config::parse_from(["supervisord"]); // no --forge-mesh-url
+        let addr = cfg.forge_mesh_addr().expect("must default, not None");
+        assert_eq!(addr.to_string(), "[fd5a:1f00:ffff::1]:8730");
+    }
+
+    #[test]
+    fn forge_mesh_addr_env_override_still_wins() {
+        let cfg = Config::parse_from(["supervisord", "--forge-mesh-url", "[fd5a::9]:8730"]);
+        assert_eq!(cfg.forge_mesh_addr().unwrap().to_string(), "[fd5a::9]:8730");
     }
 
     #[test]

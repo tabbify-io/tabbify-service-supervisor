@@ -68,7 +68,7 @@ blake3 = "1"
 # CODE_SERVICE_PORT/SSH_EXEC_PORT. Rev-pinned git-dep (same model as the
 # mesh-joiner pin) so the repo's CI builds standalone; bump the rev to adopt a
 # contract change.
-tabbify-workspace-contract = { git = "https://github.com/tabbify-io/tabbify-workspace-contract.git", rev = "35330cac6925d89928d916d0b6ce0d9839099f00" }
+tabbify-workspace-contract = { git = "https://github.com/tabbify-io/tabbify-workspace-contract.git", rev = "0ad1069e03bb60b881beac4985e37f05bd5810fa" }
 # Base64 encoding for git proxy Basic auth header (git smart-HTTP dev sessions).
 base64 = "0.22"
 # sha256 verification of fetched release binaries against the `latest` manifest
