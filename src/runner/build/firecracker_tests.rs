@@ -242,7 +242,7 @@ fn render_init_exec_form_mounts_env_workdir_and_execs() {
         env: vec!["RUST_LOG=info".to_owned(), "PORT=8080".to_owned()],
         workdir: "/app".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
 
     assert!(init.starts_with("#!"), "must be a shebang script");
     assert!(init.contains("mount -t proc"), "mounts /proc; got:\n{init}");
@@ -292,7 +292,7 @@ fn render_init_creates_pseudo_fs_mountpoints_and_mounts_best_effort() {
         env: vec![],
         workdir: "/".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
     assert!(
         init.contains("mkdir -p /proc /sys /dev"),
         "must create pseudo-fs mountpoints (minimal images lack them); got:\n{init}"
@@ -335,7 +335,7 @@ fn render_init_single_quotes_argv_and_env_values() {
         ],
         workdir: "/app".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
 
     // Each argv element is wrapped in single quotes verbatim — the shell cannot
     // word-split, glob, or `$`-expand inside single quotes.
@@ -372,7 +372,7 @@ fn render_init_escapes_embedded_single_quote() {
         env: Vec::new(),
         workdir: "/".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
     // it's fine  ->  'it'\''s fine'
     assert!(
         init.contains(r#"exec '/bin/echo' 'it'\''s fine'"#),
@@ -392,7 +392,7 @@ fn render_init_creates_workdir_before_cd() {
         env: Vec::new(),
         workdir: "/var/My App".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
     assert!(
         init.contains("mkdir -p '/var/My App'"),
         "must mkdir -p the workdir (single-quoted) before cd; got:\n{init}"
@@ -412,7 +412,7 @@ fn render_init_creates_workdir_before_cd() {
 /// guess a shell.
 #[test]
 fn render_init_shell_form_returns_clear_error() {
-    let err = render_init(&Entrypoint::ShellForm, &[]).unwrap_err();
+    let err = render_init(&Entrypoint::ShellForm, &[], None).unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("shell-form") && msg.contains("not") && msg.contains("support"),
@@ -434,7 +434,7 @@ fn render_init_rejects_reserved_init_entrypoint() {
         env: vec![],
         workdir: "/".to_owned(),
     };
-    let err = render_init(&Entrypoint::Exec(exec), &[]).unwrap_err();
+    let err = render_init(&Entrypoint::Exec(exec), &[], None).unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("/init") && msg.contains("collide"),
@@ -452,7 +452,7 @@ fn render_init_allows_distinct_init_path() {
         env: vec![],
         workdir: "/".to_owned(),
     };
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
     assert!(
         init.contains("exec '/usr/local/bin/tabbify-workspace-init'"),
         "must exec the distinct init path; got:\n{init}"
@@ -490,7 +490,7 @@ fn extra_env_merged_after_oci_env_and_exported_in_order() {
     // The REAL production merge — the same fn `resolve_rootfs` invokes.
     merge_extra_env(&mut exec.env, &extra);
 
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
 
     // EXACT export sequence: OCI vars first (insertion order), then ALL extras
     // in sorted key order. B appears twice — OCI first, extra last (so the
@@ -528,7 +528,7 @@ fn extra_env_values_are_single_quoted_in_init() {
             .collect();
     merge_extra_env(&mut exec.env, &extra);
 
-    let init = render_init(&Entrypoint::Exec(exec), &[]).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
     assert!(
         init.contains("export KEY='ssh-ed25519 AAAA spaced key'"),
         "extra env value with spaces must be single-quoted in init; got:\n{init}"
@@ -2345,7 +2345,7 @@ fn render_init_includes_cap_files_before_exec() {
         workdir: "/srv".to_owned(),
     };
     let caps = vec![("app.url".to_owned(), "http://h/git/cap".to_owned())];
-    let init = render_init(&Entrypoint::Exec(exec), &caps).unwrap();
+    let init = render_init(&Entrypoint::Exec(exec), &caps, None).unwrap();
     let cap_pos = init
         .find("/run/tabbify/caps/app.url")
         .expect("cap-file line must be present");
@@ -2353,4 +2353,66 @@ fn render_init_includes_cap_files_before_exec() {
     assert!(cap_pos < exec_pos, "cap-files must be written BEFORE exec");
     // The cap content is NOT an env export.
     assert!(!init.contains("export TABBIFY_CAP_FILES"));
+}
+
+/// Task 4: when `data_mount` is `Some(path)`, `render_init` emits
+/// `mkdir -p <path>` and `mount /dev/vdb <path> 2>/dev/null || true` AFTER the
+/// /dev mount and BEFORE the entrypoint exec. When `None`, neither line is
+/// emitted and the output is byte-identical to the pre-Task-4 output (cache-key
+/// safety).
+#[test]
+fn render_init_mounts_data_disk_when_some_skips_when_none() {
+    let exec = OciExec {
+        entrypoint: vec!["/app/forge".to_owned()],
+        cmd: vec![],
+        env: vec![],
+        workdir: "/".to_owned(),
+    };
+
+    // Some(path): both mount lines must be present, ordered correctly.
+    let mount_path = "/var/lib/tabbify-forge";
+    let init_some = render_init(
+        &Entrypoint::Exec(exec.clone()),
+        &[],
+        Some(mount_path),
+    )
+    .unwrap();
+    assert!(
+        init_some.contains(&format!("mkdir -p {mount_path}")),
+        "must emit mkdir -p for the data mount path; got:\n{init_some}"
+    );
+    assert!(
+        init_some.contains(&format!("mount /dev/vdb {mount_path} 2>/dev/null || true")),
+        "must emit mount /dev/vdb <path>; got:\n{init_some}"
+    );
+    // The data mount must appear AFTER the /dev mount.
+    let dev_mount_pos = init_some
+        .find("mount -t devtmpfs")
+        .expect("devtmpfs mount must be present");
+    let data_mkdir_pos = init_some
+        .find(&format!("mkdir -p {mount_path}"))
+        .expect("data mkdir must be present");
+    assert!(
+        dev_mount_pos < data_mkdir_pos,
+        "data mkdir must come AFTER the /dev mount; got:\n{init_some}"
+    );
+    // The data mount must appear BEFORE the entrypoint exec.
+    let exec_pos = init_some
+        .find("exec '/app/forge'")
+        .expect("exec line must be present");
+    assert!(
+        data_mkdir_pos < exec_pos,
+        "data mkdir must come BEFORE exec; got:\n{init_some}"
+    );
+
+    // None: neither line must appear — byte-identical to the no-data-mount path.
+    let init_none = render_init(&Entrypoint::Exec(exec), &[], None).unwrap();
+    assert!(
+        !init_none.contains("mount /dev/vdb"),
+        "None must not emit mount /dev/vdb; got:\n{init_none}"
+    );
+    assert!(
+        !init_none.contains(&format!("mkdir -p {mount_path}")),
+        "None must not emit mkdir -p for the data path; got:\n{init_none}"
+    );
 }

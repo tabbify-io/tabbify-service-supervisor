@@ -1060,7 +1060,11 @@ pub fn safe_cap_name(name: &str) -> bool {
 /// # Errors
 /// [`Entrypoint::ShellForm`] — shell-form entrypoints are not yet supported
 /// (D3); the error message says so clearly.
-pub fn render_init(entry: &Entrypoint, cap_files: &[(String, String)]) -> Result<String> {
+pub fn render_init(
+    entry: &Entrypoint,
+    cap_files: &[(String, String)],
+    data_mount: Option<&str>,
+) -> Result<String> {
     let exec = match entry {
         Entrypoint::Exec(e) => e,
         Entrypoint::ShellForm => {
@@ -1125,6 +1129,17 @@ pub fn render_init(entry: &Entrypoint, cap_files: &[(String, String)]) -> Result
     // NOT `export`ed (so the agent never reads them + they never freeze into a
     // Full snapshot). Empty for non-workspace images → byte-identical init.
     let cap_lines = render_cap_files_init(cap_files);
+    // Persistent data disk: when `data_mount` is `Some(path)`, mount /dev/vdb
+    // at the requested path AFTER the /dev pseudo-fs setup and BEFORE exec.
+    // `None` ⇒ empty string, so the rendered script is BYTE-IDENTICAL to the
+    // pre-Task-4 output — non-stateful rootfs cache keys are unaffected.
+    let data_mount_lines: String = match data_mount {
+        Some(m) => format!(
+            "mkdir -p {m}\n\
+             mount /dev/vdb {m} 2>/dev/null || true\n"
+        ),
+        None => String::new(),
+    };
     Ok(format!(
         "#!/bin/sh\n\
          set -e\n\
@@ -1146,6 +1161,7 @@ pub fn render_init(entry: &Entrypoint, cap_files: &[(String, String)]) -> Result
          ip link show eth0 >/dev/null 2>&1 || true\n\
          {env_lines}\
          {cap_lines}\
+         {data_mount_lines}\
          mkdir -p {workdir} 2>/dev/null; cd {workdir}\n\
          exec {exec_line}\n",
     ))
@@ -1260,7 +1276,7 @@ pub async fn resolve_rootfs(
     if let (Some(map), Entrypoint::Exec(exec)) = (extra_env, &mut entry) {
         merge_extra_env(&mut exec.env, map);
     }
-    let init = render_init(&entry, cap_files)?; // shell-form → clear error (D3)
+    let init = render_init(&entry, cap_files, None)?; // shell-form → clear error (D3)
 
     build_rootfs_ext4_inner(
         layout,
@@ -1782,7 +1798,7 @@ pub(crate) async fn ensure_toolchain_rootfs(
     guard_arch_matches_host(&config)?;
     let entry = Entrypoint::from_oci(&config);
     // Toolchain rootfs is NEVER a workspace → no cap-files to materialize.
-    let init = render_init(&entry, &[])?;
+    let init = render_init(&entry, &[], None)?;
     build_rootfs_ext4_inner(&layout, &config, &dir, 1024, Some(&init), runner).await
 }
 
