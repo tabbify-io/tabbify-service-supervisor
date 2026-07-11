@@ -366,7 +366,12 @@ impl RunnerServe {
                 std::net::IpAddr::V6(app_ula),
                 crate::tcp_forward::GUEST_SSH_PORT,
             );
-            match crate::tcp_forward::spawn_forwarder(ssh_bind, ssh_target).await {
+            match crate::tcp_forward::spawn_forwarder(
+                ssh_bind,
+                Arc::new(arc_swap::ArcSwap::from_pointee(ssh_target)),
+            )
+            .await
+            {
                 Ok(fwd) => {
                     tracing::info!(
                         bind = %ssh_bind,
@@ -403,7 +408,12 @@ impl RunnerServe {
                 std::net::IpAddr::V6(app_ula),
                 tabbify_workspace_contract::CODE_SERVICE_PORT,
             );
-            match crate::tcp_forward::spawn_forwarder(code_bind, code_target).await {
+            match crate::tcp_forward::spawn_forwarder(
+                code_bind,
+                Arc::new(arc_swap::ArcSwap::from_pointee(code_target)),
+            )
+            .await
+            {
                 Ok(fwd) => {
                     tracing::info!(
                         bind = %code_bind,
@@ -439,7 +449,12 @@ impl RunnerServe {
                 std::net::IpAddr::V6(app_ula),
                 crate::tcp_forward::GUEST_BROKER_CTRL_PORT,
             );
-            match crate::tcp_forward::spawn_forwarder(ctrl_bind, ctrl_target).await {
+            match crate::tcp_forward::spawn_forwarder(
+                ctrl_bind,
+                Arc::new(arc_swap::ArcSwap::from_pointee(ctrl_target)),
+            )
+            .await
+            {
                 Ok(fwd) => {
                     tracing::info!(
                         bind = %ctrl_bind,

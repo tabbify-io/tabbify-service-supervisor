@@ -27,8 +27,10 @@
 //!   + small response/error helpers.
 //! - [`dto`]      — response DTOs for `#[utoipa::path]` annotations.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::routing::{get, post};
 
@@ -63,7 +65,9 @@ pub use dev_sessions::{
     DevSessionPurged, DevSessionRegistry, DevSessionRow, GitTokenRefreshed, RefreshGitTokenBody,
     sweep_expired,
 };
-pub use forge_proxy::{FORGE_PROXY_IPV4_PORT, forge_proxy_gateway_url};
+pub use forge_proxy::{
+    FORGE_PROXY_IPV4_PORT, ForgeTargetBody, forge_proxy_gateway_url, set_forge_proxy_target,
+};
 pub use git_proxy::{GIT_PROXY_IPV4_PORT, GitSessionEntry, GitSessions, git_proxy_ipv4_router};
 pub use ssh_jump::SshJump;
 
@@ -142,6 +146,12 @@ pub struct SupervisorState {
     /// cannot route the v6 ULA. False ⇒ the node value is passed through unchanged
     /// (today's behavior; forge ops from the FC won't route, but nothing regresses).
     pub forge_proxy_enabled: bool,
+    /// The forge-proxy L4 forwarder's CURRENT upstream target, shared with the
+    /// running forwarder (`tcp_forward::spawn_forwarder`) via an [`ArcSwap`].
+    /// `POST /v1/forge-proxy/target` swaps it so a forge host migration reroutes
+    /// the proxy WITHOUT restarting the supervisor or re-baking any workspace.
+    /// Defaults to the fixed forge infra ULA (`FORGE_INFRA_ULA:FORGE_PORT`).
+    pub forge_target: Arc<ArcSwap<SocketAddr>>,
 }
 
 impl SupervisorState {
@@ -169,6 +179,10 @@ impl SupervisorState {
             workspaces: std::sync::Arc::new(WorkspaceRegistry::default()),
             tap_subnet: crate::config::DEFAULT_FC_TAP_SUBNET.to_owned(),
             forge_proxy_enabled: false,
+            forge_target: Arc::new(ArcSwap::from_pointee(SocketAddr::new(
+                tabbify_workspace_contract::FORGE_INFRA_ULA.into(),
+                tabbify_workspace_contract::FORGE_PORT,
+            ))),
         }
     }
 
@@ -208,6 +222,15 @@ impl SupervisorState {
     #[must_use]
     pub fn with_forge_proxy(mut self, enabled: bool) -> Self {
         self.forge_proxy_enabled = enabled;
+        self
+    }
+
+    /// Share the running forge-proxy forwarder's swappable upstream target so
+    /// `POST /v1/forge-proxy/target` can hot-reroute it. Pass the SAME `Arc`
+    /// that was handed to [`crate::tcp_forward::spawn_forwarder`].
+    #[must_use]
+    pub fn with_forge_target(mut self, forge_target: Arc<ArcSwap<SocketAddr>>) -> Self {
+        self.forge_target = forge_target;
         self
     }
 }
@@ -272,6 +295,14 @@ pub fn router(state: SupervisorState) -> Router {
             post(workspaces::forge_creds_backfill),
         )
         .route("/v1/workspaces/:uuid/stop", post(workspaces::stop_workspace))
+        // Forge-proxy hot-reroute: swap the L4 forwarder's upstream to a new
+        // forge host serving the same fixed infra ULA WITHOUT a restart or any
+        // workspace re-bake. Mesh-internal control seam (not in OpenAPI), gated
+        // by the same mesh ACL as every other control route.
+        .route(
+            "/v1/forge-proxy/target",
+            post(forge_proxy::set_forge_proxy_target),
+        )
         // Git smart-HTTP proxy — tokenless in-VM remote (dev sessions).
         // Not in OpenAPI (wire protocol, not REST).
         .route(

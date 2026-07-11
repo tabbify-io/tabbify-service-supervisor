@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 
@@ -43,7 +44,15 @@ const MAX_INFLIGHT_CONNS: usize = 16;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Spawn a TCP L4 forwarder on `bind_addr` that proxies every accepted
-/// connection to `target_addr` using [`tokio::io::copy_bidirectional`].
+/// connection to the CURRENT value of `target` using
+/// [`tokio::io::copy_bidirectional`].
+///
+/// The upstream target is held in an [`ArcSwap`] and read PER CONNECTION at
+/// dial time, so a caller can hot-swap it (`target.store(...)`) and every NEW
+/// connection lands on the new upstream WITHOUT re-binding the listener — the
+/// forge host-migration path (`POST /v1/forge-proxy/target`). In-flight copies
+/// keep their original upstream. Static callers (ssh/code/ctrl runner
+/// forwarders) simply wrap a fixed addr in an `ArcSwap` and never swap it.
 ///
 /// The listener is created with `SO_REUSEPORT` so that during a zero-downtime
 /// deploy/swap (or a purge → respawn) the NEW runner can bind the SAME
@@ -63,7 +72,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 /// Returns an error only if creating, configuring, or binding the socket fails.
 pub async fn spawn_forwarder(
     bind_addr: SocketAddr,
-    target_addr: SocketAddr,
+    target: Arc<ArcSwap<SocketAddr>>,
 ) -> Result<TcpForwarder> {
     let sock = match bind_addr {
         SocketAddr::V6(_) => TcpSocket::new_v6(),
@@ -85,17 +94,21 @@ pub async fn spawn_forwarder(
         .with_context(|| "L4 forwarder: local_addr after bind")?;
     tracing::debug!(
         %bound_addr,
-        %target_addr,
+        target = %target.load(),
         "L4 forwarder: bound; forwarding connections"
     );
 
-    let handle = tokio::spawn(accept_loop(listener, target_addr));
-    Ok(TcpForwarder { _handle: handle })
+    let handle = tokio::spawn(accept_loop(listener, target));
+    Ok(TcpForwarder {
+        _handle: handle,
+        local_addr: bound_addr,
+    })
 }
 
 /// Accept loop: accept connections on `listener` and, under a bounded
-/// semaphore, spawn a bidirectional copy task for each one.
-async fn accept_loop(listener: tokio::net::TcpListener, target: SocketAddr) {
+/// semaphore, spawn a bidirectional copy task for each one. The upstream
+/// `target` is shared and read per connection (at dial time).
+async fn accept_loop(listener: tokio::net::TcpListener, target: Arc<ArcSwap<SocketAddr>>) {
     let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_CONNS));
     loop {
         match listener.accept().await {
@@ -109,9 +122,10 @@ async fn accept_loop(listener: tokio::net::TcpListener, target: SocketAddr) {
                     // this is unreachable in practice; bail defensively.
                     break;
                 };
-                tracing::debug!(%peer, %target, "L4 forwarder: accepted connection");
+                tracing::debug!(%peer, "L4 forwarder: accepted connection");
+                let target = Arc::clone(&target);
                 tokio::spawn(async move {
-                    forward_conn(inbound, target).await;
+                    forward_conn(inbound, &target).await;
                     drop(permit);
                 });
             }
@@ -120,15 +134,18 @@ async fn accept_loop(listener: tokio::net::TcpListener, target: SocketAddr) {
                 // surfaces here. Transient errors (EINTR, ECONNABORTED) must not
                 // abort the loop; back off briefly so an fd-exhaustion condition
                 // does not busy-spin this task at 100% CPU.
-                tracing::debug!(error = %e, %target, "L4 forwarder: accept error");
+                tracing::debug!(error = %e, "L4 forwarder: accept error");
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
 }
 
-/// Connect to `target` and bidirectionally copy between `inbound` and it.
-async fn forward_conn(mut inbound: TcpStream, target: SocketAddr) {
+/// Read the CURRENT upstream target from the swap, connect, and bidirectionally
+/// copy between `inbound` and it. Reading at dial time is what makes a hot-swap
+/// take effect for new connections.
+async fn forward_conn(mut inbound: TcpStream, target: &ArcSwap<SocketAddr>) {
+    let target = *target.load_full();
     match TcpStream::connect(target).await {
         Ok(mut outbound) => {
             match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
@@ -164,6 +181,18 @@ pub struct TcpForwarder {
     /// `TcpListener` it owns is dropped → the port is freed. Do not remove the
     /// `abort()` thinking the handle's drop suffices.
     _handle: tokio::task::JoinHandle<()>,
+    /// The address the listener actually bound (resolves `port 0` to the
+    /// OS-assigned port). Exposed via [`Self::local_addr`] for callers/tests.
+    local_addr: SocketAddr,
+}
+
+impl TcpForwarder {
+    /// The address the forwarder's listener is bound on (the OS-assigned port
+    /// when `bind_addr` used port 0).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 
 impl Drop for TcpForwarder {
@@ -206,13 +235,64 @@ mod tests {
         addr
     }
 
+    /// Spawn a server on a fresh loopback port that, on each accepted
+    /// connection, writes `banner` then half-closes its write side so the
+    /// client reads exactly the banner then EOF. Returns `(addr, banner)` so a
+    /// test can assert WHICH upstream served a given connection.
+    async fn spawn_banner_server(banner: &str) -> (SocketAddr, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let banner = banner.to_owned();
+        let served = banner.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let msg = served.clone();
+                tokio::spawn(async move {
+                    let _ = stream.write_all(msg.as_bytes()).await;
+                    // Half-close so the client's read_to_end sees EOF.
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (addr, banner)
+    }
+
+    /// Connect to `addr` (a forwarder) and read the upstream banner to EOF.
+    async fn read_banner(addr: SocketAddr) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The forwarder must read its upstream target from the shared `ArcSwap` at
+    /// CONNECT time, so a hot-swap reroutes NEW connections WITHOUT re-binding
+    /// the listener — the forge host-migration path (`POST /v1/forge-proxy/target`).
+    #[tokio::test]
+    async fn forwarder_reads_target_from_arcswap_at_connect_time() {
+        // Two banner servers A, B. Point the swap at A, connect, expect A's
+        // banner; swap to B, connect again, expect B's banner — no re-bind.
+        let (a_addr, a_banner) = spawn_banner_server("A").await;
+        let (b_addr, b_banner) = spawn_banner_server("B").await;
+        let target = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(a_addr));
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let fwd = spawn_forwarder(bind, target.clone()).await.unwrap();
+        assert_eq!(read_banner(fwd.local_addr()).await, a_banner);
+        target.store(std::sync::Arc::new(b_addr));
+        assert_eq!(read_banner(fwd.local_addr()).await, b_banner);
+    }
+
     /// Bytes sent through the forwarder must round-trip bidirectionally.
     #[tokio::test]
     async fn forwarder_round_trips_bytes() {
         let echo_addr = spawn_echo(5).await;
         let fwd_addr = free_loopback_addr().await;
 
-        let _fwd = spawn_forwarder(fwd_addr, echo_addr)
+        let target = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(echo_addr));
+        let _fwd = spawn_forwarder(fwd_addr, target)
             .await
             .expect("forwarder must bind");
         // Give the forwarder a moment to start its accept loop.
@@ -239,13 +319,15 @@ mod tests {
         let shared_addr = free_loopback_addr().await;
 
         // First forwarder (the "old" runner) binds the shared addr.
-        let _fwd_old = spawn_forwarder(shared_addr, echo_addr)
+        let target_old = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(echo_addr));
+        let _fwd_old = spawn_forwarder(shared_addr, target_old)
             .await
             .expect("first forwarder must bind the shared addr");
 
         // Second forwarder (the "new" runner) MUST also bind the SAME addr
         // (SO_REUSEPORT) instead of EADDRINUSE — the regression this guards.
-        let _fwd_new = spawn_forwarder(shared_addr, echo_addr)
+        let target_new = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(echo_addr));
+        let _fwd_new = spawn_forwarder(shared_addr, target_new)
             .await
             .expect("second forwarder must also bind the shared addr via SO_REUSEPORT");
 
@@ -271,7 +353,8 @@ mod tests {
         let target_addr = free_loopback_addr().await;
         let fwd_addr = free_loopback_addr().await;
 
-        let fwd = spawn_forwarder(fwd_addr, target_addr).await.unwrap();
+        let target = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(target_addr));
+        let fwd = spawn_forwarder(fwd_addr, target).await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         // Drop the forwarder — the listener task is aborted, freeing the port.

@@ -43,6 +43,63 @@ pub fn forge_proxy_gateway_url(host_ip: &str) -> String {
     format!("http://{host_ip}:{FORGE_PROXY_IPV4_PORT}")
 }
 
+/// Request body for [`set_forge_proxy_target`]: the new forge upstream `ula`
+/// (an infra-slot `fd5a:1f00:` ULA) and an optional `port` (defaults to the
+/// contract [`tabbify_workspace_contract::FORGE_PORT`]).
+#[derive(Debug, serde::Deserialize)]
+pub struct ForgeTargetBody {
+    /// The forge's mesh ULA — MUST be a `1f00` infra-slot address.
+    pub ula: String,
+    /// Optional forge port; defaults to the contract forge port.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+/// `POST /v1/forge-proxy/target` — hot-reroute the forge-proxy L4 forwarder to a
+/// new upstream WITHOUT restarting the supervisor or re-baking any workspace.
+///
+/// Used during a forge host migration: the new host serves the SAME fixed infra
+/// ULA (`FORGE_INFRA_ULA`), the coordinator reroutes the /128, and this endpoint
+/// swaps the forwarder's upstream so in-flight guests keep reaching the forge.
+///
+/// Only a `1f00` infra-slot ULA is accepted — the forge is a non-ephemeral infra
+/// service, and pointing the proxy at an ephemeral (`1f02`) app ULA would be a
+/// misconfiguration (and the exact class of bug this indirection removes). The
+/// swap is atomic ([`arc_swap::ArcSwap`]); each new connection reads the current
+/// target at dial time.
+///
+/// Mesh-internal control seam (like the git proxy): gated by the same mesh ACL
+/// as every other supervisor control route, so only permitted peers reach it.
+///
+/// # Errors
+/// `400` if `ula` does not parse as an IPv6 address, or is not a `1f00` infra
+/// ULA.
+pub async fn set_forge_proxy_target(
+    axum::extract::State(state): axum::extract::State<super::SharedState>,
+    axum::Json(body): axum::Json<ForgeTargetBody>,
+) -> Result<http::StatusCode, (http::StatusCode, String)> {
+    let ula: std::net::Ipv6Addr = body.ula.parse().map_err(|_| {
+        (
+            http::StatusCode::BAD_REQUEST,
+            format!("invalid ULA: {}", body.ula),
+        )
+    })?;
+    // The forge is an infra service on the non-ephemeral `1f00` slot; refuse an
+    // ephemeral (`1f02`) app ULA or any other prefix — pointing the proxy there
+    // is precisely the misroute this indirection exists to prevent.
+    if ula.segments()[1] != 0x1f00 {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            "target must be a 1f00 infra ULA".to_owned(),
+        ));
+    }
+    let port = body.port.unwrap_or(tabbify_workspace_contract::FORGE_PORT);
+    let new_target = std::net::SocketAddr::new(ula.into(), port);
+    state.forge_target.store(std::sync::Arc::new(new_target));
+    tracing::info!(%new_target, "forge-proxy upstream hot-swapped via control API");
+    Ok(http::StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

@@ -1341,3 +1341,91 @@ async fn stop_known_workspace_returns_200_and_marks_stopped() {
         "stop must PRESERVE image_ref for warm restore"
     );
 }
+
+// ── POST /v1/forge-proxy/target — hot-reroute the forge-proxy forwarder ───────
+
+/// A valid `1f00` infra ULA swaps the shared forge target (the running
+/// forwarder reads it per connection) and returns 204 — the host-migration path.
+#[tokio::test]
+async fn set_forge_proxy_target_swaps_on_valid_infra_ula() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    // Hold the shared swap so we can observe the store after the request.
+    let target = state.forge_target.clone();
+    let before = **target.load();
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/forge-proxy/target")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"ula":"fd5a:1f00:abcd::1","port":8730}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after = **target.load();
+    assert_ne!(before, after, "the forge target must be swapped");
+    assert_eq!(after.to_string(), "[fd5a:1f00:abcd::1]:8730");
+}
+
+/// The port defaults to the contract forge port when omitted.
+#[tokio::test]
+async fn set_forge_proxy_target_defaults_port_when_omitted() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let target = state.forge_target.clone();
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/forge-proxy/target")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"ula":"fd5a:1f00:abcd::1"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(target.load().to_string(), "[fd5a:1f00:abcd::1]:8730");
+}
+
+/// An ephemeral (`1f02`) app ULA is rejected (400) and the target is unchanged —
+/// the forge is a non-ephemeral infra service, so only `1f00` targets are valid.
+#[tokio::test]
+async fn set_forge_proxy_target_rejects_ephemeral_app_ula() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let target = state.forge_target.clone();
+    let before = **target.load();
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/forge-proxy/target")
+        .header("content-type", "application/json")
+        // 1f02 = ephemeral app slot — must be refused.
+        .body(Body::from(r#"{"ula":"fd5a:1f02:e3ca:25c7:1171::1"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(**target.load(), before, "a rejected target must not swap");
+}
+
+/// A non-parseable ULA is rejected (400) and the target is unchanged.
+#[tokio::test]
+async fn set_forge_proxy_target_rejects_garbage_ula() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    let target = state.forge_target.clone();
+    let before = **target.load();
+    let app = router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/forge-proxy/target")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"ula":"not-an-address"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(**target.load(), before, "a rejected target must not swap");
+}

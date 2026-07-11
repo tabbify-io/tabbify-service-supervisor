@@ -233,6 +233,21 @@ async fn main() -> anyhow::Result<()> {
     // The discovery fetcher (GET /v1/apps/:uuid for an app with no runner).
     let fetcher = S3Fetcher::new(&config.s3_base_url, &config.data_dir);
 
+    // The forge-proxy L4 forwarder's upstream target, SHARED between the running
+    // forwarder (spawned below) and the control API (`POST /v1/forge-proxy/target`)
+    // via an `ArcSwap`. A forge host migration reroutes the proxy by swapping
+    // this value — no supervisor restart, no workspace re-bake. Seeded from
+    // config, which defaults to the fixed forge infra ULA (Task 3).
+    let forge_target: std::sync::Arc<arc_swap::ArcSwap<SocketAddr>> =
+        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            config.forge_mesh_addr().unwrap_or_else(|| {
+                SocketAddr::new(
+                    tabbify_workspace_contract::FORGE_INFRA_ULA.into(),
+                    tabbify_workspace_contract::FORGE_PORT,
+                )
+            }),
+        ));
+
     let state = SupervisorState::new(orchestrator, fetcher, supervisor_id, ula_str)
         .with_version(tabbify_supervisor::version::binary_version().to_owned())
         .with_firecracker(kvm)
@@ -240,7 +255,10 @@ async fn main() -> anyhow::Result<()> {
         .with_tap_subnet(config.firecracker.tap_subnet.clone())
         // Forge-proxy enabled iff a forge mesh target is configured — this drives
         // the `TABBIFY_FORGE_URL` rewrite in `create_workspace` (see below).
-        .with_forge_proxy(config.forge_mesh_addr().is_some());
+        .with_forge_proxy(config.forge_mesh_addr().is_some())
+        // Share the swappable forge target so `POST /v1/forge-proxy/target` can
+        // hot-reroute the forwarder spawned below.
+        .with_forge_target(std::sync::Arc::clone(&forge_target));
 
     // Re-adopt persisted dev-sessions before serving: the dev-VM runners survive
     // a restart/OTA (KillMode=process) but the in-memory dev_sessions/git_sessions
@@ -366,19 +384,28 @@ async fn main() -> anyhow::Result<()> {
     // couples bind + accept, so we install the firewall FIRST — a STRICTER
     // ordering (the port is not even bound during the install window). The mesh
     // ACL on the forge is the real gate; the firewall is depth-in-defence.
-    let _forge_proxy_forwarder = if let Some(forge_target) = config.forge_mesh_addr() {
+    let _forge_proxy_forwarder = {
         let ipv4_bind = SocketAddr::from(([0, 0, 0, 0], FORGE_PROXY_IPV4_PORT));
+        // The current upstream (for logging); the forwarder reads the swappable
+        // `forge_target` per connection, so a later `POST /v1/forge-proxy/target`
+        // reroutes it live.
+        let initial_target: SocketAddr = **forge_target.load();
         #[cfg(target_os = "linux")]
         tabbify_supervisor::firecracker::setup_forge_proxy_firewall(
             &config.firecracker.tap_subnet,
             FORGE_PROXY_IPV4_PORT,
         )
         .await;
-        match tabbify_supervisor::tcp_forward::spawn_forwarder(ipv4_bind, forge_target).await {
+        match tabbify_supervisor::tcp_forward::spawn_forwarder(
+            ipv4_bind,
+            std::sync::Arc::clone(&forge_target),
+        )
+        .await
+        {
             Ok(fwd) => {
                 tracing::info!(
                     port = FORGE_PROXY_IPV4_PORT,
-                    forge_target = %forge_target,
+                    forge_target = %initial_target,
                     "forge proxy IPv4 forwarder bound (FC guest gateway → in-mesh forge)"
                 );
                 Some(fwd)
@@ -392,12 +419,6 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         }
-    } else {
-        tracing::info!(
-            "forge proxy disabled (no --forge-mesh-url / TABBIFY_FORGE_MESH_URL); \
-             FC forge ops use the node-supplied URL unchanged"
-        );
-        None
     };
 
     let listener = TcpListener::bind(bind_addr)
