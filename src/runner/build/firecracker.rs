@@ -1139,9 +1139,20 @@ pub fn render_init(
             // manifest's `data_mount` can't mis-tokenize the `mkdir`/`mount` line
             // (defensive; mirrors the argv/env/workdir quoting above).
             let qm = sh_single_quote(m);
+            // Robust /dev/vdb mount (root-caused live: the disk IS attached but
+            // the mount failed silently). Cover both suspected causes and stop
+            // hiding the error:
+            //   1. Wait up to ~5s for the block device to appear — early `/init`
+            //      can outrun devtmpfs probing, so `/dev/vdb` may not exist yet.
+            //   2. Try an explicit `-t ext4` mount first (the disk is ext4), then
+            //      fall back to a bare mount (fs-type auto-detect).
+            //   3. On failure LOG a WARN to stderr (serial console under FC_DEBUG)
+            //      instead of a silent `|| true`, per the generous-logging rule.
+            //      The boot must NOT fail — some apps can run without the disk.
             format!(
                 "mkdir -p {qm}\n\
-                 mount /dev/vdb {qm} 2>/dev/null || true\n"
+                 i=0; while [ ! -b /dev/vdb ] && [ \"$i\" -lt 20 ]; do sleep 0.25; i=$((i+1)); done\n\
+                 mount -t ext4 /dev/vdb {qm} 2>/dev/null || mount /dev/vdb {qm} 2>/dev/null || echo \"tabbify-init: WARN data disk /dev/vdb failed to mount at {qm}\" 1>&2\n"
             )
         }
         None => String::new(),

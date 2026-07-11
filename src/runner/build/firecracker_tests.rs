@@ -2357,12 +2357,17 @@ fn render_init_includes_cap_files_before_exec() {
     assert!(!init.contains("export TABBIFY_CAP_FILES"));
 }
 
-/// Task 4/6: when `data_mount` is `Some(path)`, `render_init` emits
-/// `mkdir -p <path>` and `mount /dev/vdb <path> 2>/dev/null || true` AFTER the
-/// /dev mount and BEFORE the entrypoint exec, with the path POSIX single-quoted
-/// (Task 6) so a space / glob / `$` cannot mis-tokenize the line. When `None`,
-/// neither line is emitted and the output is byte-identical to the
-/// no-data-mount path (cache-key safety).
+/// Task 4/6: when `data_mount` is `Some(path)`, `render_init` emits a robust
+/// data-disk mount AFTER the /dev mount and BEFORE the entrypoint exec:
+/// a `mkdir -p <path>`, a wait loop (`[ ! -b /dev/vdb ]`) that gives the block
+/// device up to ~5s to appear (early `/init` can outrun devtmpfs probing), then
+/// `mount -t ext4 /dev/vdb <path>` with a bare-mount fs-type-auto-detect
+/// fallback and, on failure, a WARN to stderr instead of a silent `|| true`
+/// (no error swallowing — the generous-logging rule).
+///
+/// The path is POSIX single-quoted (Task 6) so a space / glob / `$` cannot
+/// mis-tokenize the line. When `None`, none of these lines is emitted and the
+/// output is byte-identical to the no-data-mount path (cache-key safety).
 #[test]
 fn render_init_mounts_data_disk_when_some_skips_when_none() {
     let exec = OciExec {
@@ -2386,9 +2391,25 @@ fn render_init_mounts_data_disk_when_some_skips_when_none() {
         init_some.contains(&format!("mkdir -p {quoted}")),
         "must emit mkdir -p for the (quoted) data mount path; got:\n{init_some}"
     );
+    // Wait loop: give /dev/vdb up to ~5s to appear before mounting.
     assert!(
-        init_some.contains(&format!("mount /dev/vdb {quoted} 2>/dev/null || true")),
-        "must emit mount /dev/vdb <quoted-path>; got:\n{init_some}"
+        init_some.contains("[ ! -b /dev/vdb ]"),
+        "must emit the block-device wait loop; got:\n{init_some}"
+    );
+    // Explicit ext4 mount (primary), with the path single-quoted.
+    assert!(
+        init_some.contains(&format!("mount -t ext4 /dev/vdb {quoted}")),
+        "must emit mount -t ext4 /dev/vdb <quoted-path>; got:\n{init_some}"
+    );
+    // On failure, WARN to stderr — no silent swallowing.
+    assert!(
+        init_some.contains("tabbify-init: WARN data disk /dev/vdb failed to mount at"),
+        "must emit a WARN log on mount failure; got:\n{init_some}"
+    );
+    // The old silent-swallow form must be gone.
+    assert!(
+        !init_some.contains(&format!("mount /dev/vdb {quoted} 2>/dev/null || true")),
+        "must NOT silently swallow the mount error with `|| true`; got:\n{init_some}"
     );
     // The data mount must appear AFTER the /dev mount.
     let dev_mount_pos = init_some
@@ -2435,14 +2456,14 @@ fn render_init_shell_quotes_a_metachar_data_mount() {
     };
     let weird = "/var/lib/tab bify$HOME";
     let init = render_init(&Entrypoint::Exec(exec), &[], Some(weird)).unwrap();
-    // Single-quoted verbatim: `mount /dev/vdb '/var/lib/tab bify$HOME' ...`.
+    // Single-quoted verbatim: `mount -t ext4 /dev/vdb '/var/lib/tab bify$HOME' ...`.
     assert!(
-        init.contains(&format!("mount /dev/vdb '{weird}' 2>/dev/null || true")),
+        init.contains(&format!("mount -t ext4 /dev/vdb '{weird}'")),
         "metachar mount path must be single-quoted verbatim; got:\n{init}"
     );
     // The RAW (unquoted) form must NOT appear as a bare mount arg.
     assert!(
-        !init.contains(&format!("mount /dev/vdb {weird} ")),
+        !init.contains(&format!("mount -t ext4 /dev/vdb {weird} ")),
         "must never emit the unquoted metachar path; got:\n{init}"
     );
 }
