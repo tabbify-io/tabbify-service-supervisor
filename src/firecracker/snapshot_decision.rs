@@ -24,12 +24,24 @@
 ///   and `FirecrackerRuntime::snapshot()` deliberately bypasses this marker
 ///   (suppress gates cold_boot ONLY).
 ///
-/// Snapshot ⇔ no snapshot yet AND not suppressed. This is the cold-boot gate; it
-/// deliberately does NOT depend on whether this is a workspace vs a dev-FC — the
-/// suppression marker is the only differentiator, written by whichever spawn path
-/// (dev-session OR workspace) needs to defer the snapshot.
+/// - `stateful` — this app owns a LIVE persistent data disk (`/dev/vdb`: a SQLite
+///   DB + git repos, from `[runtime].stateful`). A cold-boot RAM snapshot would
+///   freeze stale RAM and, on a later warm restore, resurrect it OVER the live
+///   disk = corruption. So a stateful app must NEVER be RAM-snapshotted — this is
+///   a HARD suppression (never re-taken via `Cmd::Snapshot` either), distinct from
+///   the `suppressed` TIMING-deferral used by dev-sessions/workspaces.
+///
+/// Stateful short-circuits FIRST: a stateful app never snapshots regardless of
+/// `files_present`/`suppressed`. Otherwise snapshot ⇔ no snapshot yet AND not
+/// suppressed. This is the cold-boot gate; for a non-stateful app it deliberately
+/// does NOT depend on whether this is a workspace vs a dev-FC — the suppression
+/// marker is the only differentiator, written by whichever spawn path (dev-session
+/// OR workspace) needs to defer the snapshot.
 #[must_use]
-pub fn should_snapshot_on_cold_boot(files_present: bool, suppressed: bool) -> bool {
+pub fn should_snapshot_on_cold_boot(files_present: bool, suppressed: bool, stateful: bool) -> bool {
+    if stateful {
+        return false;
+    }
     !files_present && !suppressed
 }
 
@@ -119,13 +131,26 @@ mod tests {
     #[test]
     fn cold_boot_snapshots_only_when_no_snapshot_and_not_suppressed() {
         // Regular app, fresh: no files, not suppressed → snapshot on cold boot.
-        assert!(should_snapshot_on_cold_boot(false, false));
+        assert!(should_snapshot_on_cold_boot(false, false, false));
         // Plain restart: snapshot present → do NOT re-snapshot.
-        assert!(!should_snapshot_on_cold_boot(true, false));
+        assert!(!should_snapshot_on_cold_boot(true, false, false));
         // Suppressed (dev-session OR workspace): cold boot NEVER snapshots — the
         // workspace's warm snapshot comes only from Cmd::Snapshot (post-index).
-        assert!(!should_snapshot_on_cold_boot(false, true));
-        assert!(!should_snapshot_on_cold_boot(true, true));
+        assert!(!should_snapshot_on_cold_boot(false, true, false));
+        assert!(!should_snapshot_on_cold_boot(true, true, false));
+    }
+
+    #[test]
+    fn stateful_app_never_snapshots_on_cold_boot() {
+        // A stateful app owns a LIVE persistent disk (`/dev/vdb`: SQLite DB + git
+        // repos). A cold-boot RAM snapshot would freeze stale RAM and warm-restore
+        // it OVER the live disk = corruption. So it must NEVER snapshot — the
+        // stateful short-circuit wins over EVERY files_present/suppressed combo,
+        // exactly as a workspace defers its cold snapshot.
+        assert!(!should_snapshot_on_cold_boot(false, false, true));
+        assert!(!should_snapshot_on_cold_boot(true, false, true));
+        assert!(!should_snapshot_on_cold_boot(false, true, true));
+        assert!(!should_snapshot_on_cold_boot(true, true, true));
     }
 
     #[test]

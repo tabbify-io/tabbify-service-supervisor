@@ -473,6 +473,12 @@ impl FirecrackerRuntime {
             if super::snapshot_decision::should_snapshot_on_cold_boot(
                 snapshot::files_present(dir),
                 snapshot::is_suppressed(dir),
+                // A stateful app (Some data disk) owns a LIVE `/dev/vdb` (SQLite +
+                // git); a warm-restored RAM snapshot over it = corruption, so it
+                // must NEVER snapshot. `data_disk` is None for every non-stateful
+                // caller (byte-identical to prior behavior); Task 6 passes Some for
+                // a stateful app, which auto-suppresses the cold-boot snapshot.
+                data_disk.is_some(),
             ) {
                 me.try_create_snapshot(dir).await;
                 if let (Some(reff), true) = (image_ref, snapshot::files_present(dir)) {
