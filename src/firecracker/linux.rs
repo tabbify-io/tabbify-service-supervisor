@@ -581,6 +581,15 @@ impl FirecrackerRuntime {
         // when SUPERVISOR_FC_DEBUG is truthy — see `console_stdio`).
         let console_log = pidfile::console_log_path(data_dir, uuid);
 
+        // STATEFUL app → attach a persistent per-uuid `/dev/vdb` data disk. This
+        // is the SINGLE source of truth for BOTH effects the boot path derives:
+        // (a) `configure_and_boot` creates-once + attaches it, and (b) `cold_boot`
+        // auto-SUPPRESSES the warm snapshot via `data_disk.is_some()` (a RAM
+        // snapshot over a live SQLite/git disk = corruption). `None` for every
+        // non-stateful app ⇒ byte-identical to the historical boot path.
+        let data_disk = super::stateful::stateful_data_disk(data_dir, uuid, rt);
+        let data_disk = data_disk.as_deref();
+
         let vm = if is_swap {
             // DEPLOY / SWAP: the OLD microVM stays LIVE — `perform_swap` health-
             // gates the new one and only then flips + drains the old. So we must
@@ -603,9 +612,10 @@ impl FirecrackerRuntime {
                 is_workspace,
                 Some(env_hash),
                 plan.clone(),
-                // Task 6 will pass the stateful app's data disk here; every
-                // current caller boots without one.
-                None,
+                // STATEFUL: attach the persistent `/dev/vdb` + suppress the
+                // snapshot on the SWAP cold boot (Some ⇒ both). `None` for a
+                // non-stateful app (unchanged).
+                data_disk,
             )
             .await?
         } else {
@@ -659,7 +669,11 @@ impl FirecrackerRuntime {
                             is_workspace,
                             Some(env_hash),
                             plan.clone(),
-                            None,
+                            // STATEFUL disk + snapshot-suppress on the cold-boot
+                            // fallback after a failed warm restore (a stateful app
+                            // never HAS a snapshot to restore — it is suppressed —
+                            // but pass it regardless so the disk always attaches).
+                            data_disk,
                         )
                         .await?
                     }
@@ -690,7 +704,10 @@ impl FirecrackerRuntime {
                     is_workspace,
                     Some(env_hash),
                     plan,
-                    None,
+                    // STATEFUL disk + snapshot-suppress on the primary cold-boot
+                    // path (first boot / respawn with no usable snapshot). `None`
+                    // for a non-stateful app (unchanged).
+                    data_disk,
                 )
                 .await?
             }

@@ -157,28 +157,37 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
     // a broken toml never wedges a deploy here (build-time validation is the gate).
     let managed = parse_managed_view(manifest_toml);
 
-    let (mode, idle_timeout_sec, memory_mb, vcpus, port, dynamic_prefixes) = match &managed {
-        Some(m) => {
-            let mode = crate::unified_manifest::lifecycle_mode_from_str(&m.runtime.lifecycle);
-            (
-                mode,
-                m.runtime.idle_timeout_sec,
-                m.runtime.memory_mb,
-                m.runtime.vcpus,
-                m.runtime.port,
-                m.routes.dynamic_prefixes.clone(),
-            )
-        }
-        // FC-sane defaults (today's behaviour) when no managed toml.
-        None => (
-            LifecycleMode::AlwaysOn,
-            FC_DEFAULT_IDLE_SEC,
-            FC_DEFAULT_MEMORY_MB,
-            FC_DEFAULT_VCPUS,
-            None,
-            Vec::new(),
-        ),
-    };
+    let (mode, idle_timeout_sec, memory_mb, vcpus, port, dynamic_prefixes, stateful, data_mount) =
+        match &managed {
+            Some(m) => {
+                let mode = crate::unified_manifest::lifecycle_mode_from_str(&m.runtime.lifecycle);
+                (
+                    mode,
+                    m.runtime.idle_timeout_sec,
+                    m.runtime.memory_mb,
+                    m.runtime.vcpus,
+                    m.runtime.port,
+                    m.routes.dynamic_prefixes.clone(),
+                    // Persistent-disk intent from the managed `[runtime]` — the
+                    // connect-repo / build-pipeline app has no S3 manifest, so this
+                    // is the ONLY carrier of `stateful`/`data_mount` here.
+                    m.runtime.stateful,
+                    m.runtime.data_mount.clone(),
+                )
+            }
+            // FC-sane defaults (today's behaviour) when no managed toml — a
+            // no-managed-toml deploy is ephemeral (non-stateful), unchanged.
+            None => (
+                LifecycleMode::AlwaysOn,
+                FC_DEFAULT_IDLE_SEC,
+                FC_DEFAULT_MEMORY_MB,
+                FC_DEFAULT_VCPUS,
+                None,
+                Vec::new(),
+                false,
+                None,
+            ),
+        };
 
     FetchedApp {
         // No S3 `latest` exists for a build-pipeline app; the deployed image ref
@@ -205,6 +214,8 @@ pub fn fetched_from_ref(uuid: &str, reff: &str, manifest_toml: Option<&str>) -> 
                 port,
                 kernel: None,
                 registry_ref: Some(reff.to_owned()),
+                stateful,
+                data_mount,
             },
             routes: Routes { dynamic_prefixes },
         },
@@ -241,6 +252,19 @@ fn apply_managed_overlay(mut fetched: FetchedApp, manifest_toml: Option<&str>) -
     }
     if !view.routes.dynamic_prefixes.is_empty() {
         fetched.manifest.routes.dynamic_prefixes = view.routes.dynamic_prefixes;
+    }
+    // ACTIVATE-ONLY persistent-disk overlay: when the managed toml declares
+    // `stateful = true`, adopt it (+ its `data_mount`) onto the S3-fetched
+    // manifest so an explicit deploy-time intent reaches the boot path even on
+    // the S3-hit branch. A partial toml whose `stateful` defaults to `false`
+    // must NEVER clobber an already-stateful S3 manifest (both derive from the
+    // SAME tabbify.toml, so a downgrade here could only come from a PARTIAL toml)
+    // — statefulness is "sticky-on", the SAFE direction: a live data disk is
+    // never silently demoted to ephemeral (which would drop the mount + re-enable
+    // snapshots over a live disk). `stateful = false` in the toml ⇒ no-op.
+    if view.runtime.stateful {
+        fetched.manifest.runtime.stateful = true;
+        fetched.manifest.runtime.data_mount = view.runtime.data_mount;
     }
     fetched
 }
@@ -363,6 +387,8 @@ mod tests {
                     port: None,
                     kernel: None,
                     registry_ref,
+                    stateful: false,
+                    data_mount: None,
                 },
                 routes: Routes::default(),
             },

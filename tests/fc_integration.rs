@@ -107,6 +107,8 @@ fn make_fc_fetched(uuid: &str, digest: &str) -> tabbify_supervisor::fetcher::Fet
                 port: None,
                 kernel: None,
                 registry_ref: Some(format!("[fd5a::1]:5000/test/hello@{digest}")),
+                stateful: false,
+                data_mount: None,
             },
             routes: Routes::default(),
         },

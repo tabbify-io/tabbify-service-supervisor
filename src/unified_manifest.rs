@@ -277,6 +277,12 @@ impl UnifiedManifest {
                 port: self.runtime.port,
                 kernel: None,
                 registry_ref: None,
+                // Carry the persistent-disk intent ACROSS the unified→app-manifest
+                // conversion (single source of truth = the unified `[runtime]`),
+                // so the serving boot path can attach `/dev/vdb` + suppress
+                // snapshots for a stateful app.
+                stateful: self.runtime.stateful,
+                data_mount: self.runtime.data_mount.clone(),
             },
             routes: Routes {
                 dynamic_prefixes: self.routes.dynamic_prefixes.clone(),

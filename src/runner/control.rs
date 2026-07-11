@@ -563,6 +563,8 @@ mod tests {
                     port: None,
                     kernel: None,
                     registry_ref: None,
+                    stateful: false,
+                    data_mount: None,
                 },
                 routes: Routes::default(),
             },

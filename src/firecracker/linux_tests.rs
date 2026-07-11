@@ -126,6 +126,8 @@ async fn real_vm_boots_and_serves() {
         port: None,
         kernel: None,
         registry_ref: None,
+        stateful: false,
+        data_mount: None,
     };
     let cfg = FcConfig::default();
 

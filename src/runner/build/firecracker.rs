@@ -1134,10 +1134,16 @@ pub fn render_init(
     // `None` ⇒ empty string, so the rendered script is BYTE-IDENTICAL to the
     // pre-Task-4 output — non-stateful rootfs cache keys are unaffected.
     let data_mount_lines: String = match data_mount {
-        Some(m) => format!(
-            "mkdir -p {m}\n\
-             mount /dev/vdb {m} 2>/dev/null || true\n"
-        ),
+        Some(m) => {
+            // POSIX single-quote the mount path so a space / glob / `$` in the
+            // manifest's `data_mount` can't mis-tokenize the `mkdir`/`mount` line
+            // (defensive; mirrors the argv/env/workdir quoting above).
+            let qm = sh_single_quote(m);
+            format!(
+                "mkdir -p {qm}\n\
+                 mount /dev/vdb {qm} 2>/dev/null || true\n"
+            )
+        }
         None => String::new(),
     };
     Ok(format!(
@@ -1276,7 +1282,15 @@ pub async fn resolve_rootfs(
     if let (Some(map), Entrypoint::Exec(exec)) = (extra_env, &mut entry) {
         merge_extra_env(&mut exec.env, map);
     }
-    let init = render_init(&entry, cap_files, None)?; // shell-form → clear error (D3)
+    // STATEFUL: bake a `/dev/vdb` mount into `/init` at the manifest's
+    // `[runtime].data_mount`. `stateful_data_mount` returns `None` for a
+    // non-stateful app (rootfs bytes byte-identical to today) and ERRORS for a
+    // stateful app that failed to declare a mount (else the disk attaches but is
+    // never mounted → writes lost on restart — fail the bake LOUDLY). The mount
+    // path is shell-quoted inside `render_init` via `sh_single_quote`.
+    let data_mount =
+        crate::firecracker::stateful::stateful_data_mount(&fetched.manifest.runtime)?;
+    let init = render_init(&entry, cap_files, data_mount)?; // shell-form → clear error (D3)
 
     build_rootfs_ext4_inner(
         layout,
@@ -1872,7 +1886,16 @@ pub async fn run_firecracker_build(
     // get the wrong git cap (`git clone` → 403 → no `/workspace`, the #68 bug) and
     // an app could inherit another app's secrets. The per-uuid cache stays sound
     // (uuid+digest+env are aligned). So: globally cacheable IFF no deploy env.
-    let globally_cacheable = extra_env.is_none_or(|m| m.is_empty());
+    //
+    // A STATEFUL app is ALSO excluded: its `/init` bakes a `/dev/vdb` mount at the
+    // app's `data_mount` (see `render_init`), making the rootfs app-specific for
+    // that digest just like a baked env. Publishing it globally would let a
+    // NON-stateful (or differently-mounted) app of the same digest inherit the
+    // mount, and — worse — let a stateful app inherit a NON-mounting global rootfs
+    // → `/dev/vdb` never mounts → writes silently land on the ephemeral rootfs and
+    // are lost. The per-uuid cache (uuid+digest+env) is the sound home for it.
+    let globally_cacheable =
+        extra_env.is_none_or(|m| m.is_empty()) && !fetched.manifest.runtime.stateful;
 
     // Fingerprint the /init-baked env + cap-file NAMES (#106) so the PER-UUID
     // rootfs cache key includes it: a CHANGED env on a STABLE uuid (a workspace's

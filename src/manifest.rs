@@ -108,6 +108,23 @@ pub struct Runtime {
     /// The host docker daemon must list the registry under `insecure-registries`.
     #[serde(default)]
     pub registry_ref: Option<String>,
+    /// Whether this app uses a persistent data disk (Firecracker `/dev/vdb`).
+    /// MIRRORS [`crate::unified_manifest::RuntimeSection::stateful`]: the deploy
+    /// carries it across the unified→app-manifest conversion so the serving boot
+    /// path ([`crate::firecracker::FirecrackerRuntime::launch_with_uuid`]) can
+    /// attach the persistent disk AND suppress warm snapshots. `false` (default)
+    /// = ephemeral rootfs only; the serde default keeps pre-existing manifests
+    /// (which lack the key) parsing unchanged.
+    #[serde(default)]
+    pub stateful: bool,
+    /// Guest mount path for the persistent data disk (e.g.
+    /// `"/var/lib/tabbify-forge"`). MIRRORS
+    /// [`crate::unified_manifest::RuntimeSection::data_mount`]. Ignored when
+    /// `stateful = false`; `None` when absent (default). A stateful app MUST set
+    /// it — the bake refuses a stateful app without a mount (else `/dev/vdb`
+    /// attaches but is never mounted → writes land on the ephemeral rootfs).
+    #[serde(default)]
+    pub data_mount: Option<String>,
 }
 fn default_rt() -> String {
     "wasm-http".into()

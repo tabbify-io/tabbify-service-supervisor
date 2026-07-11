@@ -1023,6 +1023,8 @@ fn fc_fetched_ref(registry_ref: &str) -> FetchedApp {
                 port: None,
                 kernel: None,
                 registry_ref: Some(registry_ref.to_owned()),
+                stateful: false,
+                data_mount: None,
             },
             routes: Routes::default(),
         },
@@ -2355,11 +2357,12 @@ fn render_init_includes_cap_files_before_exec() {
     assert!(!init.contains("export TABBIFY_CAP_FILES"));
 }
 
-/// Task 4: when `data_mount` is `Some(path)`, `render_init` emits
+/// Task 4/6: when `data_mount` is `Some(path)`, `render_init` emits
 /// `mkdir -p <path>` and `mount /dev/vdb <path> 2>/dev/null || true` AFTER the
-/// /dev mount and BEFORE the entrypoint exec. When `None`, neither line is
-/// emitted and the output is byte-identical to the pre-Task-4 output (cache-key
-/// safety).
+/// /dev mount and BEFORE the entrypoint exec, with the path POSIX single-quoted
+/// (Task 6) so a space / glob / `$` cannot mis-tokenize the line. When `None`,
+/// neither line is emitted and the output is byte-identical to the
+/// no-data-mount path (cache-key safety).
 #[test]
 fn render_init_mounts_data_disk_when_some_skips_when_none() {
     let exec = OciExec {
@@ -2369,8 +2372,10 @@ fn render_init_mounts_data_disk_when_some_skips_when_none() {
         workdir: "/".to_owned(),
     };
 
-    // Some(path): both mount lines must be present, ordered correctly.
+    // Some(path): both mount lines must be present, ordered correctly. The path
+    // is shell single-quoted in the emitted script (Task 6).
     let mount_path = "/var/lib/tabbify-forge";
+    let quoted = format!("'{mount_path}'");
     let init_some = render_init(
         &Entrypoint::Exec(exec.clone()),
         &[],
@@ -2378,19 +2383,19 @@ fn render_init_mounts_data_disk_when_some_skips_when_none() {
     )
     .unwrap();
     assert!(
-        init_some.contains(&format!("mkdir -p {mount_path}")),
-        "must emit mkdir -p for the data mount path; got:\n{init_some}"
+        init_some.contains(&format!("mkdir -p {quoted}")),
+        "must emit mkdir -p for the (quoted) data mount path; got:\n{init_some}"
     );
     assert!(
-        init_some.contains(&format!("mount /dev/vdb {mount_path} 2>/dev/null || true")),
-        "must emit mount /dev/vdb <path>; got:\n{init_some}"
+        init_some.contains(&format!("mount /dev/vdb {quoted} 2>/dev/null || true")),
+        "must emit mount /dev/vdb <quoted-path>; got:\n{init_some}"
     );
     // The data mount must appear AFTER the /dev mount.
     let dev_mount_pos = init_some
         .find("mount -t devtmpfs")
         .expect("devtmpfs mount must be present");
     let data_mkdir_pos = init_some
-        .find(&format!("mkdir -p {mount_path}"))
+        .find(&format!("mkdir -p {quoted}"))
         .expect("data mkdir must be present");
     assert!(
         dev_mount_pos < data_mkdir_pos,
@@ -2412,7 +2417,32 @@ fn render_init_mounts_data_disk_when_some_skips_when_none() {
         "None must not emit mount /dev/vdb; got:\n{init_none}"
     );
     assert!(
-        !init_none.contains(&format!("mkdir -p {mount_path}")),
+        !init_none.contains(&format!("mkdir -p {quoted}")),
         "None must not emit mkdir -p for the data path; got:\n{init_none}"
+    );
+}
+
+/// Task 6: a `data_mount` carrying a shell metachar (space / `$`) is POSIX
+/// single-quoted so the re-tokenizing `/bin/sh` treats it as ONE literal path —
+/// it can never word-split or `$`-expand into a wrong mount target.
+#[test]
+fn render_init_shell_quotes_a_metachar_data_mount() {
+    let exec = OciExec {
+        entrypoint: vec!["/app".to_owned()],
+        cmd: vec![],
+        env: vec![],
+        workdir: "/".to_owned(),
+    };
+    let weird = "/var/lib/tab bify$HOME";
+    let init = render_init(&Entrypoint::Exec(exec), &[], Some(weird)).unwrap();
+    // Single-quoted verbatim: `mount /dev/vdb '/var/lib/tab bify$HOME' ...`.
+    assert!(
+        init.contains(&format!("mount /dev/vdb '{weird}' 2>/dev/null || true")),
+        "metachar mount path must be single-quoted verbatim; got:\n{init}"
+    );
+    // The RAW (unquoted) form must NOT appear as a bare mount arg.
+    assert!(
+        !init.contains(&format!("mount /dev/vdb {weird} ")),
+        "must never emit the unquoted metachar path; got:\n{init}"
     );
 }
