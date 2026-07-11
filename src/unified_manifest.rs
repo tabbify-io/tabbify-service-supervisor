@@ -140,6 +140,16 @@ pub struct RuntimeSection {
     /// unchanged. Optional + forward-compat.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Whether this app uses a persistent data disk (Firecracker block device).
+    /// `false` (default) = ephemeral rootfs only; `true` = a durable disk is
+    /// provisioned and survives VM restarts. Gated by later tasks — this task
+    /// ONLY adds the flag so manifests can declare intent.
+    #[serde(default)]
+    pub stateful: bool,
+    /// Guest mount path for the persistent data disk (e.g. `"/var/lib/tabbify-forge"`).
+    /// Ignored when `stateful = false`. `None` when absent (default).
+    #[serde(default)]
+    pub data_mount: Option<String>,
 }
 
 impl Default for RuntimeSection {
@@ -150,6 +160,8 @@ impl Default for RuntimeSection {
             memory_mb: default_mem(),
             vcpus: default_vcpus(),
             port: None,
+            stateful: false,
+            data_mount: None,
         }
     }
 }
@@ -488,6 +500,45 @@ stable_tag = "   "
         )
         .unwrap();
         assert_eq!(blank.stable_tag(), None, "whitespace ⇒ None (no :\"\" tag)");
+    }
+
+    /// `[runtime].stateful` + `[runtime].data_mount` parse correctly, and both
+    /// default to `false` / `None` when absent (backward-compatible serde defaults).
+    #[test]
+    fn runtime_stateful_and_data_mount_parse() {
+        // Present: both fields explicit.
+        let with_fields: UnifiedManifest = toml::from_str(
+            r#"
+[app]
+name = "forge"
+[build]
+kind = "docker"
+[runtime]
+stateful   = true
+data_mount = "/var/lib/tabbify-forge"
+"#,
+        )
+        .unwrap();
+        assert!(with_fields.runtime.stateful);
+        assert_eq!(
+            with_fields.runtime.data_mount.as_deref(),
+            Some("/var/lib/tabbify-forge")
+        );
+
+        // Absent: serde defaults kick in — old manifests parse unchanged.
+        let without_fields: UnifiedManifest = toml::from_str(
+            r#"
+[app]
+name = "stateless"
+[build]
+kind = "docker"
+[runtime]
+lifecycle = "always_on"
+"#,
+        )
+        .unwrap();
+        assert!(!without_fields.runtime.stateful);
+        assert_eq!(without_fields.runtime.data_mount, None);
     }
 }
 
