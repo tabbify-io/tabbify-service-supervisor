@@ -207,6 +207,67 @@ async fn make_ext4(
     run_host(&argv, runner).await
 }
 
+/// Ensure the persistent DATA disk at `path` exists, creating it ONCE and
+/// reusing it forever after. This is the durable-storage primitive for a
+/// stateful app: the disk outlives every VM restart + redeploy, so once it
+/// holds data it must NEVER be reformatted.
+///
+/// - Absent → format a fresh EMPTY ext4 of `size_mib` (no `-d` seed — the app
+///   populates it at runtime).
+/// - Present → `e2fsck -p -f` (replay journal / auto-fix a VM killed
+///   mid-write) and REUSE the existing filesystem in place.
+///
+/// Mirrors the build-CACHE create-once lifecycle, with ONE deliberate
+/// difference: a build cache is disposable, so an unfixable fsck there is
+/// quarantined + rebuilt fresh — but a data disk is NOT disposable, so an fsck
+/// failure is SURFACED as an error (a deploy retry re-runs fsck; an exit-1
+/// "errors corrected" then passes as exit-0) and the disk is never re-created.
+/// Reformatting an existing data disk would be silent data loss.
+///
+/// # Errors
+/// Parent-dir / image creation, `mkfs.ext4` failure, or `e2fsck` reporting an
+/// unrecoverable filesystem.
+pub async fn ensure_data_disk(path: &Path, size_mib: u64) -> Result<()> {
+    // The one-shot runner has no injected seam here (it is called from the
+    // serve/attach path, not the build pipeline), so it supplies the same
+    // production host-command runner the fc build uses (`oras`/`tar`/`mkfs`).
+    let runner = super::firecracker::production_fc_build_runner();
+    ensure_data_disk_with_runner(path, size_mib, &runner).await
+}
+
+/// [`ensure_data_disk`] with an injected host-command runner. The create-once /
+/// never-reformat logic lives here so tests can observe the `mkfs.ext4` /
+/// `e2fsck` argv through a fake [`FcBuildRunner`]; the public wrapper supplies
+/// the production runner.
+async fn ensure_data_disk_with_runner(
+    path: &Path,
+    size_mib: u64,
+    runner: &FcBuildRunner,
+) -> Result<()> {
+    if path.is_file() {
+        // REUSE: never reformat a disk that already holds data. `e2fsck -p`
+        // replays the journal / auto-fixes a VM killed mid-write. The runner's
+        // bool cannot distinguish exit 1 ("errors corrected") from ≥2 (fatal),
+        // so ANY non-zero surfaces as an error rather than triggering a
+        // reformat — a retry re-runs fsck (corrections then pass as exit-0).
+        run_host(
+            &[
+                "e2fsck".to_owned(),
+                "-p".to_owned(),
+                "-f".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ],
+            runner,
+        )
+        .await
+        .with_context(|| format!("fsck persistent data disk {}", path.display()))
+    } else {
+        // CREATE: a fresh EMPTY ext4 (no `-d` seed). `make_ext4` also
+        // `create_dir_all`s the parent and sizes the sparse image.
+        make_ext4(path, size_mib, None, runner).await
+    }
+}
+
 /// Run one host command through the injected build runner (argv[0] = binary;
 /// the runner returns `(success, combined-output)`).
 async fn run_host(argv: &[String], runner: &FcBuildRunner) -> Result<()> {
@@ -583,6 +644,83 @@ mod tests {
         assert_eq!(
             mkfs_args("/d/cache.ext4", None),
             vec!["-F", "-m", "0", "/d/cache.ext4"]
+        );
+    }
+
+    /// Data-loss guard (the whole point of the primitive): `ensure_data_disk`
+    /// formats a fresh disk EXACTLY ONCE. The FIRST call over an absent path
+    /// creates + sizes + `mkfs.ext4`; the SECOND call over the now-existing
+    /// image must `e2fsck`-and-REUSE — it must NEVER re-run `mkfs.ext4` (that
+    /// would silently wipe the app's persisted data). Asserted via the same
+    /// fake-`FcBuildRunner` seam the build tests use to observe mkfs argv
+    /// (mirrors `firecracker_tests::build_rootfs_unpacks_layers_then_mkfs_with_d_flag`).
+    #[tokio::test]
+    async fn ensure_data_disk_creates_once_never_reformats() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Parent dir is ABSENT — the create arm must materialize it.
+        let data = tmp.path().join("nested").join("data.ext4");
+
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = calls.clone();
+        // Fake runner: record every argv, succeed for BOTH `mkfs.ext4` and
+        // `e2fsck`. `make_ext4` itself does the real `File::create` + `set_len`
+        // + parent `create_dir_all`, so after a "successful" fake mkfs the image
+        // exists on disk and the SECOND call takes the e2fsck-reuse arm.
+        let runner: FcBuildRunner = Arc::new(move |argv: Vec<String>| {
+            calls2.lock().unwrap().push(argv);
+            Box::pin(async move { (true, Vec::new()) })
+        });
+
+        // FIRST call: absent → create parent + format a 256 MiB empty ext4.
+        ensure_data_disk_with_runner(&data, 256, &runner)
+            .await
+            .unwrap();
+        assert!(data.is_file(), "disk image must exist after the first call");
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().len(),
+            256 * 1024 * 1024,
+            "disk must be sized to size_mib"
+        );
+
+        // SECOND call: image present → e2fsck + REUSE, never reformat.
+        ensure_data_disk_with_runner(&data, 256, &runner)
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        let mkfs_count = recorded
+            .iter()
+            .filter(|c| c.first().map(String::as_str) == Some("mkfs.ext4"))
+            .count();
+        assert_eq!(
+            mkfs_count, 1,
+            "mkfs.ext4 must run EXACTLY once across two calls (no reformat); got {recorded:?}"
+        );
+        // The create arm must NOT carry a `-d` seed dir (empty data disk).
+        let mkfs = recorded
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("mkfs.ext4"))
+            .expect("first call must run mkfs.ext4");
+        assert!(
+            !mkfs.contains(&"-d".to_owned()),
+            "data disk is EMPTY — no `-d` seed; got {mkfs:?}"
+        );
+        // The reuse arm must have run `e2fsck -p -f <path>` on the existing image.
+        let e2fsck = recorded
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("e2fsck"))
+            .expect("second call must e2fsck the existing disk");
+        assert_eq!(
+            e2fsck,
+            &vec![
+                "e2fsck".to_owned(),
+                "-p".to_owned(),
+                "-f".to_owned(),
+                data.to_string_lossy().into_owned(),
+            ],
+            "reuse arm must be `e2fsck -p -f <path>`"
         );
     }
 
