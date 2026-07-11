@@ -215,37 +215,43 @@ fn preserve_prior_record_caps(
 /// `None` ⇒ the key is omitted (no forge / an older node) — forge ops then
 /// honestly report unconfigured rather than dialing a bogus endpoint.
 ///
-/// FORGE-PROXY REWRITE: the node passes `forge_url` as the forge's RAW v6 mesh
-/// ULA (`http://[fd5a:…]:8730`). A workspace FC guest is IPv4-only on its /30 tap
-/// and cannot route v6, so when the host-side forge-proxy is enabled the caller
-/// passes `forge_proxy_gateway` = the guest's OWN tap-gateway proxy URL
-/// (`http://{host_ip}:FORGE_PROXY_IPV4_PORT`, from
-/// [`crate::api::forge_proxy_gateway_url`]) and we inject THAT instead — the L4
-/// forward relays it to the forge over the mesh. With no proxy configured
-/// (`forge_proxy_gateway == None`) the node value is passed through unchanged
-/// (today's behavior). The ORG slug is NEVER rewritten — only the URL host:port.
+/// FORGE-PROXY REWRITE (mandatory): the node passes `forge_url` as the forge's
+/// RAW v6 mesh ULA (`http://[fd5a:…]:8730`). A workspace FC guest is IPv4-only on
+/// its /30 tap and cannot route v6, so the guest-facing value is ALWAYS the
+/// host-side proxy gateway URL (`http://{host_ip}:FORGE_PROXY_IPV4_PORT`, from
+/// [`crate::api::forge_proxy_gateway_url`]) — the L4 forward relays it to the
+/// forge over the mesh. Baking the raw v6 ULA into an IPv4-only FC is the exact
+/// #107 bug, so when a `forge_url` is configured but no `forge_proxy_gateway` is
+/// supplied we return [`ForgeEnvError::MissingGateway`] rather than silently
+/// falling back to the raw ULA. The ORG slug is NEVER rewritten.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ForgeEnvError {
+    /// A forge is configured but the mandatory host-side proxy gateway was not
+    /// supplied — baking a raw v6 ULA into an IPv4-only FC is the exact bug this
+    /// guards against, so we refuse rather than silently fall back.
+    #[error("forge configured but no forge-proxy gateway available")]
+    MissingGateway,
+}
+
 fn insert_forge_env(
     extra_env: &mut HashMap<String, String>,
     forge_url: &Option<String>,
     forge_org: &Option<String>,
     forge_proxy_gateway: Option<&str>,
-) {
-    // The URL: when the host-side forge-proxy is enabled, the guest-facing value
-    // is the tap-gateway proxy (the raw v6 ULA is unreachable from the IPv4-only
-    // FC); otherwise the node value passes through unchanged. Only injected when
-    // the node supplied a forge_url (no forge → no key → honest "unconfigured").
+) -> Result<(), ForgeEnvError> {
+    // The URL is ALWAYS the tap-gateway proxy (the raw v6 ULA is unreachable
+    // from the IPv4-only FC). Only injected when the node supplied a forge_url
+    // (no forge → no key → honest "unconfigured"); a configured forge WITHOUT a
+    // gateway is a hard error — we never bake the raw ULA.
     if forge_url.is_some() {
-        let url = match forge_proxy_gateway {
-            Some(gw) => gw.to_owned(),
-            // Safe: guarded by `forge_url.is_some()` above.
-            None => forge_url.clone().unwrap_or_default(),
-        };
-        extra_env.insert("TABBIFY_FORGE_URL".to_owned(), url);
+        let gw = forge_proxy_gateway.ok_or(ForgeEnvError::MissingGateway)?;
+        extra_env.insert("TABBIFY_FORGE_URL".to_owned(), gw.to_owned());
     }
     // The ORG slug rides the env channel untouched (never rewritten).
     if let Some(org) = forge_org {
         extra_env.insert("TABBIFY_FORGE_ORG".to_owned(), org.clone());
     }
+    Ok(())
 }
 
 /// The reserved cap-file name for the §12-S6 authorized-keys cap (the `:8732`
@@ -651,12 +657,19 @@ pub async fn create_workspace(
     let forge_gateway = state
         .forge_proxy_enabled
         .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
-    insert_forge_env(
+    if let Err(e) = insert_forge_env(
         &mut extra_env,
         &body.forge_url,
         &body.forge_org,
         forge_gateway.as_deref(),
-    );
+    ) {
+        tracing::error!(workspace_uuid = %ws_uuid, error = %e, "refusing to bake a raw forge ULA: forge-proxy gateway unavailable");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("forge env: {e}") })),
+        )
+            .into_response();
+    }
     if !cap_files.is_empty() {
         // serde_json::to_string of a Map never fails (all values are strings).
         extra_env.insert(
@@ -984,12 +997,19 @@ pub async fn add_workspace_repo(
     let forge_gateway = state
         .forge_proxy_enabled
         .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
-    insert_forge_env(
+    if let Err(e) = insert_forge_env(
         &mut merged_env,
         &body.forge_url,
         &body.forge_org,
         forge_gateway.as_deref(),
-    );
+    ) {
+        tracing::error!(workspace_uuid = %uuid, error = %e, "refusing to bake a raw forge ULA: forge-proxy gateway unavailable");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("forge env: {e}") })),
+        )
+            .into_response();
+    }
 
     // DIAGNOSTIC (keys/presence ONLY — cap-file VALUES are URLs/secrets, NEVER
     // logged): the new repo cap-file being merged + the FULL post-merge cap-file
@@ -1149,12 +1169,19 @@ pub async fn forge_creds_backfill(
     let forge_gateway = state
         .forge_proxy_enabled
         .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
-    insert_forge_env(
+    if let Err(e) = insert_forge_env(
         &mut merged_env,
         &body.forge_url,
         &body.forge_org,
         forge_gateway.as_deref(),
-    );
+    ) {
+        tracing::error!(workspace_uuid = %uuid, error = %e, "refusing to bake a raw forge ULA: forge-proxy gateway unavailable");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("forge env: {e}") })),
+        )
+            .into_response();
+    }
 
     // DIAGNOSTIC (keys/presence ONLY — values are secrets/URLs, NEVER logged):
     // the full post-merge cap-file key set (so a lost authkeys/repo cap is

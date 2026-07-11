@@ -26,19 +26,18 @@
     /// non-secret; the creds ride the cap-file channel).
     #[test]
     fn insert_forge_env_injects_url_and_org_and_omits_when_none() {
-        // No forge-proxy configured (gateway None) ⇒ the node URL passes through
-        // unchanged (today's behavior).
+        // A configured forge bakes the MANDATORY gateway (never the raw ULA) plus
+        // the org slug.
         let mut env: HashMap<String, String> = HashMap::new();
+        let gateway = crate::api::forge_proxy_gateway_url("172.31.14.61");
         insert_forge_env(
             &mut env,
             &Some("http://[fd5a:1f02::1]:8730".to_owned()),
             &Some("t_acme".to_owned()),
-            None,
-        );
-        assert_eq!(
-            env.get("TABBIFY_FORGE_URL").unwrap(),
-            "http://[fd5a:1f02::1]:8730"
-        );
+            Some(gateway.as_str()),
+        )
+        .expect("with a gateway it must succeed");
+        assert_eq!(env.get("TABBIFY_FORGE_URL").unwrap(), "http://172.31.14.61:8789");
         assert_eq!(env.get("TABBIFY_FORGE_ORG").unwrap(), "t_acme");
         // The pair must survive the snapshot env-safety guard (it is baked into
         // /init and frozen into the workspace's Full snapshot by design).
@@ -48,7 +47,7 @@
 
         // None ⇒ omitted (never an empty-string env the broker would misread).
         let mut empty: HashMap<String, String> = HashMap::new();
-        insert_forge_env(&mut empty, &None, &None, None);
+        insert_forge_env(&mut empty, &None, &None, None).expect("no forge = ok");
         assert!(!empty.contains_key("TABBIFY_FORGE_URL"));
         assert!(!empty.contains_key("TABBIFY_FORGE_ORG"));
     }
@@ -67,7 +66,8 @@
             &Some("http://[fd5a:1f02:e3ca:25c7:1171::1]:8730".to_owned()),
             &Some("t_acme".to_owned()),
             Some(gateway.as_str()),
-        );
+        )
+        .expect("with a gateway it must succeed");
         assert_eq!(
             env.get("TABBIFY_FORGE_URL").unwrap(),
             "http://172.31.14.61:8789",
@@ -87,9 +87,57 @@
     fn insert_forge_env_no_url_means_no_key_even_with_gateway() {
         let mut env: HashMap<String, String> = HashMap::new();
         let gateway = crate::api::forge_proxy_gateway_url("172.31.14.61");
-        insert_forge_env(&mut env, &None, &Some("t_acme".to_owned()), Some(&gateway));
+        insert_forge_env(&mut env, &None, &Some("t_acme".to_owned()), Some(&gateway))
+            .expect("no forge_url = ok, org still set");
         assert!(!env.contains_key("TABBIFY_FORGE_URL"));
         assert_eq!(env.get("TABBIFY_FORGE_ORG").unwrap(), "t_acme");
+    }
+
+    /// Always-gateway guard: even when the node supplies a RAW v6 ULA, the baked
+    /// `TABBIFY_FORGE_URL` is the host-side proxy gateway — the raw ULA must
+    /// NEVER reach an IPv4-only FC (the exact #107 bug).
+    #[test]
+    fn insert_forge_env_always_uses_gateway_never_raw_ula() {
+        let mut env = std::collections::HashMap::new();
+        insert_forge_env(
+            &mut env,
+            &Some("http://[fd5a:1f02:e3ca:25c7:1171::1]:8730".to_owned()), // raw node ULA
+            &Some("t_org".to_owned()),
+            Some("http://172.31.14.61:8789"),
+        )
+        .expect("with a gateway it must succeed");
+        assert_eq!(
+            env.get("TABBIFY_FORGE_URL").unwrap(),
+            "http://172.31.14.61:8789"
+        );
+        // The regression guard: the raw v6 ULA must NEVER be baked.
+        assert!(!env.get("TABBIFY_FORGE_URL").unwrap().contains("fd5a:1f02"));
+        assert_eq!(env.get("TABBIFY_FORGE_ORG").unwrap(), "t_org");
+    }
+
+    /// A forge is configured but the mandatory gateway is absent: refuse loudly
+    /// (`Err(MissingGateway)`) rather than silently baking the raw ULA. Nothing
+    /// is written to the env on the error path.
+    #[test]
+    fn insert_forge_env_errors_when_forge_set_but_no_gateway() {
+        let mut env = std::collections::HashMap::new();
+        let r = insert_forge_env(
+            &mut env,
+            &Some("http://[fd5a::1]:8730".to_owned()),
+            &None,
+            None,
+        );
+        assert!(matches!(r, Err(ForgeEnvError::MissingGateway)));
+        assert!(!env.contains_key("TABBIFY_FORGE_URL")); // nothing baked
+    }
+
+    /// No forge configured at all ⇒ Ok with no key baked (an older node / a
+    /// workspace with no forge → honest "unconfigured").
+    #[test]
+    fn insert_forge_env_noop_when_no_forge_configured() {
+        let mut env = std::collections::HashMap::new();
+        insert_forge_env(&mut env, &None, &None, None).expect("no forge = ok, no key");
+        assert!(!env.contains_key("TABBIFY_FORGE_URL"));
     }
 
     /// Rollout-order safety: a create body WITHOUT the forge_url/forge_org keys
