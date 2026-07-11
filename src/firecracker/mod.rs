@@ -155,7 +155,7 @@ fn default_kvm_check() -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::protocol::{
-        boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
+        aux_drive_body, boot_source_body, copy_filtered_headers, instance_start_body, is_hop_by_hop,
         kvm_available_with, machine_config_body, network_iface_body, parse_status_line, pause_body,
         read_http_status, resolve_port, resolve_vcpus, resume_body, rootfs_drive_body,
         snapshot_create_body, snapshot_load_body, workspace_or_resolved_port,
@@ -343,6 +343,20 @@ mod tests {
         assert_eq!(b["drive_id"], "rootfs");
         assert_eq!(b["path_on_host"], "/var/lib/tabbify/rootfs.ext4");
         assert_eq!(b["is_root_device"], true);
+        assert_eq!(b["is_read_only"], false);
+    }
+
+    #[test]
+    fn aux_drive_body_for_data_disk_is_nonroot_writable() {
+        // A stateful FC app's persistent disk is attached via this exact
+        // `/drives/data` body: a NON-root, WRITABLE auxiliary block device the
+        // guest sees as /dev/vdb (attached right after the rootfs /dev/vda). This
+        // is the contract the boot path issues when a `data_disk` is requested,
+        // and the one Task 6 relies on — lock it.
+        let b = aux_drive_body("data", "/x/data.ext4", false);
+        assert_eq!(b["drive_id"], "data");
+        assert_eq!(b["path_on_host"], "/x/data.ext4");
+        assert_eq!(b["is_root_device"], false);
         assert_eq!(b["is_read_only"], false);
     }
 

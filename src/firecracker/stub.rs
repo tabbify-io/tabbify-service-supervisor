@@ -24,7 +24,12 @@ impl FirecrackerRuntime {
     /// # Errors
     /// Always — firecracker is Linux + `/dev/kvm` only.
     #[allow(clippy::unused_async)]
-    pub async fn launch(_rootfs: &Path, _rt: &Runtime, _cfg: &FcConfig) -> Result<Self> {
+    pub async fn launch(
+        _rootfs: &Path,
+        _rt: &Runtime,
+        _cfg: &FcConfig,
+        _data_disk: Option<&Path>,
+    ) -> Result<Self> {
         bail!("firecracker runtime requires Linux + /dev/kvm (host is not Linux)")
     }
 

@@ -21,13 +21,14 @@ use tokio::process::{Child, Command};
 use super::pidfile;
 use super::port_plan::{PortPlan, probe_first_answering, resolve_port_plan};
 use super::protocol::{
-    boot_source_body, instance_start_body, machine_config_body, network_iface_body, pause_body,
-    proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
+    aux_drive_body, boot_source_body, instance_start_body, machine_config_body, network_iface_body,
+    pause_body, proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
     snapshot_create_body, snapshot_load_body, workspace_or_resolved_port,
 };
 use super::snapshot;
 use super::{FcConfig, kvm_available};
 use crate::manifest::Runtime;
+use crate::runner::build::fc_sandbox::ensure_data_disk;
 use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
 
 /// How long to wait for the guest app's HTTP server to come up after boot.
@@ -55,6 +56,11 @@ const SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(180);
 const RESUME_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Delay between resume attempts in [`FirecrackerRuntime::ensure_resumed`].
 const RESUME_ENSURE_POLL: Duration = Duration::from_secs(2);
+/// Size of a stateful app's persistent data disk (`/dev/vdb`), created once as a
+/// sparse ext4 image by [`ensure_data_disk`] and never reformatted. 2 GiB is
+/// generous headroom — forge/app state is tiny, and the SPARSE image only
+/// consumes what is actually written.
+const DATA_DISK_MIB: u64 = 2048;
 
 /// Env flag enabling live-boot debugging: when truthy, the firecracker child's
 /// stdout+stderr (including the guest serial console, `console=ttyS0`) are
@@ -240,7 +246,12 @@ impl FirecrackerRuntime {
     /// `!kvm_available()`, tap setup failure, firecracker spawn failure, any
     /// REST configuration call failing, or the guest app not answering
     /// within [`READY_TIMEOUT`].
-    pub async fn launch(rootfs: &Path, rt: &Runtime, cfg: &FcConfig) -> Result<Self> {
+    pub async fn launch(
+        rootfs: &Path,
+        rt: &Runtime,
+        cfg: &FcConfig,
+        data_disk: Option<&Path>,
+    ) -> Result<Self> {
         // No per-app uuid context here (the bare entry, used by tests + simple
         // single-VM callers): a fixed identity is fine. The per-uuid production
         // path is `launch_with_uuid`.
@@ -262,6 +273,7 @@ impl FirecrackerRuntime {
             false,
             None,
             plan,
+            data_disk,
         )
         .await
     }
@@ -286,6 +298,10 @@ impl FirecrackerRuntime {
     /// non-workspace app's exposed candidate ports concurrently
     /// (first-answering-wins) — for an image `FROM nginx` that inherits `EXPOSE 80`
     /// while its real listener is elsewhere — then adopts + persists the winner.
+    /// `data_disk` — when `Some`, a persistent per-app ext4 image is created once
+    /// ([`ensure_data_disk`], never reformatted) and attached as a non-root block
+    /// device (`/dev/vdb`) for a STATEFUL app. `None` (every current caller) ⇒ no
+    /// data disk ⇒ the boot config is byte-identical to the historical behavior.
     #[allow(clippy::too_many_arguments)]
     async fn cold_boot(
         rootfs: &Path,
@@ -299,6 +315,7 @@ impl FirecrackerRuntime {
         is_workspace: bool,
         env_hash: Option<&str>,
         port_plan: PortPlan,
+        data_disk: Option<&Path>,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -395,7 +412,7 @@ impl FirecrackerRuntime {
 
         // Configure + boot the VM, then wait for the guest app. On any
         // failure `me` drops → child killed + tap deleted.
-        me.configure_and_boot(rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac)
+        me.configure_and_boot(rootfs, rt, cfg, &guest_ip, &host_ip, &guest_mac, data_disk)
             .await?;
         // Readiness. A `Fixed` plan probes the single known port. A `Probe` plan
         // dials ALL exposed candidates concurrently, FIRST-ANSWERING-WINS, then
@@ -580,6 +597,9 @@ impl FirecrackerRuntime {
                 is_workspace,
                 Some(env_hash),
                 plan.clone(),
+                // Task 6 will pass the stateful app's data disk here; every
+                // current caller boots without one.
+                None,
             )
             .await?
         } else {
@@ -633,6 +653,7 @@ impl FirecrackerRuntime {
                             is_workspace,
                             Some(env_hash),
                             plan.clone(),
+                            None,
                         )
                         .await?
                     }
@@ -663,6 +684,7 @@ impl FirecrackerRuntime {
                     is_workspace,
                     Some(env_hash),
                     plan,
+                    None,
                 )
                 .await?
             }
@@ -818,6 +840,14 @@ impl FirecrackerRuntime {
     }
 
     /// Push the full firecracker REST configuration, then start the VM.
+    ///
+    /// `data_disk` — when `Some`, a persistent per-app ext4 image is created once
+    /// ([`ensure_data_disk`], never reformatted) and attached as the FIRST
+    /// auxiliary block device (guest `/dev/vdb`, after the rootfs `/dev/vda`) for
+    /// a STATEFUL app. `None` (every current caller) ⇒ no `/drives/data` PUT and
+    /// no disk creation ⇒ the boot sequence is byte-identical to the historical
+    /// behavior.
+    #[allow(clippy::too_many_arguments)]
     async fn configure_and_boot(
         &self,
         rootfs: &Path,
@@ -826,6 +856,7 @@ impl FirecrackerRuntime {
         guest_ip: &Ipv4Addr,
         host_ip: &Ipv4Addr,
         guest_mac: &str,
+        data_disk: Option<&Path>,
     ) -> Result<()> {
         // The API socket appears asynchronously after spawn; wait for it.
         wait_for_socket(&self.api_sock).await?;
@@ -850,6 +881,23 @@ impl FirecrackerRuntime {
         self.api_put("/drives/rootfs", &rootfs_drive_body(rootfs_str, false))
             .await
             .context("PUT /drives/rootfs")?;
+        // Optional persistent data disk for a STATEFUL app. Attached RIGHT AFTER
+        // the rootfs so the guest sees it as the FIRST auxiliary block device
+        // (`/dev/vdb`, root being `/dev/vda`). Created once (ext4, never
+        // reformatted — see `ensure_data_disk`), so app state survives respawns
+        // and redeploys. `None` (every current caller) skips BOTH the create and
+        // the PUT, keeping the boot config byte-identical to before.
+        if let Some(p) = data_disk {
+            ensure_data_disk(p, DATA_DISK_MIB)
+                .await
+                .context("ensure persistent data disk")?;
+            let p_str = p
+                .to_str()
+                .ok_or_else(|| anyhow!("data disk path is not valid UTF-8"))?;
+            self.api_put("/drives/data", &aux_drive_body("data", p_str, false))
+                .await
+                .context("PUT /drives/data")?;
+        }
         self.api_put(
             "/network-interfaces/eth0",
             &network_iface_body(&self.tap_name, guest_mac),

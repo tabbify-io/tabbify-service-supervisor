@@ -129,7 +129,7 @@ async fn real_vm_boots_and_serves() {
     };
     let cfg = FcConfig::default();
 
-    let vm = FirecrackerRuntime::launch(&rootfs, &rt, &cfg)
+    let vm = FirecrackerRuntime::launch(&rootfs, &rt, &cfg, None)
         .await
         .expect("boot microVM");
     let req = Request::builder()
