@@ -52,6 +52,7 @@ impl FirecrackerRuntime {
         _env_hash: &str,
         image_exposed_ports: &[u16],
         _snapshot_ref: &str,
+        _cap_files: &[(String, String)],
     ) -> Result<Self> {
         // Никогда не бутит VM на не-Linux, но резолвим план порта тем же
         // helper'ом, что и Linux-путь — сигнатуры/логика порта остаются

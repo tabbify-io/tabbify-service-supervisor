@@ -2015,7 +2015,7 @@ pub async fn run_firecracker_build(
             // invalidates a stale warm snapshot.
             return launch_firecracker(
                 &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                &env_hash, &image_exposed_ports, digest,
+                &env_hash, &image_exposed_ports, digest, &cap_files,
             )
             .await;
         }
@@ -2056,7 +2056,7 @@ pub async fn run_firecracker_build(
                 }
                 return launch_firecracker(
                     &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                    &env_hash, &image_exposed_ports, digest,
+                    &env_hash, &image_exposed_ports, digest, &cap_files,
                 )
                 .await;
             }
@@ -2139,7 +2139,7 @@ pub async fn run_firecracker_build(
 
     launch_firecracker(
         &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace, &env_hash,
-        &image_exposed_ports, &resolved_digest,
+        &image_exposed_ports, &resolved_digest, &cap_files,
     )
     .await
 }
@@ -2168,6 +2168,7 @@ async fn launch_firecracker(
     env_hash: &str,
     image_exposed_ports: &[u16],
     snapshot_ref: &str,
+    cap_files: &[(String, String)],
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         rootfs,
@@ -2182,6 +2183,10 @@ async fn launch_firecracker(
         env_hash,
         image_exposed_ports,
         snapshot_ref,
+        // The §12-S1 cap-file set: the SAME (name → value) pairs the rootfs
+        // bake writes into /init, threaded to the runtime so the snapshot
+        // scrub/restore bracket can re-plumb the broker (values never logged).
+        cap_files,
     )
     .await?;
     Ok(std::sync::Arc::new(vm))

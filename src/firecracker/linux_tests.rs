@@ -282,18 +282,27 @@ async fn snapshot_noop_without_cache_dir() {
     );
 }
 
-/// A throwaway HTTP/1.1 server that answers the FIRST connection with `status`,
-/// then returns its bound base URL (`http://127.0.0.1:<port>`). Used to drive the
-/// GAP#4 `pre_snapshot_scrub` fail-closed semantics without a real microVM.
-async fn stub_scrub_server(status: u16) -> String {
+/// A throwaway HTTP/1.1 server that answers the FIRST connection with `status`
+/// (+ `body`), recording the raw request into `seen`, then returns its bound
+/// base URL (`http://127.0.0.1:<port>`). Used to drive the GAP#4
+/// `pre_snapshot_scrub` semantics without a real microVM.
+async fn stub_scrub_server_with(
+    status: u16,
+    body: &'static str,
+) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+    let seen2 = seen.clone();
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            let body = "ok";
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            seen2
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
             let resp = format!(
                 "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
@@ -302,30 +311,63 @@ async fn stub_scrub_server(status: u16) -> String {
             let _ = sock.flush().await;
         }
     });
-    base
+    (base, seen)
+}
+
+/// Back-compat helper: canned status with an old-broker "ok" body.
+async fn stub_scrub_server(status: u16) -> String {
+    stub_scrub_server_with(status, "ok").await.0
+}
+
+/// The cap-file set a workspace record carries (authkeys cap included).
+fn test_cap_files() -> Vec<(String, String)> {
+    vec![
+        ("authkeys.cap".to_owned(), "AK-CAP".to_owned()),
+        ("app.url".to_owned(), "http://h:8788/git/CAP".to_owned()),
+    ]
 }
 
 /// GAP#4: a NON-workspace runtime never scrubs — `pre_snapshot_scrub` is an
-/// immediate `Ok(())` even with NO server reachable (no broker, no creds).
+/// immediate `Ok(None)` even with NO server reachable (no broker, no creds).
 #[tokio::test]
 async fn pre_snapshot_scrub_skips_for_non_workspace() {
     // Point at a dead port; a non-workspace must NOT dial it.
-    let rt = FirecrackerRuntime::with_scrub_target_for_test("http://127.0.0.1:1", false);
+    let rt = FirecrackerRuntime::with_scrub_target_for_test("http://127.0.0.1:1", false, &[]);
     assert!(
-        rt.pre_snapshot_scrub().await.is_ok(),
-        "non-workspace scrub must be a no-op Ok(()) (no broker to scrub)"
+        matches!(rt.pre_snapshot_scrub().await, Ok(None)),
+        "non-workspace scrub must be a no-op Ok(None) (no broker to scrub)"
     );
 }
 
-/// GAP#4: a WORKSPACE whose broker scrub returns 200 → `Ok(())` (proceed to snapshot).
+/// GAP#4: a WORKSPACE whose broker scrub returns 200 with a nonce body →
+/// `Ok(Some(nonce))` (proceed to snapshot + the re-plumb bracket), and the
+/// request carried the authkeys-cap bearer.
 #[tokio::test]
-async fn pre_snapshot_scrub_ok_for_workspace_on_200() {
-    let base = stub_scrub_server(200).await;
-    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true);
+async fn pre_snapshot_scrub_sends_bearer_and_parses_nonce_on_200() {
+    let (base, seen) =
+        stub_scrub_server_with(200, r#"{"restore_nonce":"NONCE-FROM-BROKER"}"#).await;
+    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true, &test_cap_files());
+    let nonce = rt
+        .pre_snapshot_scrub()
+        .await
+        .expect("a 200 scrub must let the snapshot proceed");
+    assert_eq!(nonce.as_deref(), Some("NONCE-FROM-BROKER"));
+    let reqs = seen.lock().await;
+    let raw = reqs.first().expect("one scrub request");
     assert!(
-        rt.pre_snapshot_scrub().await.is_ok(),
-        "a 200 scrub must let the snapshot proceed"
+        raw.to_ascii_lowercase().contains("authorization: bearer ak-cap"),
+        "the scrub must be authorized with the authkeys cap: {raw}"
     );
+}
+
+/// An OLD broker's plain "ok" body parses to `Ok(None)`: the caller must treat
+/// the guest as non-restorable (and the probe would have refused earlier).
+#[tokio::test]
+async fn pre_snapshot_scrub_old_broker_body_yields_no_nonce() {
+    let base = stub_scrub_server(200).await;
+    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true, &test_cap_files());
+    let nonce = rt.pre_snapshot_scrub().await.expect("200 is a success");
+    assert_eq!(nonce, None, "an old broker mints no nonce");
 }
 
 /// GAP#4 FAIL-CLOSED: a WORKSPACE whose broker scrub returns 500 → `Err` so the
@@ -333,12 +375,28 @@ async fn pre_snapshot_scrub_ok_for_workspace_on_200() {
 #[tokio::test]
 async fn pre_snapshot_scrub_aborts_for_workspace_on_500() {
     let base = stub_scrub_server(500).await;
-    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true);
+    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true, &test_cap_files());
     let err = rt
         .pre_snapshot_scrub()
         .await
         .expect_err("a non-2xx scrub must abort the snapshot");
     assert!(err.to_string().contains("500"), "error names the status: {err}");
+}
+
+/// A 401 (the new bearer gate rejected us) also aborts, and the error says the
+/// broker dropped NOTHING (the live VM keeps its creds).
+#[tokio::test]
+async fn pre_snapshot_scrub_aborts_on_401_and_says_creds_kept() {
+    let base = stub_scrub_server(401).await;
+    let rt = FirecrackerRuntime::with_scrub_target_for_test(&base, true, &test_cap_files());
+    let err = rt
+        .pre_snapshot_scrub()
+        .await
+        .expect_err("401 must abort the snapshot");
+    assert!(
+        err.to_string().contains("dropped NOTHING"),
+        "the 401 error must state the creds were kept: {err}"
+    );
 }
 
 /// GAP#4 FAIL-CLOSED: a WORKSPACE whose broker is UNREACHABLE → `Err` (abort).
@@ -347,7 +405,8 @@ async fn pre_snapshot_scrub_aborts_for_workspace_on_500() {
 #[tokio::test]
 async fn pre_snapshot_scrub_aborts_for_workspace_when_unreachable() {
     // Port 1 on loopback refuses immediately.
-    let rt = FirecrackerRuntime::with_scrub_target_for_test("http://127.0.0.1:1", true);
+    let rt =
+        FirecrackerRuntime::with_scrub_target_for_test("http://127.0.0.1:1", true, &test_cap_files());
     assert!(
         rt.pre_snapshot_scrub().await.is_err(),
         "an unreachable workspace broker must abort the snapshot (fail-closed)"

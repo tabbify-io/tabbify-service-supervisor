@@ -221,6 +221,16 @@ pub struct FirecrackerRuntime {
     /// drop those creds via the in-guest broker before pausing — and ABORT the
     /// snapshot if the scrub fails. A non-workspace FC has no broker / no creds.
     is_workspace: bool,
+    /// The §12-S1 cap-file set (name → value) this VM was provisioned with — the
+    /// SAME pairs the rootfs bake writes into `/init` on a cold boot. Held so the
+    /// scrub/restore bracket can (a) authorize the pre-snapshot scrub with the
+    /// `authkeys.cap` bearer and (b) RE-PLUMB the broker after the post-snapshot
+    /// resume and after a warm restore (see `cred_restore` — the invariant is
+    /// that a guest that comes up with declared creds ends with the broker
+    /// HOLDING them). Empty for non-workspace VMs (never dialed). The runner
+    /// process already holds these values via `RUNNER_EXTRA_ENV`; storing them
+    /// here adds no new exposure. Values are never logged.
+    cap_files: Vec<(String, String)>,
     /// Test-only injectable reachability probe. Production leaves this `None`
     /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
     /// closure via [`Self::with_probe_for_test`] so no real microVM is needed.
@@ -274,6 +284,7 @@ impl FirecrackerRuntime {
             None,
             plan,
             data_disk,
+            &[],
         )
         .await
     }
@@ -316,6 +327,7 @@ impl FirecrackerRuntime {
         env_hash: Option<&str>,
         port_plan: PortPlan,
         data_disk: Option<&Path>,
+        cap_files: &[(String, String)],
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -404,6 +416,7 @@ impl FirecrackerRuntime {
             image_ref: image_ref.map(str::to_owned),
             env_hash: env_hash.map(str::to_owned),
             is_workspace,
+            cap_files: cap_files.to_vec(),
             #[cfg(test)]
             probe: None,
             #[cfg(test)]
@@ -469,7 +482,13 @@ impl FirecrackerRuntime {
         // (right after the app port answers) would freeze a pre-/mid-clone
         // rootfs, and a later warm-restore would resurrect an EMPTY /workspace.
         // Suppressed ⇒ never snapshot ⇒ every (re)launch cold-boots + re-clones.
-        if let Some(dir) = cache_dir {
+        // GAP#4 defence in depth: a WORKSPACE must NEVER be snapshotted here —
+        // the cold boot performs no scrub, so a snapshot at this point would
+        // freeze the /init-baked creds into `snap.mem`. The `.no-snapshot`
+        // marker normally guarantees this (workspaces suppress at spawn), but
+        // the marker write is best-effort; this hard guard makes the security
+        // property independent of a marker-write failure.
+        if let Some(dir) = cache_dir.filter(|_| !is_workspace) {
             if super::snapshot_decision::should_snapshot_on_cold_boot(
                 snapshot::files_present(dir),
                 snapshot::is_suppressed(dir),
@@ -550,6 +569,7 @@ impl FirecrackerRuntime {
         env_hash: &str,
         image_exposed_ports: &[u16],
         snapshot_ref: &str,
+        cap_files: &[(String, String)],
     ) -> Result<Self> {
         // Per-app paths (pidfile / snapshot cache / console) are keyed on the
         // UUID, NOT the version. The firecracker HOST identity (tap / api-sock /
@@ -616,6 +636,7 @@ impl FirecrackerRuntime {
                 // snapshot on the SWAP cold boot (Some ⇒ both). `None` for a
                 // non-stateful app (unchanged).
                 data_disk,
+                cap_files,
             )
             .await?
         } else {
@@ -635,10 +656,53 @@ impl FirecrackerRuntime {
             // `/init`-baked cap set on the SAME image (#108) would otherwise
             // warm-restore the STALE guest (the OLD broker/binaries, so the new
             // image's fix never lands; and the broker's boot-clone would never run
-            // for the new repo). `restore_matches` is safe-by-default (any mismatch /
-            // missing companion / read error → cold boot, which re-runs `/init` +
-            // re-stamps fresh companions from `snapshot_ref` + `env_hash`).
-            if snapshot::restore_matches(&cache_dir, snapshot_ref, env_hash) {
+            // for the new repo). Safe-by-default: any mismatch / missing companion /
+            // read error → cold boot, which re-runs `/init` + re-stamps fresh
+            // companions from `snapshot_ref` + `env_hash`.
+            //
+            // CRED-RESTORE GATE (the snapshot/scrub contradiction): a workspace's
+            // warm snapshot was deliberately SCRUBBED of every credential before it
+            // was frozen, and a warm restore does NOT re-run `/init` (the only
+            // cold-boot cred channel). So for a credential-bearing workspace a warm
+            // restore is sound ONLY when the one-time restore nonce is present to
+            // re-plumb the broker afterwards. INVARIANT: a workspace that comes up
+            // (warm OR cold) with declared forge creds MUST have the broker actually
+            // holding them.
+            let needs_restore = super::cred_restore::needs_cred_restore(
+                is_workspace,
+                !cap_files.is_empty(),
+            );
+            let decision = snapshot::restore_decision(&cache_dir, snapshot_ref, env_hash);
+            let restore_token = super::cred_restore::read_restore_token(&cache_dir);
+            // Self-diagnosing warm-vs-cold verdict: every gate named, so the log
+            // alone answers "why did this respawn go warm/cold?".
+            tracing::info!(
+                uuid,
+                files_present = decision.files_present,
+                ref_matched = decision.ref_matched,
+                env_matched = decision.env_matched,
+                needs_cred_restore = needs_restore,
+                restore_token_present = restore_token.is_some(),
+                is_workspace,
+                cap_files = cap_files.len(),
+                "launch: warm-vs-cold decision inputs"
+            );
+            let warm_viable =
+                decision.warm_ok() && (!needs_restore || restore_token.is_some());
+            if decision.warm_ok() && !warm_viable {
+                // The image+env gates PASS but the snapshot predates the restore
+                // protocol (no `.snapshot_restore_token`): restoring it would
+                // resurrect a scrubbed, credless broker that nothing could
+                // re-plumb — the exact forever-credless trap. Clear it and cold
+                // boot so `/init` re-bakes the creds; the next `Cmd::Snapshot`
+                // then writes a restorable (nonce-carrying) snapshot.
+                tracing::warn!(
+                    uuid,
+                    "snapshot matches image+env but carries NO restore token for a credential-bearing workspace (pre-protocol snapshot) — clearing it + cold booting so /init re-bakes the creds"
+                );
+                snapshot::clear(&cache_dir);
+            }
+            if warm_viable {
                 match Self::launch_from_snapshot(
                     &cache_dir,
                     cfg,
@@ -648,15 +712,32 @@ impl FirecrackerRuntime {
                     data_dir,
                     uuid,
                     is_workspace,
+                    cap_files,
+                    restore_token.as_deref(),
+                    needs_restore,
                 )
                 .await
                 {
                     Ok(warm_vm) => {
-                        tracing::info!(uuid, "warm start from snapshot");
+                        tracing::info!(
+                            uuid,
+                            replumbed = needs_restore,
+                            "warm start from snapshot"
+                        );
                         warm_vm
                     }
                     Err(e) => {
-                        tracing::warn!(uuid, error = %e, "snapshot load failed; cold boot");
+                        // The failed restore may have been the re-plumb (nonce
+                        // mismatch / credless broker) — keeping the snapshot would
+                        // just re-run the same failure on every respawn. Clear it:
+                        // the cold boot below re-bakes creds via /init and the next
+                        // Cmd::Snapshot writes a fresh restorable snapshot.
+                        tracing::warn!(
+                            uuid,
+                            error = %e,
+                            "warm restore failed; clearing snapshot + cold booting (cold path re-plumbs creds via /init)"
+                        );
+                        snapshot::clear(&cache_dir);
                         Self::cold_boot(
                             rootfs,
                             rt,
@@ -674,6 +755,7 @@ impl FirecrackerRuntime {
                             // never HAS a snapshot to restore — it is suppressed —
                             // but pass it regardless so the disk always attaches).
                             data_disk,
+                            cap_files,
                         )
                         .await?
                     }
@@ -688,6 +770,9 @@ impl FirecrackerRuntime {
                     tracing::info!(
                         uuid,
                         snapshot_ref,
+                        files_present = decision.files_present,
+                        ref_matched = decision.ref_matched,
+                        env_matched = decision.env_matched,
                         "snapshot present but resolved image digest or env/cap set changed; clearing + cold boot"
                     );
                     snapshot::clear(&cache_dir);
@@ -708,6 +793,7 @@ impl FirecrackerRuntime {
                     // path (first boot / respawn with no usable snapshot). `None`
                     // for a non-stateful app (unchanged).
                     data_disk,
+                    cap_files,
                 )
                 .await?
             }
@@ -735,9 +821,19 @@ impl FirecrackerRuntime {
     /// (the old `VM_SEQ` counter could hand the restore a DIFFERENT /30 than the
     /// snapshot was taken with).
     ///
+    /// `cap_files` + `restore_token` + `needs_restore` drive the POST-RESTORE
+    /// credential re-plumb (see `cred_restore`): the restored guest is the
+    /// deliberately-SCRUBBED pre-snapshot state, so for a credential-bearing
+    /// workspace the broker must be re-plumbed over `:8732` (bearer = the
+    /// one-time nonce the scrub minted, resurrected inside the frozen RAM)
+    /// before this launch may report success. A re-plumb failure FAILS the
+    /// launch so the caller falls back to a cold boot (which re-bakes creds via
+    /// `/init`) — the guest never serves credless.
+    ///
     /// # Errors
     /// Tap setup failure, firecracker spawn failure, snapshot load API failure,
-    /// or the guest app failing to answer within [`READY_TIMEOUT`].
+    /// the guest app failing to answer within [`READY_TIMEOUT`], or the
+    /// credential re-plumb failing for a credential-bearing workspace.
     #[allow(clippy::too_many_arguments)]
     async fn launch_from_snapshot(
         cache_dir: &Path,
@@ -748,6 +844,9 @@ impl FirecrackerRuntime {
         data_dir: &Path,
         uuid: &str,
         is_workspace: bool,
+        cap_files: &[(String, String)],
+        restore_token: Option<&str>,
+        needs_restore: bool,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
@@ -838,6 +937,7 @@ impl FirecrackerRuntime {
             // snapshot() path skips the env write (restore then falls back to cold).
             env_hash: std::fs::read_to_string(snapshot::env_path(cache_dir)).ok(),
             is_workspace,
+            cap_files: cap_files.to_vec(),
             #[cfg(test)]
             probe: None,
             #[cfg(test)]
@@ -859,7 +959,60 @@ impl FirecrackerRuntime {
         // should return within milliseconds (app was already initialised when
         // the snapshot was taken).
         me.wait_until_ready().await?;
+
+        // POST-RESTORE CREDENTIAL RE-PLUMB (the other half of the GAP#4 scrub).
+        // The restored guest is the post-scrub state: broker RAM zeroed, tmpfs
+        // cred files deleted, and `/init` (the cold-boot cred channel) never
+        // re-ran. Push the SAME cap-file set a cold boot would bake, authorized
+        // by the one-time nonce the scrub minted (frozen into this snapshot's
+        // RAM, persisted host-side next to it). Bounded wait inside
+        // `replumb_creds`; failure FAILS this launch → the caller cold-boots.
+        // INVARIANT: a guest that comes up with declared creds ends with the
+        // broker HOLDING them.
+        if needs_restore {
+            let token = restore_token.ok_or_else(|| {
+                anyhow!(
+                    "restored a credential-bearing workspace without a restore token (caller should have cold-booted) — cannot re-plumb"
+                )
+            })?;
+            let base = me.broker_ctrl_base();
+            tracing::info!(
+                uuid,
+                files = me.cap_files.len(),
+                names = ?super::cred_restore::cap_file_names(&me.cap_files),
+                "warm restore: re-plumbing broker creds over :8732 (values never logged)"
+            );
+            super::cred_restore::replumb_creds(
+                &me.client,
+                &base,
+                token,
+                &me.cap_files,
+                super::cred_restore::REPLUMB_BUDGET,
+                super::cred_restore::REPLUMB_POLL,
+            )
+            .await
+            .context("post-restore credential re-plumb")?;
+            tracing::info!(
+                uuid,
+                "warm restore: broker re-plumbed — invariant holds (broker holds the declared creds)"
+            );
+        }
         Ok(me)
+    }
+
+    /// The in-guest broker `:8732` control base URL this VM's scrub / re-plumb
+    /// calls target. Honors the test override so the protocol paths are
+    /// exercisable against a local stub without a real microVM.
+    fn broker_ctrl_base(&self) -> String {
+        #[cfg(test)]
+        if let Some(base) = self.scrub_base_override.clone() {
+            return base;
+        }
+        format!(
+            "http://{}:{}",
+            self.guest_ip,
+            crate::tcp_forward::GUEST_BROKER_CTRL_PORT
+        )
     }
 
     /// Push the full firecracker REST configuration, then start the VM.
@@ -1053,60 +1206,64 @@ impl FirecrackerRuntime {
     /// in-RAM creds + removes the tmpfs cred files. Only workspaces hold creds and
     /// take a Full snapshot, so this is gated on `is_workspace`
     /// ([`super::snapshot_decision::must_scrub_before_snapshot`]); a non-workspace
-    /// FC has no broker on `:8732` and skips.
+    /// FC has no broker on `:8732` and skips (returns `Ok(None)`).
+    ///
+    /// The scrub is AUTHORIZED with the `authkeys.cap` bearer from this VM's
+    /// cap-file set (the broker gates the scrub on it so the in-guest agent can
+    /// neither self-DoS the broker nor mint a restore nonce). On success the
+    /// broker's response body carries the ONE-TIME RESTORE NONCE (`Some`) that
+    /// authorizes the post-snapshot / post-restore credential re-plumb; an old
+    /// broker's plain body parses to `None` (caller must treat the guest as
+    /// non-restorable).
     ///
     /// FAIL-CLOSED: for a workspace, ANY scrub failure (broker unreachable, a
     /// non-2xx, or a transport error) returns `Err` so the caller ABORTS the
     /// snapshot — we NEVER freeze a held secret into a warm restore. The broker
     /// must be live (the scrub is a real socket round-trip inside the guest), so a
     /// connect refusal on a WORKSPACE means the broker died/never came up → abort
-    /// rather than silently snapshot creds.
+    /// rather than silently snapshot creds. On a rejected scrub (401) the broker
+    /// has dropped NOTHING, so the live VM keeps serving with its creds.
     ///
     /// # Errors
     /// The workspace broker scrub did not return 2xx (so the snapshot must not run).
-    async fn pre_snapshot_scrub(&self) -> Result<()> {
+    async fn pre_snapshot_scrub(&self) -> Result<Option<String>> {
         if !super::snapshot_decision::must_scrub_before_snapshot(self.is_workspace) {
-            return Ok(());
+            return Ok(None);
         }
-        let base = {
-            #[cfg(test)]
-            {
-                self.scrub_base_override.clone().unwrap_or_else(|| {
-                    format!(
-                        "http://{}:{}",
-                        self.guest_ip,
-                        crate::tcp_forward::GUEST_BROKER_CTRL_PORT
-                    )
-                })
-            }
-            #[cfg(not(test))]
-            {
-                format!(
-                    "http://{}:{}",
-                    self.guest_ip,
-                    crate::tcp_forward::GUEST_BROKER_CTRL_PORT
-                )
-            }
-        };
+        let base = self.broker_ctrl_base();
         let url = format!("{base}{}", super::snapshot_decision::PRE_SNAPSHOT_SCRUB_PATH);
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(API_TIMEOUT)
-            .send()
-            .await
-            .with_context(|| {
-                format!("pre-snapshot scrub POST to {url} failed (workspace broker unreachable)")
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("pre-snapshot scrub returned HTTP {status}; aborting snapshot (would freeze a held secret)");
-        }
+        let bearer = super::cred_restore::authkeys_cap_value(&self.cap_files);
         tracing::info!(
             guest_ip = %self.guest_ip,
+            authkeys_cap_present = bearer.is_some(),
+            "pre-snapshot scrub: POSTing broker scrub (bearer = authkeys cap; value never logged)"
+        );
+        let mut req = self.client.post(&url).timeout(API_TIMEOUT);
+        if let Some(cap) = bearer {
+            req = req.bearer_auth(cap);
+        }
+        let resp = req.send().await.with_context(|| {
+            format!("pre-snapshot scrub POST to {url} failed (workspace broker unreachable)")
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!(
+                "pre-snapshot scrub returned HTTP {status}; aborting snapshot (would freeze a held secret){}",
+                if status.as_u16() == 401 {
+                    " — the broker rejected the authkeys-cap bearer (cap missing host-side, or the guest's cap file diverged); the broker dropped NOTHING, the live VM keeps its creds"
+                } else {
+                    ""
+                }
+            );
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let nonce = super::cred_restore::parse_scrub_nonce(&body);
+        tracing::info!(
+            guest_ip = %self.guest_ip,
+            restore_nonce_minted = nonce.is_some(),
             "pre-snapshot scrub OK: broker dropped in-RAM creds + cred files before snapshot"
         );
-        Ok(())
+        Ok(nonce)
     }
 
     /// Poll the guest app's HTTP server until it answers (any status) or
@@ -1216,19 +1373,26 @@ impl FirecrackerRuntime {
             image_ref: None,
             env_hash: None,
             is_workspace: false,
+            cap_files: Vec::new(),
             probe: Some(probe),
             scrub_base_override: None,
         }
     }
 
-    /// Test-only: build a runtime whose `pre_snapshot_scrub` targets `scrub_base`
-    /// (e.g. a local stub server) and whose `is_workspace` flag is set, so the
-    /// GAP#4 fail-closed scrub path is exercised without a real microVM. There is
-    /// no live child/tap (mirrors [`Self::with_probe_for_test`]).
+    /// Test-only: build a runtime whose `pre_snapshot_scrub` / re-plumb calls
+    /// target `scrub_base` (e.g. a local stub server), with the given
+    /// `is_workspace` flag + cap-file set, so the GAP#4 fail-closed scrub path
+    /// and the scrub/restore bracket are exercised without a real microVM.
+    /// There is no live child/tap (mirrors [`Self::with_probe_for_test`]).
     #[cfg(test)]
-    pub fn with_scrub_target_for_test(scrub_base: &str, is_workspace: bool) -> Self {
+    pub fn with_scrub_target_for_test(
+        scrub_base: &str,
+        is_workspace: bool,
+        cap_files: &[(String, String)],
+    ) -> Self {
         let mut me = Self::with_probe_for_test("http://169.254.0.2:8080", std::sync::Arc::new(|_| true));
         me.is_workspace = is_workspace;
+        me.cap_files = cap_files.to_vec();
         me.scrub_base_override = Some(scrub_base.to_owned());
         me
     }
@@ -1379,6 +1543,32 @@ impl AppRuntime for FirecrackerRuntime {
                 // No cache dir (bare launch / build VM): nothing to refresh.
                 return Ok(());
             };
+            // THE SCRUB/RESTORE BRACKET (GAP#4 + its post-resume half).
+            // INVARIANT: a workspace that comes up (warm OR cold) with declared
+            // forge creds MUST have the broker actually holding them — including
+            // THIS live VM after the snapshot resume.
+            let needs_restore = super::cred_restore::needs_cred_restore(
+                self.is_workspace,
+                !self.cap_files.is_empty(),
+            );
+            let base = self.broker_ctrl_base();
+            if needs_restore {
+                // FAIL CLOSED BEFORE STRIPPING ANYTHING: an old broker (image
+                // predating the restore protocol) cannot be re-plumbed, so
+                // scrubbing it would leave this LIVE VM credless and every
+                // warm restore of the snapshot equally credless. Refuse the
+                // snapshot instead — the workspace keeps serving with its
+                // creds; it simply cold-respawns until the base image updates.
+                super::cred_restore::probe_restore_capability(&self.client, &base)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "Cmd::Snapshot: skipping snapshot — broker cannot be re-plumbed; live creds left untouched"
+                        );
+                        e
+                    })?;
+            }
             // GAP#4 (spec §4): a workspace's warm snapshot is a FULL snapshot — it
             // freezes ALL guest RAM + fs. Before we PAUSE, the in-guest broker MUST
             // drop its in-RAM creds (the per-repo git cap-URLs + the forge-admin
@@ -1387,7 +1577,34 @@ impl AppRuntime for FirecrackerRuntime {
             // secret-in-snapshot leak). A scrub FAILURE ABORTS the snapshot — we
             // never freeze a held secret. This runs while the VM is still RUNNING
             // (the broker socket must be live to scrub) so it precedes the pause.
-            self.pre_snapshot_scrub().await?;
+            // The authorized scrub returns the ONE-TIME RESTORE NONCE the broker
+            // now holds in RAM — the snapshot freezes the NONCE instead of the
+            // creds, and it is the key that authorizes the re-plumb below (and
+            // the re-plumb after any later warm restore).
+            let nonce = self.pre_snapshot_scrub().await?;
+            if needs_restore {
+                let Some(n) = nonce.as_deref() else {
+                    // The probe said the endpoint exists, yet the scrub minted no
+                    // nonce — an inconsistent broker. The creds ARE dropped now and
+                    // nothing can re-plumb them: surface it loudly; the node-side
+                    // heal (respawn) cold-boots and /init re-bakes the creds.
+                    snapshot::clear(&cache_dir);
+                    anyhow::bail!(
+                        "pre-snapshot scrub returned no restore nonce despite a restore-capable broker — the guest is now credless; snapshot aborted + cleared, a cold respawn will re-bake the creds"
+                    );
+                };
+                // Persist the nonce NEXT TO the snapshot files BEFORE the create so
+                // the (host token ↔ frozen-RAM nonce) pair stays consistent even if
+                // this runner dies mid-create. A write failure only degrades to
+                // "warm restore refused later" (the gate requires the token), so
+                // WARN and continue — the live re-plumb below still runs.
+                if let Err(e) = super::cred_restore::write_restore_token(&cache_dir, n) {
+                    tracing::warn!(
+                        error = %e,
+                        "Cmd::Snapshot: could not persist the restore token — later warm restores will cold-boot instead"
+                    );
+                }
+            }
             // §12 snapshot-timing: this is the explicit POST-INDEX refresh. We do
             // NOT check `snapshot::is_suppressed(&cache_dir)` — a workspace cache
             // dir CARRIES the `.no-snapshot` marker (Task 9) so cold_boot never
@@ -1401,6 +1618,39 @@ impl AppRuntime for FirecrackerRuntime {
             // workspace never strands paused. We re-check `files_present` to
             // know whether the create actually landed before stamping the ref.
             self.try_create_snapshot(&cache_dir).await;
+            // POST-RESUME RE-PLUMB (the bracket's closing half): the scrub left
+            // THIS live, still-serving VM credless — the pre-fix code stopped
+            // here, which is exactly the "workspace loses its forge credential
+            // after every snapshot refresh" bug. Push the cap-file set back via
+            // the nonce, REGARDLESS of whether the create landed (the creds were
+            // dropped either way). Runs after `ensure_resumed` (inside
+            // try_create_snapshot) so the guest is running again.
+            if needs_restore {
+                if let Some(n) = nonce.as_deref() {
+                    if let Err(e) = super::cred_restore::replumb_creds(
+                        &self.client,
+                        &base,
+                        n,
+                        &self.cap_files,
+                        super::cred_restore::REPLUMB_BUDGET,
+                        super::cred_restore::REPLUMB_POLL,
+                    )
+                    .await
+                    {
+                        // The live VM is credless and this snapshot cannot help
+                        // (same broker). Drop the snapshot so the node-side heal
+                        // (respawn) COLD-boots and /init re-bakes the creds.
+                        snapshot::clear(&cache_dir);
+                        return Err(e.context(
+                            "post-snapshot live re-plumb failed — the live VM is credless; snapshot cleared so the next respawn cold-boots and re-bakes creds",
+                        ));
+                    }
+                    tracing::info!(
+                        cache_dir = %cache_dir.display(),
+                        "Cmd::Snapshot: live VM re-plumbed after resume — invariant holds (broker holds the declared creds)"
+                    );
+                }
+            }
             if snapshot::files_present(&cache_dir) {
                 if let Some(reff) = self.image_ref.as_deref() {
                     snapshot::write_ref(&cache_dir, reff);

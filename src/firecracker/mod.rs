@@ -57,6 +57,10 @@ pub(crate) mod snapshot;
 // Pure, host-agnostic snapshot DECISION logic — NO cfg gate so it is unit-
 // testable on macOS (the rest of the snapshot path is behind the Linux gate).
 pub mod snapshot_decision;
+// Post-restore credential RE-PLUMB (the scrub/restore bracket) — NO cfg gate so
+// the protocol logic + the bounded-retry client are unit-testable on macOS (the
+// launch/snapshot wiring that consumes them is behind the Linux gate).
+pub mod cred_restore;
 // Pure, host-agnostic decisions for a STATEFUL app's persistent data-disk PATH +
 // guest MOUNT — NO cfg gate so the logic is unit-testable on macOS (the disk
 // attach + `/init` mount bake that consume it are behind the Linux / build

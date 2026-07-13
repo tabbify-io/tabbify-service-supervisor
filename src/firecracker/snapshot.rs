@@ -103,19 +103,59 @@ fn env_matches(cache_dir: &Path, env_hash: &str) -> bool {
     }
 }
 
-/// Is the snapshot in `cache_dir` a valid warm-restore candidate for BOTH
-/// `image_ref` AND `env_hash`?
+/// Test-only compatibility wrapper over [`restore_decision`]`.warm_ok()` — the
+/// production launch path consumes the STRUCT form so it can log every gate.
+#[cfg(test)]
+pub fn restore_matches(cache_dir: &Path, image_ref: &str, env_hash: &str) -> bool {
+    restore_decision(cache_dir, image_ref, env_hash).warm_ok()
+}
+
+/// The individual gates of the warm-vs-cold decision, exposed as a struct so
+/// the launch path can LOG exactly WHY it went warm or cold (fingerprint
+/// match/mismatch, ref match/mismatch) instead of a bare boolean — the operator
+/// must be able to read the log and see which branch was taken and why.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreDecision {
+    /// Both `snap.vmstate` + `snap.mem` exist on disk.
+    pub files_present: bool,
+    /// The stamped `.snapshot_ref` matches the requested resolved image digest.
+    pub ref_matched: bool,
+    /// The stamped `.snapshot_env` matches the requested env/cap fingerprint.
+    pub env_matched: bool,
+}
+
+impl RestoreDecision {
+    /// All gates open ⇒ a warm restore is sound (image + env unchanged).
+    #[must_use]
+    pub fn warm_ok(&self) -> bool {
+        self.files_present && self.ref_matched && self.env_matched
+    }
+}
+
+/// Evaluate every warm-restore gate for `cache_dir` against the requested
+/// `image_ref` + `env_hash` (the struct form exists for self-diagnosing launch
+/// logs; `warm_ok()` is the combined verdict).
 ///
 /// A warm restore resurrects the FULL guest (rootfs + frozen RAM), so it is
 /// sound ONLY when neither the image NOR the `/init`-baked env/cap set changed.
 /// [`ref_matches`] guards the image; [`env_matches`] guards the env (the #106
 /// `rootfs_env_fingerprint`). Any mismatch, a missing companion (a snapshot from
-/// before this check existed), or a read error returns `false` so the caller
-/// COLD-boots — which re-runs `/init` (a workspace's broker then re-clones the
-/// new cap set, #108) and re-stamps fresh `.snapshot_ref` + `.snapshot_env`
-/// companions. Safe-by-default: on ANY doubt we cold boot (slower, never stale).
-pub fn restore_matches(cache_dir: &Path, image_ref: &str, env_hash: &str) -> bool {
-    ref_matches(cache_dir, image_ref) && env_matches(cache_dir, env_hash)
+/// before this check existed), or a read error yields `false` gates so the
+/// caller COLD-boots — which re-runs `/init` (a workspace's broker then
+/// re-clones the new cap set, #108) and re-stamps fresh `.snapshot_ref` +
+/// `.snapshot_env` companions. Safe-by-default: on ANY doubt we cold boot
+/// (slower, never stale). NOTE the deliberately separate CRED-RESTORE gate in
+/// `launch_with_uuid`: for a credential-bearing workspace a warm restore ALSO
+/// requires the `.snapshot_restore_token` companion (see `cred_restore`) —
+/// these gates cannot see the pre-snapshot scrub because it mutates GUEST
+/// state, not the declared image/env.
+pub fn restore_decision(cache_dir: &Path, image_ref: &str, env_hash: &str) -> RestoreDecision {
+    let files_present = files_present(cache_dir);
+    RestoreDecision {
+        files_present,
+        ref_matched: ref_matches(cache_dir, image_ref),
+        env_matched: files_present && env_matches(cache_dir, env_hash),
+    }
 }
 
 /// Remove any snapshot files in `cache_dir` (best-effort). Called on a deploy:
@@ -133,6 +173,10 @@ pub fn clear(cache_dir: &Path) {
     // not outlive the snapshot files it described (else a later `restore_matches`
     // could read a fingerprint that no longer matches any on-disk snapshot).
     let _ = std::fs::remove_file(env_path(cache_dir));
+    // Drop the one-time restore nonce too: it authorizes a re-plumb ONLY against
+    // the exact snapshot whose frozen RAM holds the matching copy, so it must
+    // never outlive the snapshot files (a stale token would just 401 later).
+    let _ = std::fs::remove_file(super::cred_restore::restore_token_path(cache_dir));
 }
 
 /// Path to the companion `.app_port` file in `cache_dir`. It records the IMAGE's
@@ -407,6 +451,49 @@ mod tests {
             !env_path(dir.path()).exists(),
             "clear must drop .snapshot_env"
         );
+    }
+
+    /// `clear` drops the `.snapshot_restore_token` companion too: the one-time
+    /// restore nonce is meaningful only for the exact snapshot whose frozen RAM
+    /// holds the matching copy, so it must never outlive the snapshot files.
+    #[test]
+    fn clear_removes_restore_token_too() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_snapshot(dir.path(), "reg:5000/a/b@sha256:abc", "envhash-1");
+        super::super::cred_restore::write_restore_token(dir.path(), "NONCE").unwrap();
+        clear(dir.path());
+        assert!(
+            !super::super::cred_restore::restore_token_path(dir.path()).exists(),
+            "clear must drop .snapshot_restore_token"
+        );
+    }
+
+    /// `restore_decision` exposes the individual gates (files/ref/env) so the
+    /// launch path can LOG exactly why it went warm or cold; `warm_ok` must
+    /// agree with `restore_matches`.
+    #[test]
+    fn restore_decision_reports_each_gate_and_agrees_with_restore_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing on disk: every gate false.
+        let d = restore_decision(dir.path(), "sha256:A", "env-1");
+        assert!(!d.files_present && !d.ref_matched && !d.env_matched);
+        assert!(!d.warm_ok());
+
+        seed_snapshot(dir.path(), "sha256:A", "env-1");
+        let d = restore_decision(dir.path(), "sha256:A", "env-1");
+        assert!(d.files_present && d.ref_matched && d.env_matched);
+        assert!(d.warm_ok());
+        assert!(restore_matches(dir.path(), "sha256:A", "env-1"));
+
+        // Ref mismatch is visible as such.
+        let d = restore_decision(dir.path(), "sha256:B", "env-1");
+        assert!(d.files_present && !d.ref_matched && d.env_matched);
+        assert!(!d.warm_ok());
+
+        // Env mismatch is visible as such.
+        let d = restore_decision(dir.path(), "sha256:A", "env-2");
+        assert!(d.files_present && d.ref_matched && !d.env_matched);
+        assert!(!d.warm_ok());
     }
 
     /// The image's exposed port round-trips through the `.app_port` companion so a
