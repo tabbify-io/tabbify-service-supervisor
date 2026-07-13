@@ -358,24 +358,38 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
 /// BEYOND the image content itself, so the per-uuid rootfs cache key can tell
 /// apart two builds of the SAME image digest whose `/init` differs (#106).
 ///
+/// INVARIANT (stale-caps): a guest that boots with declared cap values MUST hold
+/// THOSE values — never a cached older generation. Any change to the effective
+/// env OR to any cap-file's NAME or VALUE must change this fingerprint, so the
+/// rootfs cache misses, `/init` is re-baked, the orchestrator force-colds, and a
+/// stale warm snapshot never restores over it.
+///
 /// `(uuid, digest)` alone is NOT enough for a WORKSPACE: its uuid is STABLE
 /// (derived from the account), yet its `/init` changes when the effective env
-/// changes (a forge-url/org rewrite) OR when a cap-file is added (a
-/// `workspace_add_repo` clone cap). Both must force a fresh conversion, or the
-/// cached rootfs keeps the OLD exported env + cap-writes — e.g. the added repo
-/// never clones.
+/// changes (a forge-url/org rewrite), when a cap-file is added (a
+/// `workspace_add_repo` clone cap), or when a cap-file's VALUE rotates (auth
+/// rotating a dead `forge-admin.token`). All three must force a fresh
+/// conversion, or the cached rootfs keeps the OLD exported env + cap-writes —
+/// e.g. the added repo never clones, or the guest broker 401s forever on the
+/// dead forge token while the host has long since healed.
 ///
 /// Hashed inputs (SORTED — `HashMap` iteration is random-seeded):
-///   - the effective `extra_env` map (each `k=v` baked as an `export` line), and
-///   - the cap-file NAMES (each written as a `/run/tabbify/caps/<name>` file).
+///   - the effective `extra_env` map (each `k=v` baked as an `export` line),
+///   - the cap-file NAMES (each written as a `/run/tabbify/caps/<name>` file),
+///   - the cap-file VALUES, as blake3 digests (the file CONTENT baked by
+///     `render_cap_files_init` — hashed so the fingerprint preimage never
+///     carries a raw secret byte-string).
 ///
-/// Cap-file VALUES are DELIBERATELY EXCLUDED: they are freshly-random tokens
-/// re-minted on every create (`generate_cap`), so hashing them would force a
-/// re-conversion on EVERY `workspace_ensure`. The NAME SET is the deterministic
-/// STRUCTURAL fingerprint — it changes exactly when the repo/forge layout does
-/// (add a repo → a new `<repo>.url` name; add a forge → `forge-admin.token`),
-/// which is precisely when the rootfs must be rebaked. Empty env + no caps
-/// (a normal deploy) yields a fixed fingerprint, so those paths stay stable.
+/// The VALUE section is appended ONLY for a non-empty cap set, keeping the
+/// no-cap fingerprint byte-identical to the pre-value-aware scheme — ordinary
+/// apps keep their cached rootfs + snapshot stamps across the upgrade (pinned by
+/// `no_env_no_cap_fingerprint_is_the_stable_upgrade_constant`).
+///
+/// COST CONTRACT: value-awareness only pays off because cap values are STABLE
+/// across ensures when nothing rotated — `create_workspace` reuses the prior
+/// repo/authkeys cap tokens instead of re-minting per ensure (see
+/// `crate::api::workspace_cap_reuse`). Re-minting per ensure would turn every
+/// ensure into a full ~2.3 GB rootfs rebuild.
 #[must_use]
 pub fn rootfs_env_fingerprint(
     extra_env: Option<&std::collections::HashMap<String, String>>,
@@ -394,13 +408,29 @@ pub fn rootfs_env_fingerprint(
         hasher.update(v.as_bytes());
         hasher.update(b"\0");
     }
-    // Cap-file NAMES, sorted (values excluded — random per mint; see above).
-    let mut names: Vec<&str> = cap_files.iter().map(|(n, _)| n.as_str()).collect();
-    names.sort_unstable();
+    // Cap-file NAMES, sorted.
+    let mut pairs: Vec<(&str, &str)> = cap_files
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    pairs.sort_unstable();
     hasher.update(b"caps\0");
-    for n in names {
+    for (n, _) in &pairs {
         hasher.update(n.as_bytes());
         hasher.update(b"\0");
+    }
+    // Cap-file VALUE digests (the stale-caps invariant). Appended ONLY for a
+    // non-empty set so the empty fingerprint stays the stable upgrade constant.
+    // No framing ambiguity: the section is present IFF the name list above is
+    // non-empty, so two streams that differ here differ deterministically.
+    if !pairs.is_empty() {
+        hasher.update(b"capvals\0");
+        for (n, v) in &pairs {
+            hasher.update(n.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(blake3::hash(v.as_bytes()).as_bytes());
+            hasher.update(b"\0");
+        }
     }
     // 16 hex chars (64 bits) — ample against collision for a per-uuid cache key,
     // and a compact single path segment.
@@ -1256,18 +1286,35 @@ pub async fn resolve_rootfs(
     extra_env: Option<&std::collections::HashMap<String, String>>,
     cap_files: &[(String, String)],
 ) -> Result<PathBuf> {
-    // Fingerprint the /init-baked env + cap-file names so a changed env on the
-    // SAME uuid+digest (a workspace add_repo / forge rewrite) misses the cache and
-    // re-bakes, instead of serving a stale rootfs (#106).
+    // Fingerprint the /init-baked env + cap-file names AND values so a changed
+    // env, cap set, or ROTATED cap value on the SAME uuid+digest (a workspace
+    // add_repo / forge rewrite / rotated forge-admin token) misses the cache and
+    // re-bakes, instead of serving a stale rootfs (#106 + the stale-caps
+    // invariant: a guest booted for declared cap values must hold THOSE values).
     let env_hash = rootfs_env_fingerprint(extra_env, cap_files);
     let cached = cached_rootfs_path(data_dir, uuid, digest, &env_hash);
     if rootfs_is_cached(data_dir, uuid, digest, &env_hash) {
         tracing::info!(
             uuid,
             digest,
-            "firecracker rootfs cache hit; skipping conversion"
+            %env_hash,
+            "firecracker rootfs cache hit (uuid+digest+env/cap fingerprint all matched); skipping conversion"
         );
         return Ok(cached);
+    }
+    // MISS: attribute WHY before paying the conversion — diff this build's
+    // fingerprint manifest against any cached sibling variant, so the log names
+    // the exact differing component ("cap values rotated for [forge-admin.token]")
+    // instead of a bare miss. Key names only; values never logged.
+    let wanted_manifest =
+        super::rootfs_variants::FingerprintManifest::compute(&env_hash, extra_env, cap_files);
+    if let Some(digest_dir) = cached.parent().and_then(Path::parent) {
+        super::rootfs_variants::log_cache_miss_attribution(
+            uuid,
+            digest,
+            digest_dir,
+            &wanted_manifest,
+        );
     }
 
     // Fail FAST on an architecture mismatch BEFORE the slow unpack + mkfs: a
@@ -1309,8 +1356,20 @@ pub async fn resolve_rootfs(
     let data_mount =
         crate::firecracker::stateful::stateful_data_mount(&fetched.manifest.runtime)?;
     let init = render_init(&entry, cap_files, data_mount)?; // shell-form → clear error (D3)
+    // Cap re-bake trace (names + destination only — a cap VALUE is a secret and
+    // is NEVER logged): exactly which cap-files this conversion writes into the
+    // guest's /run/tabbify/caps via /init.
+    if !cap_files.is_empty() {
+        tracing::info!(
+            uuid,
+            digest,
+            %env_hash,
+            cap_files = ?cap_files.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "re-baking /init cap-files into /run/tabbify/caps (names only; values never logged)"
+        );
+    }
 
-    build_rootfs_ext4_inner(
+    let built = build_rootfs_ext4_inner(
         layout,
         config,
         &out_dir,
@@ -1318,7 +1377,12 @@ pub async fn resolve_rootfs(
         Some(&init),
         runner,
     )
-    .await
+    .await?;
+    // Persist the fingerprint manifest next to the rootfs so the NEXT miss on
+    // this digest can attribute exactly which component diverged from this
+    // generation (per-key digests only — no raw values on disk).
+    wanted_manifest.save(&out_dir);
+    Ok(built)
 }
 
 /// Resolve `<layout>/index.json` → first image-manifest descriptor → manifest
@@ -2005,7 +2069,8 @@ pub async fn run_firecracker_build(
             tracing::info!(
                 uuid,
                 digest,
-                "firecracker rootfs cache hit (pre-pull); skipping pull + conversion"
+                %env_hash,
+                "firecracker rootfs cache hit (pre-pull; uuid+digest+env/cap fingerprint all matched); skipping pull + conversion"
             );
             // Config NOT read on this fast path → `image_exposed_ports` is still
             // EMPTY; `launch_with_uuid` recovers the winning port from the
@@ -2170,6 +2235,12 @@ async fn launch_firecracker(
     snapshot_ref: &str,
     cap_files: &[(String, String)],
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
+    // GC stale rootfs variants BEFORE the boot: a cap rotation re-baked this
+    // launch's rootfs at a NEW `<env_hash>` dir, stranding the previous ~2.3 GB
+    // generation — prune every sibling of the variant we are about to run so
+    // rotations never accumulate toward a disk-full (removal is safe even if the
+    // outgoing VM still holds the old file open — read-only + unlink-while-open).
+    super::rootfs_variants::prune_stale_variants(data_dir, uuid, snapshot_ref, env_hash).await;
     let vm = crate::firecracker::FirecrackerRuntime::launch_with_uuid(
         rootfs,
         &fetched.manifest.runtime,

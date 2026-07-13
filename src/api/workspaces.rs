@@ -137,11 +137,13 @@ fn merge_cap_into_env(
 /// overwriting a same-stem entry the request already produced (the request is the
 /// current source of truth for its own repos, with freshly-minted caps).
 ///
-/// ONLY `*.url` keys are carried: `authkeys.cap` and `forge-admin.token` are
-/// re-minted on every create (fresh secrets), so preserving a stale one would
-/// resurrect a revoked token — the repo cap-URLs are the durable ones to carry.
-/// No prior record / no `CAP_FILES_ENV` / a malformed prior map ⇒ a no-op (create
-/// behaves exactly as before).
+/// ONLY `*.url` keys are carried here: `forge-admin.token` is request-supplied
+/// on every create (auth is its source of truth — preserving a prior one could
+/// resurrect a revoked credential), and `authkeys.cap` has its own explicit
+/// reuse-or-mint step in [`create_workspace`] (see
+/// `crate::api::workspace_cap_reuse` — reused for value stability, minted when
+/// absent). No prior record / no `CAP_FILES_ENV` / a malformed prior map ⇒ a
+/// no-op (create behaves exactly as before).
 fn preserve_prior_repo_caps(
     cap_files: &mut serde_json::Map<String, serde_json::Value>,
     prior_extra_env: Option<&HashMap<String, String>>,
@@ -529,9 +531,27 @@ pub async fn create_workspace(
     // purely from user_id (frozen contract) — same user → same VM/ULA/snapshot.
     let ws_uuid = workspace_uuid(&body.user_id).to_string();
 
+    // PRIOR GENERATION (loaded up front — both preservation blocks below AND the
+    // cap-REUSE in the repo loop need it): the previously-persisted runner env
+    // (the CAP_FILES_ENV map) + the durable record (the (cap, repo_url) rows).
+    let prior_extra_env = RunnerHandle::load(state.orchestrator.runner_dir(), &ws_uuid)
+        .ok()
+        .flatten()
+        .and_then(|h| h.extra_env);
+    let prior_record = WorkspaceRecord::load(state.orchestrator.runner_dir(), &ws_uuid)
+        .ok()
+        .flatten();
+
     // RE-KEY #2: multi-repo. One git-proxy cap PER repo, registered in the
     // SHARED GitSessions HashMap BEFORE the spawn so the VM can reach every
     // remote from first boot. N caps are free (it is a HashMap).
+    //
+    // CAP-VALUE STABILITY (stale-caps invariant, cost half): the rootfs cache
+    // key fingerprints cap VALUES, so an ensure must only change a value when it
+    // GENUINELY rotates. Reuse the prior generation's cap token for the same
+    // repo_url (re-registered below with the request's FRESH provider token/TTL)
+    // instead of re-minting per ensure — re-minting would force a full ~2.3 GB
+    // rootfs rebuild on EVERY ensure. See `crate::api::workspace_cap_reuse`.
     let host_ip = derive_dev_fc_host_ip(&ws_uuid, &body.image_ref, &state.tap_subnet);
     let mut caps: Vec<String> = Vec::with_capacity(body.repos.len());
     let mut git_remotes: Vec<String> = Vec::with_capacity(body.repos.len());
@@ -541,7 +561,25 @@ pub async fn create_workspace(
     // `/run/tabbify/caps/<filename>` (0600, broker-uid) and REMOVED from env.
     let mut cap_files: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for repo in &body.repos {
-        let cap = generate_cap(&ws_uuid, &repo.repo_url);
+        let (cap, cap_provenance) = match crate::api::workspace_cap_reuse::prior_repo_cap(
+            prior_record.as_ref(),
+            &repo.repo_url,
+        ) {
+            Some(prior) => (prior, "reused prior token (value-stable ensure)"),
+            None => (
+                generate_cap(&ws_uuid, &repo.repo_url),
+                "minted fresh (no prior record for this repo_url)",
+            ),
+        };
+        // Cache-decision trace (token value NEVER logged): whether this ensure
+        // keeps the baked `<stem>.url` byte-stable (→ rootfs cache hit) or
+        // introduces a new value (→ fingerprint change → re-bake).
+        tracing::info!(
+            workspace_uuid = %ws_uuid,
+            repo_stem = %cap_repo_basename(&repo.repo_url),
+            provenance = cap_provenance,
+            "workspace create: git cap provenance (value never logged)"
+        );
         let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
         let expires_at = Instant::now() + Duration::from_secs(repo.git_token_ttl_secs);
         state.git_sessions.register(
@@ -576,20 +614,16 @@ pub async fn create_workspace(
     }
 
     // PRESERVE add_repo cap-URLs across a re-provision. `cap_files` was just
-    // rebuilt FROM SCRATCH (request repos + fresh forge/authkeys caps), so a repo
+    // rebuilt FROM SCRATCH (request repos + forge/authkeys caps), so a repo
     // added later via `add_workspace_repo` — whose `<repo>.url` lives ONLY in the
     // prior persisted runner env, not in THIS request — would be clobbered and the
     // cold re-bake would drop its clone (the in-house forge repo never lands in
-    // `~/projects`). Load the previously-persisted runner env (the SAME
-    // CAP_FILES_ENV map add_workspace_repo merges into) and carry every prior
-    // `*.url` entry forward. Best-effort: a load error / no prior record leaves
-    // create unchanged. The warm git-session cap stays registered (add_repo never
+    // `~/projects`). Carry every prior `*.url` entry forward (the prior runner
+    // env — the SAME CAP_FILES_ENV map add_workspace_repo merges into — was
+    // loaded above). Best-effort: a load error / no prior record leaves create
+    // unchanged. The warm git-session cap stays registered (add_repo never
     // revoked it); a cold supervisor re-registers it from the durable record on
     // readopt, so the preserved URL still resolves.
-    let prior_extra_env = RunnerHandle::load(state.orchestrator.runner_dir(), &ws_uuid)
-        .ok()
-        .flatten()
-        .and_then(|h| h.extra_env);
     preserve_prior_repo_caps(&mut cap_files, prior_extra_env.as_ref());
 
     // SYMMETRIC cold-safety: also carry the prior DURABLE record's add_repo
@@ -598,19 +632,43 @@ pub async fn create_workspace(
     // orphan the `<repo>.url` just preserved above (its /init cap-file would then
     // reference an UNregistered cap → git-proxy 403 on a cold boot). Fresh request
     // repos win on repo_url collision. Best-effort load (no prior record → no-op).
-    let prior_record = WorkspaceRecord::load(state.orchestrator.runner_dir(), &ws_uuid)
-        .ok()
-        .flatten();
     preserve_prior_record_caps(&mut record_caps, &mut branches, prior_record.as_ref());
 
-    // §12 S6: the authorized-keys cap. Generate a fresh unguessable token, write
-    // it into the FC as the off-env cap-file `authkeys.cap` (the runner writes it
-    // 0600, broker-uid — so the AGENT uid cannot read it), and ALSO return it to
-    // node so node can authorize its `[ula]:8732/v1/authorized-keys` add-key
-    // POSTs. The broker validates incoming :8732 requests against this exact
-    // token; an unauthenticated (agent) request 401s. Cap-file channel ONLY —
-    // never an env var, never the agent's reach.
-    let authkeys_cap = insert_authkeys_cap(&ws_uuid, &mut cap_files);
+    // §12 S6: the authorized-keys cap, written into the FC as the off-env
+    // cap-file `authkeys.cap` (the runner writes it 0600, broker-uid — so the
+    // AGENT uid cannot read it) and ALSO returned to node so node can authorize
+    // its `[ula]:8732/v1/authorized-keys` add-key POSTs. The broker validates
+    // incoming :8732 requests against this exact token; an unauthenticated
+    // (agent) request 401s. Cap-file channel ONLY — never an env var, never the
+    // agent's reach.
+    //
+    // CAP-VALUE STABILITY: REUSED from the prior generation when present (same
+    // workspace, same trust domain, same lifetime — a per-ensure rotation added
+    // no security and churned the rootfs fingerprint into a ~2.3 GB rebuild per
+    // ensure); minted fresh only on the first ensure / after a purge.
+    let authkeys_cap =
+        match crate::api::workspace_cap_reuse::prior_authkeys_cap(prior_extra_env.as_ref()) {
+            Some(prior) => {
+                tracing::info!(
+                    workspace_uuid = %ws_uuid,
+                    provenance = "reused prior token (value-stable ensure)",
+                    "workspace create: authkeys.cap provenance (value never logged)"
+                );
+                cap_files.insert(
+                    AUTHKEYS_CAP_FILE.to_owned(),
+                    serde_json::Value::String(prior.clone()),
+                );
+                prior
+            }
+            None => {
+                tracing::info!(
+                    workspace_uuid = %ws_uuid,
+                    provenance = "minted fresh (no prior persisted cap)",
+                    "workspace create: authkeys.cap provenance (value never logged)"
+                );
+                insert_authkeys_cap(&ws_uuid, &mut cap_files)
+            }
+        };
 
     // DIAGNOSTIC (keys/presence ONLY — a cap-file's VALUE is a git-proxy URL or a
     // secret token and is NEVER logged): exactly which cap-files this create is
@@ -923,10 +981,35 @@ pub async fn add_workspace_repo(
             .into_response();
     };
 
-    // Register the NEW repo's git-proxy cap host-side (the SAME shared GitSessions
+    // Register the repo's git-proxy cap host-side (the SAME shared GitSessions
     // the create path uses), so the respawned VM can reach the remote from boot.
+    //
+    // CAP-VALUE STABILITY (stale-caps invariant, cost half): a RE-ADD of a repo
+    // the workspace already has (the agent-retry pattern) reuses the prior cap
+    // token from the durable record — re-minting would rotate the baked
+    // `<stem>.url` value, change the rootfs fingerprint, and pay a full ~2.3 GB
+    // re-bake for a no-op add. The reused cap is re-registered with the FRESH
+    // provider token/TTL, so reuse never extends a dead upstream credential.
+    let prior_record = WorkspaceRecord::load(state.orchestrator.runner_dir(), &uuid)
+        .ok()
+        .flatten();
+    let (cap, reused_prior_cap) = match crate::api::workspace_cap_reuse::prior_repo_cap(
+        prior_record.as_ref(),
+        &body.repo_url,
+    ) {
+        Some(prior) => (prior, true),
+        None => (generate_cap(&uuid, &body.repo_url), false),
+    };
+    tracing::info!(
+        workspace_uuid = %uuid,
+        provenance = if reused_prior_cap {
+            "reused prior token (re-add of a known repo; value-stable)"
+        } else {
+            "minted fresh (first add of this repo_url)"
+        },
+        "add_repo: git cap provenance (value never logged)"
+    );
     let host_ip = derive_dev_fc_host_ip(&uuid, &image_ref, &state.tap_subnet);
-    let cap = generate_cap(&uuid, &body.repo_url);
     let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
     let expires_at = Instant::now() + Duration::from_secs(body.git_token_ttl_secs);
     state.git_sessions.register(
@@ -939,30 +1022,38 @@ pub async fn add_workspace_repo(
     );
 
     // Append to the in-mem registry (keep delete/snapshot 404-gating correct).
-    state.workspaces.append_cap(&uuid, cap.clone());
+    // A REUSED cap is already registered there (create/readopt/prior add_repo
+    // put it in) — appending again would only duplicate the row.
+    if !reused_prior_cap {
+        state.workspaces.append_cap(&uuid, cap.clone());
+    }
 
     // Append to the durable WorkspaceRecord (cap + branch) so a supervisor
     // restart re-registers this repo too. Best-effort persist (live in-mem still
-    // holds it). Load-modify-save the existing record.
+    // holds it). Load-modify-save the existing record. A REUSED cap's row is
+    // already in the record (that is where it was reused FROM) — skip the append
+    // so a re-add never duplicates rows.
     let repo_stem = cap_repo_basename(&body.repo_url);
     let repo_file = format!("{repo_stem}.url");
-    match WorkspaceRecord::load(state.orchestrator.runner_dir(), &uuid) {
-        Ok(Some(mut rec)) => {
-            rec.caps.push(WorkspaceCap {
-                cap: cap.clone(),
-                repo_url: body.repo_url.clone(),
-            });
-            rec.branches.push(body.branch.clone());
-            rec.last_activity_unix = now_unix();
-            if let Err(e) = rec.save(state.orchestrator.runner_dir()) {
-                tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: failed to persist appended workspace record");
+    if !reused_prior_cap {
+        match WorkspaceRecord::load(state.orchestrator.runner_dir(), &uuid) {
+            Ok(Some(mut rec)) => {
+                rec.caps.push(WorkspaceCap {
+                    cap: cap.clone(),
+                    repo_url: body.repo_url.clone(),
+                });
+                rec.branches.push(body.branch.clone());
+                rec.last_activity_unix = now_unix();
+                if let Err(e) = rec.save(state.orchestrator.runner_dir()) {
+                    tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: failed to persist appended workspace record");
+                }
             }
-        }
-        Ok(None) => {
-            tracing::warn!(workspace_uuid = %uuid, "add_repo: no durable workspace record to append (in-mem only)");
-        }
-        Err(e) => {
-            tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: could not load workspace record to append");
+            Ok(None) => {
+                tracing::warn!(workspace_uuid = %uuid, "add_repo: no durable workspace record to append (in-mem only)");
+            }
+            Err(e) => {
+                tracing::warn!(workspace_uuid = %uuid, error = %e, "add_repo: could not load workspace record to append");
+            }
         }
     }
 

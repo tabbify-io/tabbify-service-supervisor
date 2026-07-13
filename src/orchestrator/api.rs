@@ -756,16 +756,29 @@ impl Orchestrator {
             }
             _ => false,
         };
+        // WHY the fingerprint differs — the exact component (env key / cap-file
+        // name / ROTATED cap value), so a forced cold respawn is one-grep
+        // self-explaining. Key names only; env/cap VALUES never reach the log.
+        let env_change_reason = if env_changed {
+            crate::runner::build::rootfs_variants::describe_env_change(
+                existing.as_ref().and_then(|r| r.extra_env.as_ref()),
+                extra_env,
+            )
+        } else {
+            String::new()
+        };
 
         let live = self.client_for(uuid).health().await.is_ok();
         // Branch decision trace: which of the three deploy paths this deploy took
-        // and WHY (live? env changed vs the running runtime?). The blind spot was
-        // "did this deploy warm-swap or cold-respawn?" — now it is one grep.
+        // and WHY (live? env changed vs the running runtime? which component?).
+        // The blind spot was "did this deploy warm-swap or cold-respawn?" — now it
+        // is one grep.
         tracing::info!(
             uuid,
             reff,
             live,
             env_changed,
+            env_change_reason = %env_change_reason,
             branch = if live && !env_changed {
                 "warm-swap"
             } else if live {

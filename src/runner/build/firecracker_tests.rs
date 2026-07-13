@@ -646,9 +646,12 @@ fn cached_rootfs_path_differs_per_env_hash() {
         cached_rootfs_path(d, uuid, digest, &empty),
         cached_rootfs_path(d, uuid, digest, &with_repo),
     );
-    // Identical env ⇒ identical path (hit). A cap-file VALUE change with the SAME
-    // name set does NOT churn the fingerprint (values are excluded).
-    assert_eq!(
+    // A cap-file VALUE rotation with the SAME name set MUST land at a DIFFERENT
+    // path (the stale-caps invariant: a guest booted for declared cap values must
+    // hold THOSE values — a cached rootfs baked with the OLD value may never be
+    // served for the NEW one). This was the forge-admin 401 loop: auth rotated
+    // the token, the name set was unchanged, the cache hit served the old bake.
+    assert_ne!(
         cached_rootfs_path(d, uuid, digest, &with_repo),
         cached_rootfs_path(
             d,
@@ -659,8 +662,36 @@ fn cached_rootfs_path_differs_per_env_hash() {
                 &[("tetris.url".to_owned(), "http://DIFFERENT".to_owned())]
             )
         ),
-        "same cap-file NAME set (only the value rotated) must stay a cache HIT"
+        "a rotated cap VALUE (same NAME set) must MISS the cache and re-bake"
     );
+    // IDENTICAL name set AND values ⇒ identical path (the cache hit is preserved:
+    // value-aware fingerprinting must NOT churn the key for an unchanged set,
+    // or every ensure would pay a full ~2.3 GB rootfs rebuild).
+    assert_eq!(
+        cached_rootfs_path(d, uuid, digest, &with_repo),
+        cached_rootfs_path(
+            d,
+            uuid,
+            digest,
+            &super::rootfs_env_fingerprint(
+                None,
+                &[("tetris.url".to_owned(), "http://g".to_owned())]
+            )
+        ),
+        "an unchanged cap set (names AND values) must stay a cache HIT"
+    );
+}
+
+/// UPGRADE STABILITY: the fingerprint of a no-env / no-cap build (every regular
+/// app) is a fixed constant that must NOT change when the fingerprint scheme
+/// evolves. The cap-VALUE section is appended ONLY for a non-empty cap set, so
+/// existing per-uuid rootfs caches and snapshot `.env` stamps of ordinary apps
+/// survive a supervisor upgrade with zero re-conversion churn. If this constant
+/// ever changes, every app on every host cold-rebuilds on its next deploy —
+/// change it only deliberately.
+#[test]
+fn no_env_no_cap_fingerprint_is_the_stable_upgrade_constant() {
+    assert_eq!(super::rootfs_env_fingerprint(None, &[]), "8446cf2637cdfecb");
 }
 
 /// `split_env_and_caps` REMOVES the reserved `CAP_FILES_ENV` key from the
@@ -715,7 +746,8 @@ fn effective_env_hash_matches_the_split_fingerprint() {
 /// CHANGES `effective_env_hash` even though every other var — and the image — is
 /// unchanged. This is exactly the signal the orchestrator uses to force a cold
 /// respawn instead of a stale warm swap. A cap VALUE rotation with the SAME name
-/// set does NOT change it (values are excluded from the fingerprint).
+/// set must ALSO change it (a rotated secret needs a fresh bake — the stale-caps
+/// invariant), while an unchanged set must NOT (no needless cold respawns).
 #[test]
 fn effective_env_hash_changes_when_add_repo_appends_a_cap() {
     use std::collections::HashMap;
@@ -742,18 +774,37 @@ fn effective_env_hash_changes_when_add_repo_appends_a_cap() {
         "add_repo appending a new clone cap MUST change the env fingerprint (→ force cold)"
     );
 
-    // Same cap NAME set, rotated VALUE ⇒ unchanged fingerprint (no needless cold).
+    // Same cap NAME set, rotated VALUE ⇒ CHANGED fingerprint. This is the rotated
+    // forge-admin.token case: the live guest's rootfs holds the OLD baked value,
+    // so the deploy MUST cold-respawn (and the rootfs cache MUST miss) for the
+    // guest to ever see the new one. A names-only fingerprint silently dropped
+    // the rotation — the 401-forever bug.
     let after_value_rotated = HashMap::from([
-        base_var,
+        base_var.clone(),
         (
             crate::api::CAP_FILES_ENV.to_owned(),
             r#"{"apartami.url":"http://g/a-ROTATED"}"#.to_owned(),
         ),
     ]);
-    assert_eq!(
+    assert_ne!(
         super::effective_env_hash(Some(&before)),
         super::effective_env_hash(Some(&after_value_rotated)),
-        "a cap VALUE rotation (same NAME set) must NOT force a cold respawn"
+        "a cap VALUE rotation (same NAME set) MUST change the fingerprint (→ force cold + re-bake)"
+    );
+
+    // Byte-identical cap set (names AND values) ⇒ unchanged fingerprint — an
+    // ensure that changes nothing keeps its warm restore / cache hit.
+    let unchanged = HashMap::from([
+        base_var,
+        (
+            crate::api::CAP_FILES_ENV.to_owned(),
+            r#"{"apartami.url":"http://g/a"}"#.to_owned(),
+        ),
+    ]);
+    assert_eq!(
+        super::effective_env_hash(Some(&before)),
+        super::effective_env_hash(Some(&unchanged)),
+        "an unchanged cap set must NOT change the fingerprint (no rebuild churn)"
     );
 }
 
@@ -1089,6 +1140,123 @@ async fn run_fc_build_skips_conversion_on_cache_hit() {
     assert!(
         !*called.lock().unwrap(),
         "no conversion command may run on a cache hit"
+    );
+}
+
+/// THE STALE-CAPS ROOT CAUSE, reproduced end-to-end at the conversion layer: a
+/// re-provision carrying a ROTATED cap VALUE (same cap NAME set — the rotated
+/// `forge-admin.token` case) must MISS the rootfs cache seeded by the OLD value
+/// and RE-BAKE `/init` with the NEW value. Before value-aware fingerprinting the
+/// names-only key collided, the stale rootfs was served, and the guest kept the
+/// dead token forever (401 loop).
+#[tokio::test]
+async fn resolve_rootfs_rebakes_on_rotated_cap_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:rotated0";
+    let fetched = fc_fetched(digest);
+
+    // Seed the per-uuid cache at the OLD value's fingerprint — the rootfs a
+    // previous provision baked with the now-dead token.
+    let old_caps = vec![("forge-admin.token".to_owned(), "OLD-DEAD-TOKEN".to_owned())];
+    let old_hash = super::rootfs_env_fingerprint(None, &old_caps);
+    let stale = super::cached_rootfs_path(tmp.path(), "uuid-rot", digest, &old_hash);
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, b"\0").unwrap();
+
+    // Minimal empty-layer layout so a re-conversion actually runs end-to-end.
+    let layout_tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":[]}
+    });
+    let layout = write_min_oci_layout(layout_tmp.path(), &cfg, &[]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
+    // The mkfs stub captures the staged `/init` so we can prove WHICH cap value
+    // got baked (the guest-holds-the-new-value invariant).
+    let baked_init = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let baked_init2 = baked_init.clone();
+    let runner: super::FcBuildRunner = std::sync::Arc::new(move |argv: Vec<String>| {
+        if argv.first().map(String::as_str) == Some("mkfs.ext4") {
+            // argv: mkfs.ext4 -F -m 0 -N <inodes> -d <staging> <tmp-image>
+            let staging = argv[argv.iter().position(|a| a == "-d").unwrap() + 1].clone();
+            let init = std::fs::read_to_string(std::path::Path::new(&staging).join("init"))
+                .unwrap_or_default();
+            *baked_init2.lock().unwrap() = init;
+        }
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    // Re-provision with the ROTATED value (same cap NAME).
+    let new_caps = vec![("forge-admin.token".to_owned(), "NEW-LIVE-TOKEN".to_owned())];
+    let rootfs = super::resolve_rootfs(
+        "uuid-rot", &fetched, &layout, &config, digest, tmp.path(), &runner, None, &new_caps,
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        rootfs, stale,
+        "a rotated cap value must land at a NEW variant path, never the stale rootfs"
+    );
+    let init = baked_init.lock().unwrap().clone();
+    assert!(
+        !init.is_empty(),
+        "a rotated cap value must force a re-conversion (mkfs must run)"
+    );
+    assert!(
+        init.contains("NEW-LIVE-TOKEN"),
+        "the re-baked /init must hold the ROTATED cap value"
+    );
+    assert!(
+        !init.contains("OLD-DEAD-TOKEN"),
+        "the re-baked /init must not carry the dead value"
+    );
+}
+
+/// The (b)-alone trap guard: an ensure whose cap set is UNCHANGED (names AND
+/// values) must still HIT the cache — value-aware fingerprinting may only rebuild
+/// on a GENUINE rotation, never on every ensure (a full rootfs rebuild is ~2.3 GB
+/// of mkfs per hit-turned-miss; this host has had a disk-full incident).
+#[tokio::test]
+async fn resolve_rootfs_cache_hit_with_unchanged_cap_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:stable00";
+    let fetched = fc_fetched(digest);
+
+    let caps = vec![("forge-admin.token".to_owned(), "SAME-TOKEN".to_owned())];
+    let hash = super::rootfs_env_fingerprint(None, &caps);
+    let cached = super::cached_rootfs_path(tmp.path(), "uuid-stable", digest, &hash);
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    std::fs::write(&cached, b"\0").unwrap();
+
+    let layout_tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":[]}
+    });
+    let layout = write_min_oci_layout(layout_tmp.path(), &cfg, &[]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
+    let called = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let called2 = called.clone();
+    let runner: super::FcBuildRunner = std::sync::Arc::new(move |_argv| {
+        *called2.lock().unwrap() = true;
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    let rootfs = super::resolve_rootfs(
+        "uuid-stable", &fetched, &layout, &config, digest, tmp.path(), &runner, None, &caps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rootfs, cached, "unchanged cap values must stay a cache HIT");
+    assert!(
+        !*called.lock().unwrap(),
+        "no conversion may run when the cap set is unchanged (no rebuild churn)"
     );
 }
 

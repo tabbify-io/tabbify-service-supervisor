@@ -14,6 +14,9 @@
 //! - [`firecracker`] — the generic Firecracker RUNTIME-build (OCI image →
 //!   bootable `rootfs.ext4` + PID-1 init); `pub` so the KVM-gated integration
 //!   test can drive [`firecracker::run_firecracker_build`] end-to-end.
+//! - [`rootfs_variants`] — per-uuid rootfs-cache variant bookkeeping: fingerprint
+//!   manifests (cache-miss attribution: WHICH env/cap component differed) and
+//!   stale-variant garbage collection (disk safety on cap rotation).
 //! - Everything else (the [`BuildJob`] type, the dispatcher, the production
 //!   wiring, and the tests) lives in this file.
 
@@ -25,6 +28,7 @@ use serde::{Deserialize, Serialize};
 mod docker;
 pub(crate) mod fc_sandbox;
 pub mod firecracker;
+pub mod rootfs_variants;
 
 /// Which build pipeline a [`BuildJob`] drives.
 ///

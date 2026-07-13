@@ -44,6 +44,7 @@ mod forge_proxy;
 mod git_proxy;
 mod handlers;
 mod ssh_jump;
+mod workspace_cap_reuse;
 mod workspace_record;
 mod workspaces;
 
