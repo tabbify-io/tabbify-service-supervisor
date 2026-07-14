@@ -1,6 +1,6 @@
 [package]
 name = "tabbify-service-supervisor"
-version = "1.4.114"
+version = "1.4.115"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
