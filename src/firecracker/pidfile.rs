@@ -56,23 +56,67 @@ pub fn write(dir: &Path, uuid: &str, pid: u32) {
     }
 }
 
+/// Read the pidfile without consuming it. Teardown keeps the file until the
+/// process is confirmed gone so a failed attempt remains retryable.
+pub fn read(dir: &Path, uuid: &str) -> Option<u32> {
+    std::fs::read_to_string(path(dir, uuid))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Remove a pidfile after its process has been confirmed gone.
+pub fn remove(dir: &Path, uuid: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path(dir, uuid)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Extract the deterministic Tabbify `--api-sock` from a Firecracker command
+/// line. Both bare Firecracker and `systemd-run ... -- firecracker ...` argv
+/// shapes are accepted; unrelated executables and foreign sockets are rejected.
+pub(crate) fn parse_firecracker_api_sock(cmdline: &[u8]) -> Option<String> {
+    let argv: Vec<String> = cmdline
+        .split(|&byte| byte == 0)
+        .filter(|token| !token.is_empty())
+        .map(|token| String::from_utf8_lossy(token).into_owned())
+        .collect();
+    let invokes_firecracker = argv.iter().any(|token| {
+        std::path::Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "firecracker")
+    });
+    if !invokes_firecracker {
+        return None;
+    }
+
+    let position = argv.iter().position(|token| token == "--api-sock")?;
+    let socket = argv.get(position + 1)?;
+    if socket.starts_with("/tmp/firecracker-") && socket.ends_with(".sock") {
+        Some(socket.clone())
+    } else {
+        None
+    }
+}
+
 /// Read and remove the pidfile for `uuid` under `dir`. Returns `None` if
 /// absent or unreadable (e.g. no prior run).
 pub fn take(dir: &Path, uuid: &str) -> Option<u32> {
-    let p = path(dir, uuid);
-    let text = std::fs::read_to_string(&p).ok()?;
-    let _ = std::fs::remove_file(&p);
-    text.trim().parse::<u32>().ok()
+    let pid = read(dir, uuid)?;
+    let _ = remove(dir, uuid);
+    Some(pid)
 }
 
 /// Kill a stale firecracker process identified by `pid` if it is alive,
 /// using the injected `is_alive` probe (real: [`process_is_alive`]; tests
 /// inject a closure). Best-effort: logs but never errors.
 ///
-/// Note on PID reuse: if the PID was recycled by a different process since
-/// the pidfile was written we may kill the wrong process. This is acceptable
-/// for the RnD-phase supervisor where runners are under direct operator
-/// control. A future hardening step could cross-check `/proc/<pid>/cmdline`.
+/// Callers handling a persisted pidfile must validate the live process identity
+/// first. Direct child owners may call this without another identity check.
 pub fn kill_stale_if_alive(pid: u32, is_alive: impl Fn(u32) -> bool) {
     // pid 0 means "the caller's own process group" to kill(2): a corrupted
     // pidfile carrying 0 must never SIGKILL the calling process's own group.
@@ -83,8 +127,8 @@ pub fn kill_stale_if_alive(pid: u32, is_alive: impl Fn(u32) -> bool) {
     if !is_alive(pid) {
         return;
     }
-    // SAFETY: libc::kill is a standard POSIX syscall. We pass a valid pid
-    // and SIGKILL (9). The worst-case on PID reuse is documented above.
+    // SAFETY: libc::kill is a standard POSIX syscall. Persisted-PID callers
+    // validate process identity before reaching this helper.
     let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();

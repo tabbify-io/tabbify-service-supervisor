@@ -66,6 +66,7 @@ impl std::error::Error for SwapError {}
 pub async fn perform_swap(
     active: &ActiveRuntime,
     new: Arc<dyn AppRuntime>,
+    image_ref: Option<String>,
     drain: Duration,
     deadline: Duration,
 ) -> Result<(), SwapError> {
@@ -77,7 +78,7 @@ pub async fn perform_swap(
     }
 
     // --- 2. flip: install `new`, get the OLD back for draining -------------
-    let old = active.swap(new);
+    let old = active.swap_with_ref(new, image_ref);
 
     // --- 3. drain the OLD runtime off the hot path (fire-and-forget) -------
     // `old.shutdown()` is called at the START of the spawn body — BEFORE the
@@ -120,12 +121,15 @@ async fn await_healthy(rt: &dyn AppRuntime, deadline: Duration) -> bool {
     tokio::time::timeout(deadline, probe).await.is_ok()
 }
 
-/// Sized newtype that holds one `Arc<dyn AppRuntime>`.
+/// Sized slot holding the active runtime and the exact image ref it serves.
 ///
 /// Required because `ArcSwap<T>` requires `T: Sized`, and `dyn AppRuntime` is
 /// not.  All callers interact with `ActiveRuntime`, never with this type
 /// directly.
-pub(crate) struct RuntimeSlot(pub(crate) Arc<dyn AppRuntime>);
+pub(crate) struct RuntimeSlot {
+    runtime: Arc<dyn AppRuntime>,
+    image_ref: Option<String>,
+}
 
 /// A swappable holder for the currently-active [`AppRuntime`].
 ///
@@ -147,15 +151,34 @@ pub struct ActiveRuntime {
 impl ActiveRuntime {
     /// Wrap `rt` in a new `ActiveRuntime`.
     pub fn new(rt: Arc<dyn AppRuntime>) -> Self {
+        Self::new_with_ref(rt, None)
+    }
+
+    /// Wrap `rt` and its actual image ref in one atomically-loaded slot.
+    pub fn new_with_ref(rt: Arc<dyn AppRuntime>, image_ref: Option<String>) -> Self {
         Self {
-            cell: ArcSwap::new(Arc::new(RuntimeSlot(rt))),
+            cell: ArcSwap::new(Arc::new(RuntimeSlot {
+                runtime: rt,
+                image_ref,
+            })),
             swapped: Notify::new(),
         }
     }
 
     /// Return a cheap `Arc` clone of the currently-active runtime.
     pub fn load(&self) -> Arc<dyn AppRuntime> {
-        self.cell.load().0.clone()
+        self.cell.load().runtime.clone()
+    }
+
+    /// Load the active runtime and image ref from the same atomic slot.
+    pub fn load_with_ref(&self) -> (Arc<dyn AppRuntime>, Option<String>) {
+        let slot = self.cell.load();
+        (slot.runtime.clone(), slot.image_ref.clone())
+    }
+
+    /// Return the image ref owned by the currently-active runtime.
+    pub fn current_ref(&self) -> Option<String> {
+        self.cell.load().image_ref.clone()
     }
 
     /// Atomically install `new` as the active runtime.
@@ -173,12 +196,24 @@ impl ActiveRuntime {
     /// already started a new listener before dropping the old runtime.  The
     /// full drain + watch-re-arm logic is implemented in P2.3, NOT here.
     pub fn swap(&self, new: Arc<dyn AppRuntime>) -> Arc<dyn AppRuntime> {
-        let old_slot = self.cell.swap(Arc::new(RuntimeSlot(new)));
+        self.swap_with_ref(new, None)
+    }
+
+    /// Atomically install a runtime together with the ref it actually serves.
+    pub fn swap_with_ref(
+        &self,
+        new: Arc<dyn AppRuntime>,
+        image_ref: Option<String>,
+    ) -> Arc<dyn AppRuntime> {
+        let old_slot = self.cell.swap(Arc::new(RuntimeSlot {
+            runtime: new,
+            image_ref,
+        }));
         // `notify_waiters` (not `notify_one`) wakes tasks that called
         // `swapped().await` BEFORE this swap fires — P2.3 registers the
         // waiter BEFORE awaiting so the notification is not missed.
         self.swapped.notify_waiters();
-        old_slot.0.clone()
+        old_slot.runtime.clone()
     }
 
     /// Resolves the next time [`swap`] is called.
@@ -386,7 +421,9 @@ mod tests {
     #[tokio::test]
     async fn active_runtime_snapshot_delegates_in_place() {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let rt: Arc<dyn AppRuntime> = Arc::new(SnapFake { snapped: flag.clone() });
+        let rt: Arc<dyn AppRuntime> = Arc::new(SnapFake {
+            snapped: flag.clone(),
+        });
         let active = ActiveRuntime::new(rt);
         let before = active.load();
 
@@ -502,6 +539,7 @@ mod tests {
         perform_swap(
             &active,
             new,
+            Some("registry/app:new".to_owned()),
             Duration::from_millis(0),
             Duration::from_secs(2),
         )
@@ -514,6 +552,7 @@ mod tests {
             "NEW",
             "active.load() must serve the NEW runtime after a healthy swap"
         );
+        assert_eq!(active.current_ref().as_deref(), Some("registry/app:new"));
 
         // Give the spawned drain task (drain = 0ms) a chance to run.
         for _ in 0..50 {
@@ -632,6 +671,7 @@ mod tests {
         perform_swap(
             &active,
             new,
+            None,
             Duration::from_millis(500), // long drain: kill must NOT wait for it
             Duration::from_secs(5),
         )
@@ -667,12 +707,14 @@ mod tests {
         let err = perform_swap(
             &active,
             new,
+            Some("registry/app:unhealthy".to_owned()),
             Duration::from_millis(0),
             Duration::from_millis(300),
         )
         .await
         .expect_err("unhealthy new must abort the swap");
         assert_eq!(err, SwapError::Unhealthy);
+        assert!(active.current_ref().is_none());
 
         // The active runtime is STILL OLD — no flip happened.
         assert_eq!(

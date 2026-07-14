@@ -260,7 +260,9 @@ pub async fn run_build_vm(spec: &BuildVmSpec<'_>) -> Result<()> {
     // the FC would survive into the supervisor-independent scope otherwise.
     // Idempotent (a clean power-off already GC'd the scope via `--collect`).
     if let Some(scope) = fc_scope.as_deref() {
-        super::linux::stop_fc_scope(scope);
+        if !super::linux::stop_fc_scope(scope) {
+            tracing::warn!(scope, "build VM scope remained active after teardown");
+        }
     }
     // F2.3: consume the build pidfile on EVERY exit so a fresh build's sweep
     // doesn't see a stale build0 handle.

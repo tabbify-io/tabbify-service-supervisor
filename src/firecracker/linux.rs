@@ -80,6 +80,60 @@ fn fc_debug_enabled() -> bool {
     })
 }
 
+/// Reconcile the persisted FC identity before a cold start or warm restore.
+/// The pidfile remains until both the exact process and deterministic systemd
+/// scope are confirmed gone, so an incomplete teardown is safely retryable.
+fn reap_stale_fc_for_vm_key(data_dir: &Path, uuid: &str, vm_key: &str) -> Result<()> {
+    let stale_pid = pidfile::read(data_dir, uuid);
+    if let Some(pid) = stale_pid.filter(|pid| pidfile::process_is_alive(*pid)) {
+        let expected_socket = super::fc_api_sock_for_key(vm_key);
+        match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(cmdline) => match pidfile::parse_firecracker_api_sock(&cmdline) {
+                Some(socket) if socket == expected_socket => {
+                    pidfile::kill_stale_if_alive(pid, pidfile::process_is_alive);
+                    for _ in 0..200 {
+                        if !pidfile::process_is_alive(pid) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if pidfile::process_is_alive(pid) {
+                        bail!("stale Firecracker pid {pid} survived SIGKILL for {uuid}");
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        uuid,
+                        stale_pid = pid,
+                        "discarding stale FC pidfile without killing unrelated reused PID"
+                    );
+                }
+                Some(socket) => bail!(
+                    "stale Firecracker pid {pid} for {uuid} has unexpected API socket {socket}"
+                ),
+            },
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !pidfile::process_is_alive(pid) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("validate stale Firecracker pid {pid} identity for {uuid}")
+                });
+            }
+        }
+    }
+
+    let scope = super::cpu_scope::scope_name(vm_key);
+    if !stop_fc_scope(&scope) {
+        bail!("stale Firecracker scope {scope} remained active for {uuid}");
+    }
+    if stale_pid.is_some() {
+        pidfile::remove(data_dir, uuid)
+            .with_context(|| format!("remove reconciled Firecracker pidfile for {uuid}"))?;
+    }
+    Ok(())
+}
+
 /// Decide the firecracker child's `(stdout, stderr)` redirection.
 ///
 /// Default (debug flag off, or no console path available): both `/dev/null`
@@ -644,9 +698,7 @@ impl FirecrackerRuntime {
             // left by a crashed predecessor, then warm-restore if a snapshot
             // exists AND it was taken from the SAME image (else cold boot, which
             // re-creates a fresh snapshot for the current image).
-            if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
-                pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
-            }
+            reap_stale_fc_for_vm_key(data_dir, uuid, &vm_key)?;
             // Invalidate the snapshot when the resolved image DIGEST OR the #106
             // env/cap fingerprint has changed: the cache is keyed by UUID only, so a
             // respawn after a redeploy of a NEW image — INCLUDING a MOVING tag
@@ -859,9 +911,7 @@ impl FirecrackerRuntime {
         // via the per-uuid pidfile; mirror the SAME pidfile mutual-exclusion
         // semantics here so only one respawn runs at a time. (The active pid is
         // re-written by `launch_with_uuid` after this returns.)
-        if let Some(stale_pid) = pidfile::take(data_dir, uuid) {
-            pidfile::kill_stale_if_alive(stale_pid, pidfile::process_is_alive);
-        }
+        reap_stale_fc_for_vm_key(data_dir, uuid, vm_key)?;
 
         let vmstate = snapshot::vmstate_path(cache_dir);
         let mem = snapshot::mem_path(cache_dir);
@@ -1489,10 +1539,12 @@ impl AppRuntime for FirecrackerRuntime {
         // `systemd-run` wrapper PID above is NOT sufficient — systemd owns the
         // scope, so the firecracker process survives INTO the
         // supervisor-independent scope. `systemctl stop` the scope to SIGKILL the
-        // FC in its cgroup + GC the unit. Synchronous-ish (detached), idempotent.
+        // FC in its cgroup + GC the unit. Synchronous and idempotent.
         if let Some(scope) = self.fc_scope.as_deref() {
             tracing::info!(scope, tap = %self.tap_name, "fc shutdown: stopping CPU-capped scope");
-            stop_fc_scope(scope);
+            if !stop_fc_scope(scope) {
+                tracing::warn!(scope, "fc shutdown: scope remained active after systemctl stop");
+            }
         }
         let tap = self.tap_name.clone();
         Box::pin(async move {
@@ -1709,7 +1761,9 @@ impl Drop for FirecrackerRuntime {
         // would otherwise orphan the FC into the supervisor-independent scope).
         // Safety net mirroring `shutdown`; idempotent if already stopped.
         if let Some(scope) = self.fc_scope.as_deref() {
-            stop_fc_scope(scope);
+            if !stop_fc_scope(scope) {
+                tracing::warn!(scope, "fc drop: scope remained active after systemctl stop");
+            }
         }
         let _ = std::fs::remove_file(&self.api_sock);
         let tap = self.tap_name.clone();
@@ -1849,27 +1903,37 @@ fn systemd_run_available() -> bool {
 /// This is the supervisor-INDEPENDENT teardown: systemd owns the scope, so a
 /// `systemctl stop` SIGTERM→SIGKILLs every process in the scope's cgroup
 /// (the firecracker child) and garbage-collects the unit, even if the
-/// `systemd-run` wrapper PID was already reaped/killed. Best-effort + fire-and-
-/// forget (spawned detached) so teardown never blocks on systemd; a missing
-/// scope (already gone) is a harmless non-zero exit. Idempotent.
-pub(crate) fn stop_fc_scope(scope: &str) {
-    let scope = scope.to_owned();
-    let spawn = std::process::Command::new("systemctl")
-        .args(["stop", &scope])
+/// `systemd-run` wrapper PID was already reaped/killed. The command is awaited
+/// synchronously and the unit is checked afterward. A missing scope is
+/// idempotent success. Returns `false` only when a systemd host cannot prove the
+/// scope inactive.
+pub(crate) fn stop_fc_scope(scope: &str) -> bool {
+    if !super::cpu_scope::host_has_systemd() {
+        return true;
+    }
+
+    let status = std::process::Command::new("systemctl")
+        .args(["stop", scope])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    match spawn {
-        Ok(mut child) => {
-            // Reap asynchronously if we're on a tokio runtime; else detach. We
-            // never block the caller (shutdown/Drop) on systemd.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(e) => {
-            tracing::debug!(scope = %scope, error = %e, "systemctl stop fc scope failed to spawn (systemd absent?)");
+        .status();
+    if let Err(error) = status {
+        tracing::warn!(scope, error = %error, "systemctl stop fc scope failed to execute");
+        return false;
+    }
+
+    let active = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", scope])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match active {
+        Ok(status) => !status.success(),
+        Err(error) => {
+            tracing::warn!(scope, error = %error, "failed to confirm FC scope inactive");
+            false
         }
     }
 }

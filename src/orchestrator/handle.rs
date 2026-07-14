@@ -6,7 +6,8 @@
 //! restarted supervisor can rediscover its living runners (Task 2.5).
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -80,9 +81,8 @@ pub struct RunnerHandle {
     /// Tenant network slug this runner is scoped to (Phase-2 contract). Set on a
     /// network-scoped deploy and forwarded to a RESPAWN as `--network <slug>` so
     /// the runner rejoins the same tenant network. `None` (the default) = an
-    /// unscoped runner (today's behavior). The scoped JOIN TOKEN is NOT persisted
-    /// (short-lived, minted per deploy by the node); a respawn rejoins via the
-    /// runner's sticky per-uuid keypair.
+    /// unscoped runner (today's behavior). The separately stored scoped join
+    /// token is long-lived and is also reused by a respawn.
     ///
     /// `#[serde(default)]` keeps old on-disk records (written before this field
     /// existed) loading — they get `None`.
@@ -157,15 +157,34 @@ pub fn record_path(dir: &Path, uuid: &str) -> PathBuf {
 impl RunnerHandle {
     /// Serialize this handle to its JSON record file inside `runner_dir`.
     ///
-    /// The parent directory must already exist.
+    /// The parent directory must already exist. The JSON is written to a unique
+    /// sibling temp file and atomically renamed over the record, so a failed save
+    /// leaves the previous durable intent intact rather than truncating it.
     ///
     /// # Errors
     /// Returns an [`io::Error`] if serialization or the write fails.
     pub fn save(&self, runner_dir: &Path) -> io::Result<()> {
         let path = record_path(runner_dir, &self.uuid);
-        let json = serde_json::to_string_pretty(self)
+        let json = serde_json::to_vec_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(path, json)
+
+        let mut temp = tempfile::Builder::new()
+            .prefix(&format!(".{}.json.tmp-", self.uuid))
+            .tempfile_in(runner_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            temp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        temp.write_all(&json)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path).map_err(|error| error.error)?;
+
+        #[cfg(unix)]
+        fs::File::open(runner_dir)?.sync_all()?;
+
+        Ok(())
     }
 
     /// Load a runner handle from its JSON record file inside `runner_dir`.
@@ -690,6 +709,36 @@ mod tests {
             .unwrap()
             .expect("record must be present");
         assert_eq!(h, loaded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_record_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let h = sample_handle();
+        h.save(dir.path()).unwrap();
+
+        let mode = fs::metadata(record_path(dir.path(), &h.uuid))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn failed_save_leaves_previous_record_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let mut h = sample_handle();
+        h.uuid = "nested/app".to_owned();
+        let path = record_path(dir.path(), &h.uuid);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"previous-record").unwrap();
+
+        assert!(h.save(dir.path()).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"previous-record");
     }
 
     #[test]

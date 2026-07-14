@@ -41,7 +41,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// end-to-end; the connect still fails fast for a dead socket, the per-uuid
 /// deploy lock + monitor-shield already tolerate a long-held deploy, and the
 /// node waits on its side with no timeout.
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(300);
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(420);
 
 /// Thin client for the runner's Unix-domain control socket.
 ///
@@ -72,6 +72,36 @@ impl ControlClient {
     /// Send [`Cmd::Health`], expect [`Reply::Health { … }`].
     pub async fn health(&self) -> Result<Reply> {
         self.round_trip(Cmd::Health).await
+    }
+
+    /// Probe health with a caller-supplied short deadline. Lifecycle teardown
+    /// uses this while polling for socket disappearance so one probe cannot
+    /// consume the whole shutdown bound.
+    pub(crate) async fn health_with_timeout(&self, deadline: Duration) -> Result<Reply> {
+        self.round_trip_with_timeout(Cmd::Health, deadline).await
+    }
+
+    /// Check whether a process is still listening on the control socket without
+    /// requiring a protocol reply. Connection refused/not found is definitive
+    /// absence; a connect timeout is treated as still reachable (fail closed).
+    pub(crate) async fn socket_reachable(&self, deadline: Duration) -> Result<bool> {
+        if !self.sock.exists() {
+            return Ok(false);
+        }
+        match timeout(deadline, UnixStream::connect(&self.sock)).await {
+            Ok(Ok(_stream)) => Ok(true),
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(false)
+            }
+            Ok(Err(error)) => Err(error)
+                .with_context(|| format!("probe control socket reachability for {:?}", self.sock)),
+            Err(_) => Ok(true),
+        }
     }
 
     /// Send [`Cmd::Stop`], expect [`Reply::Ok`].
@@ -305,8 +335,8 @@ mod tests {
             "deploy must use a longer deadline than the fast commands"
         );
         assert!(
-            DEPLOY_TIMEOUT >= Duration::from_secs(120),
-            "deploy deadline must cover a multi-minute cold build"
+            DEPLOY_TIMEOUT > Duration::from_secs(360),
+            "deploy deadline must exceed the orchestrator's cold-build health bound"
         );
     }
 }

@@ -81,12 +81,12 @@ async fn body_bytes(resp: axum::response::Response) -> bytes::Bytes {
         .to_bytes()
 }
 
-// ── POST /v1/apps/:uuid/reset — 200 for known uuid ────────────────────────
+// ── POST /v1/apps/:uuid/reset — failed immediate reconcile ────────────────
 
-/// Posting reset for a uuid that has an on-disk runner record returns 200
-/// with a JSON body containing restart fields.
+/// A known record is not enough for success: if immediate respawn fails, reset
+/// must return 500 rather than claiming the app was reconciled.
 #[tokio::test]
-async fn reset_known_uuid_returns_200() {
+async fn reset_known_uuid_returns_500_when_immediate_respawn_fails() {
     let dir = TempDir::new().unwrap();
     let rec = crashed_record(dir.path());
     rec.save(dir.path()).unwrap();
@@ -101,16 +101,7 @@ async fn reset_known_uuid_returns_200() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = body_bytes(resp).await;
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    // The response mirrors running_json: state, app_ula, bound_addr.
-    assert!(json.get("state").is_some(), "response must contain 'state'");
-    assert!(
-        json.get("app_ula").is_some(),
-        "response must contain 'app_ula'"
-    );
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 // ── POST /v1/apps/:uuid/reset — 404 for unknown uuid ─────────────────────
@@ -228,10 +219,9 @@ fn deploy_body_env_defaults_to_none() {
 /// the node populates from `GET /v1/egress/resolve`.
 #[test]
 fn deploy_body_accepts_egress_allow() {
-    let body: DeployBody = serde_json::from_str(
-        r#"{"ref":"x","egress_allow":["api.telegram.org","10.0.0.0/24"]}"#,
-    )
-    .unwrap();
+    let body: DeployBody =
+        serde_json::from_str(r#"{"ref":"x","egress_allow":["api.telegram.org","10.0.0.0/24"]}"#)
+            .unwrap();
     assert_eq!(
         body.egress_allow.as_deref().unwrap(),
         ["api.telegram.org", "10.0.0.0/24"]
@@ -288,7 +278,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
     let dir = TempDir::new().unwrap();
     let sock_path = dir.path().join(format!("{APP_UUID}.sock"));
 
-    // Fake control server: replies Ok to every command (health + deploy).
+    // Fake control server: identity-bearing Health + Ok deploy.
     let sock_path_srv = sock_path.clone();
     tokio::spawn(async move {
         let listener = UnixListener::bind(&sock_path_srv).unwrap();
@@ -298,7 +288,24 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
                     let _ = reader.read_line(&mut line).await;
-                    let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                    let command: crate::control_proto::Cmd =
+                        serde_json::from_str(line.trim()).unwrap();
+                    let reply = if matches!(command, crate::control_proto::Cmd::Health) {
+                        crate::control_proto::Reply::Health {
+                            state: "running".to_owned(),
+                            app_ula: APP_ULA.to_owned(),
+                            app_uuid: APP_UUID.to_owned(),
+                            pid: 12345,
+                            image_ref: None,
+                            app_health: "serving".to_owned(),
+                            app_health_reason: None,
+                        }
+                    } else {
+                        crate::control_proto::Reply::Ok
+                    };
+                    let mut payload = serde_json::to_vec(&reply).unwrap();
+                    payload.push(b'\n');
+                    let _ = reader.into_inner().write_all(&payload).await;
                 }
                 _ => break,
             }
@@ -903,6 +910,43 @@ async fn delete_dev_session_known_returns_200_and_cleans_up() {
     }
 }
 
+#[tokio::test]
+async fn delete_dev_session_retains_retry_handle_when_purge_fails() {
+    use crate::api::dev_sessions::DevSession;
+    use std::time::Instant;
+
+    let dir = TempDir::new().unwrap();
+    let state = make_state(dir.path().to_path_buf());
+    state.dev_sessions.insert(DevSession {
+        session_id: "retry-sess".to_owned(),
+        app_uuid: APP_UUID.to_owned(),
+        cap: "retry-cap".to_owned(),
+        created_at: Instant::now(),
+        last_activity: Instant::now(),
+        repo_url: "https://github.com/acme/app.git".to_owned(),
+        branch: "main".to_owned(),
+        ssh_jump: None,
+    });
+    std::fs::write(dir.path().join(format!("{APP_UUID}.json")), b"not-json").unwrap();
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/dev-sessions/retry-sess")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        state.dev_sessions.lookup("retry-sess").is_some(),
+        "failed purge must retain the session so deletion can be retried"
+    );
+}
+
 // ── GET /v1/dev-sessions ──────────────────────────────────────────────────────
 
 /// `GET /v1/dev-sessions` returns 200 with a JSON `{ sessions: [...] }`.
@@ -993,8 +1037,8 @@ async fn get_dev_sessions_row_carries_ssh_jump_addr() {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Instant;
 
-    use crate::api::dev_sessions::DevSession;
     use crate::api::SshJump;
+    use crate::api::dev_sessions::DevSession;
 
     let dir = TempDir::new().unwrap();
     let state = make_state(dir.path().to_path_buf()); // control ULA = "::1"
@@ -1227,12 +1271,17 @@ async fn add_repo_known_workspace_registers_cap_and_appends_record() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    let json: serde_json::Value =
-        serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["workspace_uuid"], APP_UUID);
-    assert_eq!(json["repo"], cap_repo_basename("https://github.com/acme/extra.git"));
+    assert_eq!(
+        json["repo"],
+        cap_repo_basename("https://github.com/acme/extra.git")
+    );
     let git_remote = json["git_remote"].as_str().unwrap();
-    assert!(git_remote.contains("/git/"), "git_remote must be a proxy URL");
+    assert!(
+        git_remote.contains("/git/"),
+        "git_remote must be a proxy URL"
+    );
 
     // A NEW cap was registered host-side (2 total now).
     assert_eq!(
@@ -1325,8 +1374,7 @@ async fn stop_known_workspace_returns_200_and_marks_stopped() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let json: serde_json::Value =
-        serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["stopped"], true);
 
     // The record is preserved + marked stopped, with image_ref intact (warm

@@ -530,6 +530,8 @@ pub async fn create_workspace(
     // RE-KEY #1: stable identity. The FC app uuid IS the workspace uuid, derived
     // purely from user_id (frozen contract) — same user → same VM/ULA/snapshot.
     let ws_uuid = workspace_uuid(&body.user_id).to_string();
+    let operation_lock = state.workspace_operation_lock(&ws_uuid);
+    let operation_guard = operation_lock.lock_owned().await;
 
     // PRIOR GENERATION (loaded up front — both preservation blocks below AND the
     // cap-REUSE in the repo loop need it): the previously-persisted runner env
@@ -771,6 +773,7 @@ pub async fn create_workspace(
     let image_ref = body.image_ref.clone();
     let caps_for_bg = caps.clone();
     tokio::spawn(async move {
+        let _operation_guard = operation_guard;
         match bg
             .orchestrator
             // Workspace-scope egress ACL is a LABELED v2 follow-up (Track 7
@@ -783,12 +786,21 @@ pub async fn create_workspace(
         {
             Ok(_) => tracing::info!(workspace_uuid = %app_uuid, "workspace provisioned (async)"),
             Err(e) => {
-                tracing::warn!(workspace_uuid = %app_uuid, error = %e, "workspace deploy failed (async); revoking caps + dropping workspace");
-                for c in &caps_for_bg {
-                    bg.git_sessions.revoke(c);
+                tracing::warn!(workspace_uuid = %app_uuid, error = %e, "workspace deploy failed (async); purging partial runtime before dropping workspace");
+                match bg.orchestrator.purge_app(&app_uuid).await {
+                    Ok(()) => {
+                        for cap in &caps_for_bg {
+                            bg.git_sessions.revoke(cap);
+                        }
+                        bg.workspaces.remove(&app_uuid);
+                        let _ = WorkspaceRecord::remove(bg.orchestrator.runner_dir(), &app_uuid);
+                    }
+                    Err(purge_error) => tracing::error!(
+                        workspace_uuid = %app_uuid,
+                        error = %purge_error,
+                        "partial workspace purge failed; retaining workspace retry handles"
+                    ),
                 }
-                bg.workspaces.remove(&app_uuid);
-                let _ = WorkspaceRecord::remove(bg.orchestrator.runner_dir(), &app_uuid);
             }
         }
     });
@@ -843,21 +855,30 @@ pub async fn delete_workspace(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
 ) -> Response {
-    let Some(ws) = state.workspaces.remove(&uuid) else {
+    let operation_lock = state.workspace_operation_lock(&uuid);
+    let _operation_guard = operation_lock.lock_owned().await;
+    let Some(_) = state.workspaces.caps_of(&uuid) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("workspace {uuid} not found") })),
         )
             .into_response();
     };
-    for c in &ws.caps {
-        state.git_sessions.revoke(c);
+    if let Err(e) = state.orchestrator.purge_app(&uuid).await {
+        tracing::error!(workspace_uuid = %uuid, error = %e, "workspace purge_app failed; retaining workspace for retry");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to purge workspace {uuid}: {e}") })),
+        )
+            .into_response();
+    }
+    if let Some(workspace) = state.workspaces.remove(&uuid) {
+        for cap in &workspace.caps {
+            state.git_sessions.revoke(cap);
+        }
     }
     if let Err(e) = WorkspaceRecord::remove(state.orchestrator.runner_dir(), &uuid) {
         tracing::warn!(workspace_uuid = %uuid, error = %e, "failed to remove workspace record on delete");
-    }
-    if let Err(e) = state.orchestrator.purge_app(&uuid).await {
-        tracing::warn!(workspace_uuid = %uuid, error = %e, "workspace purge_app failed (continuing)");
     }
     Json(json!({ "purged": true })).into_response()
 }

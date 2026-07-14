@@ -102,10 +102,8 @@ impl DevSessionRecord {
     /// fails.
     pub fn save(&self, runner_dir: &Path) -> io::Result<()> {
         let dir = dev_sessions_dir(runner_dir);
-        fs::create_dir_all(&dir)?;
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(dir.join(format!("{}.json", self.app_uuid)), json)
+        let path = dir.join(format!("{}.json", self.app_uuid));
+        super::atomic_record::save_json(&dir, &path, self)
     }
 
     /// Load the sidecar for `app_uuid`. `Ok(None)` if there is no record.

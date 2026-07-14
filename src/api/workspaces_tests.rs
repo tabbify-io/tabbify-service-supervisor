@@ -191,6 +191,130 @@
         assert_eq!(reg.len(), 0);
     }
 
+    #[tokio::test]
+    async fn delete_retains_workspace_when_runner_purge_fails() {
+        const UUID: &str = "0191e7c2-bbbb-7222-8333-444455556666";
+
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = crate::orchestrator::Orchestrator::new(
+            crate::orchestrator::SharedRunnerConfig {
+                runner_bin: std::path::PathBuf::from("/opt/tabbify/tabbify-runner"),
+                s3_base_url: "http://s3.invalid".to_owned(),
+                data_dir: dir.path().to_path_buf(),
+                parent: None,
+                no_mesh: true,
+                relay_url: None,
+                relay_only: false,
+            },
+            dir.path().to_path_buf(),
+        );
+        let fetcher = crate::fetcher::S3Fetcher::new("http://s3.invalid", dir.path());
+        let state = std::sync::Arc::new(crate::api::SupervisorState::new(
+            orchestrator,
+            fetcher,
+            "test-supervisor".to_owned(),
+            "::1".to_owned(),
+        ));
+        state.workspaces.insert(Workspace {
+            workspace_uuid: UUID.to_owned(),
+            user_id: "user".to_owned(),
+            caps: vec!["cap".to_owned()],
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
+        });
+        std::fs::write(dir.path().join(format!("{UUID}.json")), b"not-json").unwrap();
+
+        let response = delete_workspace(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(UUID.to_owned()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            state.workspaces.caps_of(UUID).is_some(),
+            "failed purge must retain the workspace retry handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_holds_workspace_lock_through_background_failure_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = crate::orchestrator::Orchestrator::new(
+            crate::orchestrator::SharedRunnerConfig {
+                runner_bin: std::path::PathBuf::from("/opt/tabbify/missing-runner"),
+                s3_base_url: "http://s3.invalid".to_owned(),
+                data_dir: dir.path().to_path_buf(),
+                parent: None,
+                no_mesh: true,
+                relay_url: None,
+                relay_only: false,
+            },
+            dir.path().to_path_buf(),
+        );
+        let fetcher = crate::fetcher::S3Fetcher::new("http://s3.invalid", dir.path());
+        let state = std::sync::Arc::new(crate::api::SupervisorState::new(
+            orchestrator,
+            fetcher,
+            "test-supervisor".to_owned(),
+            "::1".to_owned(),
+        ));
+        let user_id = "concurrent-create-delete";
+        let uuid = workspace_uuid(user_id).to_string();
+        let lifecycle_lock = state.orchestrator.lifecycle_lock_for(&uuid);
+        let lifecycle_guard = lifecycle_lock.lock().await;
+
+        let response = create_workspace(
+            axum::extract::State(state.clone()),
+            axum::Json(CreateWorkspaceBody {
+                user_id: user_id.to_owned(),
+                image_ref: "registry.example:5000/tabbify/workspace:latest".to_owned(),
+                repos: Vec::new(),
+                authorized_key: "ssh-ed25519 AAAA test".to_owned(),
+                forge_admin_token: None,
+                forge_url: None,
+                forge_org: None,
+                network: None,
+                runner_join_token: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .workspace_operation_lock(&uuid)
+                .try_lock_owned()
+                .is_err(),
+            "create must transfer its workspace guard into the background deploy"
+        );
+
+        let delete_state = state.clone();
+        let delete_uuid = uuid.clone();
+        let delete = tokio::spawn(async move {
+            delete_workspace(
+                axum::extract::State(delete_state),
+                axum::extract::Path(delete_uuid),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished(), "delete must wait for create cleanup");
+
+        drop(lifecycle_guard);
+        let response = tokio::time::timeout(Duration::from_secs(5), delete)
+            .await
+            .expect("create cleanup and queued delete must finish")
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "delete must observe the post-cleanup generation, not race its removal"
+        );
+        assert!(state.workspaces.caps_of(&uuid).is_none());
+    }
+
     /// WORKSPACE_MAX_TTL is effectively infinite (spec §3 re-key #3): far beyond
     /// the dev-session 7d, so the safety reaper never reclaims a workspace.
     #[test]

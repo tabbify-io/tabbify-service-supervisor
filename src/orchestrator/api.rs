@@ -21,7 +21,7 @@
 //! on disk are the single source of truth (so a restarted supervisor re-adopts
 //! the living runners). Every op here loads/saves those records.
 
-use std::{net::Ipv6Addr, path::PathBuf, time::Duration};
+use std::{collections::HashSet, net::Ipv6Addr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
@@ -33,7 +33,10 @@ use crate::{
         MONITOR_INTERVAL, Orchestrator,
         client::ControlClient,
         handle::RunnerHandle,
-        monitor::{kill_fc_child_for_uuid, kill_pid},
+        monitor::{
+            RunnerPidIdentity, kill_fc_child_for_uuid, kill_pid, runner_pid_identity,
+            runner_pids_for_uuid,
+        },
         restart::{self, BackoffParams, RestartStatus},
         spawn::{SpawnSpec, spawn_runner},
     },
@@ -74,7 +77,7 @@ pub struct ColdStartUnhealthy(pub String);
 
 /// How many times a live zero-downtime swap re-sends `Cmd::Deploy` when the
 /// control round-trip fails at the TRANSPORT layer (connect/write/read error or
-/// the 5s round-trip timeout — the "deploy control message failed" symptom a
+/// the build-length round-trip timeout — the "deploy control message failed" symptom a
 /// momentarily-wedged or briefly-busy runner socket produces). Each attempt is
 /// itself a full zero-downtime swap (the runner keeps the OLD VM serving on
 /// failure), and the runner's same-ref guard makes a re-send after a lost reply
@@ -89,10 +92,8 @@ const SWAP_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// How long the force-cold-on-env-change reap ([`Orchestrator::reap_runner_for_cold_respawn`])
 /// waits for a shut-down runner's control socket to STOP answering before it
-/// proceeds to the cold spawn. Bounded so a wedged socket can't hang the deploy;
-/// the cold spawn re-derives the SAME `uuid:reff` tap/socket, so the old runner
-/// should be gone first, but proceeding after the bound is safe (the cold-boot
-/// path reconciles any stale FC via the per-uuid pidfile).
+/// falls back to SIGKILL. A cold spawn is never attempted while either the old
+/// process or its control socket remains live.
 const COLD_REAP_MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// Poll interval while waiting for the reaped runner's socket to go dead.
@@ -162,7 +163,8 @@ pub struct DeployNetwork {
     pub network: Option<String>,
     /// Scoped node-minted node-join JWT (`network=<slug>`,
     /// `tags=["tag:net-<slug>"]`, `subject=<app-uuid>`) passed to the runner via
-    /// `TABBIFY_RUNNER_JOIN_TOKEN`. NOT persisted (short-lived).
+    /// `TABBIFY_RUNNER_JOIN_TOKEN`. Persisted because these node-minted runner
+    /// tokens are long-lived and required again after a supervisor respawn.
     pub runner_join_token: Option<String>,
 }
 
@@ -226,10 +228,91 @@ impl Orchestrator {
         }
     }
 
+    /// Build the launch spec for an explicit start.
+    ///
+    /// A known app's on-disk record is its durable launch intent. Reusing it is
+    /// essential: replacing it with a fresh S3-only spec drops the registry ref,
+    /// tenant identity, managed manifest, environment, and egress policy. Only a
+    /// UUID with no record is a genuinely fresh S3-backed start.
+    fn spawn_spec_for_start(&self, uuid: &str) -> Result<(SpawnSpec, Option<RunnerHandle>)> {
+        match self
+            .load_runner_record(uuid)
+            .with_context(|| format!("load runner record for {uuid} before start"))?
+        {
+            Some(record) => {
+                tracing::info!(
+                    uuid,
+                    has_image_ref = record.image_ref.is_some(),
+                    has_manifest = record.manifest_toml.is_some(),
+                    network = record.network.as_deref().unwrap_or("unscoped"),
+                    "start_app: reconstructing launch from durable runner record"
+                );
+                Ok((self.shared().spawn_spec_for(&record), Some(record)))
+            }
+            None => {
+                tracing::info!(uuid, "start_app: no runner record — using fresh S3 launch");
+                Ok((self.spawn_spec_for_uuid(uuid), None))
+            }
+        }
+    }
+
+    /// Build a cold-deploy spec from the durable record when one exists. The
+    /// request's optional context fields are patch semantics: `Some` replaces,
+    /// `None` keeps. Managed manifest semantics deliberately remain replacement
+    /// semantics, where `None` selects the default synthesized manifest.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_spec_for_deploy(
+        &self,
+        uuid: &str,
+        existing: Option<&RunnerHandle>,
+        reff: &str,
+        manifest_toml: Option<&str>,
+        net: &DeployNetwork,
+        extra_env: Option<&std::collections::HashMap<String, String>>,
+        egress_allow: Option<&[String]>,
+    ) -> SpawnSpec {
+        let mut spec = existing.map_or_else(
+            || self.spawn_spec_for_uuid(uuid),
+            |record| self.shared().spawn_spec_for(record),
+        );
+        spec.image_ref = Some(reff.to_owned());
+        spec.manifest_toml = manifest_toml.map(str::to_owned);
+        if net.network.is_some() {
+            spec.network = net.network.clone();
+        }
+        if net.runner_join_token.is_some() {
+            spec.runner_join_token = net.runner_join_token.clone();
+        }
+        if extra_env.is_some() {
+            spec.extra_env = extra_env.cloned();
+        }
+        if egress_allow.is_some() {
+            spec.egress_allow = egress_allow.map(<[String]>::to_vec);
+        }
+        spec
+    }
+
     /// A control client for `uuid`'s runner socket.
     #[must_use]
     fn client_for(&self, uuid: &str) -> ControlClient {
         ControlClient::new(self.control_sock_for(uuid))
+    }
+
+    async fn runner_health_for(&self, uuid: &str) -> Result<Option<Reply>> {
+        match self.client_for(uuid).health().await {
+            Ok(reply) => {
+                let Reply::Health { app_uuid, .. } = &reply else {
+                    anyhow::bail!("unexpected health reply for {uuid}: {reply:?}");
+                };
+                if app_uuid != uuid {
+                    anyhow::bail!(
+                        "control socket identity mismatch for {uuid}: runner reported {app_uuid}"
+                    );
+                }
+                Ok(Some(reply))
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     /// Live state of `uuid`: `Running` iff its runner answers a health probe.
@@ -240,7 +323,7 @@ impl Orchestrator {
     pub async fn app_state(&self, uuid: &str) -> Result<AppState> {
         // Validate the uuid up front so a malformed id is a clear error.
         let _ = self.app_ula_for(uuid)?;
-        Ok(if self.client_for(uuid).health().await.is_ok() {
+        Ok(if self.runner_health_for(uuid).await?.is_some() {
             AppState::Running
         } else {
             AppState::Stopped
@@ -267,9 +350,30 @@ impl Orchestrator {
     ) -> Result<AppSummary> {
         let app_ula = self.app_ula_for(uuid)?;
 
-        // Idempotent: a live runner answering its socket → return it untouched.
-        if self.client_for(uuid).health().await.is_ok() {
-            tracing::info!(uuid, branch = "idempotent-live", "start_app: live runner already healthy — returning existing summary (no spawn)");
+        // Start, stop, purge, reset, and deploy all mutate the same durable
+        // runner record. Serialize them per app and shield this spawn from the
+        // monitor so no stale spec can overwrite a concurrent lifecycle action.
+        let lifecycle_lock = self.lifecycle_lock_for(uuid);
+        let _serialize = lifecycle_lock.lock().await;
+        let (spec, mut existing) = self.spawn_spec_for_start(uuid)?;
+        let socket_live = self.runner_health_for(uuid).await?.is_some();
+        let socket_present = socket_live
+            || self
+                .client_for(uuid)
+                .socket_reachable(COLD_REAP_POLL_INTERVAL)
+                .await
+                .with_context(|| format!("probe runner socket for {uuid} before start"))?;
+
+        // Idempotent only for an app whose durable state is running. A stopped
+        // runner may briefly keep answering after Shutdown acknowledged; treating
+        // that socket as started would leave the record stopped and the app would
+        // disappear as soon as the old process exits.
+        if existing.as_ref().is_some_and(|record| !record.stopped) && socket_live {
+            tracing::info!(
+                uuid,
+                branch = "idempotent-live",
+                "start_app: live runner already healthy — returning existing summary (no spawn)"
+            );
             return Ok(AppSummary {
                 uuid: uuid.to_owned(),
                 app_ula: app_ula.to_string(),
@@ -282,10 +386,45 @@ impl Orchestrator {
             });
         }
 
+        if let Some(record) = existing.as_ref().filter(|record| !record.stopped) {
+            match runner_pid_identity(record.pid, uuid) {
+                RunnerPidIdentity::Matches | RunnerPidIdentity::Unknown => anyhow::bail!(
+                    "runner for {uuid} is still alive or its identity is unverified while its control socket is unhealthy; refusing to spawn a duplicate"
+                ),
+                RunnerPidIdentity::Gone | RunnerPidIdentity::Mismatch => {}
+            }
+        }
+
+        // Any existing record may still own a process even when its socket is
+        // unavailable (mid-pull or mid-shutdown). A stopped record in particular
+        // is durable intent, not proof that the old runner already exited. Reap
+        // both PID and socket before spawning so Start cannot create a duplicate.
+        if let Some(record) = existing.as_mut() {
+            self.shutdown_runner_definitive(uuid, record.pid).await?;
+            if !kill_fc_child_for_uuid(&self.shared().data_dir, uuid, record.image_ref.as_deref()) {
+                anyhow::bail!("Firecracker teardown for {uuid} was not confirmed before start");
+            }
+            record.pid = 0;
+            record
+                .save(self.runner_dir())
+                .with_context(|| format!("save exited runner record for {uuid} before start"))?;
+        } else if socket_present {
+            // A live socket without a record is an untracked survivor. Its health
+            // reply provides the PID used by definitive shutdown; never spawn a
+            // second runner beside it.
+            self.shutdown_runner_definitive(uuid, 0).await?;
+            if !kill_fc_child_for_uuid(&self.shared().data_dir, uuid, None) {
+                anyhow::bail!("Firecracker teardown for {uuid} was not confirmed before start");
+            }
+        }
+
         // No live runner. Spawn one DETACHED (it persists its own record). The
         // runtime is fixed to Firecracker, so the override is not threaded in.
-        tracing::info!(uuid, branch = "cold-spawn", "start_app: no live runner — spawning detached runner");
-        let spec = self.spawn_spec_for_uuid(uuid);
+        tracing::info!(
+            uuid,
+            branch = "cold-spawn",
+            "start_app: no live runner — spawning detached runner"
+        );
         let (handle, _child) = spawn_runner(&spec, self.runner_dir())
             .await
             .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -298,7 +437,11 @@ impl Orchestrator {
         wait_healthy(&client, START_HEALTHY_TIMEOUT)
             .await
             .with_context(|| format!("runner for {uuid} never became healthy"))?;
-        tracing::info!(uuid, pid = handle.pid, "start_app: runner became healthy (cold-spawn complete)");
+        tracing::info!(
+            uuid,
+            pid = handle.pid,
+            "start_app: runner became healthy (cold-spawn complete)"
+        );
 
         Ok(AppSummary {
             uuid: uuid.to_owned(),
@@ -326,81 +469,46 @@ impl Orchestrator {
     /// [`purge_app`](Self::purge_app), the real teardown.
     ///
     /// # Errors
-    /// Returns an error only if `uuid` is malformed. A `Shutdown` round-trip
-    /// failure (e.g. the runner already gone) is logged + tolerated; the record
-    /// is marked stopped regardless.
+    /// Returns an error if the UUID is malformed, durable state cannot be loaded
+    /// or saved, or the runner survives the bounded graceful + SIGKILL teardown.
     pub async fn stop_app(&self, uuid: &str) -> Result<()> {
         let _ = self.app_ula_for(uuid)?;
 
-        // Mark the record stopped FIRST so a concurrent monitor tick cannot
-        // respawn the runner we are about to ask to exit. Preserve the deploy
-        // artifact (image_ref/manifest_toml/extra_env/runner_join_token); only
-        // the live identity (pid) is cleared so the monitor never adopts a stale
-        // live pid for a stopped app. A missing record is a no-op (already gone).
-        // F1 (audit #93): capture the deployed `image_ref` so the FC reap below
-        // can `systemctl stop` the right CPU scope (`uuid:reff`) — the pidfile pid
-        // is only the `systemd-run` wrapper, so the scoped FC leaks without it.
-        let mut image_ref: Option<String> = None;
-        let mut live_pid: u32 = 0;
-        match RunnerHandle::load(self.runner_dir(), uuid) {
-            Ok(Some(mut record)) => {
-                image_ref = record.image_ref.clone();
-                // Capture the live pid BEFORE zeroing it: if the Shutdown
-                // round-trip below cannot reach the runner, this is the only
-                // handle left to force-kill it.
-                live_pid = record.pid;
-                record.stopped = true;
-                // Clear the live pid: pid 0 reads as DEAD to the monitor's
-                // liveness probe, and the `stopped` gate short-circuits the
-                // respawn anyway. (control_sock is left so a fast restart reuses
-                // the deterministic path.)
-                record.pid = 0;
-                if let Err(e) = record.save(self.runner_dir()) {
-                    tracing::warn!(uuid, error = %e, "failed to persist stopped runner record");
-                }
-            }
-            Ok(None) => {
-                tracing::debug!(uuid, "stop_app: no runner record (already stopped/never started)");
-            }
-            Err(e) => {
-                tracing::warn!(uuid, error = %e, "stop_app: could not load runner record");
-            }
+        let lifecycle_lock = self.lifecycle_lock_for(uuid);
+        let _serialize = lifecycle_lock.lock().await;
+        let mut record = self
+            .load_runner_record(uuid)
+            .with_context(|| format!("load runner record for {uuid} before stop"))?;
+        let recorded_pid = record.as_ref().map_or(0, |record| record.pid);
+        let image_ref = record.as_ref().and_then(|record| record.image_ref.clone());
+
+        // Persist operator intent before touching the process. Keep the PID until
+        // exit is definitive: it is the fallback handle when the socket is absent
+        // during image pull or shutdown.
+        if let Some(record) = record.as_mut() {
+            record.stopped = true;
+            record
+                .save(self.runner_dir())
+                .with_context(|| format!("persist stopped intent for {uuid}"))?;
         }
 
-        // Ask the runner to exit. Best-effort: if it is already gone the marked
-        // record still prevents a respawn.
-        match self.client_for(uuid).shutdown().await {
-            Ok(Reply::Ok) => {}
-            Ok(other) => tracing::warn!(uuid, ?other, "unexpected reply to Shutdown"),
-            Err(e) => {
-                tracing::warn!(uuid, error = %e, "Shutdown failed (runner may be gone)");
-                // A runner still mid-IMAGE-PULL has no control socket yet, so
-                // the Shutdown can never reach it — and the monitor's
-                // stopped-record gate skips reaping, so the surviving runner
-                // keeps (re)spawning `oras` pulls for a STOPPED app
-                // indefinitely (observed live on MSI, 2026-07-04: stop_app
-                // returned 200 yet fresh pulls appeared seconds later).
-                // Force-kill the captured pid: the record is already marked
-                // stopped, so nothing respawns it, and the pull reap in
-                // `kill_fc_child_for_uuid` below sweeps its `oras` children.
-                // `live_pid == 0` = no live pid was recorded — nothing to kill.
-                if live_pid != 0 {
-                    tracing::warn!(
-                        uuid,
-                        pid = live_pid,
-                        "stop_app: force-killing unreachable runner (no control socket — likely mid-pull)"
-                    );
-                    kill_pid(live_pid);
-                }
-            }
-        }
+        self.shutdown_runner_definitive(uuid, recorded_pid).await?;
 
         // Reap any FC child the runner left behind (the FC process is not a
         // child of the supervisor — it busy-spins until reaped). Mirrors
         // purge_app's reap so a stopped app does not leak a 100%-CPU FC orphan.
         // Pass the captured `image_ref` so the scoped FC's `uuid:reff` scope is
         // also stopped (F1) — killing the pidfile wrapper pid alone leaks it.
-        kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref.as_deref());
+        if !kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref.as_deref()) {
+            anyhow::bail!("Firecracker teardown for stopped app {uuid} was not confirmed");
+        }
+
+        if let Some(record) = record.as_mut() {
+            record.pid = 0;
+            record
+                .save(self.runner_dir())
+                .with_context(|| format!("persist exited stopped runner for {uuid}"))?;
+        }
         Ok(())
     }
 
@@ -414,37 +522,30 @@ impl Orchestrator {
     /// stopped — the cold spawn immediately follows and writes a fresh
     /// `stopped: false` record.
     ///
-    /// Best-effort throughout; bounded wait for the control socket to go dead.
-    /// MUST be called under the [`begin_deploy`](Orchestrator::begin_deploy) guard
-    /// so the monitor does not respawn the runner mid-reap.
-    async fn reap_runner_for_cold_respawn(&self, uuid: &str, image_ref: Option<&str>) {
-        // Ask the runner to exit (best-effort — it may already be mid-shutdown
-        // from add_repo's prior `stop_app`, or unreachable mid-pull).
-        match self.client_for(uuid).shutdown().await {
-            Ok(_) => {}
-            Err(e) => tracing::debug!(
-                uuid,
-                error = %e,
-                "force-cold reap: Shutdown round-trip failed (runner may already be exiting)"
-            ),
+    /// Failure is fatal to the deploy: spawning while the old process or socket
+    /// survives would create two runners for one UUID. The caller already holds
+    /// the per-UUID lifecycle lock, so the monitor cannot race the gap.
+    async fn reap_runner_for_cold_respawn(&self, record: &RunnerHandle) -> Result<()> {
+        self.shutdown_runner_definitive(&record.uuid, record.pid)
+            .await?;
+        if !kill_fc_child_for_uuid(
+            &self.shared().data_dir,
+            &record.uuid,
+            record.image_ref.as_deref(),
+        ) {
+            anyhow::bail!(
+                "Firecracker teardown for {} was not confirmed before cold respawn",
+                record.uuid
+            );
         }
-        // Reap the firecracker child the runner leaves behind (it is not a
-        // supervisor child — it busy-spins until reaped), stopping the scoped
-        // `uuid:reff` FC too (same primitive the monitor uses before a respawn).
-        kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref);
-        // Wait (bounded) for the control socket to stop answering so the cold
-        // spawn does not race a still-live socket / pidfile on the same path.
-        let deadline = std::time::Instant::now() + COLD_REAP_MAX_WAIT;
-        while std::time::Instant::now() < deadline {
-            if self.client_for(uuid).health().await.is_err() {
-                return;
-            }
-            tokio::time::sleep(COLD_REAP_POLL_INTERVAL).await;
-        }
-        tracing::warn!(
-            uuid,
-            "force-cold reap: runner still answered its socket after the wait; proceeding with cold spawn (cold boot reconciles any stale FC via the pidfile)"
-        );
+        let mut exited = record.clone();
+        exited.pid = 0;
+        exited.save(self.runner_dir()).with_context(|| {
+            format!(
+                "persist exited runner before cold deploy for {}",
+                record.uuid
+            )
+        })
     }
 
     /// Purge `uuid`: tell the runner to clear its on-disk cache + remove its
@@ -452,19 +553,27 @@ impl Orchestrator {
     /// from the orchestrator side too (belt-and-suspenders). Idempotent.
     ///
     /// # Errors
-    /// Returns an error only if `uuid` is malformed. Control-socket failures are
-    /// logged + tolerated; the record + cache are removed regardless.
+    /// Returns an error if durable intent cannot be loaded/saved/deleted, the
+    /// old runner survives teardown, or authoritative cache cleanup is incomplete.
     pub async fn purge_app(&self, uuid: &str) -> Result<()> {
         let _ = self.app_ula_for(uuid)?;
 
-        // F1 (audit #93): read the deployed `image_ref` BEFORE `forget_record`
-        // deletes the record, so the FC reap below can `systemctl stop` the
-        // scoped FC's `uuid:reff` scope (the pidfile pid is only the
-        // `systemd-run` wrapper — stopping it alone leaks the scoped firecracker).
-        let image_ref: Option<String> = RunnerHandle::load(self.runner_dir(), uuid)
-            .ok()
-            .flatten()
-            .and_then(|r| r.image_ref);
+        let lifecycle_lock = self.lifecycle_lock_for(uuid);
+        let _serialize = lifecycle_lock.lock().await;
+        let mut record = self
+            .load_runner_record(uuid)
+            .with_context(|| format!("load runner record for {uuid} before purge"))?;
+        let recorded_pid = record.as_ref().map_or(0, |record| record.pid);
+        let image_ref = record.as_ref().and_then(|record| record.image_ref.clone());
+
+        // Durable stop intent comes first. If any later cleanup fails, the
+        // retained record prevents monitor resurrection and makes purge retryable.
+        if let Some(record) = record.as_mut() {
+            record.stopped = true;
+            record
+                .save(self.runner_dir())
+                .with_context(|| format!("persist stopped intent for {uuid} before purge"))?;
+        }
 
         let client = self.client_for(uuid);
         // Purge clears the runner's cache + docker image (the runner stays up),
@@ -474,16 +583,7 @@ impl Orchestrator {
             Ok(other) => tracing::warn!(uuid, ?other, "unexpected reply to Purge"),
             Err(e) => tracing::warn!(uuid, error = %e, "Purge failed (runner may be gone)"),
         }
-        match client.shutdown().await {
-            Ok(Reply::Ok) => {}
-            Ok(other) => tracing::warn!(uuid, ?other, "unexpected reply to Shutdown after Purge"),
-            Err(e) => {
-                tracing::warn!(uuid, error = %e, "Shutdown after Purge failed (runner may be gone)");
-            }
-        }
-
-        // Forget the record so the monitor does not respawn it.
-        self.forget_record(uuid);
+        self.shutdown_runner_definitive(uuid, recorded_pid).await?;
 
         // FIX C: reap any orphaned FC child. When a dev session is stopped the
         // runner exits (Shutdown), but the firecracker process it spawned is NOT
@@ -493,16 +593,31 @@ impl Orchestrator {
         // did not, leaving FC orphans alive until the next monitor tick found a
         // dead runner. Call the same helper here, best-effort. The pre-forget
         // `image_ref` lets it stop the scoped FC's `uuid:reff` scope too (F1).
-        kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref.as_deref());
+        if !kill_fc_child_for_uuid(&self.shared().data_dir, uuid, image_ref.as_deref()) {
+            anyhow::bail!("Firecracker teardown for purged app {uuid} was not confirmed");
+        }
+
+        if let Some(record) = record.as_mut() {
+            record.pid = 0;
+            record
+                .save(self.runner_dir())
+                .with_context(|| format!("persist exited runner for {uuid} before purge"))?;
+        }
 
         // Reclaim the on-disk cache from our side too: the runner's own purge
         // already cleared it, but if the runner was unreachable we still want a
         // clean disk. `purge_cache` is idempotent (missing dir = success).
         let fetcher =
             crate::fetcher::S3Fetcher::new(&self.shared().s3_base_url, &self.shared().data_dir);
-        if let Err(e) = fetcher.purge_cache(uuid).await {
-            tracing::warn!(uuid, error = %e, "orchestrator-side purge_cache failed (continuing)");
-        }
+        fetcher
+            .purge_cache(uuid)
+            .await
+            .with_context(|| format!("purge cache for {uuid}"))?;
+
+        // Delete only after the old runner is definitively gone and cache
+        // cleanup completed. A deletion error is part of the purge result.
+        self.forget_record(uuid)
+            .with_context(|| format!("delete runner record for {uuid} after purge"))?;
         Ok(())
     }
 
@@ -522,6 +637,8 @@ impl Orchestrator {
     ///   caller may retry. A successful snapshot returns `Ok(())`.
     pub async fn snapshot_app(&self, uuid: &str) -> Result<()> {
         let _ = self.app_ula_for(uuid)?;
+        let lifecycle_lock = self.lifecycle_lock_for(uuid);
+        let _serialize = lifecycle_lock.lock().await;
         match self.client_for(uuid).snapshot().await? {
             Reply::Ok => {
                 tracing::info!(uuid, "Cmd::Snapshot: warm snapshot refreshed");
@@ -580,7 +697,8 @@ impl Orchestrator {
     /// Returns an error only if `uuid` is malformed.
     pub async fn app_summary(&self, uuid: &str) -> Result<Option<AppSummary>> {
         let _ = self.app_ula_for(uuid)?;
-        let Some(rec) = RunnerHandle::load(self.runner_dir(), uuid)
+        let Some(rec) = self
+            .load_runner_record(uuid)
             .with_context(|| format!("load runner record for {uuid}"))?
         else {
             return Ok(None);
@@ -613,7 +731,7 @@ impl Orchestrator {
     /// control-transport failures.
     ///
     /// Returns `Ok(())` once the runner replies `Reply::Ok` (the swap landed).
-    /// The TRANSPORT-failure class — a connect/write/read error or the 5s
+    /// The TRANSPORT-failure class — a connect/write/read error or the build-length
     /// round-trip timeout, surfaced as `Err(e)` ("deploy control message failed")
     /// — is retried up to [`SWAP_MAX_ATTEMPTS`] with [`SWAP_RETRY_BACKOFF`]
     /// between tries: this is the symptom a momentarily-wedged or briefly-busy
@@ -673,6 +791,51 @@ impl Orchestrator {
         unreachable!("swap_with_retry returns inside the loop on the final attempt")
     }
 
+    /// Persist the record after a successful warm swap. If persistence fails,
+    /// shut the swapped runner down before releasing the lifecycle lock so no
+    /// live runtime disagrees with the previous atomic durable record.
+    async fn persist_warm_deploy(
+        &self,
+        record: &RunnerHandle,
+        previous_image_ref: Option<&str>,
+        reff: &str,
+    ) -> Result<()> {
+        let Err(save_error) = record.save(self.runner_dir()) else {
+            return Ok(());
+        };
+        tracing::error!(
+            uuid = %record.uuid,
+            reff,
+            error = %save_error,
+            "warm deploy landed but durable record save failed; shutting down runner fail-closed"
+        );
+        let shutdown_result = self
+            .shutdown_runner_definitive(&record.uuid, record.pid)
+            .await;
+        let mut cleanup_complete =
+            kill_fc_child_for_uuid(&self.shared().data_dir, &record.uuid, Some(reff));
+        if let Some(previous) = previous_image_ref {
+            cleanup_complete &=
+                kill_fc_child_for_uuid(&self.shared().data_dir, &record.uuid, Some(previous));
+        }
+        if let Err(shutdown_error) = shutdown_result {
+            anyhow::bail!(
+                "save runner record for {} after deploy: {save_error}; fail-closed runner shutdown also failed: {shutdown_error}",
+                record.uuid
+            );
+        }
+        if !cleanup_complete {
+            anyhow::bail!(
+                "save runner record for {} after deploy: {save_error}; Firecracker cleanup was not confirmed",
+                record.uuid
+            );
+        }
+        Err(anyhow::Error::new(save_error).context(format!(
+            "save runner record for {} after deploy",
+            record.uuid
+        )))
+    }
+
     /// Deploy `reff` to `uuid`: if a runner is live send it a `Deploy` control
     /// message (zero-downtime swap); if there is no live runner, spawn one
     /// pinned to `reff`. The deployed ref is persisted so a future supervisor
@@ -716,21 +879,20 @@ impl Orchestrator {
         // first finishes its swap; DIFFERENT apps contend on different locks and
         // still deploy in parallel. Held across every await below for the whole
         // deploy (control round-trip and any cold spawn + health wait).
-        let deploy_lock = self.deploy_lock_for(uuid);
-        let _serialize = deploy_lock.lock().await;
+        let lifecycle_lock = self.lifecycle_lock_for(uuid);
+        let _serialize = lifecycle_lock.lock().await;
 
         // Mark this uuid as deploy-in-flight for the WHOLE deploy. The RAII guard
-        // clears it on every exit path (early `?`, error, success). While it is
-        // held the monitor's reconcile defers killing + respawning this runner —
-        // the runner can be briefly busy/unresponsive on its control socket while
-        // it builds the new VM + performs the swap, and a reap mid-deploy would
-        // abort the swap and orphan the half-built VM.
+        // clears it on every exit path and protects the record-less shared build
+        // VM from the Linux orphan sweep. Per-app monitor reconciliation is
+        // already excluded by the lifecycle lock above.
         let _deploy_guard = self.begin_deploy(uuid);
 
         // Load the persisted record up front: needed both to compare the LIVE
         // env-hash against this deploy's requested env (the force-cold gate below)
         // and, on the warm path, to persist the new ref/env after the swap.
-        let existing = RunnerHandle::load(self.runner_dir(), uuid)
+        let existing = self
+            .load_runner_record(uuid)
             .with_context(|| format!("load runner record for {uuid} before deploy"))?;
 
         // Force-cold-on-env-change (#108). A live runner's `/init`-baked env is
@@ -750,9 +912,7 @@ impl Orchestrator {
         let env_changed = match (extra_env, existing.as_ref()) {
             (Some(_), Some(rec)) => {
                 crate::runner::build::firecracker::effective_env_hash(extra_env)
-                    != crate::runner::build::firecracker::effective_env_hash(
-                        rec.extra_env.as_ref(),
-                    )
+                    != crate::runner::build::firecracker::effective_env_hash(rec.extra_env.as_ref())
             }
             _ => false,
         };
@@ -768,7 +928,15 @@ impl Orchestrator {
             String::new()
         };
 
-        let live = self.client_for(uuid).health().await.is_ok();
+        let live = self.runner_health_for(uuid).await?.is_some();
+        let socket_present = live
+            || self
+                .client_for(uuid)
+                .socket_reachable(COLD_REAP_POLL_INTERVAL)
+                .await
+                .with_context(|| format!("probe runner socket for {uuid} before deploy"))?;
+        let warm_eligible =
+            live && existing.as_ref().is_some_and(|record| !record.stopped) && !env_changed;
         // Branch decision trace: which of the three deploy paths this deploy took
         // and WHY (live? env changed vs the running runtime? which component?).
         // The blind spot was "did this deploy warm-swap or cold-respawn?" — now it
@@ -777,18 +945,21 @@ impl Orchestrator {
             uuid,
             reff,
             live,
+            socket_present,
             env_changed,
             env_change_reason = %env_change_reason,
-            branch = if live && !env_changed {
+            branch = if warm_eligible {
                 "warm-swap"
-            } else if live {
+            } else if live && env_changed {
                 "cold-respawn (env changed on live runner)"
+            } else if socket_present {
+                "cold-respawn (stopped or untracked live runner)"
             } else {
                 "cold-spawn (no live runner)"
             },
             "deploy: branch selected"
         );
-        if live && !env_changed {
+        if warm_eligible {
             // Live runner, env UNCHANGED: send the Deploy message, retrying
             // transient transport failures. On a persistent failure this returns
             // Err BEFORE the persist block below — so `image_ref` is left at its
@@ -799,8 +970,9 @@ impl Orchestrator {
             self.swap_with_retry(uuid, reff).await?;
 
             // Persist the new ref so a future respawn comes up on this version.
-            let mut record = existing
-                .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
+            let mut record =
+                existing.ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
+            let previous_image_ref = record.image_ref.clone();
             record.image_ref = Some(reff.to_owned());
             // Persist this deploy's managed `tabbify.toml` so the durable record
             // always reflects the LATEST deploy's runtime config. Without this a
@@ -845,9 +1017,8 @@ impl Orchestrator {
             if egress_allow.is_some() {
                 record.egress_allow = egress_allow.map(<[String]>::to_vec);
             }
-            record
-                .save(self.runner_dir())
-                .with_context(|| format!("save runner record for {uuid} after deploy"))?;
+            self.persist_warm_deploy(&record, previous_image_ref.as_deref(), reff)
+                .await?;
 
             Ok(AppSummary {
                 uuid: uuid.to_owned(),
@@ -863,50 +1034,42 @@ impl Orchestrator {
             if live {
                 // env_changed but a runner IS live (add_repo's prior `stop_app`
                 // hadn't fully exited, or a monitor tick respawned it in the gap
-                // before this deploy took its `begin_deploy` guard). A warm swap
+                // before this deploy took its lifecycle lock). A warm swap
                 // can't apply the new `/init` env, so REAP the live runner first:
                 // the cold spawn below re-derives the IDENTICAL `uuid:reff` tap /
                 // api-socket, which must be free, or the new VM collides with the
                 // still-live one ("socket never appeared"). Held under the
-                // `begin_deploy` guard so the monitor won't respawn it mid-reap.
+                // lifecycle lock so the monitor cannot respawn it mid-reap.
                 tracing::info!(
                     uuid,
                     reff,
                     "deploy: env/cap set changed vs the live runtime — forcing a cold respawn (a warm swap cannot re-bake /init env)"
                 );
-                self.reap_runner_for_cold_respawn(
-                    uuid,
-                    existing.as_ref().and_then(|r| r.image_ref.as_deref()),
-                )
-                .await;
+            }
+            if let Some(record) = existing.as_ref() {
+                self.reap_runner_for_cold_respawn(record).await?;
+            } else if socket_present {
+                // A socket without a record is an untracked survivor. Reap it
+                // before creating the first durable runner for this UUID.
+                self.shutdown_runner_definitive(uuid, 0).await?;
+                if !kill_fc_child_for_uuid(&self.shared().data_dir, uuid, None) {
+                    anyhow::bail!(
+                        "Firecracker teardown for untracked runner {uuid} was not confirmed"
+                    );
+                }
             }
             // No live runner (never started, or just reaped for an env change):
             // spawn one pinned to reff. The runtime is fixed to Firecracker, so
             // the override is not threaded into the spec.
-            let mut spec = self.spawn_spec_for_uuid(uuid);
-            spec.image_ref = Some(reff.to_owned());
-            // Apply the managed `tabbify.toml` (when supplied) so a BUILD-pipeline
-            // app's `[runtime]`/`[routes]` drive its synthesized manifest. `None`
-            // keeps the hardcoded FC defaults.
-            spec.manifest_toml = manifest_toml.map(str::to_owned);
-            // Phase-2: scope the cold spawn to the tenant network. Both the
-            // `--network` slug and the scoped join token are PERSISTED on the
-            // record (the token travels to the runner via env, never the arg
-            // list) so a future respawn re-joins the validating coordinator
-            // with the same long-lived token instead of 401ing. Both `None`
-            // keeps the unscoped spawn. The live path above applies the same
-            // Some-replaces/None-keeps policy; the only way to explicitly
-            // CLEAR a persisted token is purge + fresh deploy.
-            spec.network = net.network.clone();
-            spec.runner_join_token = net.runner_join_token.clone();
-            // Bake the deploy-time extra env into the guest via the runner.
-            // Persisted on the record so a RESPAWN re-bakes the same vars.
-            spec.extra_env = extra_env.cloned();
-            // Thread the egress allow-list into the cold spawn so the runner
-            // installs host-side egress-filter rules at boot. Persisted on the
-            // record (via `RunnerHandle::from`) so a RESPAWN re-applies it. `None`
-            // keeps today's unrestricted egress.
-            spec.egress_allow = egress_allow.map(<[String]>::to_vec);
+            let spec = self.spawn_spec_for_deploy(
+                uuid,
+                existing.as_ref(),
+                reff,
+                manifest_toml,
+                &net,
+                extra_env,
+                egress_allow,
+            );
             let (handle, _child) = spawn_runner(&spec, self.runner_dir())
                 .await
                 .with_context(|| format!("spawn runner for {uuid}"))?;
@@ -982,7 +1145,7 @@ impl Orchestrator {
     /// a fast cold start.
     ///
     /// After the state is cleared the record is persisted and
-    /// [`reconcile_record`](crate::orchestrator::monitor) is called so the
+    /// the already-locked reconcile path is called so the
     /// respawn fires NOW rather than waiting for the next monitor tick.
     ///
     /// # Errors
@@ -992,31 +1155,43 @@ impl Orchestrator {
     pub async fn reset_app(&self, uuid: &str) -> Result<AppSummary> {
         let _ = self.app_ula_for(uuid)?;
 
+        let lifecycle_lock = self.lifecycle_lock_for(uuid);
+        let _serialize = lifecycle_lock.lock().await;
+
         // Load the record — a missing record means "never started" → 404.
-        let mut record = RunnerHandle::load(self.runner_dir(), uuid)
+        let mut record = self
+            .load_runner_record(uuid)
             .with_context(|| format!("load runner record for {uuid}"))?
             .ok_or_else(|| anyhow::anyhow!("no runner record found for {uuid}"))?;
 
         // Clear the crash-loop / backoff state so the runner is immediately
         // eligible for a respawn (next_retry_at is zeroed by reset()).
         record.restart = restart::reset(record.restart);
-        // Also clear the circuit-breaker park flag so the monitor will resume
-        // respawning the runner.
         record.crash_looped = false;
-        // Clear the operator-stopped flag too: `reset` is an explicit "bring it
-        // back" — a stopped app must become respawn-eligible again (the preserved
-        // image_ref/manifest_toml/extra_env drive the cold start).
         record.stopped = false;
 
-        // Persist the cleared state BEFORE triggering reconcile so a concurrent
-        // monitor tick also sees the clean state.
         record
             .save(self.runner_dir())
             .with_context(|| format!("save runner record for {uuid} after reset"))?;
 
         // Fire an immediate reconcile: if the runner is dead it will be
-        // respawned right now; if it is alive it is adopted untouched.
-        self.reconcile_record(&record).await;
+        // respawned right now; if it is alive it is adopted untouched. Calling
+        // the locked internal entry point avoids trying to acquire our own lock.
+        let outcome = self.reconcile_record_locked(&record).await;
+        if matches!(
+            outcome,
+            crate::orchestrator::monitor::RecordOutcome::RespawnFailed
+                | crate::orchestrator::monitor::RecordOutcome::Missing
+                | crate::orchestrator::monitor::RecordOutcome::Busy
+        ) {
+            anyhow::bail!("reset could not reconcile runner for {uuid}: {outcome:?}");
+        }
+
+        // Reconciliation may have replaced the PID/restart state. Reload before
+        // constructing the response rather than returning the pre-reconcile copy.
+        let record = self
+            .load_runner_record(uuid)?
+            .ok_or_else(|| anyhow::anyhow!("runner record disappeared during reset for {uuid}"))?;
 
         // Re-derive the summary from the (now-clean) on-disk record.
         let now = std::time::SystemTime::now()
@@ -1056,16 +1231,151 @@ impl Orchestrator {
             .filter(|t| !t.trim().is_empty())
     }
 
-    /// Remove `uuid`'s on-disk runner record (best-effort; a missing file is
-    /// success). After this the monitor will not respawn the runner.
-    fn forget_record(&self, uuid: &str) {
-        let path = crate::orchestrator::handle::record_path(self.runner_dir(), uuid);
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(uuid, path = %path.display(), error = %e, "failed to remove runner record");
+    /// Gracefully shut down a runner, then use bounded SIGKILL fallback. Success
+    /// means both every known runner PID and the control-socket listener are gone.
+    pub(crate) async fn shutdown_runner_definitive(
+        &self,
+        uuid: &str,
+        recorded_pid: u32,
+    ) -> Result<()> {
+        let client = self.client_for(uuid);
+        let mut known_pids = HashSet::new();
+        let mut uncertain_pid = None;
+
+        // A legacy stopped record may already have pid=0 while its runner still
+        // answers. Recover the live PID from the identity-bearing health reply.
+        if let Ok(Reply::Health { app_uuid, pid, .. }) =
+            client.health_with_timeout(Duration::from_secs(1)).await
+        {
+            if app_uuid != uuid {
+                anyhow::bail!(
+                    "control socket identity mismatch for {uuid}: runner reported {app_uuid}"
+                );
+            }
+            if pid != 0 {
+                known_pids.insert(pid);
             }
         }
+
+        match runner_pid_identity(recorded_pid, uuid) {
+            RunnerPidIdentity::Matches => {
+                known_pids.insert(recorded_pid);
+            }
+            RunnerPidIdentity::Unknown => uncertain_pid = Some(recorded_pid),
+            RunnerPidIdentity::Mismatch => tracing::warn!(
+                uuid,
+                pid = recorded_pid,
+                "recorded PID was reused by another process; excluding it from runner teardown"
+            ),
+            RunnerPidIdentity::Gone => {}
+        }
+        known_pids.extend(runner_pids_for_uuid(uuid));
+
+        match client.shutdown().await {
+            Ok(Reply::Ok) => {}
+            Ok(other) => tracing::warn!(uuid, ?other, "unexpected reply to runner Shutdown"),
+            Err(error) => tracing::debug!(
+                uuid,
+                error = %error,
+                "runner Shutdown round-trip failed; checking process/socket before fallback"
+            ),
+        }
+
+        if wait_runner_exit(
+            &client,
+            uuid,
+            &known_pids,
+            uncertain_pid,
+            COLD_REAP_MAX_WAIT,
+        )
+        .await
+        {
+            return Ok(());
+        }
+
+        known_pids.extend(runner_pids_for_uuid(uuid));
+        let live_pids: Vec<u32> = known_pids
+            .iter()
+            .copied()
+            .chain(uncertain_pid)
+            .filter(|pid| runner_identity_allows_sigkill(runner_pid_identity(*pid, uuid)))
+            .collect();
+        if live_pids.is_empty() {
+            tracing::warn!(
+                uuid,
+                "runner socket survived graceful shutdown but exposed no killable PID"
+            );
+        } else {
+            tracing::warn!(
+                uuid,
+                pids = ?live_pids,
+                "runner survived graceful shutdown; applying SIGKILL fallback"
+            );
+            for pid in live_pids {
+                // Revalidate immediately before every SIGKILL. Any PID can exit
+                // and be reused while graceful shutdown is waiting, including a
+                // PID learned from the earlier health reply.
+                let identity = runner_pid_identity(pid, uuid);
+                if runner_identity_allows_sigkill(identity) {
+                    kill_pid(pid);
+                } else {
+                    tracing::warn!(
+                        uuid,
+                        pid,
+                        ?identity,
+                        "runner PID changed before SIGKILL; refusing to kill"
+                    );
+                }
+            }
+        }
+
+        if wait_runner_exit(
+            &client,
+            uuid,
+            &known_pids,
+            uncertain_pid,
+            COLD_REAP_MAX_WAIT,
+        )
+        .await
+        {
+            return Ok(());
+        }
+        let still_alive: Vec<u32> = known_pids
+            .iter()
+            .copied()
+            .filter(|pid| runner_pid_may_still_match(*pid, uuid))
+            .collect();
+        let socket_reachable = client
+            .socket_reachable(COLD_REAP_POLL_INTERVAL)
+            .await
+            .unwrap_or(true);
+        anyhow::bail!(
+            "runner for {uuid} survived definitive shutdown: live_pids={still_alive:?}, matching_pids={:?}, uncertain_pid={uncertain_pid:?}, socket_reachable={socket_reachable}",
+            runner_pids_for_uuid(uuid)
+        )
     }
+
+    /// Remove `uuid`'s on-disk runner record. A missing file is success; every
+    /// other deletion error is returned to the lifecycle caller.
+    fn forget_record(&self, uuid: &str) -> std::io::Result<()> {
+        let path = crate::orchestrator::handle::record_path(self.runner_dir(), uuid);
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+const fn runner_identity_allows_sigkill(identity: RunnerPidIdentity) -> bool {
+    matches!(identity, RunnerPidIdentity::Matches)
+}
+
+fn runner_pid_may_still_match(pid: u32, uuid: &str) -> bool {
+    matches!(
+        runner_pid_identity(pid, uuid),
+        RunnerPidIdentity::Matches | RunnerPidIdentity::Unknown
+    )
 }
 
 /// Map a [`RestartStatus`] to its snake_case wire string.
@@ -1101,6 +1411,43 @@ async fn wait_healthy(client: &ControlClient, timeout: Duration) -> Result<Reply
     Err(anyhow::anyhow!(
         "control socket never became healthy within {timeout:?}: {last_err:?}"
     ))
+}
+
+/// Wait until all known PIDs have exited and the control socket no longer has a
+/// listener. Reachability probe errors fail closed and are treated as live.
+async fn wait_runner_exit(
+    client: &ControlClient,
+    uuid: &str,
+    known_pids: &HashSet<u32>,
+    uncertain_pid: Option<u32>,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let process_alive = known_pids
+            .iter()
+            .any(|pid| runner_pid_may_still_match(*pid, uuid))
+            || uncertain_pid.is_some_and(|pid| runner_pid_may_still_match(pid, uuid))
+            || !runner_pids_for_uuid(uuid).is_empty();
+        let socket_reachable = client
+            .socket_reachable(COLD_REAP_POLL_INTERVAL)
+            .await
+            .unwrap_or(true);
+        if !process_alive && !socket_reachable {
+            return true;
+        }
+        tokio::time::sleep(COLD_REAP_POLL_INTERVAL).await;
+    }
+    let process_alive = known_pids
+        .iter()
+        .any(|pid| runner_pid_may_still_match(*pid, uuid))
+        || uncertain_pid.is_some_and(|pid| runner_pid_may_still_match(pid, uuid))
+        || !runner_pids_for_uuid(uuid).is_empty();
+    let socket_reachable = client
+        .socket_reachable(COLD_REAP_POLL_INTERVAL)
+        .await
+        .unwrap_or(true);
+    !process_alive && !socket_reachable
 }
 
 /// Cold-spawn readiness verdict (option B). `Serving` = the runner reports
@@ -1234,7 +1581,10 @@ fn boot_failure_diagnostic(tail: &str) -> Option<String> {
 ///
 /// NOTE: the tail surfaces whatever the runner printed — keep this API
 /// mesh-internal; do not propagate to external callers unredacted.
-pub(crate) async fn read_last_lines(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
+pub(crate) async fn read_last_lines(
+    path: &std::path::Path,
+    lines: usize,
+) -> std::io::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     const CHUNK: u64 = 8192;
     let mut f = tokio::fs::File::open(path).await?;
@@ -1258,6 +1608,7 @@ mod tests {
 
     use super::*;
     use crate::orchestrator::SharedRunnerConfig;
+    use crate::orchestrator::monitor::runner_is_alive;
 
     const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
     const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
@@ -1285,6 +1636,14 @@ mod tests {
             START_HEALTHY_TIMEOUT >= std::time::Duration::from_secs(300),
             "cold-spawn health wait must outlast a cold WAN pull"
         );
+    }
+
+    #[test]
+    fn sigkill_requires_fresh_exact_runner_identity() {
+        assert!(runner_identity_allows_sigkill(RunnerPidIdentity::Matches));
+        assert!(!runner_identity_allows_sigkill(RunnerPidIdentity::Gone));
+        assert!(!runner_identity_allows_sigkill(RunnerPidIdentity::Mismatch));
+        assert!(!runner_identity_allows_sigkill(RunnerPidIdentity::Unknown));
     }
 
     #[test]
@@ -1318,6 +1677,97 @@ mod tests {
         assert_eq!(spec.s3_base_url, "http://s3.invalid");
         assert!(spec.no_mesh);
         assert!(spec.parent.is_none());
+    }
+
+    #[test]
+    fn start_spec_preserves_existing_deploy_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let mut seeded = seed_deployed_record(dir.path(), APP_UUID);
+        seeded.pid = 0;
+        seeded.stopped = true;
+        seeded.save(dir.path()).unwrap();
+
+        let (spec, existing) = o.spawn_spec_for_start(APP_UUID).unwrap();
+
+        assert!(existing.is_some_and(|record| record.stopped));
+        assert_eq!(spec.image_ref, seeded.image_ref);
+        assert_eq!(spec.manifest_toml, seeded.manifest_toml);
+        assert_eq!(spec.network, seeded.network);
+        assert_eq!(spec.runner_join_token, seeded.runner_join_token);
+        assert_eq!(spec.extra_env, seeded.extra_env);
+        assert_eq!(spec.egress_allow, seeded.egress_allow);
+    }
+
+    #[test]
+    fn start_spec_without_record_uses_fresh_s3_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+
+        let (spec, existing) = o.spawn_spec_for_start(APP_UUID).unwrap();
+
+        assert!(existing.is_none());
+        assert!(spec.image_ref.is_none());
+        assert!(spec.manifest_toml.is_none());
+        assert!(spec.network.is_none());
+        assert!(spec.runner_join_token.is_none());
+        assert!(spec.extra_env.is_none());
+        assert!(spec.egress_allow.is_none());
+    }
+
+    #[test]
+    fn start_rejects_record_with_mismatched_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let mut record = seed_deployed_record(dir.path(), APP_UUID);
+        record.uuid = "0191e7c2-2222-7222-8333-444455556666".to_owned();
+        std::fs::write(
+            dir.path().join(format!("{APP_UUID}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        let error = o.spawn_spec_for_start(APP_UUID).unwrap_err();
+
+        assert!(format!("{error:#}").contains("identity mismatch"));
+    }
+
+    #[test]
+    fn start_fails_closed_on_unparseable_durable_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        std::fs::write(dir.path().join(format!("{APP_UUID}.json")), b"not-json").unwrap();
+
+        let error = o.spawn_spec_for_start(APP_UUID).unwrap_err();
+
+        assert!(error.to_string().contains("load runner record"));
+    }
+
+    #[test]
+    fn cold_deploy_omitted_context_keeps_durable_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let existing = seed_deployed_record(dir.path(), APP_UUID);
+
+        let spec = o.spawn_spec_for_deploy(
+            APP_UUID,
+            Some(&existing),
+            "registry/app:new",
+            None,
+            &DeployNetwork::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(spec.image_ref.as_deref(), Some("registry/app:new"));
+        assert_eq!(spec.network, existing.network);
+        assert_eq!(spec.runner_join_token, existing.runner_join_token);
+        assert_eq!(spec.extra_env, existing.extra_env);
+        assert_eq!(spec.egress_allow, existing.egress_allow);
+        assert!(
+            spec.manifest_toml.is_none(),
+            "manifest None deliberately keeps synthesized-default semantics"
+        );
     }
 
     /// A malformed uuid is a clear error on the read paths (so the API can 400)
@@ -1433,10 +1883,10 @@ mod tests {
     /// propagated). We verify the state-clearing effect on the persisted record,
     /// which is the core guarantee of reset.
     #[tokio::test]
-    async fn reset_app_clears_restart_state_on_disk() {
+    async fn reset_app_persists_new_backoff_when_immediate_respawn_fails() {
         use tempfile::TempDir;
 
-        use crate::orchestrator::restart::{RestartState, should_respawn};
+        use crate::orchestrator::restart::RestartState;
 
         let dir = TempDir::new().unwrap();
         let o = orch(dir.path().to_path_buf());
@@ -1468,22 +1918,18 @@ mod tests {
         };
         rec.save(dir.path()).unwrap();
 
-        // reset_app should clear the state regardless of reconcile outcome.
-        let _ = o.reset_app(APP_UUID).await;
+        let result = o.reset_app(APP_UUID).await;
+        assert!(result.is_err(), "failed immediate respawn must fail reset");
 
-        // Load the record back and assert the crash state is cleared.
+        // Reset clears the old streak, then the failed immediate spawn is a new
+        // failure and must be durable for the next monitor tick.
         let updated = RunnerHandle::load(dir.path(), APP_UUID)
             .unwrap()
             .expect("record must still exist after reset");
-        assert_eq!(
-            updated.restart,
-            RestartState::default(),
-            "reset must zero the restart state on disk"
-        );
-        // should_respawn must be true for any `now` after the reset.
         assert!(
-            should_respawn(updated.restart, 1_700_001_000),
-            "after reset, runner must be immediately eligible for respawn"
+            updated.restart.consecutive_failures == 1 && updated.restart.next_retry_at > 0,
+            "spawn failure after reset must persist a fresh backoff state: {:?}",
+            updated.restart
         );
     }
 
@@ -1517,6 +1963,42 @@ mod tests {
         assert!(
             o.reset_app("not-a-uuid").await.is_err(),
             "malformed uuid must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_waits_for_lifecycle_lock_and_reconciles_without_deadlock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let mut record = seed_deployed_record(dir.path(), APP_UUID);
+        record.pid = 0;
+        record.stopped = true;
+        record.save(dir.path()).unwrap();
+
+        let lock = o.lifecycle_lock_for(APP_UUID);
+        let guard = lock.lock().await;
+        assert_eq!(
+            o.reconcile_record(&record).await,
+            crate::orchestrator::monitor::RecordOutcome::Busy,
+            "monitor must try-lock and skip while reset/lifecycle work owns the UUID"
+        );
+
+        let reset_orchestrator = o.clone();
+        let reset = tokio::spawn(async move { reset_orchestrator.reset_app(APP_UUID).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reset.is_finished(),
+            "reset must wait for the lifecycle lock"
+        );
+        drop(guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), reset)
+            .await
+            .expect("reset must not deadlock after acquiring its lock")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "reset must report the immediate respawn failure: {result:?}"
         );
     }
 
@@ -1600,12 +2082,24 @@ mod tests {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
                         let _ = reader.read_line(&mut line).await;
-                        // Reply Ok to everything (health probe or deploy).
-                        let reply = r#"{"reply":"ok"}"#;
-                        let _ = reader
-                            .into_inner()
-                            .write_all(format!("{reply}\n").as_bytes())
-                            .await;
+                        let command: crate::control_proto::Cmd =
+                            serde_json::from_str(line.trim()).unwrap();
+                        let reply = if matches!(command, crate::control_proto::Cmd::Health) {
+                            Reply::Health {
+                                state: "running".to_owned(),
+                                app_ula: APP_ULA.to_owned(),
+                                app_uuid: APP_UUID.to_owned(),
+                                pid: 12345,
+                                image_ref: None,
+                                app_health: "serving".to_owned(),
+                                app_health_reason: None,
+                            }
+                        } else {
+                            Reply::Ok
+                        };
+                        let mut payload = serde_json::to_vec(&reply).unwrap();
+                        payload.push(b'\n');
+                        let _ = reader.into_inner().write_all(&payload).await;
                     }
                     _ => break,
                 }
@@ -1639,7 +2133,15 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
         let reff = "[fd5a::1]:5000/acme/app:sha256abc";
         let result = o
-            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None, None)
+            .deploy_app(
+                APP_UUID,
+                reff,
+                None,
+                None,
+                DeployNetwork::default(),
+                None,
+                None,
+            )
             .await;
 
         assert!(result.is_ok(), "deploy_app must succeed: {result:?}");
@@ -1658,9 +2160,80 @@ mod tests {
         );
     }
 
-    /// Spawn a fake runner control server on `sock_path` that answers the first
-    /// `max_conns` connections with `{"reply":"ok"}` (a health probe, a Deploy /
-    /// Shutdown round-trip, …), then UNLINKS the socket so any further connect
+    #[tokio::test]
+    async fn warm_deploy_save_failure_shuts_runner_down_fail_closed() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut record = seed_deployed_record(dir.path(), APP_UUID);
+        record.pid = 0;
+        let record_path = crate::orchestrator::handle::record_path(dir.path(), APP_UUID);
+        std::fs::remove_file(&record_path).unwrap();
+        std::fs::create_dir(&record_path).unwrap();
+
+        let socket = record.control_sock.clone();
+        let server_socket = socket.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let command: crate::control_proto::Cmd = serde_json::from_str(line.trim()).unwrap();
+                let shutdown = matches!(command, crate::control_proto::Cmd::Shutdown);
+                let reply = if shutdown {
+                    Reply::Ok
+                } else {
+                    Reply::Health {
+                        state: "running".to_owned(),
+                        app_ula: APP_ULA.to_owned(),
+                        app_uuid: APP_UUID.to_owned(),
+                        pid: 0,
+                        image_ref: Some("registry/app:new".to_owned()),
+                        app_health: "serving".to_owned(),
+                        app_health_reason: None,
+                    }
+                };
+                let mut payload = serde_json::to_vec(&reply).unwrap();
+                payload.push(b'\n');
+                reader.into_inner().write_all(&payload).await.unwrap();
+                if shutdown {
+                    break;
+                }
+            }
+            drop(listener);
+            let _ = std::fs::remove_file(server_socket);
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        record.image_ref = Some("registry/app:new".to_owned());
+        let error = o
+            .persist_warm_deploy(&record, Some("registry/app:old"), "registry/app:new")
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("save runner record"));
+        assert!(
+            !ControlClient::new(&socket)
+                .socket_reachable(Duration::from_millis(100))
+                .await
+                .unwrap(),
+            "save failure compensation must leave no live runner socket"
+        );
+    }
+
+    /// Spawn a fake runner control server on `sock_path` that answers Health
+    /// with an identity-bearing snapshot and mutations with `Ok`, then UNLINKS
+    /// the socket so any further connect
     /// fails fast — so a force-cold reap's post-shutdown health probe returns
     /// promptly instead of waiting out the whole reap timeout.
     fn spawn_fake_ok_server(sock_path: PathBuf, max_conns: usize) {
@@ -1676,7 +2249,24 @@ mod tests {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
                         let _ = reader.read_line(&mut line).await;
-                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                        let command: crate::control_proto::Cmd =
+                            serde_json::from_str(line.trim()).unwrap();
+                        let reply = if matches!(command, crate::control_proto::Cmd::Health) {
+                            Reply::Health {
+                                state: "running".to_owned(),
+                                app_ula: APP_ULA.to_owned(),
+                                app_uuid: APP_UUID.to_owned(),
+                                pid: 12345,
+                                image_ref: None,
+                                app_health: "serving".to_owned(),
+                                app_health_reason: None,
+                            }
+                        } else {
+                            Reply::Ok
+                        };
+                        let mut payload = serde_json::to_vec(&reply).unwrap();
+                        payload.push(b'\n');
+                        let _ = reader.into_inner().write_all(&payload).await;
                     }
                     _ => break,
                 }
@@ -1688,7 +2278,11 @@ mod tests {
 
     /// Build a live-runner record whose control socket is `sock_path`, image is
     /// `reff`, and baked env is `extra_env`.
-    fn live_record(sock_path: &std::path::Path, reff: &str, extra_env: Option<HashMap<String, String>>) -> RunnerHandle {
+    fn live_record(
+        sock_path: &std::path::Path,
+        reff: &str,
+        extra_env: Option<HashMap<String, String>>,
+    ) -> RunnerHandle {
         RunnerHandle {
             uuid: APP_UUID.to_owned(),
             pid: 12345,
@@ -1732,7 +2326,15 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
         // Same reff (⇒ same digest) AND same env ⇒ warm swap, not cold.
         let result = o
-            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), Some(&env), None)
+            .deploy_app(
+                APP_UUID,
+                reff,
+                None,
+                None,
+                DeployNetwork::default(),
+                Some(&env),
+                None,
+            )
             .await;
         assert!(
             result.is_ok(),
@@ -1772,7 +2374,15 @@ mod tests {
         // SAME reff (same digest), DIFFERENT env ⇒ forced cold respawn ⇒ the
         // (binary-less) spawn Errs.
         let result = o
-            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), Some(&new_env), None)
+            .deploy_app(
+                APP_UUID,
+                reff,
+                None,
+                None,
+                DeployNetwork::default(),
+                Some(&new_env),
+                None,
+            )
             .await;
         assert!(
             result.is_err(),
@@ -1800,7 +2410,10 @@ mod tests {
         // Create-time env: one repo cap.
         let before = HashMap::from([
             ("TABBIFY_WORKSPACE_UUID".to_owned(), APP_UUID.to_owned()),
-            (cap_key.to_owned(), r#"{"apartami.url":"http://g/a"}"#.to_owned()),
+            (
+                cap_key.to_owned(),
+                r#"{"apartami.url":"http://g/a"}"#.to_owned(),
+            ),
         ]);
         live_record(&sock_path, reff, Some(before))
             .save(dir.path())
@@ -1816,7 +2429,15 @@ mod tests {
             ),
         ]);
         let result = o
-            .deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), Some(&after), None)
+            .deploy_app(
+                APP_UUID,
+                reff,
+                None,
+                None,
+                DeployNetwork::default(),
+                Some(&after),
+                None,
+            )
             .await;
         assert!(
             result.is_err(),
@@ -1859,7 +2480,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let o = orch(dir.path().to_path_buf());
-        o.snapshot_app(APP_UUID).await.expect("snapshot must succeed");
+        o.snapshot_app(APP_UUID)
+            .await
+            .expect("snapshot must succeed");
         assert!(
             captured.lock().await.contains("\"cmd\":\"snapshot\""),
             "snapshot_app must send Cmd::Snapshot, got: {}",
@@ -1893,7 +2516,9 @@ mod tests {
                 let _ = reader.read_line(&mut line).await;
                 let _ = reader
                     .into_inner()
-                    .write_all(b"{\"reply\":\"err\",\"message\":\"create did not produce files\"}\n")
+                    .write_all(
+                        b"{\"reply\":\"err\",\"message\":\"create did not produce files\"}\n",
+                    )
                     .await;
             }
         });
@@ -1916,6 +2541,27 @@ mod tests {
         assert!(o.snapshot_app("not-a-uuid").await.is_err());
     }
 
+    #[tokio::test]
+    async fn snapshot_waits_for_the_app_lifecycle_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = orch(dir.path().to_path_buf());
+        let lock = orchestrator.lifecycle_lock_for(APP_UUID);
+        let guard = lock.lock().await;
+        let snapshot_orchestrator = orchestrator.clone();
+        let snapshot =
+            tokio::spawn(async move { snapshot_orchestrator.snapshot_app(APP_UUID).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!snapshot.is_finished());
+        drop(guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), snapshot)
+            .await
+            .expect("snapshot must proceed after lifecycle lock release")
+            .unwrap();
+        assert!(result.is_err(), "fixture has no runner socket");
+    }
+
     /// Two concurrent `deploy_app` calls for the SAME uuid must be SERIALIZED.
     ///
     /// The bug this guards: a single push fans out into two deploys (e.g.
@@ -1934,8 +2580,8 @@ mod tests {
     async fn deploy_app_serializes_concurrent_same_uuid() {
         use std::{
             sync::{
-                atomic::{AtomicUsize, Ordering},
                 Arc,
+                atomic::{AtomicUsize, Ordering},
             },
             time::Duration,
         };
@@ -1973,7 +2619,24 @@ mod tests {
                             let mut line = String::new();
                             let _ = reader.read_line(&mut line).await;
                             tokio::time::sleep(Duration::from_millis(80)).await;
-                            let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                            let command: crate::control_proto::Cmd =
+                                serde_json::from_str(line.trim()).unwrap();
+                            let reply = if matches!(command, crate::control_proto::Cmd::Health) {
+                                Reply::Health {
+                                    state: "running".to_owned(),
+                                    app_ula: APP_ULA.to_owned(),
+                                    app_uuid: APP_UUID.to_owned(),
+                                    pid: 12345,
+                                    image_ref: None,
+                                    app_health: "serving".to_owned(),
+                                    app_health_reason: None,
+                                }
+                            } else {
+                                Reply::Ok
+                            };
+                            let mut payload = serde_json::to_vec(&reply).unwrap();
+                            payload.push(b'\n');
+                            let _ = reader.into_inner().write_all(&payload).await;
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
@@ -2011,12 +2674,28 @@ mod tests {
         let o1 = o.clone();
         let o2 = o.clone();
         let h1 = tokio::spawn(async move {
-            o1.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None, None)
-                .await
+            o1.deploy_app(
+                APP_UUID,
+                reff,
+                None,
+                None,
+                DeployNetwork::default(),
+                None,
+                None,
+            )
+            .await
         });
         let h2 = tokio::spawn(async move {
-            o2.deploy_app(APP_UUID, reff, None, None, DeployNetwork::default(), None, None)
-                .await
+            o2.deploy_app(
+                APP_UUID,
+                reff,
+                None,
+                None,
+                DeployNetwork::default(),
+                None,
+                None,
+            )
+            .await
         });
         let (r1, r2) = tokio::join!(h1, h2);
         assert!(r1.unwrap().is_ok(), "first concurrent deploy must succeed");
@@ -2062,6 +2741,8 @@ mod tests {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
                         let _ = reader.read_line(&mut line).await;
+                        let command: crate::control_proto::Cmd =
+                            serde_json::from_str(line.trim()).unwrap();
                         match behavior {
                             Behavior::DropNoReply => {
                                 // Close without writing a reply → client sees EOF.
@@ -2074,7 +2755,23 @@ mod tests {
                                     .await;
                             }
                             Behavior::Ok => {
-                                let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                                let reply = if matches!(command, crate::control_proto::Cmd::Health)
+                                {
+                                    Reply::Health {
+                                        state: "running".to_owned(),
+                                        app_ula: APP_ULA.to_owned(),
+                                        app_uuid: APP_UUID.to_owned(),
+                                        pid: 12345,
+                                        image_ref: None,
+                                        app_health: "serving".to_owned(),
+                                        app_health_reason: None,
+                                    }
+                                } else {
+                                    Reply::Ok
+                                };
+                                let mut payload = serde_json::to_vec(&reply).unwrap();
+                                payload.push(b'\n');
+                                let _ = reader.into_inner().write_all(&payload).await;
                             }
                         }
                     }
@@ -2132,7 +2829,15 @@ mod tests {
         let o = orch(dir.path().to_path_buf());
         let new_ref = "[fd5a::1]:5000/acme/app:NEW";
         let result = o
-            .deploy_app(APP_UUID, new_ref, None, None, DeployNetwork::default(), None, None)
+            .deploy_app(
+                APP_UUID,
+                new_ref,
+                None,
+                None,
+                DeployNetwork::default(),
+                None,
+                None,
+            )
             .await;
 
         assert!(
@@ -2242,7 +2947,24 @@ mod tests {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
                         let _ = reader.read_line(&mut line).await;
-                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                        let command: crate::control_proto::Cmd =
+                            serde_json::from_str(line.trim()).unwrap();
+                        let reply = if matches!(command, crate::control_proto::Cmd::Health) {
+                            Reply::Health {
+                                state: "running".to_owned(),
+                                app_ula: APP_ULA.to_owned(),
+                                app_uuid: APP_UUID.to_owned(),
+                                pid: 12345,
+                                image_ref: None,
+                                app_health: "serving".to_owned(),
+                                app_health_reason: None,
+                            }
+                        } else {
+                            Reply::Ok
+                        };
+                        let mut payload = serde_json::to_vec(&reply).unwrap();
+                        payload.push(b'\n');
+                        let _ = reader.into_inner().write_all(&payload).await;
                     }
                     _ => break,
                 }
@@ -2417,7 +3139,24 @@ mod tests {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
                         let _ = reader.read_line(&mut line).await;
-                        let _ = reader.into_inner().write_all(b"{\"reply\":\"ok\"}\n").await;
+                        let command: crate::control_proto::Cmd =
+                            serde_json::from_str(line.trim()).unwrap();
+                        let reply = if matches!(command, crate::control_proto::Cmd::Health) {
+                            Reply::Health {
+                                state: "running".to_owned(),
+                                app_ula: APP_ULA.to_owned(),
+                                app_uuid: APP_UUID.to_owned(),
+                                pid: 12345,
+                                image_ref: None,
+                                app_health: "serving".to_owned(),
+                                app_health_reason: None,
+                            }
+                        } else {
+                            Reply::Ok
+                        };
+                        let mut payload = serde_json::to_vec(&reply).unwrap();
+                        payload.push(b'\n');
+                        let _ = reader.into_inner().write_all(&payload).await;
                     }
                     _ => break,
                 }
@@ -2620,18 +3359,27 @@ mod tests {
     /// spin up a real `sleep` child (the stand-in FC orphan), write its pid to
     /// the pidfile, call `purge_app`, then assert the pidfile is removed AND
     /// the child is dead.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn purge_app_reaps_fc_child_via_pidfile() {
         use crate::firecracker::pidfile;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::TempDir::new().unwrap();
         let uuid = "0191e7c2-beef-7222-8333-444455556666";
 
-        // Spawn a real "FC orphan" child we can safely kill.
-        let mut fc_orphan = std::process::Command::new("sleep")
-            .arg("60")
+        // Keep a shell process alive with the same identity-bearing argv as a
+        // real Firecracker child. The script path supplies the exact binary
+        // basename while its ignored arguments supply the expected API socket.
+        let fake_fc = dir.path().join("firecracker");
+        fs::write(&fake_fc, b"#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        fs::set_permissions(&fake_fc, fs::Permissions::from_mode(0o700)).unwrap();
+        let api_sock = crate::firecracker::fc_api_sock_for_key(uuid);
+        let mut fc_orphan = std::process::Command::new(&fake_fc)
+            .args(["--api-sock", &api_sock])
             .spawn()
-            .expect("spawn sleep child");
+            .expect("spawn fake firecracker child");
         let fc_pid = fc_orphan.id();
 
         // Write the pidfile as the runner would after spawning firecracker.
@@ -2670,10 +3418,52 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let _ = fc_orphan.wait(); // best-effort cleanup
+        #[cfg(target_os = "linux")]
+        assert!(
+            fc_alive_after,
+            "purge must not kill an unrelated reused pidfile PID"
+        );
+        #[cfg(not(target_os = "linux"))]
         assert!(
             !fc_alive_after,
-            "FC orphan (pid {fc_pid}) must be killed by purge_app"
+            "non-Linux fake FC process should be cleaned up for local tests"
+        );
+        if fc_alive_after {
+            let _ = fc_orphan.kill();
+        }
+        let _ = fc_orphan.wait();
+    }
+
+    #[tokio::test]
+    async fn purge_surfaces_incomplete_cache_cleanup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let apps = dir.path().join("apps");
+        std::fs::create_dir(&apps).unwrap();
+        // `purge_cache` expects this path to be a directory. A file makes its
+        // remove_dir_all fail deterministically rather than silently succeeding.
+        std::fs::write(apps.join(APP_UUID), b"not a cache directory").unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+
+        let error = o.purge_app(APP_UUID).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("purge cache"));
+        assert!(
+            apps.join(APP_UUID).exists(),
+            "incomplete cache must remain visible"
+        );
+    }
+
+    #[test]
+    fn record_deletion_failure_is_returned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let record_path = crate::orchestrator::handle::record_path(dir.path(), APP_UUID);
+        std::fs::create_dir(&record_path).unwrap();
+        std::fs::write(record_path.join("still-present"), b"x").unwrap();
+
+        assert!(
+            o.forget_record(APP_UUID).is_err(),
+            "non-NotFound deletion failures must propagate"
         );
     }
 
@@ -2727,12 +3517,18 @@ mod tests {
         assert!(after.stopped, "stop_app must mark the record stopped");
         assert_eq!(after.pid, 0, "stop_app must clear the live pid");
         // The deploy artifact must survive so a later respawn/reset/deploy works.
-        assert_eq!(after.image_ref, seeded.image_ref, "image_ref must be preserved");
+        assert_eq!(
+            after.image_ref, seeded.image_ref,
+            "image_ref must be preserved"
+        );
         assert_eq!(
             after.manifest_toml, seeded.manifest_toml,
             "manifest_toml must be preserved"
         );
-        assert_eq!(after.extra_env, seeded.extra_env, "extra_env must be preserved");
+        assert_eq!(
+            after.extra_env, seeded.extra_env,
+            "extra_env must be preserved"
+        );
         assert_eq!(
             after.egress_allow, seeded.egress_allow,
             "egress_allow must be preserved so a respawn re-applies the same egress posture"
@@ -2741,6 +3537,101 @@ mod tests {
             after.runner_join_token, seeded.runner_join_token,
             "runner_join_token must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_propagates_durable_record_load_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        std::fs::write(
+            crate::orchestrator::handle::record_path(dir.path(), APP_UUID),
+            b"not-json",
+        )
+        .unwrap();
+
+        let error = o.stop_app(APP_UUID).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("load runner record"));
+    }
+
+    #[tokio::test]
+    async fn start_reaps_stopped_survivor_before_attempting_spawn() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut survivor = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn surviving old runner stand-in");
+        let survivor_pid = survivor.id();
+        let socket = dir.path().join(format!("{APP_UUID}.sock"));
+        let socket_server = socket.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&socket_server).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let command: crate::control_proto::Cmd = serde_json::from_str(line.trim()).unwrap();
+                let shutdown = matches!(command, crate::control_proto::Cmd::Shutdown);
+                let reply = if shutdown {
+                    kill_pid(survivor_pid);
+                    Reply::Ok
+                } else {
+                    Reply::Health {
+                        state: "running".to_owned(),
+                        app_ula: APP_ULA.to_owned(),
+                        app_uuid: APP_UUID.to_owned(),
+                        pid: survivor_pid,
+                        image_ref: None,
+                        app_health: "serving".to_owned(),
+                        app_health_reason: None,
+                    }
+                };
+                let mut payload = serde_json::to_vec(&reply).unwrap();
+                payload.push(b'\n');
+                reader.into_inner().write_all(&payload).await.unwrap();
+                if shutdown {
+                    break;
+                }
+            }
+            drop(listener);
+            let _ = std::fs::remove_file(socket_server);
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let o = orch_with_data_dir(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let mut record = seed_deployed_record(dir.path(), APP_UUID);
+        record.pid = survivor_pid;
+        record.stopped = true;
+        record.save(dir.path()).unwrap();
+
+        // The configured runner binary does not exist, so Start fails immediately
+        // after teardown. The invariant under test is that the old runner is gone
+        // before that spawn is attempted.
+        assert!(o.start_app(APP_UUID, None).await.is_err());
+        for _ in 0..20 {
+            if !runner_is_alive(survivor_pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !runner_is_alive(survivor_pid),
+            "Start must not leave the stopped survivor beside a replacement attempt"
+        );
+        let _ = survivor.wait();
+        let after = o.load_runner_record(APP_UUID).unwrap().unwrap();
+        assert_eq!(after.pid, 0, "exited survivor PID must be durably cleared");
+        assert!(after.stopped, "failed Start must retain stopped intent");
     }
 
     /// A `stopped` record must NOT be respawned by the monitor's reconcile (it is

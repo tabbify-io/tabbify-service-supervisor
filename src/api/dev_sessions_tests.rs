@@ -113,6 +113,8 @@ fn registry_snapshot_lists_all_sessions() {
 
 use std::path::PathBuf;
 
+const SWEEP_APP_UUID: &str = "0191e7c2-aaaa-7222-8333-444455556666";
+
 fn make_state_for_sweep() -> Arc<crate::api::SupervisorState> {
     let runner_dir = PathBuf::from("/tmp/dev-session-sweep-runners");
     let data_dir = PathBuf::from("/tmp/dev-session-sweep-data");
@@ -176,7 +178,7 @@ async fn sweep_removes_idle_expired_session() {
     insert_session_aged(
         &state,
         "idle-sess",
-        "app-idle",
+        SWEEP_APP_UUID,
         "cap-idle",
         Duration::from_secs(10),
         Duration::from_secs(120),
@@ -185,7 +187,7 @@ async fn sweep_removes_idle_expired_session() {
     insert_session_aged(
         &state,
         "fresh-sess",
-        "app-fresh",
+        SWEEP_APP_UUID,
         "cap-fresh",
         Duration::from_secs(5),
         Duration::from_secs(1),
@@ -212,7 +214,7 @@ async fn sweep_removes_max_ttl_expired_session() {
     insert_session_aged(
         &state,
         "old-sess",
-        "app-old",
+        SWEEP_APP_UUID,
         "cap-old",
         Duration::from_secs(120),
         Duration::from_secs(5),
@@ -257,14 +259,14 @@ async fn sweep_removes_dev_session_record_sidecar() {
     insert_session_aged(
         &state,
         "old-sess",
-        "app-old",
+        SWEEP_APP_UUID,
         "cap-old",
         Duration::from_secs(120),
         Duration::from_secs(5),
     );
     crate::api::DevSessionRecord {
         session_id: "old-sess".to_owned(),
-        app_uuid: "app-old".to_owned(),
+        app_uuid: SWEEP_APP_UUID.to_owned(),
         cap: "cap-old".to_owned(),
         repo_url: "https://github.com/acme/app.git".to_owned(),
         branch: "main".to_owned(),
@@ -275,7 +277,9 @@ async fn sweep_removes_dev_session_record_sidecar() {
     .save(&runner_dir)
     .unwrap();
     assert_eq!(
-        crate::api::DevSessionRecord::list(&runner_dir).unwrap().len(),
+        crate::api::DevSessionRecord::list(&runner_dir)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -290,6 +294,51 @@ async fn sweep_removes_dev_session_record_sidecar() {
     );
 }
 
+#[tokio::test]
+async fn sweep_retains_expired_session_when_purge_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let orchestrator = crate::orchestrator::Orchestrator::new(
+        crate::orchestrator::SharedRunnerConfig {
+            runner_bin: PathBuf::from("/opt/tabbify/tabbify-runner"),
+            s3_base_url: "http://s3.invalid".to_owned(),
+            data_dir: tmp.path().to_path_buf(),
+            parent: None,
+            no_mesh: true,
+            relay_url: None,
+            relay_only: false,
+        },
+        tmp.path().to_path_buf(),
+    );
+    let fetcher = crate::fetcher::S3Fetcher::new("http://s3.invalid", tmp.path());
+    let state = Arc::new(crate::api::SupervisorState::new(
+        orchestrator,
+        fetcher,
+        "test-supervisor".to_owned(),
+        "::1".to_owned(),
+    ));
+    insert_session_aged(
+        &state,
+        "retry-expired",
+        SWEEP_APP_UUID,
+        "retry-cap",
+        Duration::from_secs(120),
+        Duration::from_secs(120),
+    );
+    std::fs::write(
+        tmp.path().join(format!("{SWEEP_APP_UUID}.json")),
+        b"not-json",
+    )
+    .unwrap();
+
+    let purged = sweep_expired(&state, Duration::from_secs(60), Duration::from_secs(60)).await;
+
+    assert!(purged.is_empty());
+    assert!(
+        state.dev_sessions.lookup("retry-expired").is_some(),
+        "expiry must retain the session when VM purge is incomplete"
+    );
+}
+
 /// Both sessions expired: both purged.
 #[tokio::test]
 async fn sweep_removes_both_expired() {
@@ -297,7 +346,7 @@ async fn sweep_removes_both_expired() {
     insert_session_aged(
         &state,
         "e1",
-        "app-e1",
+        SWEEP_APP_UUID,
         "cap-e1",
         Duration::from_secs(10),
         Duration::from_secs(120),
@@ -305,7 +354,7 @@ async fn sweep_removes_both_expired() {
     insert_session_aged(
         &state,
         "e2",
-        "app-e2",
+        SWEEP_APP_UUID,
         "cap-e2",
         Duration::from_secs(10),
         Duration::from_secs(120),
@@ -326,7 +375,7 @@ async fn sweep_keeps_fresh_sessions() {
     insert_session_aged(
         &state,
         "f1",
-        "app-f1",
+        SWEEP_APP_UUID,
         "cap-f1",
         Duration::from_secs(5),
         Duration::from_secs(1),
@@ -334,7 +383,7 @@ async fn sweep_keeps_fresh_sessions() {
     insert_session_aged(
         &state,
         "f2",
-        "app-f2",
+        SWEEP_APP_UUID,
         "cap-f2",
         Duration::from_secs(5),
         Duration::from_secs(1),
@@ -357,7 +406,7 @@ async fn sweep_revokes_git_cap() {
     insert_session_aged(
         &state,
         "cap-sess",
-        "app-cap",
+        SWEEP_APP_UUID,
         "cap-to-revoke",
         Duration::from_secs(10),
         Duration::from_secs(120),

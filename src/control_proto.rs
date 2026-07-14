@@ -59,6 +59,10 @@ pub enum Reply {
         app_uuid: String,
         /// PID of the runner process.
         pid: u32,
+        /// OCI image ref owned by the currently-active runtime. Older runners
+        /// omit this field; supervisors must then keep the durable value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_ref: Option<String>,
         /// App-level health from [`crate::runtime::AppRuntime::health`].
         /// `"serving"` or `"unavailable"`.
         app_health: String,
@@ -158,6 +162,7 @@ mod tests {
                 app_ula: "fd5a:1f02::1".to_owned(),
                 app_uuid: "abc-123".to_owned(),
                 pid: 42,
+                image_ref: Some("registry/app:current".to_owned()),
                 app_health: "serving".to_owned(),
                 app_health_reason: None,
             },
@@ -191,6 +196,7 @@ mod tests {
             app_ula: "fd5a::1".to_owned(),
             app_uuid: "abc".to_owned(),
             pid: 1,
+            image_ref: None,
             app_health: "serving".to_owned(),
             app_health_reason: None,
         };
@@ -205,6 +211,7 @@ mod tests {
             app_ula: "fd5a::1".to_owned(),
             app_uuid: "abc".to_owned(),
             pid: 1,
+            image_ref: None,
             app_health: "unavailable".to_owned(),
             app_health_reason: Some("TCP connect refused".to_owned()),
         };
@@ -214,5 +221,18 @@ mod tests {
             "got: {json2}"
         );
         assert!(json2.contains("TCP connect refused"), "got: {json2}");
+    }
+
+    #[test]
+    fn health_reply_without_image_ref_is_backward_compatible() {
+        let json = r#"{"reply":"health","state":"running","app_ula":"fd5a::1","app_uuid":"abc","pid":1,"app_health":"serving"}"#;
+        let reply: Reply = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            reply,
+            Reply::Health {
+                image_ref: None,
+                ..
+            }
+        ));
     }
 }

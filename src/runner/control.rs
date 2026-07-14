@@ -58,10 +58,6 @@ pub struct RunnerLifecycle {
     pub(crate) fetcher: S3Fetcher,
     /// Docker config — used by `Purge` to remove the built docker image.
     pub(crate) docker: DockerConfig,
-    /// The app runtime, held so `Health` can call `AppRuntime::health()` to
-    /// report the app's own liveness (not just whether the runner process is
-    /// alive).
-    pub(crate) runtime: Arc<dyn AppRuntime>,
     /// The swappable active-runtime cell `Deploy` performs its zero-downtime
     /// swap against. Shared with [`super::serve::RunnerServe`] and the binary's
     /// `run_until_exit` loop (which re-arms its crash-watch across swaps).
@@ -76,6 +72,10 @@ pub struct RunnerLifecycle {
     /// Local data dir for the artifact / AOT cache — passed to
     /// [`build_runtime`] when `Deploy` rebuilds the runtime.
     pub(crate) data_dir: PathBuf,
+    /// Serializes the complete runner-side deploy transaction across cloned
+    /// per-connection lifecycle handles. A transport retry may queue here, but
+    /// can never overtake a still-building first request.
+    pub(crate) deploy_lock: Arc<Mutex<()>>,
     /// Optional sender that signals the main task to exit cleanly when
     /// `Shutdown` is dispatched. `None` when the control server was started
     /// without a shutdown notifier (legacy / test path).
@@ -84,26 +84,15 @@ pub struct RunnerLifecycle {
     /// duplicate the sender (only one `send` must fire; clones share the same
     /// slot and the first `take` wins).
     pub(crate) shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    /// The OCI image ref the CURRENTLY-active runtime was built from (the
-    /// manifest's `runtime.registry_ref` at start, then the last successfully
-    /// deployed ref). `None` when the initial build had no explicit ref (a
-    /// source/S3 build with no deployed version).
-    ///
-    /// Shared via `Arc<Mutex<…>>` because the lifecycle handle is cloned
-    /// per-connection (see [`serve`]); a same-ref re-deploy guard reads this and
-    /// a successful swap writes it, so the value MUST be shared across clones,
-    /// not duplicated. Guards [`RunnerLifecycle::deploy`] against a wasteful
-    /// rebuild + tap collision when the requested ref already runs healthily.
-    pub(crate) current_ref: Arc<Mutex<Option<String>>>,
     /// The resolved OCI manifest DIGEST (`sha256:…`) of the currently-active
     /// runtime's image. The deploy guard compares THIS, not the (possibly-
-    /// floating) string ref in [`Self::current_ref`]: for a connected-repo
+    /// floating) string ref in [`ActiveRuntime`]: for a connected-repo
     /// deploy the ref string can stay equal while the digest behind a moving tag
     /// changes, so a string-equal "no-op" would wrongly skip the new commit
     /// (TAB-10). `None` ⇒ unknown digest ⇒ the next deploy rebuilds (safe).
     ///
     /// Shared via `Arc<Mutex<…>>` for the same per-connection-clone reason as
-    /// [`Self::current_ref`]: the guard reads it and a successful swap writes it.
+    /// the active slot: the guard reads it and a successful swap writes it.
     pub(crate) current_digest: Arc<Mutex<Option<String>>>,
     /// Deploy-time extra `KEY=VALUE` env baked into the guest `/init`. Populated
     /// from the runner's `RUNNER_EXTRA_ENV` at startup and passed into
@@ -122,8 +111,7 @@ pub struct RunnerLifecycle {
     /// [`crate::runner::build::firecracker::production_fc_build_runner`] (real
     /// `oras resolve`). Tests set `Some(fake)` to exercise the digest
     /// short-circuit / fail-open logic hermetically without a real registry.
-    pub(crate) digest_resolver:
-        Option<crate::runner::build::firecracker::FcBuildRunner>,
+    pub(crate) digest_resolver: Option<crate::runner::build::firecracker::FcBuildRunner>,
 }
 
 impl RunnerLifecycle {
@@ -178,7 +166,8 @@ impl RunnerLifecycle {
         } else {
             "stopped"
         };
-        let (app_health, app_health_reason) = match self.runtime.health().await {
+        let (runtime, image_ref) = self.active.load_with_ref();
+        let (app_health, app_health_reason) = match runtime.health().await {
             RuntimeHealth::Serving => ("serving".to_owned(), None),
             RuntimeHealth::Unavailable(reason) => ("unavailable".to_owned(), Some(reason)),
         };
@@ -187,6 +176,7 @@ impl RunnerLifecycle {
             app_ula: self.app_ula.clone(),
             app_uuid: self.uuid.clone(),
             pid: std::process::id(),
+            image_ref,
             app_health,
             app_health_reason,
         }
@@ -230,6 +220,10 @@ impl RunnerLifecycle {
     ///   unhealthy — in both cases the OLD runtime stays in service (no
     ///   downtime).
     async fn deploy(&self, reff: &str) -> Reply {
+        let _serialize = self.deploy_lock.lock().await;
+        let mut runtime_ref = reff.to_owned();
+        let mut resolved_digest = None;
+
         // Same-DIGEST re-deploy guard: if the requested ref resolves to the SAME
         // OCI manifest digest as the live runtime AND the active runtime is
         // healthy, a rebuild is a wasteful no-op — and worse, the new VM would
@@ -259,11 +253,10 @@ impl RunnerLifecycle {
             // create a socket the live one already holds). A coexist-swap is
             // therefore safe ONLY when `reff != current_ref`; when the ref is
             // unchanged we must NOT rebuild unless we can PROVE the image moved.
-            let same_ref = self.current_ref.lock().await.as_deref() == Some(reff);
+            let same_ref = self.active.current_ref().as_deref() == Some(reff);
             let runner = self.digest_runner();
             // `None` = anonymous resolve; the deploy guard only needs a digest.
-            match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None).await
-            {
+            match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None).await {
                 Ok(want) => {
                     let current = self.current_digest.lock().await.clone();
                     if Some(want.as_str()) == current.as_deref() {
@@ -278,9 +271,8 @@ impl RunnerLifecycle {
                     // Same ref string but no recorded digest to disprove sameness
                     // (e.g. post-respawn `current_digest = None`): a rebuild would
                     // collide on the identical identity and we have no evidence the
-                    // image changed → no-op. (A KNOWN-moved digest still falls
-                    // through to rebuild — the TAB-10 moving-tag case, which needs
-                    // a distinct identity, is out of scope here.)
+                    // image changed → no-op. A KNOWN-moved digest falls through
+                    // and is pinned below so its coexist identity is distinct.
                     if same_ref && current.is_none() {
                         tracing::warn!(
                             uuid = %self.uuid,
@@ -289,6 +281,22 @@ impl RunnerLifecycle {
                         );
                         return Reply::Ok;
                     }
+                    if let Some(pinned) = moved_tag_runtime_ref(
+                        reff,
+                        self.active.current_ref().as_deref(),
+                        current.as_deref(),
+                        &want,
+                    ) {
+                        tracing::info!(
+                            uuid = %self.uuid,
+                            requested_ref = %reff,
+                            active_ref = %pinned,
+                            digest = %want,
+                            "deploy: moving tag changed; using digest-pinned runtime identity"
+                        );
+                        runtime_ref = pinned;
+                    }
+                    resolved_digest = Some(want);
                 }
                 Err(e) => {
                     if same_ref {
@@ -317,13 +325,12 @@ impl RunnerLifecycle {
             }
         }
 
-        // Build the new runtime from the app's manifest with the deploy ref
-        // applied: the runtime is always Firecracker, which pulls `reff` from the
-        // mesh registry, converts the OCI image to a rootfs.ext4, and boots it.
-        let next_fetched = fetched_with_ref(&self.fetched, reff);
+        // Build the new runtime from the app's manifest with the effective ref
+        // applied. A proven moving-tag change uses its digest-pinned ref here.
+        let next_fetched = fetched_with_ref(&self.fetched, &runtime_ref);
         // Deploy (`is_swap = true`): the OLD runtime keeps serving until
-        // `perform_swap` flips; the new VM cold-boots `reff` on its own
-        // `uuid:reff` tap so both coexist (no reconcile-kill of the old).
+        // `perform_swap` flips; the new VM cold-boots `runtime_ref` on its own
+        // `uuid:runtime_ref` tap so both coexist (no reconcile-kill of the old).
         // `extra_env` is the same deploy-time env the runner was launched with
         // (populated from `RUNNER_EXTRA_ENV`), so the new rootfs gets the same
         // vars as the initial build — no env drift across zero-downtime swaps.
@@ -353,35 +360,42 @@ impl RunnerLifecycle {
         match perform_swap(
             &self.active,
             new_runtime,
+            Some(runtime_ref.clone()),
             DEPLOY_DRAIN,
             DEPLOY_HEALTH_TIMEOUT,
         )
         .await
         {
             Ok(()) => {
-                // The swap flipped the active runtime to the one built from
-                // `reff`; record it so a subsequent same-ref deploy short-circuits.
-                *self.current_ref.lock().await = Some(reff.to_owned());
                 // Re-resolve the digest of the now-live ref so the next deploy's
                 // digest guard has the correct baseline. On a resolve failure
                 // leave `current_digest = None` (the next deploy then rebuilds —
                 // safe) and warn; we never strand a stale digest.
-                let runner = self.digest_runner();
-                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None)
+                if let Some(digest) = resolved_digest {
+                    *self.current_digest.lock().await = Some(digest);
+                } else {
+                    let runner = self.digest_runner();
+                    match crate::runner::build::firecracker::resolve_oci_digest(
+                        &runtime_ref,
+                        &runner,
+                        None,
+                    )
                     .await
-                {
-                    Ok(d) => *self.current_digest.lock().await = Some(d),
-                    Err(e) => {
-                        *self.current_digest.lock().await = None;
-                        tracing::warn!(
-                            uuid = %self.uuid,
-                            reff = %reff,
-                            error = %e,
-                            "deploy: post-swap digest re-resolve failed — current_digest=None (next deploy rebuilds)"
-                        );
+                    {
+                        Ok(d) => *self.current_digest.lock().await = Some(d),
+                        Err(e) => {
+                            *self.current_digest.lock().await = None;
+                            tracing::warn!(
+                                uuid = %self.uuid,
+                                requested_ref = %reff,
+                                active_ref = %runtime_ref,
+                                error = %e,
+                                "deploy: post-swap digest re-resolve failed — current_digest=None (next deploy rebuilds)"
+                            );
+                        }
                     }
                 }
-                tracing::info!(uuid = %self.uuid, reff = %reff, "deploy: zero-downtime swap complete");
+                tracing::info!(uuid = %self.uuid, requested_ref = %reff, active_ref = %runtime_ref, "deploy: zero-downtime swap complete");
                 Reply::Ok
             }
             Err(e) => {
@@ -392,6 +406,32 @@ impl RunnerLifecycle {
             }
         }
     }
+}
+
+fn digest_pinned_oci_ref(reff: &str, digest: &str) -> String {
+    let without_digest = reff
+        .split_once('@')
+        .map_or(reff, |(repository, _)| repository);
+    let last_slash = without_digest.rfind('/');
+    let repository = match without_digest
+        .rfind(':')
+        .filter(|colon| last_slash.is_none_or(|slash| *colon > slash))
+    {
+        Some(tag_separator) => &without_digest[..tag_separator],
+        None => without_digest,
+    };
+    format!("{repository}@{digest}")
+}
+
+fn moved_tag_runtime_ref(
+    requested_ref: &str,
+    active_ref: Option<&str>,
+    current_digest: Option<&str>,
+    resolved_digest: &str,
+) -> Option<String> {
+    (active_ref == Some(requested_ref)
+        && current_digest.is_some_and(|current| current != resolved_digest))
+    .then(|| digest_pinned_oci_ref(requested_ref, resolved_digest))
 }
 
 /// Accept connections on `socket_path` forever; for each connection read one
@@ -582,13 +622,12 @@ mod tests {
             hosted: Arc::new(Mutex::new(None)), // stopped
             fetcher: S3Fetcher::new("http://s3.invalid", std::path::Path::new("/tmp")),
             docker: DockerConfig::default(),
-            runtime: runtime.clone(),
             active: Arc::new(ActiveRuntime::new(runtime)),
             fetched: fc_fetched(),
             fc: FcConfig::default(),
             data_dir: std::env::temp_dir().join("tabbify-deploy-test"),
+            deploy_lock: Arc::new(Mutex::new(())),
             shutdown_tx: Arc::new(Mutex::new(None)),
-            current_ref: Arc::new(Mutex::new(None)),
             current_digest: Arc::new(Mutex::new(None)),
             extra_env: None,
             egress_allow: None,
@@ -635,6 +674,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn health_reply_carries_ref_from_the_same_active_runtime_slot() {
+        let lc = fake_lifecycle(RuntimeHealth::Serving);
+        lc.active
+            .swap_with_ref(lc.active.load(), Some("registry/app:current".to_owned()));
+
+        let reply = dispatch(Cmd::Health, &lc).await;
+
+        assert!(matches!(
+            reply,
+            Reply::Health {
+                image_ref: Some(ref image_ref),
+                ..
+            } if image_ref == "registry/app:current"
+        ));
+    }
+
     /// `Cmd::Snapshot` dispatches to the lifecycle's snapshot path and replies
     /// `Ok` when the runtime's (default no-op) snapshot succeeds. The active
     /// runtime is unchanged (snapshot is an in-place refresh, never a swap).
@@ -678,6 +734,85 @@ mod tests {
     }
 
     // ---- Deploy dispatch tests ----------------------------------------------
+
+    #[test]
+    fn digest_pin_replaces_tag_without_mistaking_registry_port_for_tag() {
+        assert_eq!(
+            digest_pinned_oci_ref("registry.example:5000/acme/app:main", "sha256:abc"),
+            "registry.example:5000/acme/app@sha256:abc"
+        );
+        assert_eq!(
+            digest_pinned_oci_ref("[fd5a::1]:5000/acme/app:main", "sha256:def"),
+            "[fd5a::1]:5000/acme/app@sha256:def"
+        );
+    }
+
+    #[test]
+    fn moved_same_ref_uses_digest_pinned_runtime_identity() {
+        let requested = "registry.example:5000/acme/app:main";
+        assert_eq!(
+            moved_tag_runtime_ref(requested, Some(requested), Some("sha256:old"), "sha256:new")
+                .as_deref(),
+            Some("registry.example:5000/acme/app@sha256:new")
+        );
+        assert!(
+            moved_tag_runtime_ref(requested, Some(requested), Some("sha256:new"), "sha256:new")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_commands_are_serialized_across_lifecycle_clones() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const DIGEST: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let active_resolves = Arc::new(AtomicUsize::new(0));
+        let max_active_resolves = Arc::new(AtomicUsize::new(0));
+        let active_for_runner = active_resolves.clone();
+        let max_for_runner = max_active_resolves.clone();
+        let resolver: FcBuildRunner = Arc::new(move |_argv| {
+            let active = active_for_runner.clone();
+            let max = max_for_runner.clone();
+            Box::pin(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                (true, format!("{DIGEST}\n").into_bytes())
+            })
+        });
+
+        let mut lifecycle = fake_lifecycle(RuntimeHealth::Serving);
+        lifecycle.digest_resolver = Some(resolver);
+        *lifecycle.current_digest.lock().await = Some(DIGEST.to_owned());
+        let reff = "registry.example:5000/acme/app:main";
+        lifecycle
+            .active
+            .swap_with_ref(lifecycle.active.load(), Some(reff.to_owned()));
+
+        let first = dispatch(
+            Cmd::Deploy {
+                reff: reff.to_owned(),
+            },
+            &lifecycle,
+        );
+        let second = dispatch(
+            Cmd::Deploy {
+                reff: reff.to_owned(),
+            },
+            &lifecycle,
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert!(matches!(first, Reply::Ok));
+        assert!(matches!(second, Reply::Ok));
+        assert_eq!(
+            max_active_resolves.load(Ordering::SeqCst),
+            1,
+            "runner-side deploy transactions must never overlap"
+        );
+    }
 
     // NOTE: the happy-path deploy/swap test was removed with the in-process WASM
     // runtime — it was the only runtime that could build a healthy app hermetically
@@ -728,14 +863,18 @@ mod tests {
     /// and `current_digest` is seeded to MATCH it.
     #[tokio::test]
     async fn deploy_same_digest_when_healthy_is_noop() {
-        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const LIVE_DIGEST: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let mut lc = fake_lifecycle(RuntimeHealth::Serving);
         // The guard resolves ANY ref to LIVE_DIGEST via the fake resolver…
         lc.digest_resolver = Some(fake_digest_runner(LIVE_DIGEST));
         // …and the live runtime is already at LIVE_DIGEST → digests match.
         *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
         // The ref STRING is irrelevant to the digest guard; set it for realism.
-        *lc.current_ref.lock().await = Some("[fd5a::1]:5000/acme/app:main".to_owned());
+        lc.active.swap_with_ref(
+            lc.active.load(),
+            Some("[fd5a::1]:5000/acme/app:main".to_owned()),
+        );
         let before = lc.active.load();
 
         let reply = dispatch(
@@ -766,8 +905,10 @@ mod tests {
     /// proving the short-circuit was bypassed and a real build was attempted).
     #[tokio::test]
     async fn deploy_moved_digest_when_healthy_rebuilds() {
-        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-        const NEW_DIGEST: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        const LIVE_DIGEST: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const NEW_DIGEST: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
         let mut lc = fake_lifecycle(RuntimeHealth::Serving);
         // The requested ref now resolves to NEW_DIGEST…
         lc.digest_resolver = Some(fake_digest_runner(NEW_DIGEST));
@@ -775,7 +916,8 @@ mod tests {
         *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
         // Same ref string as before — the string-compare bug would wrongly no-op.
         let live_ref = "[fd5a::1]:5000/acme/app:main";
-        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        lc.active
+            .swap_with_ref(lc.active.load(), Some(live_ref.to_owned()));
 
         let reply = dispatch(
             Cmd::Deploy {
@@ -792,9 +934,7 @@ mod tests {
                 message.contains("deploy"),
                 "moved-digest deploy must attempt a rebuild (Err), got: {message}"
             ),
-            other => panic!(
-                "moved-digest deploy must rebuild (not no-op); got {other:?}"
-            ),
+            other => panic!("moved-digest deploy must rebuild (not no-op); got {other:?}"),
         }
     }
 
@@ -805,11 +945,15 @@ mod tests {
     /// and the FC build then fails on the unroutable ref → Err.
     #[tokio::test]
     async fn deploy_resolve_failure_different_ref_fails_open_and_rebuilds() {
-        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const LIVE_DIGEST: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let mut lc = fake_lifecycle(RuntimeHealth::Serving);
         lc.digest_resolver = Some(failing_digest_runner());
         *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
-        *lc.current_ref.lock().await = Some("[fd5a::1]:5000/acme/app:oldsha".to_owned());
+        lc.active.swap_with_ref(
+            lc.active.load(),
+            Some("[fd5a::1]:5000/acme/app:oldsha".to_owned()),
+        );
 
         let reply = dispatch(
             Cmd::Deploy {
@@ -845,12 +989,14 @@ mod tests {
     /// rebuilt onto the same identity, and the swap died "socket never appeared").
     #[tokio::test]
     async fn deploy_resolve_failure_same_ref_is_noop() {
-        const LIVE_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const LIVE_DIGEST: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let mut lc = fake_lifecycle(RuntimeHealth::Serving);
         lc.digest_resolver = Some(failing_digest_runner());
         *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
         let live_ref = "[fd5a::1]:5000/acme/app:6457e5c";
-        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        lc.active
+            .swap_with_ref(lc.active.load(), Some(live_ref.to_owned()));
         let before = lc.active.load();
 
         let reply = dispatch(
@@ -883,7 +1029,8 @@ mod tests {
         // No recorded digest (post-respawn): cannot disprove sameness.
         *lc.current_digest.lock().await = None;
         let live_ref = "[fd5a::1]:5000/acme/app:6457e5c";
-        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        lc.active
+            .swap_with_ref(lc.active.load(), Some(live_ref.to_owned()));
         let before = lc.active.load();
 
         let reply = dispatch(
@@ -912,7 +1059,8 @@ mod tests {
     async fn deploy_same_ref_when_unhealthy_does_not_short_circuit() {
         let lc = fake_lifecycle(RuntimeHealth::Unavailable("guest down".to_owned()));
         let live_ref = "[fd5a::1]:5000/acme/app:sha";
-        *lc.current_ref.lock().await = Some(live_ref.to_owned());
+        lc.active
+            .swap_with_ref(lc.active.load(), Some(live_ref.to_owned()));
 
         let reply = dispatch(
             Cmd::Deploy {

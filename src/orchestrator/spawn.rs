@@ -96,16 +96,16 @@ pub struct SpawnSpec {
     /// to the runner via the `TABBIFY_RUNNER_JOIN_TOKEN` environment variable
     /// (NOT a CLI arg — it is a credential, kept off the process arg list / ps
     /// output) so a validating coordinator authenticates the runner's register.
-    /// NOT persisted to disk (it is short-lived + minted per deploy); `None` on
-    /// a respawn means the runner rejoins via its sticky per-uuid keypair.
-    /// `None` (the default) keeps the current tokenless behavior.
+    /// Persisted in the runner record because node-minted runner tokens are
+    /// long-lived and a respawn must authenticate with the same token. `None`
+    /// (the default) keeps the current tokenless behavior.
     pub runner_join_token: Option<String>,
     /// The Tabbify-MANAGED `tabbify.toml` (raw TOML) for a connect-repo deploy.
     /// Passed to the runner via the `RUNNER_MANIFEST_TOML` environment variable
     /// (an env, not an arg: the toml is multi-line and would clutter `ps`) so a
     /// BUILD-pipeline app's `[runtime]`/`[routes]` drive its synthesized
-    /// manifest. NOT persisted to the runner record (it is re-supplied per
-    /// deploy). `None` (the default) keeps the hardcoded FC defaults.
+    /// manifest. Persisted to the runner record so a cold respawn retains the
+    /// latest managed runtime settings. `None` keeps the hardcoded FC defaults.
     pub manifest_toml: Option<String>,
     /// Deploy-time extra `KEY=VALUE` env vars baked into the guest `/init`.
     /// Passed to the runner via the `RUNNER_EXTRA_ENV` environment variable as a
@@ -349,7 +349,7 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
     // NOTE: we intentionally leave `kill_on_drop` at its default (`false`).
     // Dropping the returned `Child` must NOT kill the detached runner.
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn runner binary {:?}", spec.runner_bin))?;
 
@@ -405,9 +405,7 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         stopped: false,
     };
 
-    handle
-        .save(runner_dir)
-        .with_context(|| format!("persist runner record for {}", spec.uuid))?;
+    persist_handle_or_reap(&handle, runner_dir, &spec.data_dir, &mut child).await?;
 
     tracing::info!(
         uuid = %spec.uuid,
@@ -418,6 +416,57 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
     );
 
     Ok((handle, child))
+}
+
+/// Persist a newly spawned runner before exposing it to the caller. If the
+/// durable record cannot be written, kill and reap the child so no live runner
+/// exists without a durable handle.
+async fn persist_handle_or_reap(
+    handle: &RunnerHandle,
+    runner_dir: &Path,
+    data_dir: &Path,
+    child: &mut Child,
+) -> Result<()> {
+    let Err(save_error) = handle.save(runner_dir) else {
+        return Ok(());
+    };
+
+    let pid = handle.pid;
+    // spawn_runner made the child a session/process-group leader. Kill the
+    // whole group first so helpers already forked by a mid-pull runner cannot
+    // survive as untracked descendants.
+    let group_kill = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if group_kill != 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(
+            uuid = %handle.uuid,
+            pid,
+            error = %error,
+            "failed to SIGKILL untracked runner process group; falling back to Child"
+        );
+        let _ = child.start_kill();
+    }
+    let wait_result = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    if wait_result.is_err() {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    }
+
+    let fc_complete = crate::orchestrator::monitor::kill_fc_child_for_uuid(
+        data_dir,
+        &handle.uuid,
+        handle.image_ref.as_deref(),
+    );
+    let matching = crate::orchestrator::monitor::runner_pids_for_uuid(&handle.uuid);
+    if crate::orchestrator::monitor::runner_is_alive(pid) || !matching.is_empty() || !fc_complete {
+        anyhow::bail!(
+            "persist runner record for {}: {save_error}; cleanup incomplete: pid_alive={}, matching_pids={matching:?}, fc_complete={fc_complete}",
+            handle.uuid,
+            crate::orchestrator::monitor::runner_is_alive(pid),
+        );
+    }
+    Err(anyhow::Error::new(save_error)
+        .context(format!("persist runner record for {}", handle.uuid)))
 }
 
 /// Canonical path of the per-app runner log: `<data_dir>/runners/<uuid>.log`.
@@ -1260,6 +1309,86 @@ mod tests {
         child.wait().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn failed_handle_persistence_kills_and_reaps_spawned_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = dir.path().join("records");
+        std::fs::create_dir(&records).unwrap();
+        let uuid = "0191e7c2-8888-7222-8333-444455556666";
+        // Atomic save cannot rename a temp file over a directory at the record
+        // destination, giving a deterministic post-spawn persistence failure.
+        std::fs::create_dir(crate::orchestrator::handle::record_path(&records, uuid)).unwrap();
+
+        let descendant_pid_path = dir.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; wait",
+            "sh",
+        ]);
+        command.arg(&descendant_pid_path);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        for _ in 0..100 {
+            if descendant_pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let parsed = Uuid::parse_str(uuid).unwrap();
+        let handle = RunnerHandle {
+            uuid: uuid.to_owned(),
+            pid,
+            control_sock: records.join(format!("{uuid}.sock")),
+            app_ula: derive_app_ula(parsed).to_string(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: None,
+            extra_env: None,
+            egress_allow: None,
+            crash_looped: false,
+            stopped: false,
+        };
+
+        let error = persist_handle_or_reap(&handle, &records, dir.path(), &mut child)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("persist runner record"));
+        assert!(
+            !crate::orchestrator::monitor::runner_is_alive(pid),
+            "a child without a durable record must not remain alive"
+        );
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+        for _ in 0..100 {
+            if !crate::orchestrator::monitor::runner_is_alive(descendant_pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !crate::orchestrator::monitor::runner_is_alive(descendant_pid),
+            "save-failure cleanup must kill the runner's descendant process group"
+        );
+    }
+
     /// An oversized runner log is rotated to `<path>.1` (P2-2) so the live log
     /// restarts small, and the prior content is preserved for post-mortem.
     #[test]
@@ -1272,7 +1401,10 @@ mod tests {
         rotate_if_oversized(&log, 4);
 
         let rotated = dir.path().join("app.log.1");
-        assert!(rotated.exists(), "oversized log must be rotated to <path>.1");
+        assert!(
+            rotated.exists(),
+            "oversized log must be rotated to <path>.1"
+        );
         assert!(!log.exists(), "the oversized log must be moved aside");
         assert_eq!(
             std::fs::read(&rotated).unwrap(),

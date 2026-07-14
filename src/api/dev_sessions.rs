@@ -465,11 +465,21 @@ pub async fn create_dev_session(
             Err(e) => {
                 tracing::warn!(
                     app_uuid = %app_uuid, session_id = %sid, error = %e,
-                    "dev-session deploy failed (async); revoking git cap + dropping session"
+                    "dev-session deploy failed (async); purging partial runtime before dropping session"
                 );
-                bg.git_sessions.revoke(&cap);
-                bg.dev_sessions.remove(&sid);
-                let _ = DevSessionRecord::remove(bg.orchestrator.runner_dir(), &app_uuid);
+                match bg.orchestrator.purge_app(&app_uuid).await {
+                    Ok(()) => {
+                        bg.git_sessions.revoke(&cap);
+                        bg.dev_sessions.remove(&sid);
+                        let _ = DevSessionRecord::remove(bg.orchestrator.runner_dir(), &app_uuid);
+                    }
+                    Err(purge_error) => tracing::error!(
+                        app_uuid = %app_uuid,
+                        session_id = %sid,
+                        error = %purge_error,
+                        "partial dev-session purge failed; retaining session retry handles"
+                    ),
+                }
             }
         }
     });
@@ -573,12 +583,17 @@ pub async fn delete_dev_session(
 
     // Purge the VM FIRST (purge NOT stop — the monitor must never respawn it).
     if let Err(e) = state.orchestrator.purge_app(&app_uuid).await {
-        tracing::warn!(
+        tracing::error!(
             session_id = %id,
             app_uuid = %app_uuid,
             error = %e,
-            "dev-session purge_app failed (continuing)"
+            "dev-session purge_app failed; retaining session for retry"
         );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to purge dev session {id}: {e}") })),
+        )
+            .into_response();
     }
 
     // FC reaped — now forget the session everywhere.
@@ -677,8 +692,9 @@ pub async fn sweep_expired(
                 session_id,
                 app_uuid,
                 error = %e,
-                "dev-session idle-reap purge_app failed (continuing)"
+                "dev-session idle-reap purge_app failed; retaining retry handles"
             );
+            continue;
         }
         // Now the FC is reaped — safe to forget the session everywhere.
         // Remove from registry so a concurrent request gets 404.

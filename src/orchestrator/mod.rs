@@ -169,37 +169,28 @@ pub struct Orchestrator {
     shared: SharedRunnerConfig,
     /// Directory holding one `<uuid>.json` [`RunnerHandle`] record per runner.
     runner_dir: PathBuf,
-    /// UUIDs with a deploy currently in flight. While a uuid is in this set the
-    /// monitor's [`reconcile_record`](Self::reconcile_record) MUST NOT kill +
-    /// respawn its runner: during a zero-downtime swap the runner can be briefly
-    /// busy/unresponsive on its control socket, and reaping it mid-deploy would
-    /// abort the swap (and orphan the half-built new VM). `deploy_app` inserts
-    /// the uuid before dispatching `Deploy` and removes it on every exit path via
-    /// an RAII [`DeployGuard`]. Shared across clones (the orchestrator is cloned
-    /// to the monitor task + the API layer), so a `std::sync::Mutex` is enough —
-    /// it is only ever locked for the duration of a `contains`/`insert`/`remove`,
-    /// never across an await.
+    /// UUIDs with a deploy currently in flight. Per-UUID lifecycle locks protect
+    /// reconciliation; this set separately tells the Linux orphan-FC sweep that
+    /// the shared build VM may be active and must be protected. `deploy_app`
+    /// inserts before dispatch and an RAII [`DeployGuard`] removes on every exit.
     deploying: Arc<Mutex<HashSet<String>>>,
-    /// Per-uuid async locks that SERIALIZE concurrent deploys of the SAME app.
+    /// Per-uuid async locks that serialize every lifecycle mutation and monitor
+    /// reconciliation for the same app.
     ///
-    /// A single push commonly fans out into two deploys — `commit_repo_edit`'s
-    /// server-side redeploy AND the GitHub-App webhook's redeploy of the same
-    /// commit both arrive at the node and call [`deploy_app`](Self::deploy_app)
-    /// near-simultaneously. Without this, both reach the runner's control socket
-    /// at once and race the in-flight Firecracker swap: one returns
-    /// `deploy control message failed` (the supervisor answers 500) and the
-    /// surviving artifact is non-deterministic. Holding the per-uuid lock for the
-    /// whole deploy makes same-app deploys QUEUE (the second waits for the first
-    /// to finish its swap) while DIFFERENT apps still deploy fully in parallel.
+    /// Start, stop, purge, reset, deploy, and the monitor all read and write the
+    /// same durable record. Holding one lock across each complete operation
+    /// prevents a stale monitor snapshot from undoing an operator action and
+    /// prevents two lifecycle paths from spawning duplicate runners. Different
+    /// apps still proceed independently.
     ///
     /// A `tokio::sync::Mutex` (not `std`) because the guard is held ACROSS awaits
-    /// — the entire `deploy_app`, including the control round-trip and any cold
-    /// spawn + health wait. The OUTER `std::sync::Mutex` only guards the
+    /// — the entire lifecycle operation, including control round-trips and any
+    /// cold spawn + health wait. The OUTER `std::sync::Mutex` only guards the
     /// map's get-or-insert and is never held across an await. Shared across
     /// clones via `Arc` (same as `deploying`) so every caller contends on the
     /// same per-uuid lock. Entries are never removed — an empty mutex per app
-    /// ever deployed is negligible and removal would race a waiting deployer.
-    deploy_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// ever seen is negligible and removal would race a waiting operation.
+    lifecycle_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-uuid image-pull progress observed by the monitor (bytes landed in the
     /// runner's `.pull` layout dir + when they last GREW). Drives the
     /// PROGRESS-BASED reap deferral in [`monitor`]: a pull that keeps making
@@ -216,7 +207,8 @@ pub struct Orchestrator {
 /// RAII guard that removes a uuid from the orchestrator's in-flight-deploy set
 /// when dropped. Guarantees the uuid is cleared on EVERY exit path of
 /// [`Orchestrator::deploy_app`] (early `?` returns, panics, the happy path) so a
-/// failed deploy can never leave a runner permanently shielded from the monitor.
+/// failed deploy can never leave the orphan sweep permanently shielding the
+/// shared build VM.
 pub(crate) struct DeployGuard {
     deploying: Arc<Mutex<HashSet<String>>>,
     uuid: String,
@@ -239,19 +231,20 @@ impl Orchestrator {
             shared,
             runner_dir,
             deploying: Arc::new(Mutex::new(HashSet::new())),
-            deploy_locks: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             pull_progress: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// The per-uuid async lock that serializes deploys for `uuid`, created on
-    /// first use. The returned `Arc<tokio::sync::Mutex<()>>` is what the caller
-    /// `.lock().await`s to enter the deploy critical section. The outer
+    /// The per-uuid async lock that serializes lifecycle mutation and monitor
+    /// reconciliation for `uuid`, created on first use. API mutations await it;
+    /// the monitor only try-locks it so one busy app never blocks a whole tick.
+    /// The outer
     /// `std::sync::Mutex` is only held for the map lookup/insert here, never
     /// across the await.
-    pub(crate) fn deploy_lock_for(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn lifecycle_lock_for(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self
-            .deploy_locks
+            .lifecycle_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(
@@ -261,8 +254,8 @@ impl Orchestrator {
     }
 
     /// Mark `uuid` as deploy-in-flight and return an RAII [`DeployGuard`] that
-    /// clears it on drop. While the guard is alive the monitor defers reaping
-    /// this runner (see [`reconcile_record`](Self::reconcile_record)).
+    /// clears it on drop. The Linux orphan sweep uses this as a conservative
+    /// signal that the record-less build VM may be active.
     pub(crate) fn begin_deploy(&self, uuid: &str) -> DeployGuard {
         if let Ok(mut set) = self.deploying.lock() {
             set.insert(uuid.to_owned());
@@ -271,15 +264,6 @@ impl Orchestrator {
             deploying: Arc::clone(&self.deploying),
             uuid: uuid.to_owned(),
         }
-    }
-
-    /// Is a deploy currently in flight for `uuid`? The monitor consults this
-    /// before killing + respawning an unresponsive runner.
-    pub(crate) fn is_deploying(&self, uuid: &str) -> bool {
-        self.deploying
-            .lock()
-            .map(|set| set.contains(uuid))
-            .unwrap_or(false)
     }
 
     /// The shared runner config.
@@ -292,6 +276,32 @@ impl Orchestrator {
     #[must_use]
     pub fn runner_dir(&self) -> &std::path::Path {
         &self.runner_dir
+    }
+
+    /// Load a runner record and verify that its immutable identity matches the
+    /// filename/requested app. Mutable launch fields remain record-owned.
+    pub(crate) fn load_runner_record(&self, uuid: &str) -> anyhow::Result<Option<RunnerHandle>> {
+        let Some(record) =
+            RunnerHandle::load(&self.runner_dir, uuid).map_err(|error| anyhow::anyhow!(error))?
+        else {
+            return Ok(None);
+        };
+        let expected_sock = self.runner_dir.join(format!("{uuid}.sock"));
+        let parsed = uuid::Uuid::parse_str(uuid)
+            .map_err(|error| anyhow::anyhow!("invalid app uuid {uuid:?}: {error}"))?;
+        let expected_ula = crate::app_ula::derive_app_ula(parsed).to_string();
+        if record.uuid != uuid
+            || record.control_sock != expected_sock
+            || record.app_ula != expected_ula
+        {
+            anyhow::bail!(
+                "runner record identity mismatch for {uuid}: record_uuid={:?}, control_sock={}, app_ula={}",
+                record.uuid,
+                record.control_sock.display(),
+                record.app_ula
+            );
+        }
+        Ok(Some(record))
     }
 
     /// Re-adopt the recorded fleet on supervisor startup.
@@ -328,7 +338,9 @@ impl Orchestrator {
                 // failures are retried on the next tick.
                 RecordOutcome::RespawnFailed
                 | RecordOutcome::Backoff
-                | RecordOutcome::CrashLooped => {}
+                | RecordOutcome::CrashLooped
+                | RecordOutcome::Busy
+                | RecordOutcome::Missing => {}
             }
         }
 
@@ -349,7 +361,10 @@ impl Orchestrator {
         {
             let reaped = self.sweep_orphan_fcs();
             if reaped > 0 {
-                tracing::warn!(reaped, "startup orphan-FC sweep reaped record-less FC orphans");
+                tracing::warn!(
+                    reaped,
+                    "startup orphan-FC sweep reaped record-less FC orphans"
+                );
             }
         }
 
@@ -394,6 +409,13 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    fn is_deploying(orch: &Orchestrator, uuid: &str) -> bool {
+        orch.deploying
+            .lock()
+            .map(|set| set.contains(uuid))
+            .unwrap_or(false)
+    }
 
     fn shared() -> SharedRunnerConfig {
         SharedRunnerConfig {
@@ -603,15 +625,18 @@ mod tests {
         let uuid = "0191e7c2-1111-7222-8333-444455556666";
 
         assert!(
-            !orch.is_deploying(uuid),
+            !is_deploying(&orch, uuid),
             "not deploying before begin_deploy"
         );
         {
             let _guard = orch.begin_deploy(uuid);
-            assert!(orch.is_deploying(uuid), "in-flight while the guard is held");
+            assert!(
+                is_deploying(&orch, uuid),
+                "in-flight while the guard is held"
+            );
         }
         assert!(
-            !orch.is_deploying(uuid),
+            !is_deploying(&orch, uuid),
             "guard drop must clear the in-flight mark"
         );
     }
@@ -626,7 +651,7 @@ mod tests {
 
         let _guard = orch.begin_deploy(uuid);
         assert!(
-            monitor_view.is_deploying(uuid),
+            is_deploying(&monitor_view, uuid),
             "a deploy begun on one clone must be visible to the monitor clone"
         );
     }
@@ -640,9 +665,9 @@ mod tests {
         let b = "019e7903-aaaa-7bbb-8ccc-ddddeeeeffff";
 
         let _guard = orch.begin_deploy(a);
-        assert!(orch.is_deploying(a));
+        assert!(is_deploying(&orch, a));
         assert!(
-            !orch.is_deploying(b),
+            !is_deploying(&orch, b),
             "guard must be scoped to its own uuid"
         );
     }

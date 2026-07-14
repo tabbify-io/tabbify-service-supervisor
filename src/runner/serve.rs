@@ -296,16 +296,19 @@ impl RunnerServe {
         .await
         .with_context(|| format!("build runtime for {}", cfg.uuid))?;
 
+        // Runtime and ref share one atomic slot. If the supervisor dies after a
+        // warm swap but before persisting its record, Health still reports the
+        // exact ref owned by the live runtime for re-adoption reconciliation.
+        let initial_ref = fetched.manifest.runtime.registry_ref.clone();
+
         // Wrap the initial runtime in a swappable cell so P2.3 can atomically
         // replace it for zero-downtime deploys without touching the listener or
         // the mesh peer.  In P2.2 no swap happens; behavior is identical to
         // holding a plain Arc<dyn AppRuntime>.
-        let active: Arc<ActiveRuntime> = Arc::new(ActiveRuntime::new(initial_runtime));
-
-        // Clone the active-runtime handle so the lifecycle can call health() on
-        // it independently of the AppServe's copy.  Both coerce to
-        // Arc<dyn AppRuntime> via the AppRuntime impl on ActiveRuntime.
-        let runtime_for_lifecycle: Arc<dyn AppRuntime> = active.clone();
+        let active: Arc<ActiveRuntime> = Arc::new(ActiveRuntime::new_with_ref(
+            initial_runtime,
+            initial_ref.clone(),
+        ));
 
         // No idle-reaper in the runner yet — the on_request callback is a no-op.
         let on_request: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
@@ -477,12 +480,6 @@ impl RunnerServe {
             None
         };
 
-        // The ref the INITIAL runtime was built from: the resolved manifest's
-        // `runtime.registry_ref` (a deployed version applied via `--image-ref`,
-        // or `None` for a plain source/S3 build). Seeds the same-ref re-deploy
-        // guard so a deploy of the already-running ref is a no-op.
-        let initial_ref = fetched.manifest.runtime.registry_ref.clone();
-
         // Best-effort cold-start digest seed: resolve the initial ref to its OCI
         // manifest digest so the deploy guard's digest comparison has a baseline
         // from the first cold start. On any error (no initial ref, registry
@@ -518,7 +515,6 @@ impl RunnerServe {
             hosted: Arc::new(Mutex::new(Some(hosted))),
             fetcher,
             docker: cfg.docker,
-            runtime: runtime_for_lifecycle,
             // Shared with this RunnerServe + the binary's run_until_exit loop so
             // a `Deploy` swaps the live runtime here and the crash-watch re-arms.
             active: active.clone(),
@@ -526,12 +522,11 @@ impl RunnerServe {
             fetched,
             fc: cfg.fc,
             data_dir: cfg.data_dir,
+            deploy_lock: Arc::new(Mutex::new(())),
             // Wired by the binary after start(); None here so the control
             // server falls back to the legacy direct-exit path until the
             // binary calls lifecycle.set_shutdown_tx(tx).
             shutdown_tx: Arc::new(Mutex::new(None)),
-            // Seed the same-ref guard with the initial build's ref.
-            current_ref: Arc::new(Mutex::new(initial_ref)),
             // Seed the digest guard with the initial ref's resolved digest (or
             // None — first deploy then rebuilds, which is safe).
             current_digest: Arc::new(Mutex::new(initial_digest)),
@@ -1021,7 +1016,11 @@ mod tests {
             crate::tcp_forward::GUEST_SSH_PORT,
             "code port must differ from the ssh exec port"
         );
-        assert_ne!(code_bind.port(), 8730, "code port must differ from the app port");
+        assert_ne!(
+            code_bind.port(),
+            8730,
+            "code port must differ from the app port"
+        );
     }
 
     /// §12 S6: the broker add-key forwarder must bind the app-ULA on

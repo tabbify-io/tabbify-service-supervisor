@@ -37,6 +37,7 @@ use axum::routing::{get, post};
 use crate::fetcher::S3Fetcher;
 use crate::orchestrator::Orchestrator;
 
+mod atomic_record;
 mod dev_session_record;
 mod dev_sessions;
 mod dto;
@@ -136,6 +137,11 @@ pub struct SupervisorState {
     /// (user_id + N caps). The evolution of `dev_sessions` (stable identity,
     /// multi-cap, persistent). Shares the SAME `git_sessions` Arc.
     pub workspaces: std::sync::Arc<WorkspaceRegistry>,
+    /// Per-workspace high-level operation locks. Create transfers its owned guard
+    /// into the background deploy task; delete holds the same lock through purge
+    /// and all registry/sidecar cleanup.
+    workspace_operation_locks:
+        Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// FC tap subnet (CIDR, e.g. `172.31.0.0/16`). Used by `create_dev_session`
     /// to derive the IPv4 `host_ip` for a dev-FC's tap link so the `git_remote`
     /// URL points at the tap gateway the guest will see as its default route.
@@ -178,6 +184,7 @@ impl SupervisorState {
             git_sessions: std::sync::Arc::new(GitSessions::default()),
             dev_sessions: std::sync::Arc::new(DevSessionRegistry::default()),
             workspaces: std::sync::Arc::new(WorkspaceRegistry::default()),
+            workspace_operation_locks: Arc::new(dashmap::DashMap::new()),
             tap_subnet: crate::config::DEFAULT_FC_TAP_SUBNET.to_owned(),
             forge_proxy_enabled: false,
             forge_target: Arc::new(ArcSwap::from_pointee(SocketAddr::new(
@@ -233,6 +240,13 @@ impl SupervisorState {
     pub fn with_forge_target(mut self, forge_target: Arc<ArcSwap<SocketAddr>>) -> Self {
         self.forge_target = forge_target;
         self
+    }
+
+    pub(crate) fn workspace_operation_lock(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.workspace_operation_locks
+            .entry(uuid.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 

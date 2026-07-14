@@ -91,6 +91,154 @@ pub(crate) fn runner_is_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum RunnerPidIdentity {
+    Gone,
+    Matches,
+    Mismatch,
+    Unknown,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nul_tokens(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cmdline_is_runner(argv: &[&[u8]]) -> bool {
+    argv.first().is_some_and(|executable| {
+        executable
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .is_some_and(|basename| basename == b"tabbify-runner")
+    })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn argv_has_exact_uuid(argv: &[&[u8]], uuid: &str) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == b"--uuid" && pair[1] == uuid.as_bytes())
+        || argv.iter().any(|arg| {
+            arg.strip_prefix(b"--uuid=")
+                .is_some_and(|value| value == uuid.as_bytes())
+        })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn environ_has_exact_uuid(environ: &[u8], uuid: &str) -> bool {
+    nul_tokens(environ).iter().any(|entry| {
+        entry
+            .strip_prefix(b"RUNNER_UUID=")
+            .is_some_and(|value| value == uuid.as_bytes())
+    })
+}
+
+/// Exact, allocation-free identity check for `/proc/<pid>/{cmdline,environ}`.
+/// A UUID appearing as an unrelated substring is never sufficient.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn process_bytes_match_runner_uuid(cmdline: &[u8], environ: &[u8], uuid: &str) -> bool {
+    let argv = nul_tokens(cmdline);
+    cmdline_is_runner(&argv)
+        && (argv_has_exact_uuid(&argv, uuid) || environ_has_exact_uuid(environ, uuid))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn select_matching_runner_pids<'a>(
+    processes: impl IntoIterator<Item = (u32, &'a [u8], &'a [u8])>,
+    uuid: &str,
+) -> Vec<u32> {
+    let mut pids: Vec<u32> = processes
+        .into_iter()
+        .filter_map(|(pid, cmdline, environ)| {
+            process_bytes_match_runner_uuid(cmdline, environ, uuid).then_some(pid)
+        })
+        .collect();
+    pids.sort_unstable();
+    pids
+}
+
+/// Validate a recorded PID before treating it as this app's runner. Linux uses
+/// `/proc`; other platforms fail closed because there is no equivalent exact
+/// process identity source available here.
+pub(crate) fn runner_pid_identity(pid: u32, uuid: &str) -> RunnerPidIdentity {
+    if !runner_is_alive(pid) {
+        return RunnerPidIdentity::Gone;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return RunnerPidIdentity::Gone;
+            }
+            Err(_) => return RunnerPidIdentity::Unknown,
+        };
+        let argv = nul_tokens(&cmdline);
+        if !cmdline_is_runner(&argv) {
+            return RunnerPidIdentity::Mismatch;
+        }
+        if argv_has_exact_uuid(&argv, uuid) {
+            return RunnerPidIdentity::Matches;
+        }
+        match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(environ) if environ_has_exact_uuid(&environ, uuid) => RunnerPidIdentity::Matches,
+            Ok(_) => RunnerPidIdentity::Mismatch,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RunnerPidIdentity::Gone,
+            Err(_) => RunnerPidIdentity::Unknown,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = uuid;
+        RunnerPidIdentity::Unknown
+    }
+}
+
+/// Scan Linux `/proc` for exact runner identities. This recovers legacy stopped
+/// records whose PID was cleared before the surviving process actually exited.
+pub(crate) fn runner_pids_for_uuid(uuid: &str) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut processes = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let environ = std::fs::read(entry.path().join("environ")).unwrap_or_default();
+            processes.push((pid, cmdline, environ));
+        }
+        select_matching_runner_pids(
+            processes
+                .iter()
+                .map(|(pid, cmdline, environ)| (*pid, cmdline.as_slice(), environ.as_slice())),
+            uuid,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = uuid;
+        Vec::new()
+    }
+}
+
 /// How long after a spawn to treat an alive-but-unhealthy-socket runner as
 /// "still starting" (adopt without requiring socket health). This prevents the
 /// monitor from respawning a just-spawned runner before its control socket has
@@ -112,6 +260,17 @@ pub(crate) enum RecordOutcome {
     /// The runner has exceeded the crash-loop threshold and has been parked —
     /// no further respawns until a new deploy clears the `crash_looped` flag.
     CrashLooped,
+    /// Another lifecycle operation owns this UUID's lock. The monitor skips it
+    /// without blocking the rest of the tick.
+    Busy,
+    /// The listed snapshot was deleted before reconciliation acquired the lock.
+    Missing,
+}
+
+enum HealthProbe {
+    Valid { pid: u32, image_ref: Option<String> },
+    Unavailable,
+    IdentityMismatch(String),
 }
 
 /// Result of the pure backoff gate check.
@@ -280,16 +439,16 @@ fn fc_tap_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
 }
 
 /// Kill the Firecracker child process for `uuid` by reading its pidfile from
-/// `data_dir`, AND tear down its CPU-capped systemd scope(s). Best-effort: logs
-/// if the pidfile is absent or the kill fails.
+/// `data_dir`, AND tear down its CPU-capped systemd scope(s). Returns `true`
+/// only when every known FC process/scope is confirmed gone.
 ///
 /// Mechanism: the runner writes `<data_dir>/tabbify-fc-<uuid>.pid` after
 /// spawning the firecracker child (via [`crate::firecracker::pidfile::write`]).
 /// When the runner is killed by the monitor the firecracker child is NOT
 /// automatically reaped — it was spawned by the runner (not the supervisor)
 /// and `setsid` is NOT called on the FC child, so it gets reparented to PID 1
-/// and spins forever at 100% CPU. Reading + consuming the pidfile here lets
-/// the supervisor kill the orphan before it spawns a fresh runner.
+/// and spins forever at 100% CPU. The pidfile remains retryable until the
+/// matching process is confirmed gone; a reused unrelated PID is never killed.
 ///
 /// F1 (audit #93) — CRITICAL completeness fix: on a systemd host the FC now runs
 /// inside a `systemd-run --scope`, so the pidfile records the `systemd-run`
@@ -303,8 +462,8 @@ fn fc_tap_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
 /// host. `image_ref` is the record's deployed ref (the caller passes it from the
 /// `RunnerHandle` / loaded record); `None` falls back to the cold-start scope.
 ///
-/// The pidfile is consumed by this call (removed from disk) so the fresh
-/// runner's own cold-start reconciliation does not re-kill the NEW FC.
+/// A confirmed-dead or provably stale pidfile is removed so a fresh runner's
+/// cold-start reconciliation cannot target the new FC.
 ///
 /// #17 — ATOMIC per-uuid FC teardown. Historically the orphan cleanup was split
 /// across several steps that did not all run together (pidfile-pid kill, the F1
@@ -313,7 +472,7 @@ fn fc_tap_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
 /// or its NAT rules behind. This function is now THE single place that tears down
 /// the in-host footprint of one app's FC, in one shot:
 ///
-///   1. SIGKILL the pidfile pid (the `systemd-run` wrapper, or the bare FC).
+///   1. Validate then SIGKILL the pidfile pid (the wrapper, or the bare FC).
 ///   2. `systemctl stop` the reconstructed CPU scope(s) (F1) — kills the real FC
 ///      inside the cgroup when (1) only hit the wrapper.
 ///   3. `ip link del` the reconstructed host TAP(s) (#17) — the runner's `Drop`
@@ -343,7 +502,7 @@ fn fc_tap_names_for_uuid(uuid: &str, image_ref: Option<&str>) -> Vec<String> {
 ///
 /// Exposed as `pub(crate)` so `purge_app` / `stop_app` reuse the same reaping
 /// logic (FIX C: purge must also reap the FC orphan).
-pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Option<&str>) {
+pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Option<&str>) -> bool {
     // Reap any in-flight/orphaned image pull FIRST: a SIGKILLed runner does not
     // take its `oras` child with it (it reparents to PID 1 and keeps
     // downloading), and a respawn would start a SECOND from-scratch pull beside
@@ -352,13 +511,76 @@ pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Opt
     // outage). Every per-uuid teardown (park / respawn / stop / purge / hung
     // reap) funnels through here, so this is the single choke point.
     kill_pull_procs_for_uuid(data_dir, uuid);
-    if let Some(fc_pid) = pidfile::take(data_dir, uuid) {
+    #[allow(unused_mut)]
+    let mut complete = true;
+    if let Some(fc_pid) = pidfile::read(data_dir, uuid) {
         tracing::info!(
             uuid,
             fc_pid,
             "killing orphaned FC child (pidfile pid) before runner respawn"
         );
-        pidfile::kill_stale_if_alive(fc_pid, pidfile::process_is_alive);
+        #[cfg(target_os = "linux")]
+        {
+            let mut expected_sockets =
+                std::collections::HashSet::from([crate::firecracker::fc_api_sock_for_key(uuid)]);
+            if let Some(reff) = image_ref {
+                expected_sockets.insert(crate::firecracker::fc_api_sock_for_key(&format!(
+                    "{uuid}:{reff}"
+                )));
+            }
+            if !pidfile::process_is_alive(fc_pid) {
+                let _ = pidfile::remove(data_dir, uuid);
+            } else {
+                match std::fs::read(format!("/proc/{fc_pid}/cmdline")) {
+                    Ok(cmdline)
+                        if parse_tabbify_fc_api_sock(&cmdline)
+                            .is_some_and(|socket| expected_sockets.contains(&socket)) =>
+                    {
+                        pidfile::kill_stale_if_alive(fc_pid, pidfile::process_is_alive);
+                        for _ in 0..200 {
+                            if !pidfile::process_is_alive(fc_pid) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        if pidfile::process_is_alive(fc_pid) {
+                            tracing::warn!(uuid, fc_pid, "FC pidfile process survived SIGKILL");
+                            complete = false;
+                        } else {
+                            let _ = pidfile::remove(data_dir, uuid);
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            uuid,
+                            fc_pid,
+                            "discarding stale pidfile without killing unrelated reused PID"
+                        );
+                        let _ = pidfile::remove(data_dir, uuid);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = pidfile::remove(data_dir, uuid);
+                    }
+                    Err(error) => {
+                        tracing::warn!(uuid, fc_pid, error = %error, "cannot validate FC pidfile process identity");
+                        complete = false;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if pidfile::process_is_alive(fc_pid) {
+                tracing::warn!(
+                    uuid,
+                    fc_pid,
+                    "cannot validate live FC pidfile process identity on this platform"
+                );
+                complete = false;
+            } else {
+                let _ = pidfile::remove(data_dir, uuid);
+            }
+        }
     }
     // F1 — also stop the CPU-capped scope(s): on systemd the pidfile pid above is
     // only the `systemd-run` wrapper; the firecracker lives inside the scope and
@@ -373,7 +595,7 @@ pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Opt
     #[cfg(target_os = "linux")]
     {
         for scope in fc_scope_names_for_uuid(uuid, image_ref) {
-            crate::firecracker::linux::stop_fc_scope(&scope);
+            complete &= crate::firecracker::linux::stop_fc_scope(&scope);
         }
         for tap in fc_tap_names_for_uuid(uuid, image_ref) {
             crate::firecracker::linux::delete_fc_tap(&tap);
@@ -381,6 +603,7 @@ pub(crate) fn kill_fc_child_for_uuid(data_dir: &Path, uuid: &str, image_ref: Opt
     }
     #[cfg(not(target_os = "linux"))]
     let _ = image_ref; // used only by the Linux scope/tap-teardown above
+    complete
 }
 
 /// The path token that a live `oras` image pull for `uuid` carries in its
@@ -551,9 +774,10 @@ pub const fn pull_stall_update(
     stall_secs: u64,
 ) -> (PullProgress, bool) {
     match prev {
-        Some(p) if cur_bytes == p.bytes => {
-            (p, now_secs.saturating_sub(p.last_progress_secs) < stall_secs)
-        }
+        Some(p) if cur_bytes == p.bytes => (
+            p,
+            now_secs.saturating_sub(p.last_progress_secs) < stall_secs,
+        ),
         // First observation, or the byte count MOVED since the last one.
         _ => (
             PullProgress {
@@ -634,36 +858,7 @@ fn build_fc_api_sock() -> String {
 /// an unrecognised process is NEVER a kill candidate. Pure (testable).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_tabbify_fc_api_sock(cmdline: &[u8]) -> Option<String> {
-    // Split the NUL-separated argv into UTF-8-lossy tokens.
-    let argv: Vec<String> = cmdline
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    if argv.is_empty() {
-        return None;
-    }
-    // Must invoke the firecracker binary (the basename of SOME argv token equals
-    // `firecracker`). Covers both the bare `firecracker` argv[0] and the scoped
-    // `systemd-run … -- firecracker …` form.
-    let invokes_fc = argv.iter().any(|tok| {
-        std::path::Path::new(tok)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|base| base == "firecracker")
-    });
-    if !invokes_fc {
-        return None;
-    }
-    // Find the `--api-sock <value>` pair and require the deterministic tabbify
-    // socket prefix `/tmp/firecracker-….sock` (never matches an unrelated FC).
-    let pos = argv.iter().position(|t| t == "--api-sock")?;
-    let sock = argv.get(pos + 1)?;
-    if sock.starts_with("/tmp/firecracker-") && sock.ends_with(".sock") {
-        Some(sock.clone())
-    } else {
-        None
-    }
+    pidfile::parse_firecracker_api_sock(cmdline)
 }
 
 /// Build the set of api-sockets belonging to LIVE FCs that the sweep must NEVER
@@ -682,7 +877,10 @@ fn parse_tabbify_fc_api_sock(cmdline: &[u8]) -> Option<String> {
 /// live runner parent, so it is excluded by the parent gate, not this set.
 /// Pure (testable).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn live_fc_socket_set(records: &[RunnerHandle], build_maybe_running: bool) -> std::collections::HashSet<String> {
+fn live_fc_socket_set(
+    records: &[RunnerHandle],
+    build_maybe_running: bool,
+) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for r in records {
         // Cold-start key = uuid.
@@ -812,14 +1010,18 @@ impl Orchestrator {
     /// build socket from the sweep.
     #[cfg(target_os = "linux")]
     fn build_maybe_running(&self) -> bool {
-        let build_pidfile =
-            pidfile::path(&self.shared.data_dir, crate::firecracker::BUILD_SCOPE_ID_NAME);
+        let build_pidfile = pidfile::path(
+            &self.shared.data_dir,
+            crate::firecracker::BUILD_SCOPE_ID_NAME,
+        );
         if build_pidfile.exists() {
             return true;
         }
-        // Any in-flight deploy may be in its build phase (build VM not yet pidfiled).
-        RunnerHandle::list(&self.runner_dir)
-            .map(|recs| recs.iter().any(|r| self.is_deploying(&r.uuid)))
+        // Any in-flight deploy may be in its build phase, including a first
+        // deploy with no runner record yet.
+        self.deploying
+            .lock()
+            .map(|deploying| !deploying.is_empty())
             .unwrap_or(true) // can't tell ⇒ assume yes (protect build socket)
     }
 
@@ -883,7 +1085,39 @@ impl Orchestrator {
         Ok(respawned)
     }
 
-    /// Reconcile ONE record: adopt it if its runner is alive, else respawn it.
+    /// Safely reconcile one listed record snapshot.
+    ///
+    /// The snapshot is used only to identify the UUID. The monitor try-locks the
+    /// same per-UUID lifecycle mutex used by API mutations, then reloads the
+    /// durable record under that lock. This prevents an old tick snapshot from
+    /// overwriting a concurrent stop, deploy, reset, or purge.
+    pub(crate) async fn reconcile_record(&self, snapshot: &RunnerHandle) -> RecordOutcome {
+        let lifecycle_lock = self.lifecycle_lock_for(&snapshot.uuid);
+        let Ok(_guard) = lifecycle_lock.try_lock() else {
+            tracing::debug!(
+                uuid = %snapshot.uuid,
+                "lifecycle operation in progress; skipping monitor reconcile this tick"
+            );
+            return RecordOutcome::Busy;
+        };
+        let record = match self.load_runner_record(&snapshot.uuid) {
+            Ok(Some(record)) => record,
+            Ok(None) => return RecordOutcome::Missing,
+            Err(error) => {
+                tracing::error!(
+                    uuid = %snapshot.uuid,
+                    error = %error,
+                    "failed to reload durable runner record for monitor reconcile"
+                );
+                return RecordOutcome::RespawnFailed;
+            }
+        };
+        self.reconcile_record_locked(&record).await
+    }
+
+    /// Reconcile a freshly loaded record while its per-UUID lifecycle lock is
+    /// already held. `reset_app` uses this entry point to avoid self-deadlock;
+    /// periodic tick and startup readopt must use [`Self::reconcile_record`].
     ///
     /// Implements the Task 2.7 decision matrix (grace window + kill-before-respawn).
     /// This is the single source of truth shared by [`tick`](Self::tick) and
@@ -893,17 +1127,47 @@ impl Orchestrator {
     /// Backoff is gated via [`backoff_action`]: if the runner is dead but its
     /// next-retry window has not yet elapsed, the function returns
     /// [`RecordOutcome::Backoff`] without touching the process table.
-    pub(crate) async fn reconcile_record(&self, record: &RunnerHandle) -> RecordOutcome {
+    pub(crate) async fn reconcile_record_locked(&self, record: &RunnerHandle) -> RecordOutcome {
         // Operator-stopped: `stop_app` shut the runner down but PRESERVED its
         // record (so the deploy artifact survives for a later respawn/reset).
         // A stopped record must NOT be respawned — treat it like a parked one
         // until the app is brought back up (a fresh spawn writes `stopped:
         // false`; `reset_app` clears it).
         if record.stopped {
-            tracing::debug!(
-                uuid = %record.uuid,
-                "runner is operator-stopped — skipping respawn until restarted/reset/deployed"
-            );
+            if let Err(error) = self
+                .shutdown_runner_definitive(&record.uuid, record.pid)
+                .await
+            {
+                tracing::warn!(
+                    uuid = %record.uuid,
+                    error = %error,
+                    "stopped intent has a surviving or unverified runner; monitor will retry"
+                );
+                return RecordOutcome::RespawnFailed;
+            }
+            if !kill_fc_child_for_uuid(
+                &self.shared.data_dir,
+                &record.uuid,
+                record.image_ref.as_deref(),
+            ) {
+                tracing::warn!(
+                    uuid = %record.uuid,
+                    "stopped intent FC teardown was not confirmed; monitor will retry"
+                );
+                return RecordOutcome::RespawnFailed;
+            }
+            if record.pid != 0 {
+                let mut stopped = record.clone();
+                stopped.pid = 0;
+                if let Err(error) = stopped.save(&self.runner_dir) {
+                    tracing::warn!(
+                        uuid = %record.uuid,
+                        error = %error,
+                        "failed to persist converged stopped runner state"
+                    );
+                    return RecordOutcome::RespawnFailed;
+                }
+            }
             return RecordOutcome::CrashLooped;
         }
 
@@ -923,26 +1187,50 @@ impl Orchestrator {
             .unwrap_or_default()
             .as_secs();
 
-        match decide_pid_grace(record.pid, record.spawned_at, now_secs, runner_is_alive) {
-            PidDecision::RespawnDead => {
-                // A deploy is in flight for this uuid: `deploy_app` OWNS the
-                // (re)spawn while its `begin_deploy` guard is held. It may have
-                // just REAPED the runner mid-op — the force-cold-on-env-change
-                // path (#108) reaps a live runner so a fresh one can cold-boot the
-                // new env — so a dead runner here is EXPECTED, not a crash. Racing
-                // in with our own respawn would collide with the deploy's cold
-                // spawn on the identical `uuid:reff` tap/socket, and would boot the
-                // STALE record env (add_repo's new cap is applied by the deploy's
-                // spawn, not yet persisted). Defer: if the deploy fails, its guard
-                // drops and the next tick respawns from the record as usual.
-                if self.is_deploying(&record.uuid) {
-                    tracing::info!(
-                        uuid = %record.uuid,
-                        "deploy in progress; deferring respawn of dead runner (deploy owns the respawn)"
-                    );
-                    return RecordOutcome::Adopted;
+        let mut current = record.clone();
+        let mut pid_identity = runner_pid_identity(current.pid, &current.uuid);
+        if pid_identity != RunnerPidIdentity::Matches {
+            match self.probe_runner_health(&current).await {
+                HealthProbe::Valid { pid, image_ref } => {
+                    return self.adopt_health(&current, pid, image_ref, now_secs);
                 }
+                HealthProbe::IdentityMismatch(reported) => {
+                    tracing::error!(
+                        uuid = %current.uuid,
+                        reported_uuid = %reported,
+                        "control socket belongs to a different runner; refusing lifecycle action"
+                    );
+                    return RecordOutcome::RespawnFailed;
+                }
+                HealthProbe::Unavailable => {}
+            }
 
+            let matching = runner_pids_for_uuid(&current.uuid);
+            if matching.len() > 1 {
+                tracing::error!(
+                    uuid = %current.uuid,
+                    pids = ?matching,
+                    "multiple exact runner processes found; refusing to guess which one to adopt"
+                );
+                return RecordOutcome::RespawnFailed;
+            }
+            if let Some(pid) = matching.first().copied() {
+                current.pid = pid;
+                pid_identity = RunnerPidIdentity::Matches;
+            } else if pid_identity == RunnerPidIdentity::Unknown {
+                tracing::warn!(
+                    uuid = %current.uuid,
+                    pid = current.pid,
+                    "recorded PID identity could not be verified; failing closed"
+                );
+                return RecordOutcome::RespawnFailed;
+            }
+        }
+
+        match decide_pid_grace(current.pid, current.spawned_at, now_secs, |_| {
+            pid_identity == RunnerPidIdentity::Matches
+        }) {
+            PidDecision::RespawnDead => {
                 // Gate the actual respawn behind the backoff policy.
                 if backoff_action(record.restart, now_secs) == BackoffAction::Wait {
                     tracing::debug!(
@@ -971,12 +1259,14 @@ impl Orchestrator {
                     );
                     // Kill the FC orphan (best-effort) even when parking: the
                     // runner is dead and the FC child is spinning at 100% CPU.
-                    kill_fc_child_for_uuid(
+                    if !kill_fc_child_for_uuid(
                         &self.shared.data_dir,
-                        &record.uuid,
-                        record.image_ref.as_deref(),
-                    );
-                    return self.park_runner(record, new_restart).await;
+                        &current.uuid,
+                        current.image_ref.as_deref(),
+                    ) {
+                        return RecordOutcome::RespawnFailed;
+                    }
+                    return self.park_runner(&current, new_restart).await;
                 }
 
                 tracing::warn!(
@@ -990,12 +1280,14 @@ impl Orchestrator {
                 );
                 // Kill any lingering FC child left by the dead runner before
                 // spawning a fresh one so we do not accumulate orphaned VMs.
-                kill_fc_child_for_uuid(
+                if !kill_fc_child_for_uuid(
                     &self.shared.data_dir,
-                    &record.uuid,
-                    record.image_ref.as_deref(),
-                );
-                self.do_respawn(record, None, new_restart).await
+                    &current.uuid,
+                    current.image_ref.as_deref(),
+                ) {
+                    return RecordOutcome::RespawnFailed;
+                }
+                self.do_respawn(&current, None, new_restart).await
             }
 
             PidDecision::AdoptInGrace => {
@@ -1006,18 +1298,15 @@ impl Orchestrator {
                 );
                 // Update healthy timestamp but do not reset failures yet — the
                 // runner is still within its startup window.
-                self.persist_healthy_if_changed(record, now_secs);
+                self.persist_healthy_if_changed(&current, now_secs);
                 RecordOutcome::Adopted
             }
 
             PidDecision::CheckSocket => {
                 // Past grace window: require the socket to be healthy.
-                let socket_ok = ControlClient::new(&record.control_sock)
-                    .health()
-                    .await
-                    .is_ok();
+                let health = self.probe_runner_health(&current).await;
 
-                if socket_ok {
+                if let HealthProbe::Valid { pid, image_ref } = &health {
                     tracing::debug!(
                         uuid = %record.uuid,
                         pid = record.pid,
@@ -1025,22 +1314,15 @@ impl Orchestrator {
                     );
                     // Runner is healthy: advance state (may reset failure count
                     // once stable_secs have elapsed since last exit).
-                    self.persist_healthy_if_changed(record, now_secs);
-                    RecordOutcome::Adopted
-                } else if self.is_deploying(&record.uuid) {
-                    // A deploy is in flight for this uuid: the runner is alive but
-                    // briefly busy/unresponsive on its control socket while it
-                    // builds the new VM + swaps. Killing it now would abort the
-                    // deploy and orphan the half-built VM. Defer the reap — the
-                    // deploy guard clears once the deploy finishes, and the next
-                    // tick re-evaluates with the runner responsive again.
-                    tracing::info!(
-                        uuid = %record.uuid,
-                        pid = record.pid,
-                        "deploy in progress; deferring reap (runner busy mid-deploy)"
+                    self.adopt_health(&current, *pid, image_ref.clone(), now_secs)
+                } else if let HealthProbe::IdentityMismatch(reported) = &health {
+                    tracing::error!(
+                        uuid = %current.uuid,
+                        reported_uuid = %reported,
+                        "control socket identity mismatch; refusing to kill recorded PID"
                     );
-                    RecordOutcome::Adopted
-                } else if self.pull_deferral_active(&record.uuid, now_secs) {
+                    RecordOutcome::RespawnFailed
+                } else if self.pull_deferral_active(&current.uuid, now_secs) {
                     // The control socket is not up yet because the runner is
                     // STILL PULLING its image over the (slow, relay-only) mesh —
                     // not hung. Reaping now kills the in-flight `oras` pull; the
@@ -1086,13 +1368,21 @@ impl Orchestrator {
                             reason = "crash-loop-threshold-exceeded",
                             "runner exceeded crash-loop threshold — parking (no further respawns until re-deployed)"
                         );
-                        kill_pid(record.pid);
-                        kill_fc_child_for_uuid(
-                        &self.shared.data_dir,
-                        &record.uuid,
-                        record.image_ref.as_deref(),
-                    );
-                        return self.park_runner(record, new_restart).await;
+                        if let Err(error) = self
+                            .shutdown_runner_definitive(&current.uuid, current.pid)
+                            .await
+                        {
+                            tracing::warn!(uuid = %current.uuid, error = %error, "failed to stop hung runner before parking");
+                            return RecordOutcome::RespawnFailed;
+                        }
+                        if !kill_fc_child_for_uuid(
+                            &self.shared.data_dir,
+                            &current.uuid,
+                            current.image_ref.as_deref(),
+                        ) {
+                            return RecordOutcome::RespawnFailed;
+                        }
+                        return self.park_runner(&current, new_restart).await;
                     }
 
                     tracing::warn!(
@@ -1104,16 +1394,68 @@ impl Orchestrator {
                         reason = "hung-socket-past-grace",
                         "runner alive but socket unhealthy past grace window — killing before respawn"
                     );
-                    kill_pid(record.pid);
-                    kill_fc_child_for_uuid(
+                    if let Err(error) = self
+                        .shutdown_runner_definitive(&current.uuid, current.pid)
+                        .await
+                    {
+                        tracing::warn!(uuid = %current.uuid, error = %error, "failed to stop hung runner before respawn");
+                        return RecordOutcome::RespawnFailed;
+                    }
+                    if !kill_fc_child_for_uuid(
                         &self.shared.data_dir,
-                        &record.uuid,
-                        record.image_ref.as_deref(),
-                    );
-                    self.do_respawn(record, Some(record.pid), new_restart).await
+                        &current.uuid,
+                        current.image_ref.as_deref(),
+                    ) {
+                        return RecordOutcome::RespawnFailed;
+                    }
+                    self.do_respawn(&current, Some(current.pid), new_restart)
+                        .await
                 }
             }
         }
+    }
+
+    async fn probe_runner_health(&self, record: &RunnerHandle) -> HealthProbe {
+        match ControlClient::new(&record.control_sock).health().await {
+            Ok(crate::control_proto::Reply::Health {
+                app_uuid,
+                pid,
+                image_ref,
+                ..
+            }) if app_uuid == record.uuid => HealthProbe::Valid { pid, image_ref },
+            Ok(crate::control_proto::Reply::Health { app_uuid, .. }) => {
+                HealthProbe::IdentityMismatch(app_uuid)
+            }
+            _ => HealthProbe::Unavailable,
+        }
+    }
+
+    fn adopt_health(
+        &self,
+        record: &RunnerHandle,
+        pid: u32,
+        image_ref: Option<String>,
+        now_secs: u64,
+    ) -> RecordOutcome {
+        let mut updated = record.clone();
+        if pid != 0 {
+            updated.pid = pid;
+        }
+        if image_ref.is_some() {
+            updated.image_ref = image_ref;
+        }
+        updated.restart = on_healthy(record.restart, BackoffParams::default(), now_secs);
+        if updated != *record {
+            if let Err(error) = updated.save(&self.runner_dir) {
+                tracing::warn!(
+                    uuid = %record.uuid,
+                    error = %error,
+                    "failed to reconcile live runner identity into durable record"
+                );
+                return RecordOutcome::RespawnFailed;
+            }
+        }
+        RecordOutcome::Adopted
     }
 
     /// Compute the `on_healthy` state for `record` and, if it differs from the
@@ -1179,6 +1521,15 @@ impl Orchestrator {
                 RecordOutcome::Respawned
             }
             Err(e) => {
+                let mut failed = record.clone();
+                failed.restart = new_restart;
+                if let Err(save_error) = failed.save(&self.runner_dir) {
+                    tracing::error!(
+                        uuid = %record.uuid,
+                        error = %save_error,
+                        "failed to persist restart/backoff state after respawn spawn failure"
+                    );
+                }
                 tracing::error!(
                     uuid = %record.uuid,
                     error = %e,
@@ -1234,12 +1585,64 @@ mod tests {
             .as_secs()
     }
 
+    #[test]
+    fn runner_identity_parser_requires_exact_uuid_argument_or_env() {
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let other = "0191e7c2-2222-7222-8333-444455556666";
+
+        assert!(process_bytes_match_runner_uuid(
+            format!("/opt/tabbify/tabbify-runner\0--uuid\0{uuid}\0").as_bytes(),
+            b"",
+            uuid,
+        ));
+        assert!(process_bytes_match_runner_uuid(
+            b"tabbify-runner\0--no-mesh\0",
+            format!("PATH=/bin\0RUNNER_UUID={uuid}\0").as_bytes(),
+            uuid,
+        ));
+        assert!(!process_bytes_match_runner_uuid(
+            format!("tabbify-runner\0--uuid\0{other}\0--note\0{uuid}\0").as_bytes(),
+            b"",
+            uuid,
+        ));
+        assert!(!process_bytes_match_runner_uuid(
+            format!("sleep\0{uuid}\0").as_bytes(),
+            format!("RUNNER_UUID={uuid}\0").as_bytes(),
+            uuid,
+        ));
+    }
+
+    #[test]
+    fn runner_process_scan_selects_only_exact_matching_runner() {
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let other = "0191e7c2-2222-7222-8333-444455556666";
+        let exact = format!("tabbify-runner\0--uuid={uuid}\0");
+        let wrong = format!("tabbify-runner\0--uuid\0{other}\0--label\0{uuid}\0");
+        let unrelated = format!("worker\0{uuid}\0");
+        let selected = select_matching_runner_pids(
+            [
+                (30, wrong.as_bytes(), b"".as_slice()),
+                (20, exact.as_bytes(), b"".as_slice()),
+                (10, unrelated.as_bytes(), b"".as_slice()),
+            ],
+            uuid,
+        );
+
+        assert_eq!(selected, vec![20]);
+    }
+
+    #[test]
+    fn live_unrelated_pid_never_validates_as_recorded_runner() {
+        let status =
+            runner_pid_identity(std::process::id(), "0191e7c2-1111-7222-8333-444455556666");
+        assert_ne!(status, RunnerPidIdentity::Matches);
+    }
+
     // ── image-pull-in-progress guard (don't reap a runner mid-pull) ───────────
 
     #[test]
     fn pull_path_needle_targets_the_runner_pull_dir() {
-        let needle = pull_path_needle(Path::new("/opt/tabbify/data"), "abc-123")
-            .expect("needle");
+        let needle = pull_path_needle(Path::new("/opt/tabbify/data"), "abc-123").expect("needle");
         assert_eq!(needle, "/opt/tabbify/data/apps/abc-123/fc/.pull");
     }
 
@@ -1248,13 +1651,22 @@ mod tests {
         let needle = pull_path_needle(Path::new("/opt/tabbify/data"), "abc-123").unwrap();
         // Realistic /proc/<pid>/cmdline: NUL-separated argv of the live oras pull.
         let cmdline = b"oras\0copy\0--from-plain-http\0[fd5a::1]:5000/tabbify/x:tag\0--to-oci-layout\0/opt/tabbify/data/apps/abc-123/fc/.pull/oci\0";
-        assert!(cmdline_matches_pull(cmdline, &needle), "pull argv must match");
+        assert!(
+            cmdline_matches_pull(cmdline, &needle),
+            "pull argv must match"
+        );
         // A different uuid's pull must NOT match (no false-positive defer).
         let other = pull_path_needle(Path::new("/opt/tabbify/data"), "zzz-999").unwrap();
-        assert!(!cmdline_matches_pull(cmdline, &other), "other uuid must not match");
+        assert!(
+            !cmdline_matches_pull(cmdline, &other),
+            "other uuid must not match"
+        );
         // An unrelated process (the FC itself) must NOT match.
         let fc = b"firecracker\0--api-sock\0/tmp/firecracker-fc-deadbeef.sock\0";
-        assert!(!cmdline_matches_pull(fc, &needle), "unrelated proc must not match");
+        assert!(
+            !cmdline_matches_pull(fc, &needle),
+            "unrelated proc must not match"
+        );
     }
 
     #[test]
@@ -1273,11 +1685,24 @@ mod tests {
         // First observation: clock starts, defer.
         let (s1, defer) = pull_stall_update(None, 1_000, 100, PULL_GRACE_SECS);
         assert!(defer, "first observation must defer");
-        assert_eq!(s1, PullProgress { bytes: 1_000, last_progress_secs: 100 });
+        assert_eq!(
+            s1,
+            PullProgress {
+                bytes: 1_000,
+                last_progress_secs: 100
+            }
+        );
         // Growth: restamp, defer — even if the previous stamp is ancient.
-        let old = PullProgress { bytes: 1_000, last_progress_secs: 100 };
-        let (s2, defer) =
-            pull_stall_update(Some(old), 2_000, 100 + 10 * PULL_GRACE_SECS, PULL_GRACE_SECS);
+        let old = PullProgress {
+            bytes: 1_000,
+            last_progress_secs: 100,
+        };
+        let (s2, defer) = pull_stall_update(
+            Some(old),
+            2_000,
+            100 + 10 * PULL_GRACE_SECS,
+            PULL_GRACE_SECS,
+        );
         assert!(defer, "byte growth must defer regardless of elapsed time");
         assert_eq!(s2.bytes, 2_000);
         assert_eq!(s2.last_progress_secs, 100 + 10 * PULL_GRACE_SECS);
@@ -1288,11 +1713,21 @@ mod tests {
     /// stamp so the window is not self-extending.
     #[test]
     fn pull_stall_update_defers_within_stall_window_without_growth() {
-        let prev = PullProgress { bytes: 5_000, last_progress_secs: 100 };
-        let (s, defer) =
-            pull_stall_update(Some(prev), 5_000, 100 + PULL_GRACE_SECS - 1, PULL_GRACE_SECS);
+        let prev = PullProgress {
+            bytes: 5_000,
+            last_progress_secs: 100,
+        };
+        let (s, defer) = pull_stall_update(
+            Some(prev),
+            5_000,
+            100 + PULL_GRACE_SECS - 1,
+            PULL_GRACE_SECS,
+        );
         assert!(defer, "quiet spell inside the window must defer");
-        assert_eq!(s, prev, "no-change must keep the original stamp (no self-extension)");
+        assert_eq!(
+            s, prev,
+            "no-change must keep the original stamp (no self-extension)"
+        );
     }
 
     /// A full stall window with ZERO byte change is a genuinely wedged pull —
@@ -1300,7 +1735,10 @@ mod tests {
     /// kills the pull process via `kill_fc_child_for_uuid`).
     #[test]
     fn pull_stall_update_reaps_after_full_stall_window() {
-        let prev = PullProgress { bytes: 5_000, last_progress_secs: 100 };
+        let prev = PullProgress {
+            bytes: 5_000,
+            last_progress_secs: 100,
+        };
         let (_, defer) =
             pull_stall_update(Some(prev), 5_000, 100 + PULL_GRACE_SECS, PULL_GRACE_SECS);
         assert!(!defer, "a full window of zero progress must stop deferring");
@@ -1312,10 +1750,16 @@ mod tests {
     /// gets reaped on its very first tick.
     #[test]
     fn pull_stall_update_restamps_on_shrink_fresh_attempt() {
-        let stale = PullProgress { bytes: 400_000_000, last_progress_secs: 100 };
+        let stale = PullProgress {
+            bytes: 400_000_000,
+            last_progress_secs: 100,
+        };
         let (s, defer) =
             pull_stall_update(Some(stale), 64, 100 + 10 * PULL_GRACE_SECS, PULL_GRACE_SECS);
-        assert!(defer, "a fresh from-scratch pull must get its own stall window");
+        assert!(
+            defer,
+            "a fresh from-scratch pull must get its own stall window"
+        );
         assert_eq!(s.bytes, 64);
         assert_eq!(s.last_progress_secs, 100 + 10 * PULL_GRACE_SECS);
     }
@@ -1566,8 +2010,7 @@ mod tests {
 
         // The DEPLOY-key scope (`uuid:reff`) is the production serving identity —
         // it MUST be present (this is the leak the review flagged), and FIRST.
-        let deploy_scope =
-            crate::firecracker::cpu_scope::scope_name(&format!("{uuid}:{reff}"));
+        let deploy_scope = crate::firecracker::cpu_scope::scope_name(&format!("{uuid}:{reff}"));
         assert_eq!(
             names.first().map(String::as_str),
             Some(deploy_scope.as_str()),
@@ -1626,8 +2069,7 @@ mod tests {
         let reff = "[fd5a:1f02::1]:5000/acme/app:sha256abc";
         let names = fc_tap_names_for_uuid(uuid, Some(reff));
 
-        let deploy_tap =
-            crate::firecracker::fc_tap_name_for_key(&format!("{uuid}:{reff}"));
+        let deploy_tap = crate::firecracker::fc_tap_name_for_key(&format!("{uuid}:{reff}"));
         assert_eq!(
             names.first().map(String::as_str),
             Some(deploy_tap.as_str()),
@@ -1905,8 +2347,8 @@ mod tests {
         RunnerHandle {
             uuid: uuid.to_owned(),
             pid,
-            // Non-existent socket → health probe fails (unhealthy).
-            control_sock: dir.join("no-such.sock"),
+            // Deterministic but non-existent socket → health probe fails.
+            control_sock: dir.join(format!("{uuid}.sock")),
             app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
             parent: None,
             // spawned_at = 0 → treated as well past the grace window.
@@ -1926,9 +2368,8 @@ mod tests {
 
     /// A runner whose pid is ALIVE (a real `sleep` child) but whose control
     /// socket is unhealthy, past the grace window, is normally killed +
-    /// respawned. With a deploy in flight for its uuid, the monitor must instead
-    /// DEFER the reap and report `Adopted` — the runner is left running so the
-    /// in-flight deploy can finish (its pid is NOT killed).
+    /// respawned. While any lifecycle operation owns its UUID lock, the monitor
+    /// must skip it without blocking or killing the process.
     #[tokio::test]
     async fn reconcile_defers_reap_while_deploying() {
         let dir = TempDir::new().unwrap();
@@ -1938,13 +2379,14 @@ mod tests {
         let mut child = spawn_sleep_child();
         let record = unhealthy_record(uuid, child.id(), dir.path());
 
-        // Hold the deploy guard for the uuid across the reconcile.
-        let _guard = orch.begin_deploy(uuid);
+        record.save(dir.path()).unwrap();
+        let lock = orch.lifecycle_lock_for(uuid);
+        let _guard = lock.lock().await;
         let outcome = orch.reconcile_record(&record).await;
         assert_eq!(
             outcome,
-            RecordOutcome::Adopted,
-            "a runner with a deploy in flight must be adopted (reap deferred), not reaped"
+            RecordOutcome::Busy,
+            "a busy lifecycle lock must make monitor reconciliation skip, not wait or reap"
         );
         // The child must still be alive — the defer must NOT have killed it.
         assert!(
@@ -1969,6 +2411,7 @@ mod tests {
         let mut child = spawn_sleep_child();
         let child_pid = child.id();
         let record = unhealthy_record(uuid, child_pid, dir.path());
+        record.save(dir.path()).unwrap();
 
         // No deploy guard → the runner is reaped: SIGKILL then respawn (which
         // fails on the nonexistent binary → RespawnFailed).
@@ -1998,31 +2441,30 @@ mod tests {
         // Dead runner pid (non-existent, past grace) → normally RespawnDead.
         let dead_record = unhealthy_record(uuid, 99_999_999, dir.path());
 
-        // Hold the deploy guard for the uuid across the reconcile.
-        let _guard = orch.begin_deploy(uuid);
+        dead_record.save(dir.path()).unwrap();
+        let lock = orch.lifecycle_lock_for(uuid);
+        let _guard = lock.lock().await;
         let outcome = orch.reconcile_record(&dead_record).await;
         assert_eq!(
             outcome,
-            RecordOutcome::Adopted,
+            RecordOutcome::Busy,
             "a dead runner with a deploy in flight must be deferred (deploy owns the respawn), not respawned"
         );
     }
 
     // ── FC child reaping via pidfile (Fix 2) ──────────────────────────────────
 
-    /// When the monitor kills a dead runner, it reads the per-uuid FC pidfile
-    /// and kills the orphaned firecracker child. Test: write a real pidfile for
-    /// a live `sleep` child (simulating the FC orphan), let reconcile_record run
-    /// on a DEAD runner pid, then assert the pidfile is consumed AND the sleep
-    /// child is dead.
+    /// A stale FC pidfile can point at a reused, unrelated PID. Reconciliation
+    /// must never kill that process. Linux can prove the mismatch and discard
+    /// the stale file; other platforms retain it because identity is unknown.
     #[tokio::test]
-    async fn reconcile_kills_fc_child_via_pidfile_when_runner_dead() {
+    async fn reconcile_never_kills_unrelated_fc_pidfile_pid() {
         use crate::firecracker::pidfile;
 
         let dir = TempDir::new().unwrap();
         let uuid = "0191e7c2-dead-7222-8333-444455556666";
 
-        // Spin up a "FC orphan" — a real `sleep` child we can safely SIGKILL.
+        // A live unrelated process whose PID was reused after the FC exited.
         let mut fc_orphan = spawn_sleep_child();
         let fc_pid = fc_orphan.id();
 
@@ -2042,7 +2484,7 @@ mod tests {
         let orch = Orchestrator::new(cfg, dir.path().to_path_buf());
 
         let dead_record = unhealthy_record(uuid, 99_999_999, dir.path());
-        let outcome = orch.reconcile_record(&dead_record).await;
+        let outcome = orch.reconcile_record_locked(&dead_record).await;
 
         // The reconcile attempts a respawn (fails on the non-existent binary).
         assert_eq!(
@@ -2051,20 +2493,28 @@ mod tests {
             "reconcile of a dead runner must attempt a respawn"
         );
 
-        // The pidfile must have been consumed (removed from disk).
+        // Linux validated the mismatch through /proc, so the stale pidfile is
+        // safe to discard. Other platforms retain unknown identity for retry.
+        #[cfg(target_os = "linux")]
         assert!(
             !pidfile::path(dir.path(), uuid).exists(),
-            "pidfile must be removed after kill_fc_child_for_uuid"
+            "a proven-mismatched pidfile must be discarded"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            pidfile::path(dir.path(), uuid).exists(),
+            "an unvalidated live pidfile must remain retryable"
         );
 
-        // The FC orphan must be dead now.
-        // Give the kernel a moment to process the SIGKILL.
         let fc_alive_after = runner_is_alive(fc_pid);
-        let _ = fc_orphan.wait();
         assert!(
-            !fc_alive_after,
-            "FC orphan (pid {fc_pid}) must be killed by the monitor"
+            fc_alive_after,
+            "an unrelated pidfile PID must never be SIGKILLed"
         );
+        if fc_alive_after {
+            let _ = fc_orphan.kill();
+        }
+        let _ = fc_orphan.wait();
     }
 
     // ── Crash-loop circuit breaker (Fix 3) ───────────────────────────────────
@@ -2080,7 +2530,7 @@ mod tests {
         let mut record = unhealthy_record(uuid, 99_999_999, dir.path());
         record.crash_looped = true;
 
-        let outcome = orch.reconcile_record(&record).await;
+        let outcome = orch.reconcile_record_locked(&record).await;
         assert_eq!(
             outcome,
             RecordOutcome::CrashLooped,
@@ -2110,7 +2560,7 @@ mod tests {
         record.restart = pre_threshold;
         record.save(dir.path()).unwrap();
 
-        let outcome = orch.reconcile_record(&record).await;
+        let outcome = orch.reconcile_record_locked(&record).await;
         assert_eq!(
             outcome,
             RecordOutcome::CrashLooped,
@@ -2190,7 +2640,7 @@ mod tests {
         parked.save(dir.path()).unwrap();
 
         // Confirm it is parked.
-        let outcome_before = orch.reconcile_record(&parked).await;
+        let outcome_before = orch.reconcile_record_locked(&parked).await;
         assert_eq!(outcome_before, RecordOutcome::CrashLooped);
 
         // Simulate a cold deploy: fresh record with crash_looped = false.
@@ -2199,12 +2649,189 @@ mod tests {
 
         // Now reconcile must NOT return CrashLooped (it may fail the spawn, but
         // the parking gate must be cleared).
-        let outcome_after = orch.reconcile_record(&fresh).await;
+        let outcome_after = orch.reconcile_record_locked(&fresh).await;
         assert_ne!(
             outcome_after,
             RecordOutcome::CrashLooped,
             "a fresh record (crash_looped=false) must NOT be parked"
         );
+    }
+
+    /// A monitor snapshot captured before Stop must not write its old running
+    /// state back after the durable record is marked stopped.
+    #[tokio::test]
+    async fn stale_reconcile_cannot_undo_stopped_intent() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let stale = unhealthy_record(uuid, 99_999_999, dir.path());
+        let mut stopped = stale.clone();
+        stopped.stopped = true;
+        stopped.pid = 0;
+        stopped.save(dir.path()).unwrap();
+
+        assert_eq!(
+            orch.reconcile_record(&stale).await,
+            RecordOutcome::CrashLooped
+        );
+        let after = orch.load_runner_record(uuid).unwrap().unwrap();
+        assert!(after.stopped, "stale monitor state must not undo Stop");
+        assert_eq!(after.pid, 0);
+    }
+
+    #[tokio::test]
+    async fn monitor_converges_stopped_intent_after_supervisor_crash() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let mut survivor = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = survivor.id();
+        let socket = dir.path().join(format!("{uuid}.sock"));
+        let server_socket = socket.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let command: crate::control_proto::Cmd = serde_json::from_str(line.trim()).unwrap();
+                let shutdown = matches!(command, crate::control_proto::Cmd::Shutdown);
+                if shutdown {
+                    kill_pid(pid);
+                }
+                let reply = if shutdown {
+                    crate::control_proto::Reply::Ok
+                } else {
+                    crate::control_proto::Reply::Health {
+                        state: "running".to_owned(),
+                        app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
+                        app_uuid: uuid.to_owned(),
+                        pid,
+                        image_ref: Some("registry/app:live".to_owned()),
+                        app_health: "serving".to_owned(),
+                        app_health_reason: None,
+                    }
+                };
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                reader.into_inner().write_all(&bytes).await.unwrap();
+                if shutdown {
+                    break;
+                }
+            }
+            drop(listener);
+            let _ = std::fs::remove_file(server_socket);
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut record = unhealthy_record(uuid, pid, dir.path());
+        record.control_sock = socket;
+        record.stopped = true;
+        record.image_ref = Some("registry/app:durable".to_owned());
+        record.save(dir.path()).unwrap();
+
+        assert_eq!(
+            orch.reconcile_record(&record).await,
+            RecordOutcome::CrashLooped
+        );
+        assert!(!runner_is_alive(pid));
+        let persisted = orch.load_runner_record(uuid).unwrap().unwrap();
+        assert!(persisted.stopped);
+        assert_eq!(persisted.pid, 0);
+        let _ = survivor.try_wait();
+    }
+
+    #[tokio::test]
+    async fn readopt_reconciles_durable_ref_from_live_runner_health() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let socket = dir.path().join(format!("{uuid}.sock"));
+        let server_socket = socket.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let reply = crate::control_proto::Reply::Health {
+                state: "running".to_owned(),
+                app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
+                app_uuid: uuid.to_owned(),
+                pid: 4242,
+                image_ref: Some("registry/app:swapped".to_owned()),
+                app_health: "serving".to_owned(),
+                app_health_reason: None,
+            };
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            reader.into_inner().write_all(&bytes).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut record = unhealthy_record(uuid, 0, dir.path());
+        record.control_sock = socket;
+        record.image_ref = Some("registry/app:before-swap".to_owned());
+        record.save(dir.path()).unwrap();
+
+        assert_eq!(orch.reconcile_record(&record).await, RecordOutcome::Adopted);
+        let persisted = orch.load_runner_record(uuid).unwrap().unwrap();
+        assert_eq!(persisted.pid, 4242);
+        assert_eq!(persisted.image_ref.as_deref(), Some("registry/app:swapped"));
+    }
+
+    /// A stale pre-deploy snapshot may update restart health, but it must reload
+    /// first and preserve the newly deployed image/context fields.
+    #[tokio::test]
+    async fn stale_reconcile_cannot_undo_deploy_context() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let mut stale = unhealthy_record(uuid, std::process::id(), dir.path());
+        stale.spawned_at = now_secs();
+        stale.image_ref = Some("registry/app:old".to_owned());
+        let mut deployed = stale.clone();
+        deployed.image_ref = Some("registry/app:new".to_owned());
+        deployed.network = Some("n_current".to_owned());
+        deployed.save(dir.path()).unwrap();
+
+        assert_eq!(
+            orch.reconcile_record(&stale).await,
+            RecordOutcome::RespawnFailed,
+            "an unverified reused PID must fail closed rather than be adopted"
+        );
+        let after = orch.load_runner_record(uuid).unwrap().unwrap();
+        assert_eq!(after.image_ref.as_deref(), Some("registry/app:new"));
+        assert_eq!(after.network.as_deref(), Some("n_current"));
+    }
+
+    /// A record deleted by Purge after the tick listed it must stay deleted;
+    /// reconciliation of the old snapshot is a no-op.
+    #[tokio::test]
+    async fn stale_reconcile_cannot_recreate_purged_record() {
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let stale = unhealthy_record(uuid, 99_999_999, dir.path());
+        stale.save(dir.path()).unwrap();
+        std::fs::remove_file(crate::orchestrator::handle::record_path(dir.path(), uuid)).unwrap();
+
+        assert_eq!(orch.reconcile_record(&stale).await, RecordOutcome::Missing);
+        assert!(orch.load_runner_record(uuid).unwrap().is_none());
     }
 
     // ── pid 0 guard (regression) ─────────────────────────────────────────────
@@ -2230,7 +2857,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
         let record = unhealthy_record("0191e7c2-aaaa-7222-8333-444455556666", 0, dir.path());
-        let outcome = orch.reconcile_record(&record).await;
+        let outcome = orch.reconcile_record_locked(&record).await;
         assert_eq!(
             outcome,
             RecordOutcome::RespawnFailed,
