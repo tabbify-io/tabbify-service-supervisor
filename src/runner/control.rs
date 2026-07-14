@@ -112,6 +112,8 @@ pub struct RunnerLifecycle {
     /// `oras resolve`). Tests set `Some(fake)` to exercise the digest
     /// short-circuit / fail-open logic hermetically without a real registry.
     pub(crate) digest_resolver: Option<crate::runner::build::firecracker::FcBuildRunner>,
+    /// Runner-owned OCI auth config shared by pulls and every digest resolve.
+    pub(crate) registry_config: Option<Arc<crate::runner::registry::RegistryConfig>>,
 }
 
 impl RunnerLifecycle {
@@ -122,6 +124,15 @@ impl RunnerLifecycle {
         self.digest_resolver
             .clone()
             .unwrap_or_else(crate::runner::build::firecracker::production_fc_build_runner)
+    }
+
+    async fn resolve_digest(&self, reff: &str) -> anyhow::Result<String> {
+        crate::runner::registry::resolve_oci_digest(
+            reff,
+            &self.digest_runner(),
+            self.registry_config.as_deref(),
+        )
+        .await
     }
 
     /// Wire a shutdown notifier into this lifecycle. When `Shutdown` is
@@ -254,9 +265,7 @@ impl RunnerLifecycle {
             // therefore safe ONLY when `reff != current_ref`; when the ref is
             // unchanged we must NOT rebuild unless we can PROVE the image moved.
             let same_ref = self.active.current_ref().as_deref() == Some(reff);
-            let runner = self.digest_runner();
-            // `None` = anonymous resolve; the deploy guard only needs a digest.
-            match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None).await {
+            match self.resolve_digest(reff).await {
                 Ok(want) => {
                     let current = self.current_digest.lock().await.clone();
                     if Some(want.as_str()) == current.as_deref() {
@@ -328,6 +337,20 @@ impl RunnerLifecycle {
         // Build the new runtime from the app's manifest with the effective ref
         // applied. A proven moving-tag change uses its digest-pinned ref here.
         let next_fetched = fetched_with_ref(&self.fetched, &runtime_ref);
+        let registry_config_file = match self
+            .registry_config
+            .as_deref()
+            .map(|config| config.file_for_ref(&runtime_ref))
+            .transpose()
+        {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!(uuid = %self.uuid, reff = %reff, error = %e, "deploy: registry auth config rejected ref (keeping old)");
+                return Reply::Err {
+                    message: format!("deploy: registry auth for {reff}: {e}"),
+                };
+            }
+        };
         // Deploy (`is_swap = true`): the OLD runtime keeps serving until
         // `perform_swap` flips; the new VM cold-boots `runtime_ref` on its own
         // `uuid:runtime_ref` tap so both coexist (no reconcile-kill of the old).
@@ -342,6 +365,7 @@ impl RunnerLifecycle {
             true,
             self.extra_env.as_ref(),
             self.egress_allow.as_deref(),
+            registry_config_file,
         )
         .await
         {
@@ -374,14 +398,7 @@ impl RunnerLifecycle {
                 if let Some(digest) = resolved_digest {
                     *self.current_digest.lock().await = Some(digest);
                 } else {
-                    let runner = self.digest_runner();
-                    match crate::runner::build::firecracker::resolve_oci_digest(
-                        &runtime_ref,
-                        &runner,
-                        None,
-                    )
-                    .await
-                    {
+                    match self.resolve_digest(&runtime_ref).await {
                         Ok(d) => *self.current_digest.lock().await = Some(d),
                         Err(e) => {
                             *self.current_digest.lock().await = None;
@@ -632,6 +649,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             digest_resolver: None,
+            registry_config: None,
         }
     }
 
@@ -896,6 +914,44 @@ mod tests {
             Arc::ptr_eq(&before, &lc.active.load()),
             "same-digest deploy must NOT rebuild/swap the active runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn deploy_digest_resolve_uses_runner_registry_auth_config() {
+        const LIVE_DIGEST: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const REFF: &str = "registry.example:5000/acme/app:main";
+        const TOKEN: &str = "runner-secret-token";
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_runner = calls.clone();
+        let resolver: FcBuildRunner = Arc::new(move |argv| {
+            calls_for_runner.lock().unwrap().push(argv);
+            Box::pin(async { (true, format!("{LIVE_DIGEST}\n").into_bytes()) })
+        });
+        let registry = Arc::new(crate::runner::registry::RegistryConfig::new(TOKEN, REFF).unwrap());
+        let config_file = registry.file_for_ref(REFF).unwrap().to_owned();
+        let mut lc = fake_lifecycle(RuntimeHealth::Serving);
+        lc.digest_resolver = Some(resolver);
+        lc.registry_config = Some(registry);
+        *lc.current_digest.lock().await = Some(LIVE_DIGEST.to_owned());
+        lc.active
+            .swap_with_ref(lc.active.load(), Some(REFF.to_owned()));
+
+        let reply = dispatch(
+            Cmd::Deploy {
+                reff: REFF.to_owned(),
+            },
+            &lc,
+        )
+        .await;
+
+        assert!(matches!(reply, Reply::Ok));
+        let argv = &calls.lock().unwrap()[0];
+        assert!(
+            argv.windows(2)
+                .any(|args| args[0] == "--registry-config" && args[1] == config_file)
+        );
+        assert!(!argv.iter().any(|arg| arg.contains(TOKEN)));
     }
 
     /// A deploy whose ref resolves to a DIFFERENT digest than the live runtime

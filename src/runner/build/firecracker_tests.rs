@@ -1556,6 +1556,7 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
         false,
         None,
         None,
+        None,
     )
     .await;
 
@@ -2254,11 +2255,10 @@ fn read_manifest_digest_from_layout_errors_on_empty_index() {
     );
 }
 
-/// THE #1 e2e blocker: a TAG `registry_ref` (NO `@<digest>`) must NOT bail.
-/// `run_firecracker_build` must pull the layout first, DERIVE the immutable
-/// digest from the layout's `index.json`, and then convert with THAT digest as
-/// the cache key — the produced rootfs must land at the digest-keyed path
-/// (fc-3 invariant), not at any tag-derived path.
+/// A TAG `registry_ref` must use the supplied runner registry config for BOTH
+/// `oras resolve` and the native resumable pull, without exposing the token in
+/// subprocess argv. The pull then derives the immutable digest from the layout
+/// and converts with that digest as the cache key.
 ///
 /// The registry is a local mock HTTP server (the resumable `crate::oci_pull`
 /// puller talks plain HTTP), the ref host points at it, the `oras resolve` is a
@@ -2267,9 +2267,10 @@ fn read_manifest_digest_from_layout_errors_on_empty_index() {
 /// Firecracker/KVM here so it errors, but conversion (incl. the digest-keyed
 /// `mkfs.ext4` argv) runs BEFORE the boot and is asserted on the recorded argv.
 #[tokio::test]
-async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
+async fn run_fc_build_authenticates_resolve_and_pull_for_tag_ref() {
+    use base64::Engine as _;
     use sha2::{Digest as _, Sha256};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2296,7 +2297,13 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_hex = hexf(&manifest_bytes);
 
+    const TOKEN: &str = "runner-secret-token";
     let server = MockServer::start().await;
+    let host = server.uri().strip_prefix("http://").unwrap().to_owned();
+    let expected_auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x:{TOKEN}"))
+    );
     for (p, body) in [
         ("/v2/acme/vm/manifests/latest".to_owned(), manifest_bytes.clone()),
         (format!("/v2/acme/vm/blobs/sha256:{config_hex}"), config_bytes.clone()),
@@ -2304,15 +2311,19 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
     ] {
         Mock::given(method("GET"))
             .and(path(p))
+            .and(header("Authorization", expected_auth.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
             .mount(&server)
             .await;
     }
 
     // A TAG ref (no `@sha256:…`) whose host is the mock registry.
-    let host = server.uri().strip_prefix("http://").unwrap().to_owned();
     let fetched = fc_fetched_ref(&format!("{host}/acme/vm:latest"));
     let fc = <crate::config::FcConfig as clap::Parser>::parse_from(["fc"]);
+    let auth_dir = tempfile::tempdir().unwrap();
+    crate::skopeo::write_registry_config(TOKEN, &host, auth_dir.path()).unwrap();
+    let registry_config_file = auth_dir.path().join("config.json");
+    let registry_config_file = registry_config_file.to_string_lossy().into_owned();
 
     // The immutable digest the build MUST derive from the layout + key the cache by.
     let expected_digest = format!("sha256:{manifest_hex}");
@@ -2345,11 +2356,34 @@ async fn run_fc_build_derives_digest_from_layout_for_tag_ref() {
 
     // Tag ref must NOT bail; the boot at the end errors (no KVM) — irrelevant to
     // the digest-derivation assertion below.
-    let _ =
-        super::run_firecracker_build(uuid, &fetched, &fc, tmp.path(), &runner, false, None, None)
-            .await;
+    let _ = super::run_firecracker_build(
+        uuid,
+        &fetched,
+        &fc,
+        tmp.path(),
+        &runner,
+        false,
+        None,
+        None,
+        Some(&registry_config_file),
+    )
+    .await;
 
     let recorded = calls.lock().unwrap().clone();
+    let resolve = recorded
+        .iter()
+        .find(|argv| argv.first().map(String::as_str) == Some("oras"))
+        .expect("tag ref must be resolved before pull");
+    assert!(
+        resolve.windows(2).any(|args| {
+            args[0] == "--registry-config" && args[1] == registry_config_file
+        }),
+        "oras resolve must use the runner registry config; got {resolve:?}"
+    );
+    assert!(
+        recorded.iter().flatten().all(|arg| !arg.contains(TOKEN)),
+        "runner token must never appear in subprocess argv: {recorded:?}"
+    );
     // The conversion ran and wrote the rootfs to the DIGEST-keyed path.
     let mkfs = recorded
         .iter()

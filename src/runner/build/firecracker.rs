@@ -577,19 +577,19 @@ pub fn global_rootfs_is_cached(data_dir: &Path, digest: &str) -> bool {
 /// pulling layer blobs (`oras resolve`, ~0.2 s). Lets the build consult the
 /// digest-keyed caches BEFORE the (slow) `oras copy` and skip the pull on a hit.
 ///
-/// `registry_config_dir`: when `Some(dir)`, passes `--registry-config <dir>` to
+/// `registry_config_file`: when `Some(file)`, passes `--registry-config <file>` to
 /// oras so the resolve is authenticated (Phase-A). Pass `None` for anonymous
-/// access (today's default; all existing callers use `None`).
+/// access.
 ///
 /// # Errors
 /// The runner reports failure, or stdout is not a `sha256:…` digest line.
 pub(crate) async fn resolve_oci_digest(
     reff: &str,
     runner: &FcBuildRunner,
-    registry_config_dir: Option<&str>,
+    registry_config_file: Option<&str>,
 ) -> Result<String> {
     let mut argv = vec!["oras".to_owned()];
-    argv.extend(crate::oras::oras_resolve_args(reff, registry_config_dir));
+    argv.extend(crate::oras::oras_resolve_args(reff, registry_config_file));
     let (ok, out) = (runner)(argv).await;
     let digest = String::from_utf8_lossy(&out).trim().to_owned();
     if !ok || !digest.starts_with("sha256:") {
@@ -1404,16 +1404,6 @@ fn read_oci_config_from_layout(layout: &Path) -> Result<oci_spec::image::ImageCo
     Ok(cfg)
 }
 
-/// Extract the registry host portion from an OCI reference (everything before
-/// the first `/`). Used to key the oras auth config to the correct registry.
-///
-/// # Examples
-/// - `"[fd5a::1]:5000/acme/app:sha"` → `"[fd5a::1]:5000"`
-/// - `"reg.example.com/acme/app:v1"` → `"reg.example.com"`
-fn registry_host_from_ref(reff: &str) -> &str {
-    reff.split('/').next().unwrap_or(reff)
-}
-
 /// Resolve `<layout>/index.json` → the first image-manifest descriptor. Shared
 /// by [`read_oci_config_from_layout`] (which then reads the manifest+config
 /// blobs) and [`read_manifest_digest_from_layout`] (which only needs the
@@ -1915,6 +1905,7 @@ pub async fn run_firecracker_build(
     is_swap: bool,
     extra_env: Option<&std::collections::HashMap<String, String>>,
     egress_allow: Option<&[String]>,
+    registry_config_file: Option<&str>,
 ) -> Result<std::sync::Arc<dyn crate::runtime::AppRuntime>> {
     // SNAPSHOT SUPPRESS (§12 snapshot-timing). A dev-FC's `/init` async-clones
     // `/workspace`; a WORKSPACE's `cold_boot` readiness probe answers BEFORE
@@ -2003,36 +1994,9 @@ pub async fn run_firecracker_build(
     let reff = crate::oras::lowercase_oci_repo(reff);
     let reff = reff.as_str();
 
-    // Phase-A registry auth: read `TABBIFY_RUNNER_JOIN_TOKEN` once (already set
-    // by the supervisor when launching this runner). When present, write a
-    // docker-format auth config keyed to this ref's registry host and pass its
-    // dir to every `oras resolve` / `oras copy` call so pulls are authenticated.
-    // When absent (anonymous registry or Phase-A not yet enabled), pass `None`
-    // — identical to today's behaviour.
-    let oras_cfg_owned: Option<String> = match std::env::var("TABBIFY_RUNNER_JOIN_TOKEN") {
-        Ok(token) if !token.is_empty() => {
-            let cfg_dir = data_dir.join("oras-cfg");
-            let host = registry_host_from_ref(reff);
-            match crate::skopeo::write_registry_config(&token, host, &cfg_dir) {
-                Ok(()) => {
-                    tracing::debug!(host, "oras auth config written for registry pull");
-                    // oras `--from-registry-config` wants the auth FILE, not its
-                    // dir: write_registry_config writes `<cfg_dir>/config.json`.
-                    Some(cfg_dir.join("config.json").to_string_lossy().into_owned())
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        host,
-                        error = %e,
-                        "failed to write oras auth config; proceeding anonymous"
-                    );
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
-    let oras_cfg = oras_cfg_owned.as_deref();
+    // One runner-owned config is shared by cold-start, pull, and control-path
+    // resolves. A configured credential is never downgraded to anonymous.
+    let oras_cfg = registry_config_file;
 
     // The app's OWN declared candidate ports (ALL `ExposedPorts` TCP, tier 2 of
     // `resolve_port_plan`), set whenever this launch READS the OCI config. On a

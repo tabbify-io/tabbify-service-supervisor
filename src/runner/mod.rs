@@ -4,6 +4,7 @@ pub mod active;
 pub mod build;
 pub mod config;
 pub mod control;
+pub(crate) mod registry;
 pub mod serve;
 pub mod wire;
 

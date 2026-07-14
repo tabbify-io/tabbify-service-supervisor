@@ -46,7 +46,7 @@ use crate::{
     fetcher::{FetchedApp, S3Fetcher},
     host::{AppHost, AppServe},
     mesh::MeshMembership,
-    runner::{active::ActiveRuntime, control::RunnerLifecycle},
+    runner::{active::ActiveRuntime, control::RunnerLifecycle, registry::RegistryConfig},
     runtime::{AppRuntime, ExitReason},
     tcp_forward::TcpForwarder,
 };
@@ -280,6 +280,31 @@ impl RunnerServe {
         let fetcher = S3Fetcher::new(&cfg.s3_base_url, &cfg.data_dir);
 
         let fetched = resolve_app(&cfg).await?;
+        let registry_config = match cfg.runner_join_token.as_deref() {
+            Some(token) => {
+                let reff = fetched
+                    .manifest
+                    .runtime
+                    .registry_ref
+                    .as_deref()
+                    .context("runner token supplied but app has no OCI registry ref")?;
+                Some(Arc::new(RegistryConfig::new(token, reff)?))
+            }
+            None => None,
+        };
+        let registry_config_file = match registry_config.as_deref() {
+            Some(config) => Some(
+                config.file_for_ref(
+                    fetched
+                        .manifest
+                        .runtime
+                        .registry_ref
+                        .as_deref()
+                        .context("authenticated runner has no OCI registry ref")?,
+                )?,
+            ),
+            None => None,
+        };
 
         // Cold start (first boot / monitor respawn): reconcile a stale VM +
         // warm-restore allowed (`is_swap = false`). Deploy-time extra env is
@@ -292,6 +317,7 @@ impl RunnerServe {
             false,
             cfg.extra_env.as_ref(),
             cfg.egress_allow.as_deref(),
+            registry_config_file,
         )
         .await
         .with_context(|| format!("build runtime for {}", cfg.uuid))?;
@@ -488,10 +514,12 @@ impl RunnerServe {
         let initial_digest: Option<String> = match &initial_ref {
             Some(reff) => {
                 let runner = crate::runner::build::firecracker::production_fc_build_runner();
-                // `None` = anonymous resolve; the cold-start guard only needs a
-                // digest baseline — fail-open on any error is the existing contract.
-                match crate::runner::build::firecracker::resolve_oci_digest(reff, &runner, None)
-                    .await
+                match crate::runner::registry::resolve_oci_digest(
+                    reff,
+                    &runner,
+                    registry_config.as_deref(),
+                )
+                .await
                 {
                     Ok(d) => Some(d),
                     Err(e) => {
@@ -540,6 +568,7 @@ impl RunnerServe {
             // Production: resolve digests via the real `oras` runner (no
             // override). Only tests inject a fake resolver here.
             digest_resolver: None,
+            registry_config,
         };
 
         Ok(Self {
