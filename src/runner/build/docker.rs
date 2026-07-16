@@ -4,6 +4,7 @@
 
 use anyhow::Context as _;
 
+use super::stage::{StageFailure, stage_names};
 use super::{ArtifactRef, BuildJob, BuildSpec};
 use crate::build_backend::BuildBackend;
 use crate::docker::CommandRunner;
@@ -46,22 +47,27 @@ pub(super) async fn run_docker_build(
         .clone()
         .unwrap_or_else(|| spec.context_dir.join("Dockerfile"));
 
-    // Require the resolved Dockerfile to exist.
+    // Require the resolved Dockerfile to exist. USER-fault BUILD stage: the
+    // Dockerfile (and its `[build].dockerfile` pointer) is the user's own repo
+    // content — this message must reach them verbatim.
     if !dockerfile_for_check.is_file() {
-        anyhow::bail!(
+        return Err(anyhow::anyhow!(
             "no Dockerfile at {} (set [build].dockerfile in tabbify.toml to point at it)",
             dockerfile_for_check.display()
-        );
+        )
+        .context(StageFailure::user(stage_names::BUILD)));
     }
 
     // Build the local image from the resolved context, honouring the Dockerfile
     // path when the toml specified one. Local tag is scoped to this build so
-    // concurrent builds don't collide.
+    // concurrent builds don't collide. USER-fault BUILD stage: a `docker build`
+    // failure is the user's Dockerfile/source failing — its stderr IS the fix.
     let local_tag = format!("tbf-build-{}", job.app_uuid);
     backend
         .build(&spec.context_dir, &local_tag, spec.dockerfile.as_deref())
         .await
-        .context("build image")?;
+        .context("build image")
+        .context(StageFailure::user(stage_names::BUILD))?;
 
     // Push to the mesh registry in TWO supervisor-side steps: skopeo copies
     // the built image out of the docker daemon into an OCI layout (local
@@ -92,7 +98,8 @@ pub(super) async fn run_docker_build(
         crate::skopeo::write_registry_config(token, &job.registry_ula, &cfg_dir)
             .with_context(|| {
                 format!("write oras registry auth config to {}", cfg_dir.display())
-            })?;
+            })
+            .context(StageFailure::platform(stage_names::PUSH))?;
         // oras `--to-registry-config` wants the auth FILE, not its dir:
         // write_registry_config writes `<cfg_dir>/config.json`.
         Some(cfg_dir.join("config.json").to_string_lossy().into_owned())
@@ -111,7 +118,9 @@ pub(super) async fn run_docker_build(
     )
     .await
     {
-        anyhow::bail!("push to registry failed: {reff}: {e}");
+        // PLATFORM-fault PUSH stage: the registry leg is infrastructure.
+        return Err(anyhow::anyhow!("push to registry failed: {reff}: {e}")
+            .context(StageFailure::platform(stage_names::PUSH)));
     }
 
     // Move the stable "moving" tag (`[build].stable_tag`, e.g. `:current`) onto
@@ -130,7 +139,8 @@ pub(super) async fn run_docker_build(
         )
         .await
         {
-            anyhow::bail!("push stable tag failed: {stable}: {e}");
+            return Err(anyhow::anyhow!("push stable tag failed: {stable}: {e}")
+                .context(StageFailure::platform(stage_names::PUSH)));
         }
         tracing::info!(%reff, stable_tag = %stable, "published stable moving tag");
     }

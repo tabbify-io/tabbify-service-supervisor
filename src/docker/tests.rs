@@ -264,22 +264,30 @@ async fn run_docker_build_bails_with_push_stderr() {
         manifest_toml: None,
     };
 
-    let err = run_build(
-        &job,
-        &backend,
-        &git,
-        &git_capture,
-        &skopeo_runner,
-        "skopeo",
-        "oras",
-        dir.path(),
-    )
-    .await
-    .expect_err("push failure → run_build must bail")
-    .to_string();
+    // Chain rendering (`{:#}`) — the failing-stage attribution now tops the
+    // chain (deploy observability); the registry stderr rides right under it.
+    let err = format!(
+        "{:#}",
+        run_build(
+            &job,
+            &backend,
+            &git,
+            &git_capture,
+            &skopeo_runner,
+            "skopeo",
+            "oras",
+            dir.path(),
+        )
+        .await
+        .expect_err("push failure → run_build must bail")
+    );
 
     assert!(
         err.contains("unauthorized: authentication required"),
         "run_build must bail with the registry stderr, not just the ref; got: {err}"
+    );
+    assert!(
+        err.contains("'push' stage"),
+        "run_build must attribute the failing stage; got: {err}"
     );
 }

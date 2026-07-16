@@ -17,10 +17,16 @@
 //! - [`rootfs_variants`] — per-uuid rootfs-cache variant bookkeeping: fingerprint
 //!   manifests (cache-miss attribution: WHICH env/cap component differed) and
 //!   stale-variant garbage collection (disk safety on cap rotation).
+//! - [`spec`] — `[build]` directive resolution (`BuildSpec`, stable-tag ref,
+//!   oras push-auth config).
+//! - [`stage`] — failing-STAGE attribution: per-stage error markers the builder
+//!   child prints on failure so the supervisor (and, through it, the node +
+//!   deploy owner) learns WHICH step failed and whether it is the user's fault.
 //! - Everything else (the [`BuildJob`] type, the dispatcher, the production
 //!   wiring, and the tests) lives in this file.
 
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -29,6 +35,11 @@ mod docker;
 pub(crate) mod fc_sandbox;
 pub mod firecracker;
 pub mod rootfs_variants;
+mod spec;
+pub mod stage;
+
+pub(crate) use spec::{BuildSpec, build_stable_reff, oras_push_cfg_file, resolve_build_spec};
+use stage::{StageFailure, stage_names};
 
 /// Which build pipeline a [`BuildJob`] drives.
 ///
@@ -112,6 +123,32 @@ pub struct ArtifactRef {
     pub commit_sha: Option<String>,
 }
 
+/// Log one pipeline stage's completion with its duration — the per-stage
+/// structured trace that makes a build traceable end-to-end (these lines run in
+/// the builder child, so they land in the live progress log + build log).
+fn log_stage_ok(app_uuid: &str, stage: &str, started: Instant) {
+    tracing::info!(
+        app_uuid,
+        stage,
+        duration_ms = started.elapsed().as_millis() as u64,
+        outcome = "ok",
+        "build stage complete"
+    );
+}
+
+/// Log one pipeline stage's failure with its duration (the error itself rides
+/// the returned chain; this line pins WHERE and HOW LONG).
+fn log_stage_failed(app_uuid: &str, stage: &str, started: Instant, e: &anyhow::Error) {
+    tracing::warn!(
+        app_uuid,
+        stage,
+        duration_ms = started.elapsed().as_millis() as u64,
+        outcome = "failed",
+        error = %format!("{e:#}"),
+        "build stage FAILED"
+    );
+}
+
 /// Run a build job end-to-end with injected dependencies.
 ///
 /// Dispatches on [`BuildJob::build_kind`]:
@@ -129,6 +166,10 @@ pub struct ArtifactRef {
 /// `skopeo_runner` + `skopeo_bin` drive the registry PUSH (the image is built by
 /// `backend`, then `skopeo` copies it from the local docker daemon to the mesh
 /// registry — the daemon never needs a mesh route).
+///
+/// Every pipeline stage is stage-attributed ([`stage::StageFailure`] on the
+/// error chain) and logged with its duration, so a failure names the step
+/// (`clone`/`manifest`/`build`/`push`) end-to-end.
 ///
 /// # Errors
 /// Clone failure; an unprovable commit SHA (fail-closed — see
@@ -148,9 +189,15 @@ pub async fn run_build(
     oras_bin: &str,
     workdir: &Path,
 ) -> anyhow::Result<ArtifactRef> {
-    // 1. Clone into <workdir>/src.
+    let app_uuid = job.app_uuid.as_str();
+
+    // ── stage: clone ── source acquisition: `git clone` + immutable-SHA resolve.
+    // PLATFORM-attributed: a repo-not-found/auth failure is classified into its
+    // own actionable code by the node's clone-signal matching; everything else
+    // here (network, git plumbing) is infra.
+    let stage_started = Instant::now();
     let src = workdir.join("src");
-    crate::git::clone(
+    let cloned = crate::git::clone(
         &job.repo_url,
         &job.git_ref,
         job.clone_token.as_deref(),
@@ -158,7 +205,11 @@ pub async fn run_build(
         git,
     )
     .await
-    .context("clone")?;
+    .context(StageFailure::platform(stage_names::CLONE));
+    if let Err(e) = &cloned {
+        log_stage_failed(app_uuid, stage_names::CLONE, stage_started, e);
+    }
+    cloned?;
 
     // Resolve the IMMUTABLE commit SHA the clone left at HEAD. For a "deploy now"
     // job whose `git_ref` is a branch (e.g. `main`), this turns the floating ref
@@ -168,24 +219,38 @@ pub async fn run_build(
     // rather than shipping a mutable tag.
     let commit_sha = crate::git::resolve_cloned_head(&src, git_capture)
         .await
-        .context("resolve clone commit sha")?;
+        .context("resolve clone commit sha")
+        .context(StageFailure::platform(stage_names::CLONE))
+        .inspect_err(|e| log_stage_failed(app_uuid, stage_names::CLONE, stage_started, e))?;
+    log_stage_ok(app_uuid, stage_names::CLONE, stage_started);
 
+    // ── stage: manifest ── `tabbify.toml` injection + `[build]` resolution.
+    // USER-attributed: the toml is the user's own config (managed or in-repo) —
+    // a parse error here (e.g. `missing field \`build\``) is exactly the message
+    // the user must see to fix their deploy.
+    let stage_started = Instant::now();
     // Inject the Tabbify-MANAGED `tabbify.toml` ONLY when the repo ships none
     // (repo-wins): a repo that carries its own `tabbify.toml` keeps using it,
     // while a repo with none gets the managed default written at the clone root.
     let toml_path = src.join("tabbify.toml");
     if !toml_path.exists() {
         if let Some(t) = &job.manifest_toml {
-            std::fs::write(&toml_path, t).with_context(|| {
-                format!("write managed tabbify.toml to {}", toml_path.display())
-            })?;
+            std::fs::write(&toml_path, t)
+                .with_context(|| format!("write managed tabbify.toml to {}", toml_path.display()))
+                .context(StageFailure::platform(stage_names::MANIFEST))
+                .inspect_err(|e| {
+                    log_stage_failed(app_uuid, stage_names::MANIFEST, stage_started, e);
+                })?;
         }
     }
 
     // Resolve `[build]` (dockerfile/context) from the toml now present at the
     // clone root (repo's own or the injected managed one). Absent ⇒ today's
     // defaults: context = `<src>` and Docker's default `<src>/Dockerfile`.
-    let build_spec = resolve_build_spec(&src, &toml_path)?;
+    let build_spec = resolve_build_spec(&src, &toml_path)
+        .context(StageFailure::user(stage_names::MANIFEST))
+        .inspect_err(|e| log_stage_failed(app_uuid, stage_names::MANIFEST, stage_started, e))?;
+    log_stage_ok(app_uuid, stage_names::MANIFEST, stage_started);
 
     // Image ref: <registry_ula>/<tenant>/<app_uuid>:<commit_sha>.
     // The tag component is the IMMUTABLE commit SHA (resolved above), NOT the
@@ -224,6 +289,13 @@ pub async fn run_build(
             // (explicit opt-in + KVM). The host clones (above), the VM
             // builds, the host pushes — no docker daemon anywhere.
             if fc_sandbox::enabled() {
+                // ── stage: build ── USER-attributed: a sandboxed-build failure
+                // overwhelmingly reflects the user's Dockerfile / source (their
+                // compile errors, their bad base image) — the stderr IS the
+                // message they need. Rare sandbox-infra faults (KVM, rootfs)
+                // land here too; the node still token-redacts and bounds
+                // everything it returns.
+                let stage_started = Instant::now();
                 let fc_runner = firecracker::production_fc_build_runner();
                 // The one-shot build child resolves data_dir from
                 // SUPERVISOR_DATA_DIR (the spawner injects the supervisor's
@@ -246,11 +318,24 @@ pub async fn run_build(
                     &fc_runner,
                 )
                 .await
-                .context("sandboxed (firecracker) build")?;
+                .context("sandboxed (firecracker) build")
+                .context(StageFailure::user(stage_names::BUILD))
+                .inspect_err(|e| {
+                    log_stage_failed(app_uuid, stage_names::BUILD, stage_started, e);
+                })?;
+                log_stage_ok(app_uuid, stage_names::BUILD, stage_started);
 
+                // ── stage: push ── PLATFORM-attributed: the registry leg is
+                // infrastructure; its detail (mesh ULAs, auth state) stays
+                // server-side.
+                let stage_started = Instant::now();
                 // Phase-A: write oras auth config when a push token is supplied.
                 let oras_cfg_owned =
-                    oras_push_cfg_file(workdir, job.push_token.as_deref(), &job.registry_ula)?;
+                    oras_push_cfg_file(workdir, job.push_token.as_deref(), &job.registry_ula)
+                        .context(StageFailure::platform(stage_names::PUSH))
+                        .inspect_err(|e| {
+                            log_stage_failed(app_uuid, stage_names::PUSH, stage_started, e);
+                        })?;
 
                 if let Err(e) = (tool_runner)(crate::skopeo::oras_push_args(
                     oras_bin,
@@ -260,7 +345,10 @@ pub async fn run_build(
                 ))
                 .await
                 {
-                    anyhow::bail!("push to registry failed: {reff}: {e}");
+                    let err = anyhow::anyhow!("push to registry failed: {reff}: {e}")
+                        .context(StageFailure::platform(stage_names::PUSH));
+                    log_stage_failed(app_uuid, stage_names::PUSH, stage_started, &err);
+                    return Err(err);
                 }
                 // Move the stable tag onto the just-pushed image (reuses the same
                 // sandbox-built layout — oras leg only). FAIL-CLOSED: a base image
@@ -276,10 +364,14 @@ pub async fn run_build(
                     )
                     .await
                     {
-                        anyhow::bail!("push stable tag failed: {stable}: {e}");
+                        let err = anyhow::anyhow!("push stable tag failed: {stable}: {e}")
+                            .context(StageFailure::platform(stage_names::PUSH));
+                        log_stage_failed(app_uuid, stage_names::PUSH, stage_started, &err);
+                        return Err(err);
                     }
                     tracing::info!(%reff, stable_tag = %stable, "published stable moving tag");
                 }
+                log_stage_ok(app_uuid, stage_names::PUSH, stage_started);
                 return Ok(ArtifactRef {
                     reff,
                     digest: None,
@@ -300,142 +392,6 @@ pub async fn run_build(
             .await
         }
     }
-}
-
-/// Build the oras `--to-registry-config` value for a SANDBOXED-build push.
-///
-/// [`crate::skopeo::write_registry_config`] writes `<workdir>/oras-cfg/config.json`;
-/// oras's `--to-registry-config` flag wants that config.json FILE, NOT the
-/// containing dir — the SAME dir-vs-file contract the v1.4.79 PULL/copy fix
-/// established for `--from-registry-config` (this sandbox PUSH path was missed).
-/// Returns `None` when no push token is supplied (anonymous registry — today's
-/// default), so an unauthenticated push is byte-for-byte unchanged.
-///
-/// # Errors
-/// Auth-config write failure.
-fn oras_push_cfg_file(
-    workdir: &Path,
-    push_token: Option<&str>,
-    registry_ula: &str,
-) -> anyhow::Result<Option<String>> {
-    let Some(token) = push_token else {
-        return Ok(None);
-    };
-    let cfg_dir = workdir.join("oras-cfg");
-    crate::skopeo::write_registry_config(token, registry_ula, &cfg_dir)
-        .with_context(|| format!("write oras registry auth config to {}", cfg_dir.display()))?;
-    // The FILE, not the dir — `--to-registry-config` decodes it as config.json.
-    Ok(Some(
-        cfg_dir.join("config.json").to_string_lossy().into_owned(),
-    ))
-}
-
-/// The resolved `[build]` directives for a docker build: the clone root, the
-/// context directory the image is built from, and the optional Dockerfile path.
-/// All are absolute paths under the clone root.
-#[derive(Debug, Clone)]
-pub(crate) struct BuildSpec {
-    /// The clone root (`<workdir>/src`); used to place the `oci-out` push layout
-    /// stably at `<workdir>/oci-out` regardless of a non-root build context.
-    pub clone_root: std::path::PathBuf,
-    /// The build context dir (`<src>/<[build].context>`, default `<src>`).
-    pub context_dir: std::path::PathBuf,
-    /// The Dockerfile path (`<src>/<[build].dockerfile>`). `None` ⇒ Docker's
-    /// default (`<context_dir>/Dockerfile`).
-    pub dockerfile: Option<std::path::PathBuf>,
-    /// The raw `[build].context` from the toml (default `"."`), RELATIVE to the
-    /// clone root. Threaded verbatim into the fc-sandbox job contract (job.json
-    /// v2) so the guest builder can honor a subdir context; the docker path uses
-    /// the absolute [`Self::context_dir`].
-    pub raw_context: String,
-    /// The raw `[build].dockerfile` from the toml (default `"Dockerfile"`),
-    /// RELATIVE to the clone root. Threaded into job.json v2 alongside
-    /// [`Self::raw_context`]; the guest splits it into a dockerfile DIR +
-    /// `--opt filename=` basename for buildkit.
-    pub raw_dockerfile: String,
-    /// OPTIONAL stable "moving" tag (`[build].stable_tag`, e.g. `"current"`) the
-    /// build publishes ALONGSIDE the immutable `:<commit_sha>` artifact tag. When
-    /// `Some`, the push ALSO registers `<registry>/<tenant>/<uuid>:<stable_tag>`
-    /// re-pointed at the freshly-built digest — the mechanism that makes a BASE
-    /// image rebuild auto-take-effect for a consumer that references the stable
-    /// tag (the node's workspace/devbox base ref). `None` ⇒ only `:<sha>` (today).
-    pub stable_tag: Option<String>,
-}
-
-#[cfg(test)]
-impl BuildSpec {
-    /// `true` when `[build].context`/`[build].dockerfile` are at their defaults
-    /// (`"."` / `"Dockerfile"`). Test-only predicate over the resolved raw
-    /// fields: the fc-sandbox path no longer rejects a non-default layout (the
-    /// v2 guest honors it), so this is just a readability helper for the
-    /// `resolve_build_spec` resolution tests.
-    fn is_default_layout(&self) -> bool {
-        self.raw_context == "." && self.raw_dockerfile == "Dockerfile"
-    }
-}
-
-/// Resolve the [`BuildSpec`] from the `tabbify.toml` at `toml_path` (if present).
-///
-/// - No toml at the clone root ⇒ today's defaults: `context_dir = src`,
-///   `dockerfile = None` (Docker's default `<src>/Dockerfile`).
-/// - Toml present ⇒ parse it with the vendored [`crate::unified_manifest::UnifiedManifest`]
-///   and resolve `[build].context` (default `.`) + `[build].dockerfile`
-///   (default `Dockerfile`) relative to `src`.
-///
-/// # Errors
-/// A malformed `tabbify.toml` (parse error) is surfaced so the build fails with
-/// a clear diagnostic rather than silently ignoring a broken managed config.
-fn resolve_build_spec(src: &Path, toml_path: &Path) -> anyhow::Result<BuildSpec> {
-    if !toml_path.exists() {
-        return Ok(BuildSpec {
-            clone_root: src.to_path_buf(),
-            context_dir: src.to_path_buf(),
-            dockerfile: None,
-            raw_context: ".".to_owned(),
-            raw_dockerfile: "Dockerfile".to_owned(),
-            stable_tag: None,
-        });
-    }
-    let text = std::fs::read_to_string(toml_path)
-        .with_context(|| format!("read tabbify.toml at {}", toml_path.display()))?;
-    let manifest: crate::unified_manifest::UnifiedManifest = toml::from_str(&text)
-        .with_context(|| format!("parse tabbify.toml at {}", toml_path.display()))?;
-    Ok(BuildSpec {
-        clone_root: src.to_path_buf(),
-        context_dir: src.join(manifest.context()),
-        dockerfile: Some(src.join(manifest.dockerfile())),
-        raw_context: manifest.context().to_owned(),
-        raw_dockerfile: manifest.dockerfile().to_owned(),
-        stable_tag: manifest.stable_tag().map(str::to_owned),
-    })
-}
-
-/// Reconstruct the STABLE "moving"-tag registry ref
-/// (`<registry_ula>/<tenant>/<app_uuid>:<stable_tag>`) the build publishes
-/// alongside the immutable `:<commit_sha>` artifact when `[build].stable_tag` is
-/// set — byte-for-byte the same scheme as the primary [`run_build`] `reff`, only
-/// the tag component differs. `stable_tag == None` ⇒ `None` (no extra tag).
-///
-/// Kept as a pure fn (mirrors the node's `deterministic_reff`) so the ref shape
-/// is unit-testable without a live build. The tenant is lowercased for the SAME
-/// reason the primary ref lowercases it (OCI repository names are lowercase; a
-/// mixed-case GitHub owner would otherwise be rejected by oras/skopeo).
-#[must_use]
-fn build_stable_reff(
-    registry_ula: &str,
-    tenant: &str,
-    app_uuid: &str,
-    stable_tag: Option<&str>,
-) -> Option<String> {
-    stable_tag.map(|tag| {
-        format!(
-            "{}/{}/{}:{}",
-            registry_ula,
-            tenant.to_lowercase(),
-            app_uuid,
-            tag
-        )
-    })
 }
 
 /// Read + parse a [`BuildJob`] from `spec_path` and run it with production

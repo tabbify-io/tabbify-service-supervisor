@@ -513,7 +513,41 @@ pub async fn build_app(State(state): State<SharedState>, Json(body): Json<BuildB
     };
     match state.orchestrator.spawn_build(&job).await {
         Ok(art) => axum::Json(art).into_response(),
-        Err(e) => anyhow_to_response(&e),
+        Err(e) => {
+            // Failing-STAGE attribution (deploy observability): a staged build
+            // failure renders the structured body the node's classifier reads —
+            // {error, stage, user_fault, log_tail} — so the deploy owner learns
+            // WHICH step failed and (for user-fault failures) WHY, instead of a
+            // bare "build failed". 422 for a user-fault failure (their repo /
+            // config), 500 for a platform fault; a legacy node treats both as
+            // "ran and failed" (any non-2xx), so the split is wire-compatible.
+            if let Some(staged) =
+                e.downcast_ref::<crate::runner::build::stage::StagedBuildError>()
+            {
+                let status = if staged.user_fault {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                tracing::warn!(
+                    stage = %staged.stage,
+                    user_fault = staged.user_fault,
+                    status = status.as_u16(),
+                    "build_app: staged build failure → structured error body"
+                );
+                return (
+                    status,
+                    axum::Json(json!({
+                        "error": staged.to_string(),
+                        "stage": staged.stage,
+                        "user_fault": staged.user_fault,
+                        "log_tail": staged.log_tail,
+                    })),
+                )
+                    .into_response();
+            }
+            anyhow_to_response(&e)
+        }
     }
 }
 
