@@ -316,14 +316,23 @@ async fn run_build_errors_when_no_dockerfile() {
     let skopeo_runner = fail_runner();
 
     let job = test_job();
-    let err = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
-        .await
-        .unwrap_err()
-        .to_string();
+    // Render the CHAIN (`{:#}`) — the shape every production consumer reads
+    // (the one-shot builder's stderr + failure marker): the stage attribution
+    // sits on top, the actionable cause right under it.
+    let err = format!(
+        "{:#}",
+        run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+            .await
+            .unwrap_err()
+    );
 
     assert!(
         err.to_lowercase().contains("dockerfile"),
         "error must mention Dockerfile; got: {err}"
+    );
+    assert!(
+        err.contains("'build' stage"),
+        "error must attribute the failing stage; got: {err}"
     );
 }
 
@@ -339,10 +348,14 @@ async fn run_build_errors_when_push_fails() {
     let skopeo_runner = fail_runner();
 
     let job = test_job();
-    let err = run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
-        .await
-        .unwrap_err()
-        .to_string();
+    // Chain rendering (`{:#}`) — the stage context tops the chain; the push
+    // cause + ref ride right under it (what the failure marker carries).
+    let err = format!(
+        "{:#}",
+        run_docker_test(&job, &backend, &git, &skopeo_runner, "skopeo", dir.path())
+            .await
+            .unwrap_err()
+    );
 
     assert!(
         err.contains("push to registry failed"),
@@ -351,6 +364,10 @@ async fn run_build_errors_when_push_fails() {
     assert!(
         err.contains(&format!("[fd5a::1]:5000/acme/u:{TEST_HEAD_SHA}")),
         "error must contain the sha-tagged registry ref; got: {err}"
+    );
+    assert!(
+        err.contains("'push' stage"),
+        "error must attribute the failing stage; got: {err}"
     );
 }
 

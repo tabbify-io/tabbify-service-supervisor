@@ -16,13 +16,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::orchestrator::Orchestrator;
 use crate::runner::build::ArtifactRef;
 use crate::runner::build::BuildJob;
+
+/// Bounded build-log tail returned on a build failure: enough lines to show a
+/// compiler/manifest error in full without letting a runaway build log flood
+/// the `POST /v1/build` error body (the node re-bounds again before any client
+/// sees it).
+const BUILD_LOG_TAIL_LINES: usize = 60;
+/// Byte cap on the same tail (a single enormous line cannot flood the body).
+const BUILD_LOG_TAIL_BYTES: usize = 8 * 1024;
 
 /// Outcome of one [`BuildSpawner`] invocation: the captured stdout bytes plus
 /// a boolean indicating whether the child exited with status 0.
@@ -318,10 +326,12 @@ impl Orchestrator {
         // `app_uuid` is forwarded explicitly: `tabbify-runner --uuid` is required
         // at parse time even in builder mode, so the spawner can't infer it from
         // the spec file alone.
+        let build_started = std::time::Instant::now();
         let result = spawner.run(&spec_path, &job.app_uuid).await;
         let _ = std::fs::remove_file(&spec_path); // best-effort cleanup
 
         let output = result.context("build runner invocation")?;
+        let duration_ms = build_started.elapsed().as_millis() as u64;
 
         // Persist the captured build output (stdout + stderr) to a per-app log
         // BEFORE branching on success: a failed build is exactly when the
@@ -335,8 +345,46 @@ impl Orchestrator {
         );
 
         if !output.success {
+            // Failing-STAGE attribution: the builder child prints a
+            // machine-readable marker ({stage, user_fault, error}) as its last
+            // stdout line; a child that died before printing one (crash,
+            // pre-marker binary) falls back to `unknown`/platform with the
+            // stderr trim as the message — fail-closed on the fault class.
+            let marker = crate::runner::build::stage::parse_failure_marker(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("build runner exited non-zero; stderr: {}", stderr.trim());
+            let (stage, user_fault, message) = match marker {
+                Some(m) => (m.stage, m.user_fault, m.error),
+                None => (
+                    crate::runner::build::stage::stage_names::UNKNOWN.to_owned(),
+                    false,
+                    format!("build runner exited non-zero; stderr: {}", stderr.trim()),
+                ),
+            };
+            // Bounded tail of the combined output — what the deploy owner needs
+            // to see WHY the build failed (the node redacts + re-bounds it
+            // before anything reaches a client).
+            let mut combined = output.stdout.clone();
+            combined.extend_from_slice(b"\n--- stderr ---\n");
+            combined.extend_from_slice(&output.stderr);
+            let log_tail =
+                crate::runner::build::stage::tail_lines(&combined, BUILD_LOG_TAIL_LINES, BUILD_LOG_TAIL_BYTES);
+            tracing::warn!(
+                app_uuid = %job.app_uuid,
+                stage = %stage,
+                user_fault,
+                duration_ms,
+                outcome = "failed",
+                error = %message,
+                "build FAILED"
+            );
+            return Err(anyhow::Error::new(
+                crate::runner::build::stage::StagedBuildError {
+                    stage,
+                    user_fault,
+                    message,
+                    log_tail,
+                },
+            ));
         }
 
         // Parse the ArtifactRef from the last non-empty line of stdout (the
@@ -348,8 +396,17 @@ impl Orchestrator {
             .rfind(|l| !l.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("build runner produced no stdout"))?;
 
-        serde_json::from_str(last_line)
-            .with_context(|| format!("parse ArtifactRef from stdout line: {last_line:?}"))
+        let art: ArtifactRef = serde_json::from_str(last_line)
+            .with_context(|| format!("parse ArtifactRef from stdout line: {last_line:?}"))?;
+        tracing::info!(
+            app_uuid = %job.app_uuid,
+            duration_ms,
+            outcome = "ok",
+            reff = %art.reff,
+            commit_sha = art.commit_sha.as_deref().unwrap_or("<unresolved>"),
+            "build complete"
+        );
+        Ok(art)
     }
 
     /// Snapshot the current build's progress (P1-3): the last `lines` lines of

@@ -43,7 +43,20 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(0);
             }
             Err(e) => {
+                // Human-readable chain to stderr (captured into the build log)…
                 eprintln!("build failed: {e:#}");
+                // …and the machine-readable failure marker as the LAST stdout
+                // line, so the supervisor attributes the failing STAGE + fault
+                // class without scraping stderr (stdout is otherwise reserved
+                // for the success-path ArtifactRef JSON).
+                let marker = build::stage::failure_marker_from(&e);
+                tracing::error!(
+                    stage = %marker.stage,
+                    user_fault = marker.user_fault,
+                    error = %marker.error,
+                    "one-shot build failed"
+                );
+                println!("{}", marker.to_stdout_line());
                 std::process::exit(1);
             }
         }
