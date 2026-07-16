@@ -70,6 +70,8 @@ pub mod stateful;
 // network ACL) — NO cfg gate so the rule LOGIC is unit-testable on macOS (the
 // `setup_guest_nat` enforcement that consumes it is behind the Linux gate).
 pub mod egress_filter;
+/// Host-wide durable `/30` slot allocator shared by all runner processes.
+pub(crate) mod link_allocator;
 // Pure, host-agnostic iptables arg builder for the IPv4 tap-gateway proxy
 // firewalls (git-proxy :8788 + forge-proxy :8789) — NO cfg gate so the rule
 // LOGIC is unit-testable on macOS (the `iptables` shell-out that consumes it,

@@ -179,16 +179,17 @@ impl DevSessionRegistry {
 /// We must hash the SAME key to get the same `/30` link_idx and thus the same
 /// `host_ip` as the FC launch.
 ///
-/// The derivation is Linux-only in production (FC requires `/dev/kvm`), but
-/// the math is platform-independent. On non-Linux builds we fall back to
-/// `"127.0.0.1"` (functionally harmless — non-Linux hosts can't boot FC VMs;
-/// tests that need the real value must run on Linux).
-pub(crate) fn derive_dev_fc_host_ip(app_uuid: &str, image_ref: &str, tap_subnet: &str) -> String {
-    super::ssh_jump::derive_dev_fc_link_ips(app_uuid, image_ref, tap_subnet)
+/// The host-wide allocator persists the selected slot so API-side git routing,
+/// the runner launch, and later warm restores all use the same `/30` even when
+/// two VM keys have the same preferred hash slot.
+pub(crate) fn derive_dev_fc_host_ip(
+    data_dir: &std::path::Path,
+    app_uuid: &str,
+    image_ref: &str,
+    tap_subnet: &str,
+) -> anyhow::Result<String> {
+    super::ssh_jump::derive_dev_fc_link_ips(data_dir, app_uuid, image_ref, tap_subnet)
         .map(|(host_ip, _)| host_ip.to_string())
-        // Non-Linux / un-derivable: FC VMs cannot run here, so a sentinel is
-        // harmless (dev-session create only really runs on a Linux KVM host).
-        .unwrap_or_else(|| "127.0.0.1".to_owned())
 }
 
 // The `(host_ip, guest_ip)` /30 derivation + the SSH-jump start/address helpers
@@ -351,7 +352,23 @@ pub async fn create_dev_session(
     //
     // vm_key used by FC launch = `format!("{uuid}:{reff}")` where reff =
     // registry_ref = image_ref — `derive_dev_fc_host_ip` takes both to match it.
-    let host_ip = derive_dev_fc_host_ip(&body.app_uuid, &body.image_ref, &state.tap_subnet);
+    let data_dir = &state.orchestrator.shared().data_dir;
+    let host_ip = match derive_dev_fc_host_ip(
+        data_dir,
+        &body.app_uuid,
+        &body.image_ref,
+        &state.tap_subnet,
+    ) {
+        Ok(host_ip) => host_ip,
+        Err(error) => {
+            tracing::error!(app_uuid = %body.app_uuid, %error, "dev-session link allocation failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("allocate Firecracker link: {error}") })),
+            )
+                .into_response();
+        }
+    };
     let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
 
     // Start the per-session SSH TCP jump: the node has NO route into the tenant
@@ -364,8 +381,15 @@ pub async fn create_dev_session(
     // the node falls back to the direct app-ULA path.
     let ssh_jump = match state.ula.parse::<IpAddr>() {
         Ok(my_ula) => {
-            start_dev_ssh_jump(my_ula, &body.app_uuid, &body.image_ref, &state.tap_subnet, None)
-                .await
+            start_dev_ssh_jump(
+                my_ula,
+                data_dir,
+                &body.app_uuid,
+                &body.image_ref,
+                &state.tap_subnet,
+                None,
+            )
+            .await
         }
         Err(e) => {
             tracing::warn!(ula = %state.ula, error = %e, "control ULA not an IP; ssh-jump disabled");
@@ -630,7 +654,16 @@ pub async fn list_dev_sessions(State(state): State<SharedState>) -> Response {
         .snapshot()
         .into_iter()
         .map(
-            |(session_id, app_uuid, _, created_at, last_activity, repo_url, branch, ssh_jump_port)| {
+            |(
+                session_id,
+                app_uuid,
+                _,
+                created_at,
+                last_activity,
+                repo_url,
+                branch,
+                ssh_jump_port,
+            )| {
                 DevSessionRow {
                     session_id,
                     app_uuid,
@@ -668,15 +701,17 @@ pub async fn sweep_expired(
         .dev_sessions
         .snapshot()
         .into_iter()
-        .filter_map(|(session_id, app_uuid, cap, created_at, last_activity, _, _, _)| {
-            let idle = now.duration_since(last_activity);
-            let age = now.duration_since(created_at);
-            if idle > idle_ttl || age > max_ttl {
-                Some((session_id, app_uuid, cap))
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(session_id, app_uuid, cap, created_at, last_activity, _, _, _)| {
+                let idle = now.duration_since(last_activity);
+                let age = now.duration_since(created_at);
+                if idle > idle_ttl || age > max_ttl {
+                    Some((session_id, app_uuid, cap))
+                } else {
+                    None
+                }
+            },
+        )
         .collect();
 
     let mut purged = Vec::new();

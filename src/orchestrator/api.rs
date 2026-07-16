@@ -614,8 +614,19 @@ impl Orchestrator {
             .await
             .with_context(|| format!("purge cache for {uuid}"))?;
 
-        // Delete only after the old runner is definitively gone and cache
-        // cleanup completed. A deletion error is part of the purge result.
+        // Release network ownership before deleting the durable runner record.
+        // If allocator persistence fails, preserve the record so purge remains
+        // retryable instead of losing the last ownership handle.
+        let tap_subnet = std::env::var("SUPERVISOR_FC_TAP_SUBNET")
+            .unwrap_or_else(|_| crate::config::DEFAULT_FC_TAP_SUBNET.to_owned());
+        let released = crate::firecracker::link_allocator::LinkSlotAllocator::new(
+            &self.shared().data_dir,
+            &tap_subnet,
+        )
+        .release_uuid(uuid)
+        .with_context(|| format!("release Firecracker link assignments for {uuid}"))?;
+        tracing::info!(uuid, released, "purge released FC link assignments");
+        // Delete only after the old runner, cache, and link allocation are gone.
         self.forget_record(uuid)
             .with_context(|| format!("delete runner record for {uuid} after purge"))?;
         Ok(())

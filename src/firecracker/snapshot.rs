@@ -82,6 +82,44 @@ pub fn env_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(".snapshot_env")
 }
 
+/// Complete host-network identity frozen into a Firecracker snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotLink {
+    /// Allocated `/30` slot.
+    pub slot: u32,
+    /// Normalized allocator subnet, including prefix.
+    pub tap_subnet: String,
+    /// Deterministic TAP name encoded by this VM generation.
+    pub tap_name: String,
+}
+
+/// Path to the host-network metadata companion.
+pub fn link_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(".snapshot_link.json")
+}
+
+/// Stamp the exact host-network identity used by a freshly-created snapshot.
+pub fn write_link(cache_dir: &Path, link: &SnapshotLink) {
+    let path = link_path(cache_dir);
+    let result = serde_json::to_vec(link)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&path, bytes));
+    if let Err(error) = result {
+        tracing::warn!(path = %path.display(), error = %error, "failed to write .snapshot_link.json");
+    }
+}
+
+/// Read the complete host-network identity frozen into a snapshot. Missing or
+/// malformed legacy metadata is deliberately unusable.
+pub fn read_link(cache_dir: &Path) -> Option<SnapshotLink> {
+    serde_json::from_slice(&std::fs::read(link_path(cache_dir)).ok()?).ok()
+}
+
+/// Whether snapshot networking exactly matches the selected host allocation.
+pub fn link_matches(cache_dir: &Path, expected: &SnapshotLink) -> bool {
+    read_link(cache_dir).as_ref() == Some(expected)
+}
+
 /// Record the env/cap fingerprint a freshly-created snapshot was baked with.
 /// Best-effort (logs on failure): a missing/garbled `.snapshot_env` is treated
 /// by [`restore_matches`] as "no usable snapshot" → cold boot (the safe path).
@@ -173,6 +211,7 @@ pub fn clear(cache_dir: &Path) {
     // not outlive the snapshot files it described (else a later `restore_matches`
     // could read a fingerprint that no longer matches any on-disk snapshot).
     let _ = std::fs::remove_file(env_path(cache_dir));
+    let _ = std::fs::remove_file(link_path(cache_dir));
     // Drop the one-time restore nonce too: it authorizes a re-plumb ONLY against
     // the exact snapshot whose frozen RAM holds the matching copy, so it must
     // never outlive the snapshot files (a stale token would just 401 later).
@@ -345,8 +384,53 @@ mod tests {
         std::fs::write(mem_path(dir.path()), b"mem").unwrap();
         write_ref(dir.path(), "reg:5000/a/b@sha256:abc");
         clear(dir.path());
-        assert!(!ref_path(dir.path()).exists(), "clear must drop .snapshot_ref");
+        assert!(
+            !ref_path(dir.path()).exists(),
+            "clear must drop .snapshot_ref"
+        );
         assert!(!files_present(dir.path()));
+    }
+
+    #[test]
+    fn link_metadata_round_trips_and_clear_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = SnapshotLink {
+            slot: 15_623,
+            tap_subnet: "172.31.0.0/16".to_owned(),
+            tap_name: "fc-example".to_owned(),
+        };
+        write_link(dir.path(), &link);
+        assert_eq!(read_link(dir.path()), Some(link));
+        clear(dir.path());
+        assert_eq!(read_link(dir.path()), None);
+    }
+
+    #[test]
+    fn legacy_snapshot_without_link_slot_has_no_allocation_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(vmstate_path(dir.path()), b"vmstate").unwrap();
+        std::fs::write(mem_path(dir.path()), b"mem").unwrap();
+        assert!(files_present(dir.path()));
+        assert_eq!(read_link(dir.path()), None);
+    }
+
+    #[test]
+    fn link_match_requires_slot_subnet_and_tap_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = SnapshotLink {
+            slot: 7,
+            tap_subnet: "172.31.0.0/16".to_owned(),
+            tap_name: "fc-a".to_owned(),
+        };
+        write_link(dir.path(), &expected);
+        assert!(link_matches(dir.path(), &expected));
+        for mismatched in [
+            SnapshotLink { slot: 8, ..expected.clone() },
+            SnapshotLink { tap_subnet: "172.30.0.0/16".to_owned(), ..expected.clone() },
+            SnapshotLink { tap_name: "fc-b".to_owned(), ..expected.clone() },
+        ] {
+            assert!(!link_matches(dir.path(), &mismatched));
+        }
     }
 
     /// Helper: lay down a complete warm-restore candidate (both snapshot files +
@@ -545,7 +629,10 @@ mod tests {
         assert!(!is_suppressed(&dir));
         suppress(&dir);
         assert!(is_suppressed(&dir), "marker must exist after suppress");
-        assert!(!files_present(&dir), "suppress must not create snapshot files");
+        assert!(
+            !files_present(&dir),
+            "suppress must not create snapshot files"
+        );
         // Idempotent: a second suppress is harmless.
         suppress(&dir);
         assert!(is_suppressed(&dir));
