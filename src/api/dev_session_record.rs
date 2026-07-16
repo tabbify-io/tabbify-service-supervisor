@@ -112,10 +112,11 @@ impl DevSessionRecord {
     /// Returns an [`io::Error`] if the file exists but cannot be read/parsed.
     pub fn load(runner_dir: &Path, app_uuid: &str) -> io::Result<Option<Self>> {
         match fs::read_to_string(record_path(runner_dir, app_uuid)) {
-            Ok(json) => Ok(Some(
-                serde_json::from_str(&json)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            )),
+            Ok(json) => {
+                Ok(Some(serde_json::from_str(&json).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e)
+                })?))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -212,6 +213,7 @@ pub(crate) fn unix_to_instant(unix_secs: u64) -> Instant {
 /// transient FS hiccup never blocks startup.
 pub async fn readopt_dev_sessions(
     runner_dir: &Path,
+    data_dir: &Path,
     dev_sessions: &DevSessionRegistry,
     git_sessions: &GitSessions,
     tap_subnet: &str,
@@ -269,7 +271,15 @@ pub async fn readopt_dev_sessions(
         // address survives this restart.
         let ssh_jump = match (my_ula, image_ref.as_deref()) {
             (Some(ula), Some(reff)) => {
-                start_dev_ssh_jump(ula, &rec.app_uuid, reff, tap_subnet, rec.ssh_jump_port).await
+                start_dev_ssh_jump(
+                    ula,
+                    data_dir,
+                    &rec.app_uuid,
+                    reff,
+                    tap_subnet,
+                    rec.ssh_jump_port,
+                )
+                .await
             }
             _ => None,
         };
@@ -350,7 +360,9 @@ mod tests {
     #[test]
     fn record_roundtrips_through_disk() {
         let dir = TempDir::new().unwrap();
-        record("sess-1", "app-1", "capabc").save(dir.path()).unwrap();
+        record("sess-1", "app-1", "capabc")
+            .save(dir.path())
+            .unwrap();
         let listed = DevSessionRecord::list(dir.path()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, "sess-1");
@@ -384,7 +396,10 @@ mod tests {
             "created_at_unix": 1, "last_activity_unix": 2
         }"#;
         let decoded: DevSessionRecord = serde_json::from_str(legacy).unwrap();
-        assert_eq!(decoded.ssh_jump_port, None, "pre-field record must default to None");
+        assert_eq!(
+            decoded.ssh_jump_port, None,
+            "pre-field record must default to None"
+        );
     }
 
     #[test]
@@ -409,7 +424,8 @@ mod tests {
         let git = GitSessions::default();
         // `my_ula = None` ⇒ no SSH jump is bound (keeps this test off the network
         // + cross-platform); the adopt/cap-register path is what's under test.
-        let summary = readopt_dev_sessions(dir.path(), &dev, &git, "172.31.0.0/16", None).await;
+        let summary =
+            readopt_dev_sessions(dir.path(), dir.path(), &dev, &git, "172.31.0.0/16", None).await;
 
         assert_eq!(summary.adopted, 1);
         assert_eq!(summary.gc, 0);
@@ -440,7 +456,8 @@ mod tests {
 
         let dev = DevSessionRegistry::default();
         let git = GitSessions::default();
-        let summary = readopt_dev_sessions(dir.path(), &dev, &git, "172.31.0.0/16", None).await;
+        let summary =
+            readopt_dev_sessions(dir.path(), dir.path(), &dev, &git, "172.31.0.0/16", None).await;
 
         assert_eq!(summary.adopted, 0);
         assert_eq!(summary.gc, 1);
@@ -459,7 +476,8 @@ mod tests {
 
         let dev = DevSessionRegistry::default();
         let git = GitSessions::default();
-        let summary = readopt_dev_sessions(dir.path(), &dev, &git, "172.31.0.0/16", None).await;
+        let summary =
+            readopt_dev_sessions(dir.path(), dir.path(), &dev, &git, "172.31.0.0/16", None).await;
 
         assert_eq!(summary.adopted, 0);
         assert_eq!(summary.gc, 0);

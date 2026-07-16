@@ -26,6 +26,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -141,34 +142,21 @@ async fn forward(mut inbound: TcpStream, target: SocketAddr) -> io::Result<()> {
 /// `guest_ip` is `host_ip + 1` and is where the dev-FC sshd
 /// ([`DEV_FC_SSH_PORT`]) is reachable from the host — the [`SshJump`] target.
 ///
-/// Returns `None` when the derivation cannot run: on non-Linux builds (no FC),
-/// or when [`crate::firecracker::linux::derive_link_ips`] errors (subnet
-/// exhausted / malformed). Callers fall back (host_ip → `127.0.0.1`; jump →
-/// disabled, node uses the direct path). The math is platform-independent but
-/// the `firecracker::linux` source of truth is `cfg(target_os = "linux")`.
+/// Returns an error when the durable allocator cannot reserve a slot or the tap
+/// subnet is invalid/exhausted. Callers fail closed instead of routing a dev
+/// capability or SSH connection to another VM.
 pub(crate) fn derive_dev_fc_link_ips(
+    data_dir: &Path,
     app_uuid: &str,
     image_ref: &str,
     tap_subnet: &str,
-) -> Option<(Ipv4Addr, Ipv4Addr)> {
+) -> anyhow::Result<(Ipv4Addr, Ipv4Addr)> {
     // vm_key matches `launch_with_uuid` cold-start: `format!("{uuid}:{reff}")`.
     let vm_key = format!("{app_uuid}:{image_ref}");
-    #[cfg(target_os = "linux")]
-    {
-        let (_, link_idx) = crate::firecracker::linux::fc_identity_for_key(&vm_key);
-        match crate::firecracker::linux::derive_link_ips(tap_subnet, link_idx) {
-            Ok(pair) => Some(pair),
-            Err(e) => {
-                tracing::warn!(app_uuid, error = %e, "dev-session: failed to derive tap link ips");
-                None
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (vm_key, tap_subnet); // suppress unused warnings
-        None
-    }
+    let allocation =
+        crate::firecracker::link_allocator::LinkSlotAllocator::new(data_dir, tap_subnet)
+            .reserve(&vm_key)?;
+    crate::firecracker::link_allocator::link_ips(tap_subnet, allocation.slot)
 }
 
 /// Format a node-facing SSH-jump address (`"[<my_ula>]:<port>"`).
@@ -190,12 +178,19 @@ pub(crate) fn jump_addr_string(my_ula: &str, port: u16) -> String {
 /// Every failure is logged + degraded to `None` (never fatal to a session).
 pub(crate) async fn start_dev_ssh_jump(
     my_ula: IpAddr,
+    data_dir: &Path,
     app_uuid: &str,
     image_ref: &str,
     tap_subnet: &str,
     desired_port: Option<u16>,
 ) -> Option<SshJump> {
-    let (_, guest_ip) = derive_dev_fc_link_ips(app_uuid, image_ref, tap_subnet)?;
+    let (_, guest_ip) = match derive_dev_fc_link_ips(data_dir, app_uuid, image_ref, tap_subnet) {
+        Ok(pair) => pair,
+        Err(error) => {
+            tracing::warn!(app_uuid, %error, "ssh-jump allocation lookup failed");
+            return None;
+        }
+    };
     let started = match desired_port {
         Some(p) => match SshJump::start_on_port(my_ula, guest_ip, p).await {
             Ok(j) => Ok(j),
@@ -265,7 +260,10 @@ mod tests {
         client.write_all(b"hello jump").await.unwrap();
         let mut buf = [0u8; 10];
         client.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"hello jump", "bytes must round-trip through the forward");
+        assert_eq!(
+            &buf, b"hello jump",
+            "bytes must round-trip through the forward"
+        );
     }
 
     /// Dropping the jump tears the listener down: a later dial is refused.
@@ -297,8 +295,13 @@ mod tests {
 
         let app_uuid = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
         let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
-        let (host_ip, guest_ip) =
-            derive_dev_fc_link_ips(app_uuid, image_ref, DEFAULT_FC_TAP_SUBNET).unwrap();
+        let (host_ip, guest_ip) = derive_dev_fc_link_ips(
+            tempfile::tempdir().unwrap().path(),
+            app_uuid,
+            image_ref,
+            DEFAULT_FC_TAP_SUBNET,
+        )
+        .unwrap();
 
         // Matches the FC launch derivation for vm_key = "uuid:image_ref".
         let (_, link_idx) = fc_identity_for_key(&format!("{app_uuid}:{image_ref}"));

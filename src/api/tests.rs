@@ -1203,7 +1203,7 @@ async fn add_repo_known_workspace_registers_cap_and_appends_record() {
     use std::time::Instant;
 
     let dir = TempDir::new().unwrap();
-    let state = make_state(dir.path().to_path_buf());
+    let state = make_state_with_data_dir(dir.path().to_path_buf(), dir.path().join("data"));
 
     // Seed the workspace: registry entry (caps gate), a durable WorkspaceRecord
     // with one existing repo, and a RunnerHandle carrying the FULL extra_env

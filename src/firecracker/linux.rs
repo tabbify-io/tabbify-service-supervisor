@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
+use super::link_allocator::{LinkAllocation, LinkSlotAllocator, SERVING_LINK_SLOTS};
 use super::pidfile;
 use super::port_plan::{PortPlan, probe_first_answering, resolve_port_plan};
 use super::protocol::{
@@ -174,8 +175,6 @@ pub(crate) fn console_stdio(console_log: Option<&Path>) -> (Stdio, Stdio) {
 /// occupies the very top slot ([`super::build_vm::BUILD_SEQ`] = `0xFFFF/4 - 1`
 /// = 16382), so serving VMs hash into `[0, SERVING_LINK_SLOTS)` and never land
 /// on the build VM's `/30`.
-const SERVING_LINK_SLOTS: u32 = 16_382;
-
 /// Deterministic firecracker host identity from a `key` — replaces the old
 /// process-global `VM_SEQ` counter. The key is the app `uuid` on a cold start
 /// and `"uuid:reff"` on a deploy, so the new microVM of a zero-downtime swap
@@ -191,16 +190,15 @@ const SERVING_LINK_SLOTS: u32 = 16_382;
 /// under a live microVM → unhealthy → monitor crash-loop. (`app_ula` was
 /// already per-uuid, so only the host-side plumbing collided.)
 ///
-/// Deriving the identity from the key (same `blake3` source as
-/// [`crate::app_ula`]) makes it STABLE and collision-free in practice:
+/// Deriving the preferred identity from the key (same `blake3` source as
+/// [`crate::app_ula`]) makes the TAP stable; the host-wide [`LinkSlotAllocator`]
+/// resolves the smaller link-slot namespace without collisions:
 /// - `tap_name`: `fc-<48-bit blake3 hex>` — 15 chars, the IFNAMSIZ limit; also
 ///   names the `/tmp/firecracker-<tap>.sock` api socket. 48 bits ⇒ two distinct
 ///   keys effectively never share a tap device or socket.
-/// - `link_idx`: `hash % SERVING_LINK_SLOTS` — the `/30` + MAC index fed to
-///   [`derive_link_ips`] / [`derive_guest_mac`]. Only 14 bits (the `/16` holds
-///   16384 `/30`s), so a same-`link_idx` (different-`tap_name`) clash is rare
-///   and surfaces as a hard `ip addr add` duplicate-address error rather than
-///   silent corruption.
+/// - `link_idx`: the preferred `/30` + MAC slot. It is only 14 bits, so it must
+///   never be used directly by a serving launch: Linux permits duplicate IPv4
+///   addresses on distinct TAPs and may silently route readiness to the wrong VM.
 pub(crate) fn fc_identity_for_key(key: &str) -> (String, u32) {
     let digest = blake3::hash(key.as_bytes());
     let b = digest.as_bytes();
@@ -248,6 +246,12 @@ pub struct FirecrackerRuntime {
     /// The guest's IPv4 address on its /30 tap. Used by the L4 SSH forwarder
     /// (`guest_ssh_addr`) to expose `guest_ip:2222` via `[app_ula]:2222`.
     guest_ip: Ipv4Addr,
+    /// Host-wide allocator slot from which `guest_ip`, the gateway, and MAC were
+    /// derived. Snapshots stamp this exact value because guest networking is
+    /// frozen into vmstate/RAM.
+    link_slot: u32,
+    /// Normalized subnet paired with `link_slot` in snapshot metadata.
+    tap_subnet: String,
     client: reqwest::Client,
     /// The per-uuid snapshot cache dir (`<data_dir>/apps/<uuid>/cache`) this VM
     /// writes its snapshot to. `None` for the bare `launch` entry (tests /
@@ -299,6 +303,14 @@ pub struct FirecrackerRuntime {
 }
 
 impl FirecrackerRuntime {
+    fn snapshot_link(&self) -> snapshot::SnapshotLink {
+        snapshot::SnapshotLink {
+            slot: self.link_slot,
+            tap_subnet: self.tap_subnet.clone(),
+            tap_name: self.tap_name.clone(),
+        }
+    }
+
     /// Boot `rootfs` as a microVM and wait for its app HTTP server.
     ///
     /// Steps (design §4): KVM guard → allocate tap + /30 → spawn
@@ -332,6 +344,7 @@ impl FirecrackerRuntime {
             None,
             None,
             "fc-launch-default",
+            None,
             None,
             None,
             false,
@@ -375,6 +388,7 @@ impl FirecrackerRuntime {
         cache_dir: Option<&Path>,
         console_log: Option<&Path>,
         vm_key: &str,
+        allocation: Option<&LinkAllocation>,
         image_ref: Option<&str>,
         egress_allow: Option<&[String]>,
         is_workspace: bool,
@@ -394,7 +408,11 @@ impl FirecrackerRuntime {
         // STABLE per (app, version), collision-free across concurrent apps,
         // respawns, AND the old/new VMs of a zero-downtime swap (see
         // `fc_identity_for_key`).
-        let (tap_name, link_idx) = fc_identity_for_key(vm_key);
+        let (preferred_tap, preferred_idx) = fc_identity_for_key(vm_key);
+        let tap_name = allocation
+            .map(|value| value.tap_name.clone())
+            .unwrap_or(preferred_tap);
+        let link_idx = allocation.map_or(preferred_idx, |value| value.slot);
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_mac = derive_guest_mac(link_idx);
@@ -465,6 +483,8 @@ impl FirecrackerRuntime {
             fc_scope,
             guest_base,
             guest_ip,
+            link_slot: link_idx,
+            tap_subnet: super::link_allocator::normalize_subnet(&cfg.tap_subnet)?,
             client: reqwest::Client::new(),
             snapshot_cache_dir: cache_dir.map(Path::to_path_buf),
             image_ref: image_ref.map(str::to_owned),
@@ -556,6 +576,7 @@ impl FirecrackerRuntime {
                 me.try_create_snapshot(dir).await;
                 if let (Some(reff), true) = (image_ref, snapshot::files_present(dir)) {
                     snapshot::write_ref(dir, reff);
+                    snapshot::write_link(dir, &me.snapshot_link());
                     // Stamp the env/cap fingerprint alongside the ref so a later
                     // restore is gated on BOTH (a workspace `add_repo` changes the
                     // env, not the image — #108). Paired with the ref write so a
@@ -635,6 +656,16 @@ impl FirecrackerRuntime {
         // digest so a moved tag is detected as a content change.
         let vm_key = format!("{uuid}:{reff}");
         let cache_dir = data_dir.join("apps").join(uuid).join("cache");
+        if !is_swap {
+            // Remove this vm_key's own stale TAP before live-interface migration
+            // detection, otherwise its historical preferred slot would look
+            // foreign and force an unnecessary fallback assignment.
+            reap_stale_fc_for_vm_key(data_dir, uuid, &vm_key)?;
+        }
+        let reservation = LinkSlotAllocator::new(data_dir, &cfg.tap_subnet)
+            .acquire(&vm_key)
+            .with_context(|| format!("allocate Firecracker link for {vm_key}"))?;
+        let allocation = reservation.allocation().clone();
 
         // The port(s) a prior launch of this uuid PERSISTED as its winning app
         // port — recovered on a config-read-less cache-hit respawn / warm restore
@@ -681,6 +712,7 @@ impl FirecrackerRuntime {
                 Some(&cache_dir),
                 Some(&console_log),
                 &vm_key,
+                Some(&allocation),
                 Some(snapshot_ref),
                 egress_allow,
                 is_workspace,
@@ -698,7 +730,6 @@ impl FirecrackerRuntime {
             // left by a crashed predecessor, then warm-restore if a snapshot
             // exists AND it was taken from the SAME image (else cold boot, which
             // re-creates a fresh snapshot for the current image).
-            reap_stale_fc_for_vm_key(data_dir, uuid, &vm_key)?;
             // Invalidate the snapshot when the resolved image DIGEST OR the #106
             // env/cap fingerprint has changed: the cache is keyed by UUID only, so a
             // respawn after a redeploy of a NEW image — INCLUDING a MOVING tag
@@ -720,11 +751,17 @@ impl FirecrackerRuntime {
             // re-plumb the broker afterwards. INVARIANT: a workspace that comes up
             // (warm OR cold) with declared forge creds MUST have the broker actually
             // holding them.
-            let needs_restore = super::cred_restore::needs_cred_restore(
-                is_workspace,
-                !cap_files.is_empty(),
-            );
+            let needs_restore =
+                super::cred_restore::needs_cred_restore(is_workspace, !cap_files.is_empty());
             let decision = snapshot::restore_decision(&cache_dir, snapshot_ref, env_hash);
+            let snapshot_link_matched = snapshot::link_matches(
+                &cache_dir,
+                &snapshot::SnapshotLink {
+                    slot: allocation.slot,
+                    tap_subnet: allocation.tap_subnet.clone(),
+                    tap_name: allocation.tap_name.clone(),
+                },
+            );
             let restore_token = super::cred_restore::read_restore_token(&cache_dir);
             // Self-diagnosing warm-vs-cold verdict: every gate named, so the log
             // alone answers "why did this respawn go warm/cold?".
@@ -735,19 +772,30 @@ impl FirecrackerRuntime {
                 env_matched = decision.env_matched,
                 needs_cred_restore = needs_restore,
                 restore_token_present = restore_token.is_some(),
+                snapshot_link_matched,
+                allocated_link_slot = allocation.slot,
                 is_workspace,
                 cap_files = cap_files.len(),
                 "launch: warm-vs-cold decision inputs"
             );
-            let warm_viable =
-                decision.warm_ok() && (!needs_restore || restore_token.is_some());
-            if decision.warm_ok() && !warm_viable {
-                // The image+env gates PASS but the snapshot predates the restore
-                // protocol (no `.snapshot_restore_token`): restoring it would
-                // resurrect a scrubbed, credless broker that nothing could
-                // re-plumb — the exact forever-credless trap. Clear it and cold
-                // boot so `/init` re-bakes the creds; the next `Cmd::Snapshot`
-                // then writes a restorable (nonce-carrying) snapshot.
+            let warm_viable = decision.warm_ok()
+                && snapshot_link_matched
+                && (!needs_restore || restore_token.is_some());
+            let invalid_link = decision.files_present && !snapshot_link_matched;
+            let missing_restore_token = decision.warm_ok()
+                && snapshot_link_matched
+                && needs_restore
+                && restore_token.is_none();
+            if invalid_link {
+                tracing::warn!(
+                    uuid,
+                    allocated_link_slot = allocation.slot,
+                    allocated_tap = %allocation.tap_name,
+                    allocated_subnet = %allocation.tap_subnet,
+                    "snapshot link metadata missing or mismatched (legacy/foreign snapshot); clearing + cold booting"
+                );
+                snapshot::clear(&cache_dir);
+            } else if missing_restore_token {
                 tracing::warn!(
                     uuid,
                     "snapshot matches image+env but carries NO restore token for a credential-bearing workspace (pre-protocol snapshot) — clearing it + cold booting so /init re-bakes the creds"
@@ -760,6 +808,7 @@ impl FirecrackerRuntime {
                     cfg,
                     Some(&console_log),
                     &vm_key,
+                    &allocation,
                     restore_port,
                     data_dir,
                     uuid,
@@ -771,11 +820,7 @@ impl FirecrackerRuntime {
                 .await
                 {
                     Ok(warm_vm) => {
-                        tracing::info!(
-                            uuid,
-                            replumbed = needs_restore,
-                            "warm start from snapshot"
-                        );
+                        tracing::info!(uuid, replumbed = needs_restore, "warm start from snapshot");
                         warm_vm
                     }
                     Err(e) => {
@@ -797,6 +842,7 @@ impl FirecrackerRuntime {
                             Some(&cache_dir),
                             Some(&console_log),
                             &vm_key,
+                            Some(&allocation),
                             Some(snapshot_ref),
                             egress_allow,
                             is_workspace,
@@ -818,7 +864,7 @@ impl FirecrackerRuntime {
                 // cold boot. If a now-stale snapshot is on disk, clear it first so
                 // the fresh cold-boot snapshot + its `.snapshot_ref`/`.snapshot_env`
                 // replace it cleanly.
-                if snapshot::files_present(&cache_dir) {
+                if snapshot::files_present(&cache_dir) && !invalid_link && !missing_restore_token {
                     tracing::info!(
                         uuid,
                         snapshot_ref,
@@ -836,6 +882,7 @@ impl FirecrackerRuntime {
                     Some(&cache_dir),
                     Some(&console_log),
                     &vm_key,
+                    Some(&allocation),
                     Some(snapshot_ref),
                     egress_allow,
                     is_workspace,
@@ -850,6 +897,11 @@ impl FirecrackerRuntime {
                 .await?
             }
         };
+
+        // The runtime is fully constructed. Clear only this launch's owner token;
+        // cancellation or any earlier `?` drops the reservation and releases it.
+        let confirmed = reservation.confirm()?;
+        debug_assert_eq!(confirmed, allocation);
 
         // Record the active VM's pid for cold-start reconciliation.
         if let Some(pid) = vm.child.as_ref().and_then(|c| c.id()) {
@@ -892,6 +944,7 @@ impl FirecrackerRuntime {
         cfg: &FcConfig,
         console_log: Option<&Path>,
         vm_key: &str,
+        allocation: &LinkAllocation,
         app_port: u16,
         data_dir: &Path,
         uuid: &str,
@@ -925,7 +978,8 @@ impl FirecrackerRuntime {
 
         // `uuid:reff` tap + /30 — MATCHES the cold boot that took the snapshot
         // (same key ⇒ same tap/IP as the baked-in guest networking).
-        let (tap_name, link_idx) = fc_identity_for_key(vm_key);
+        let tap_name = allocation.tap_name.clone();
+        let link_idx = allocation.slot;
         let (host_ip, guest_ip) = derive_link_ips(&cfg.tap_subnet, link_idx)
             .with_context(|| format!("derive /30 from subnet {}", cfg.tap_subnet))?;
         let guest_base = format!("http://{guest_ip}:{app_port}");
@@ -975,6 +1029,8 @@ impl FirecrackerRuntime {
             fc_scope,
             guest_base,
             guest_ip,
+            link_slot: link_idx,
+            tap_subnet: allocation.tap_subnet.clone(),
             client: reqwest::Client::new(),
             snapshot_cache_dir: Some(cache_dir.to_path_buf()),
             // Carry the ref the existing snapshot was stamped with so a later
@@ -1281,7 +1337,10 @@ impl FirecrackerRuntime {
             return Ok(None);
         }
         let base = self.broker_ctrl_base();
-        let url = format!("{base}{}", super::snapshot_decision::PRE_SNAPSHOT_SCRUB_PATH);
+        let url = format!(
+            "{base}{}",
+            super::snapshot_decision::PRE_SNAPSHOT_SCRUB_PATH
+        );
         let bearer = super::cred_restore::authkeys_cap_value(&self.cap_files);
         tracing::info!(
             guest_ip = %self.guest_ip,
@@ -1418,6 +1477,8 @@ impl FirecrackerRuntime {
             fc_scope: None,
             guest_base: guest_base.to_owned(),
             guest_ip: Ipv4Addr::new(169, 254, 0, 2),
+            link_slot: 0,
+            tap_subnet: "169.254.0.0/30".to_owned(),
             client: reqwest::Client::new(),
             snapshot_cache_dir: None,
             image_ref: None,
@@ -1440,7 +1501,8 @@ impl FirecrackerRuntime {
         is_workspace: bool,
         cap_files: &[(String, String)],
     ) -> Self {
-        let mut me = Self::with_probe_for_test("http://169.254.0.2:8080", std::sync::Arc::new(|_| true));
+        let mut me =
+            Self::with_probe_for_test("http://169.254.0.2:8080", std::sync::Arc::new(|_| true));
         me.is_workspace = is_workspace;
         me.cap_files = cap_files.to_vec();
         me.scrub_base_override = Some(scrub_base.to_owned());
@@ -1543,7 +1605,10 @@ impl AppRuntime for FirecrackerRuntime {
         if let Some(scope) = self.fc_scope.as_deref() {
             tracing::info!(scope, tap = %self.tap_name, "fc shutdown: stopping CPU-capped scope");
             if !stop_fc_scope(scope) {
-                tracing::warn!(scope, "fc shutdown: scope remained active after systemctl stop");
+                tracing::warn!(
+                    scope,
+                    "fc shutdown: scope remained active after systemctl stop"
+                );
             }
         }
         let tap = self.tap_name.clone();
@@ -1707,6 +1772,7 @@ impl AppRuntime for FirecrackerRuntime {
                 if let Some(reff) = self.image_ref.as_deref() {
                     snapshot::write_ref(&cache_dir, reff);
                 }
+                snapshot::write_link(&cache_dir, &self.snapshot_link());
                 // Stamp the env/cap fingerprint alongside the ref (#108). A
                 // workspace's warm snapshot is created HERE (post-index), NOT in
                 // `cold_boot` (which is `.no-snapshot`-suppressed for workspaces),
@@ -1855,7 +1921,9 @@ fn spawn_firecracker(
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
-            .with_context(|| format!("spawn firecracker binary {:?} (no systemd scope)", cfg.bin))?;
+            .with_context(|| {
+                format!("spawn firecracker binary {:?} (no systemd scope)", cfg.bin)
+            })?;
         Ok((child, None))
     }
 }
@@ -1961,7 +2029,9 @@ pub(crate) fn delete_fc_tap(tap: &str) {
         Ok(s) if s.success() => {}
         // Non-zero exit = the tap was already gone (the common, healthy case on a
         // respawn where the runner's Drop already removed it). Debug, not warn.
-        Ok(s) => tracing::debug!(%tap, code = ?s.code(), "ip link del tap nonzero exit (already gone?)"),
+        Ok(s) => {
+            tracing::debug!(%tap, code = ?s.code(), "ip link del tap nonzero exit (already gone?)")
+        }
         Err(e) => tracing::debug!(%tap, error = %e, "ip link del tap failed to spawn (ip absent?)"),
     }
 }
@@ -2020,10 +2090,28 @@ pub(crate) async fn setup_guest_nat(
     // MASQUERADE is needed in BOTH modes (allowed flows must still be SNAT'd out
     // the uplink). Idempotent (`-C ... || -A ...`).
     let masq_check: Vec<&str> = vec![
-        "-t", "nat", "-C", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE",
+        "-t",
+        "nat",
+        "-C",
+        "POSTROUTING",
+        "-s",
+        tap_subnet,
+        "-o",
+        &uplink,
+        "-j",
+        "MASQUERADE",
     ];
     let masq_add: Vec<&str> = vec![
-        "-t", "nat", "-A", "POSTROUTING", "-s", tap_subnet, "-o", &uplink, "-j", "MASQUERADE",
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-s",
+        tap_subnet,
+        "-o",
+        &uplink,
+        "-j",
+        "MASQUERADE",
     ];
     if let Err(e) = ensure_iptables(&masq_check, &masq_add).await {
         tracing::warn!(error = %e, "fc nat: masquerade rule add failed");
@@ -2070,17 +2158,42 @@ pub(crate) async fn setup_guest_nat(
             // head so they precede any docker-installed DROP/jump.
             let rules: [(Vec<&str>, Vec<&str>); 2] = [
                 (
-                    vec!["-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
-                    vec!["-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT"],
+                    vec![
+                        "-C", "FORWARD", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
+                    ],
+                    vec![
+                        "-I", "FORWARD", "1", "-i", tap_name, "-o", &uplink, "-j", "ACCEPT",
+                    ],
                 ),
                 (
                     vec![
-                        "-C", "FORWARD", "-i", &uplink, "-o", tap_name, "-m", "state", "--state",
-                        "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                        "-C",
+                        "FORWARD",
+                        "-i",
+                        &uplink,
+                        "-o",
+                        tap_name,
+                        "-m",
+                        "state",
+                        "--state",
+                        "RELATED,ESTABLISHED",
+                        "-j",
+                        "ACCEPT",
                     ],
                     vec![
-                        "-I", "FORWARD", "1", "-i", &uplink, "-o", tap_name, "-m", "state",
-                        "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                        "-I",
+                        "FORWARD",
+                        "1",
+                        "-i",
+                        &uplink,
+                        "-o",
+                        tap_name,
+                        "-m",
+                        "state",
+                        "--state",
+                        "RELATED,ESTABLISHED",
+                        "-j",
+                        "ACCEPT",
                     ],
                 ),
             ];
@@ -2292,17 +2405,7 @@ fn parse_default_dev(route_output: &str) -> Option<String> {
 /// `subnet`. We carve sequential /30s: VM `n` gets hosts
 /// `base + 4n + 1` (host) and `base + 4n + 2` (guest).
 pub(crate) fn derive_link_ips(subnet: &str, seq: u32) -> Result<(Ipv4Addr, Ipv4Addr)> {
-    let base = subnet
-        .split('/')
-        .next()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .ok_or_else(|| anyhow!("invalid tap subnet {subnet:?}"))?;
-    let base_u32 = u32::from(base);
-    let host = base_u32
-        .checked_add(seq * 4 + 1)
-        .ok_or_else(|| anyhow!("tap subnet exhausted at seq {seq}"))?;
-    let guest = host + 1;
-    Ok((Ipv4Addr::from(host), Ipv4Addr::from(guest)))
+    super::link_allocator::link_ips(subnet, seq)
 }
 
 /// Deterministic locally-administered guest MAC from the VM index.

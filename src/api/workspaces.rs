@@ -77,9 +77,19 @@ pub fn cap_repo_basename(repo_url: &str) -> String {
     let last = last.strip_suffix(".git").unwrap_or(last);
     let cleaned: String = last
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if cleaned.is_empty() { "repo".to_owned() } else { cleaned }
+    if cleaned.is_empty() {
+        "repo".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 /// MERGE one cap-file entry (a repo's `<repo>.url`, or the reserved
@@ -102,11 +112,7 @@ pub fn cap_repo_basename(repo_url: &str) -> String {
 /// secret, the token stays host-side in `GitSessions` — or the forge-admin creds
 /// JSON). A malformed prior value (not a JSON object) is replaced by a fresh
 /// single-entry map rather than propagating corruption.
-fn merge_cap_into_env(
-    extra_env: &mut HashMap<String, String>,
-    cap_file: &str,
-    value: &str,
-) {
+fn merge_cap_into_env(extra_env: &mut HashMap<String, String>, cap_file: &str, value: &str) {
     let mut cap_files: serde_json::Map<String, serde_json::Value> = extra_env
         .get(CAP_FILES_ENV)
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -445,7 +451,10 @@ impl WorkspaceRegistry {
 
     /// Remove by uuid; returns the removed workspace (or `None`).
     pub fn remove(&self, workspace_uuid: &str) -> Option<Workspace> {
-        self.0.lock().expect("workspace lock").remove(workspace_uuid)
+        self.0
+            .lock()
+            .expect("workspace lock")
+            .remove(workspace_uuid)
     }
 
     /// Append one repo's git-proxy `cap` to a live workspace's cap list
@@ -554,7 +563,22 @@ pub async fn create_workspace(
     // repo_url (re-registered below with the request's FRESH provider token/TTL)
     // instead of re-minting per ensure — re-minting would force a full ~2.3 GB
     // rootfs rebuild on EVERY ensure. See `crate::api::workspace_cap_reuse`.
-    let host_ip = derive_dev_fc_host_ip(&ws_uuid, &body.image_ref, &state.tap_subnet);
+    let host_ip = match derive_dev_fc_host_ip(
+        &state.orchestrator.shared().data_dir,
+        &ws_uuid,
+        &body.image_ref,
+        &state.tap_subnet,
+    ) {
+        Ok(host_ip) => host_ip,
+        Err(error) => {
+            tracing::error!(workspace_uuid = %ws_uuid, %error, "workspace link allocation failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("allocate Firecracker link: {error}") })),
+            )
+                .into_response();
+        }
+    };
     let mut caps: Vec<String> = Vec::with_capacity(body.repos.len());
     let mut git_remotes: Vec<String> = Vec::with_capacity(body.repos.len());
     let mut record_caps: Vec<WorkspaceCap> = Vec::with_capacity(body.repos.len());
@@ -825,15 +849,17 @@ pub async fn list_workspaces(State(state): State<SharedState>) -> Response {
         .workspaces
         .snapshot()
         .into_iter()
-        .map(|(workspace_uuid, user_id, cap_count, created_at, last_activity)| {
-            json!({
-                "workspace_uuid": workspace_uuid,
-                "user_id": user_id,
-                "repo_count": cap_count,
-                "created_age_secs": now.duration_since(created_at).as_secs(),
-                "idle_secs": now.duration_since(last_activity).as_secs(),
-            })
-        })
+        .map(
+            |(workspace_uuid, user_id, cap_count, created_at, last_activity)| {
+                json!({
+                    "workspace_uuid": workspace_uuid,
+                    "user_id": user_id,
+                    "repo_count": cap_count,
+                    "created_age_secs": now.duration_since(created_at).as_secs(),
+                    "idle_secs": now.duration_since(last_activity).as_secs(),
+                })
+            },
+        )
         .collect();
     Json(json!({ "workspaces": rows })).into_response()
 }
@@ -1030,7 +1056,22 @@ pub async fn add_workspace_repo(
         },
         "add_repo: git cap provenance (value never logged)"
     );
-    let host_ip = derive_dev_fc_host_ip(&uuid, &image_ref, &state.tap_subnet);
+    let host_ip = match derive_dev_fc_host_ip(
+        &state.orchestrator.shared().data_dir,
+        &uuid,
+        &image_ref,
+        &state.tap_subnet,
+    ) {
+        Ok(host_ip) => host_ip,
+        Err(error) => {
+            tracing::error!(workspace_uuid = %uuid, %error, "add_repo link allocation failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("allocate Firecracker link: {error}") })),
+            )
+                .into_response();
+        }
+    };
     let git_remote = format!("http://{host_ip}:{GIT_PROXY_IPV4_PORT}/git/{cap}");
     let expires_at = Instant::now() + Duration::from_secs(body.git_token_ttl_secs);
     state.git_sessions.register(
@@ -1162,10 +1203,20 @@ pub async fn add_workspace_repo(
         }
         match bg
             .orchestrator
-            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&merged_env), None)
+            .deploy_app(
+                &app_uuid,
+                &image_ref,
+                None,
+                None,
+                net,
+                Some(&merged_env),
+                None,
+            )
             .await
         {
-            Ok(_) => tracing::info!(workspace_uuid = %app_uuid, "add_repo: workspace respawned with new repo cap (async)"),
+            Ok(_) => {
+                tracing::info!(workspace_uuid = %app_uuid, "add_repo: workspace respawned with new repo cap (async)")
+            }
             Err(e) => {
                 // The new cap is durably recorded; a later respawn/ensure still
                 // picks it up. Revoke the freshly-minted git-session cap so a
@@ -1275,9 +1326,28 @@ pub async fn forge_creds_backfill(
     // token is a credential and is NEVER logged (presence/destination only). The
     // URL is proxy-rewritten to the tap gateway exactly as create/add_repo do
     // (the IPv4-only guest cannot route the raw v6 mesh ULA the node supplies).
-    let host_ip = derive_dev_fc_host_ip(&uuid, &image_ref, &state.tap_subnet);
+    let host_ip = match derive_dev_fc_host_ip(
+        &state.orchestrator.shared().data_dir,
+        &uuid,
+        &image_ref,
+        &state.tap_subnet,
+    ) {
+        Ok(host_ip) => host_ip,
+        Err(error) => {
+            tracing::error!(workspace_uuid = %uuid, %error, "forge-creds link allocation failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("allocate Firecracker link: {error}") })),
+            )
+                .into_response();
+        }
+    };
     let mut merged_env = runner.extra_env.clone().unwrap_or_default();
-    merge_cap_into_env(&mut merged_env, "forge-admin.token", &body.forge_admin_token);
+    merge_cap_into_env(
+        &mut merged_env,
+        "forge-admin.token",
+        &body.forge_admin_token,
+    );
     let forge_gateway = state
         .forge_proxy_enabled
         .then(|| crate::api::forge_proxy_gateway_url(&host_ip));
@@ -1328,11 +1398,23 @@ pub async fn forge_creds_backfill(
         }
         match bg
             .orchestrator
-            .deploy_app(&app_uuid, &image_ref, None, None, net, Some(&merged_env), None)
+            .deploy_app(
+                &app_uuid,
+                &image_ref,
+                None,
+                None,
+                net,
+                Some(&merged_env),
+                None,
+            )
             .await
         {
-            Ok(_) => tracing::info!(workspace_uuid = %app_uuid, "forge-creds: workspace respawned with forge cred (async)"),
-            Err(e) => tracing::warn!(workspace_uuid = %app_uuid, error = %e, "forge-creds: respawn failed (cred recorded in env; will converge on next ensure)"),
+            Ok(_) => {
+                tracing::info!(workspace_uuid = %app_uuid, "forge-creds: workspace respawned with forge cred (async)")
+            }
+            Err(e) => {
+                tracing::warn!(workspace_uuid = %app_uuid, error = %e, "forge-creds: respawn failed (cred recorded in env; will converge on next ensure)")
+            }
         }
     });
 
@@ -1363,7 +1445,10 @@ pub async fn forge_creds_backfill(
     ),
 )]
 #[tracing::instrument(skip(state), fields(workspace_uuid = %uuid))]
-pub async fn stop_workspace(State(state): State<SharedState>, Path(uuid): Path<String>) -> Response {
+pub async fn stop_workspace(
+    State(state): State<SharedState>,
+    Path(uuid): Path<String>,
+) -> Response {
     // Registry gate (mirror snapshot/delete): only stop a workspace this
     // supervisor hosts.
     if state.workspaces.caps_of(&uuid).is_none() {

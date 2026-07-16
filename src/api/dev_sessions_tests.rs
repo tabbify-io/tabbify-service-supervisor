@@ -455,6 +455,7 @@ fn git_remote_host_ip_matches_fc_launch_host_ip() {
     let app_uuid = "cc4bfba2-17a9-512d-b6f4-43f69114be65";
     let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
     let subnet = DEFAULT_FC_TAP_SUBNET;
+    let data_dir = tempfile::tempdir().unwrap();
     // vm_key as constructed by launch_with_uuid (linux.rs ~315).
     let vm_key = format!("{app_uuid}:{image_ref}");
 
@@ -463,7 +464,8 @@ fn git_remote_host_ip_matches_fc_launch_host_ip() {
     let (expected_host_ip, _) = derive_link_ips(subnet, link_idx).unwrap();
 
     // What derive_dev_fc_host_ip produces (used by create_dev_session).
-    let derived = super::derive_dev_fc_host_ip(app_uuid, image_ref, subnet);
+    let derived =
+        super::derive_dev_fc_host_ip(data_dir.path(), app_uuid, image_ref, subnet).unwrap();
 
     assert_eq!(
         derived,
@@ -507,9 +509,10 @@ fn git_remote_host_ip_distinct_for_distinct_uuids() {
     let uuid_b = "78a254d8-77ab-5e0b-ac55-c95e0ce7f0c3";
     let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
     let subnet = DEFAULT_FC_TAP_SUBNET;
+    let data_dir = tempfile::tempdir().unwrap();
 
-    let ip_a = super::derive_dev_fc_host_ip(uuid_a, image_ref, subnet);
-    let ip_b = super::derive_dev_fc_host_ip(uuid_b, image_ref, subnet);
+    let ip_a = super::derive_dev_fc_host_ip(data_dir.path(), uuid_a, image_ref, subnet).unwrap();
+    let ip_b = super::derive_dev_fc_host_ip(data_dir.path(), uuid_b, image_ref, subnet).unwrap();
 
     assert_ne!(
         ip_a, ip_b,
@@ -527,9 +530,10 @@ fn git_remote_host_ip_is_stable_per_uuid() {
     let uuid = "0191e7c2-1111-7222-8333-444455556666";
     let image_ref = "[fd5a::1]:5000/tabbify/devbox:latest";
     let subnet = DEFAULT_FC_TAP_SUBNET;
+    let data_dir = tempfile::tempdir().unwrap();
 
-    let ip1 = super::derive_dev_fc_host_ip(uuid, image_ref, subnet);
-    let ip2 = super::derive_dev_fc_host_ip(uuid, image_ref, subnet);
+    let ip1 = super::derive_dev_fc_host_ip(data_dir.path(), uuid, image_ref, subnet).unwrap();
+    let ip2 = super::derive_dev_fc_host_ip(data_dir.path(), uuid, image_ref, subnet).unwrap();
     assert_eq!(
         ip1, ip2,
         "host_ip derivation must be deterministic for the same inputs"

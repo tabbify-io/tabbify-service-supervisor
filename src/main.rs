@@ -271,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
     let my_ula: Option<std::net::IpAddr> = state.ula.parse().ok();
     tabbify_supervisor::api::readopt_dev_sessions(
         state.orchestrator.runner_dir(),
+        &state.orchestrator.shared().data_dir,
         &state.dev_sessions,
         &state.git_sessions,
         &state.tap_subnet,
