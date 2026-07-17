@@ -508,6 +508,16 @@ fn open_runner_log(data_dir: &Path, uuid: &str) -> std::io::Result<std::fs::File
         .open(&log_path)
 }
 
+/// The rotated-aside sibling of a log: `<path>.1` (the single prior generation
+/// kept by [`rotate_if_oversized`]). `.1` is appended to the WHOLE name so a
+/// uuid containing dots is handled unambiguously. Lives in one place so
+/// rotation and purge-time artifact cleanup agree on the name.
+pub(crate) fn rotated_log_path(log_path: &Path) -> PathBuf {
+    let mut rotated = log_path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
 /// If `log_path` already exceeds `max_bytes`, move it aside to `<path>.1`
 /// (keeping exactly one prior generation) so the freshly-opened append log
 /// restarts small. Best-effort: any metadata/remove/rename error is logged and
@@ -522,11 +532,7 @@ fn rotate_if_oversized(log_path: &Path, max_bytes: u64) {
     if !oversized {
         return;
     }
-    // `<uuid>.log` → `<uuid>.log.1` (append `.1` to the WHOLE name so a uuid
-    // containing dots is handled unambiguously).
-    let mut rotated = log_path.as_os_str().to_owned();
-    rotated.push(".1");
-    let rotated = PathBuf::from(rotated);
+    let rotated = rotated_log_path(log_path);
     // Drop the previous generation first (rename won't clobber across some
     // platforms cleanly, and we only keep one), then move the oversized log.
     let _ = std::fs::remove_file(&rotated);

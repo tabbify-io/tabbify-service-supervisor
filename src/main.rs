@@ -214,6 +214,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let orchestrator = Orchestrator::new(shared, runner_dir);
 
+    // Sweep the legacy `runners.stale/` graveyard once per boot: nothing writes
+    // it anymore, so entries there are pure leaked cruft from older
+    // generations. Fail-closed — uuids with a live runner record are kept.
+    orchestrator.sweep_stale_runner_graveyard();
+
     // Pre-start configured apps: spawn a runner per `--app` uuid (replaces the
     // old in-process pre-register). Best-effort — a transient failure must not
     // stop the supervisor from coming up and serving other apps.
