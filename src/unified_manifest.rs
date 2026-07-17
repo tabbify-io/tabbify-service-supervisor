@@ -45,7 +45,14 @@ pub fn lifecycle_mode_from_str(lifecycle: &str) -> LifecycleMode {
 pub struct UnifiedManifest {
     /// `[app]` — identity + display metadata.
     pub app: AppSection,
-    /// `[build]` — how to produce the ONE artifact.
+    /// `[build]` — how to produce the ONE artifact. OPTIONAL: an absent
+    /// `[build]` (e.g. a `tabbify.toml` carrying only `[app]`) resolves to the
+    /// docker pipeline defaults (`kind=docker`, `context="."`, `Dockerfile`) —
+    /// the SAME result as shipping no `tabbify.toml` at all. A partial manifest
+    /// must NOT hard-fail the build ("no Dockerfile, no YAML / sensible
+    /// defaults"); the old required-field parse error (`missing field \`build\``)
+    /// was a brick, not a feature.
+    #[serde(default)]
     pub build: BuildSection,
     /// `[runtime]` — runtime resource limits + lifecycle. No runtime SELECTION:
     /// the runtime is always Firecracker-from-OCI-image (single-runtime model).
@@ -113,6 +120,25 @@ pub struct BuildSection {
 }
 fn default_context() -> String {
     ".".to_owned()
+}
+
+/// A MISSING `[build]` table must resolve to the SAME docker defaults serde
+/// fills for an empty `[build]` table: `context = "."` (NOT `String::default()`
+/// = `""`, which `context()` would return verbatim as an empty build context),
+/// Docker's default Dockerfile, and the docker `kind`. This is what makes the
+/// `#[serde(default)]` on [`UnifiedManifest::build`] correct — an `[app]`-only
+/// manifest builds with docker defaults instead of erroring `missing field
+/// \`build\``.
+impl Default for BuildSection {
+    fn default() -> Self {
+        Self {
+            kind: BuildKind::default(),
+            context: default_context(),
+            dockerfile: None,
+            builder: None,
+            stable_tag: None,
+        }
+    }
 }
 
 /// `[runtime]` table — runtime resource limits + lifecycle.
@@ -374,6 +400,25 @@ kind = "docker"
         assert_eq!(m.runtime.vcpus, 1);
         assert!(m.deploy.is_empty()); // fallback D2 — handled downstream
         assert!(m.env.is_empty());
+    }
+
+    #[test]
+    fn app_only_manifest_defaults_build_to_docker() {
+        // A `tabbify.toml` carrying ONLY `[app]` (no `[build]` table) must NOT
+        // error `missing field \`build\`` — it resolves to the docker pipeline,
+        // the SAME result as shipping no `tabbify.toml` at all. (Regression: a
+        // partial manifest used to brick the build at the manifest stage.)
+        let src = r#"
+[app]
+name = "app-only"
+"#;
+        let m: UnifiedManifest = toml::from_str(src)
+            .expect("an [app]-only manifest must parse (build defaults to docker)");
+        assert_eq!(m.effective_build_kind(), BuildKind::Docker);
+        assert_eq!(m.context(), "."); // default_context, NOT String::default() ("")
+        assert_eq!(m.dockerfile(), "Dockerfile");
+        assert!(m.build.builder.is_none());
+        assert!(m.stable_tag().is_none());
     }
 
     #[test]
