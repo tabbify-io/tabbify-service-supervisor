@@ -626,6 +626,10 @@ impl Orchestrator {
         .release_uuid(uuid)
         .with_context(|| format!("release Firecracker link assignments for {uuid}"))?;
         tracing::info!(uuid, released, "purge released FC link assignments");
+        // Remove the small per-uuid auxiliary artifacts (meshkey, logs, socket,
+        // legacy graveyard entries) that previously leaked on disk forever.
+        // Best-effort by design: the record deletion below stays the hard gate.
+        self.remove_app_artifacts(uuid);
         // Delete only after the old runner, cache, and link allocation are gone.
         self.forget_record(uuid)
             .with_context(|| format!("delete runner record for {uuid} after purge"))?;
@@ -1374,6 +1378,123 @@ impl Orchestrator {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Best-effort removal of every per-uuid AUXILIARY artifact once a purge is
+    /// definitive. The runner RECORD (`runners/<uuid>.json`) is deliberately NOT
+    /// touched here — its removal stays [`forget_record`](Self::forget_record)'s
+    /// job, a hard error that keeps a failed purge retryable. Everything below
+    /// is small leftover state that previously leaked on disk forever:
+    /// - `runners/<uuid>.meshkey` — the runner's persistent WireGuard keypair
+    /// - `runners/<uuid>.log` (+ rotated `.log.1`) — captured runner stdout/stderr
+    /// - `runners/<uuid>.sock` — the control socket, if the dead runner left it
+    /// - `fc/<uuid>.console.log` — FC serial-console capture
+    /// - `build/<uuid>.log` + `build/<uuid>.progress.log` — build output logs
+    /// - `runners.stale/<uuid>.*` — legacy graveyard entries (see
+    ///   [`sweep_stale_runner_graveyard`](Self::sweep_stale_runner_graveyard))
+    ///
+    /// The FC pidfile is NOT listed: `kill_fc_child_for_uuid` already consumed
+    /// it (purge bails earlier if FC teardown was not confirmed). A missing file
+    /// is success; a real deletion error is logged and NEVER fails the purge.
+    fn remove_app_artifacts(&self, uuid: &str) {
+        let data_dir = &self.shared().data_dir;
+        let runner_log = crate::orchestrator::spawn::runner_log_path(data_dir, uuid);
+        let rotated_log = crate::orchestrator::spawn::rotated_log_path(&runner_log);
+        let paths = [
+            crate::runner::serve::runner_keypair_path(data_dir, uuid),
+            rotated_log,
+            runner_log,
+            self.control_sock_for(uuid),
+            crate::firecracker::pidfile::console_log_path(data_dir, uuid),
+            crate::orchestrator::build::build_log_path(data_dir, uuid),
+            crate::orchestrator::build::build_progress_log_path(data_dir, uuid),
+        ];
+        for path in &paths {
+            remove_artifact_file(path, uuid);
+        }
+        remove_stale_graveyard_entries(data_dir, uuid);
+    }
+
+    /// One-shot startup sweep of the LEGACY `runners.stale/` graveyard.
+    ///
+    /// Nothing in the current codebase creates or reads `runners.stale/` — it is
+    /// a leftover from an old supervisor generation / manual data-dir migration
+    /// whose entries were never GC'd. Purge now removes per-uuid entries
+    /// ([`remove_app_artifacts`](Self::remove_app_artifacts)), but entries
+    /// orphaned BEFORE that fix would stay forever, so sweep them once per boot.
+    /// Fail-closed: only files whose `<uuid>.`-prefix has NO runner record under
+    /// `runners/` are removed; everything else is kept. Strictly bounded to
+    /// `runners.stale/` — it never touches `runners/` itself. Best-effort: any
+    /// error is logged and never fails startup.
+    pub fn sweep_stale_runner_graveyard(&self) {
+        let stale_dir = self.shared().data_dir.join(LEGACY_STALE_RUNNERS_DIR);
+        let entries = match std::fs::read_dir(&stale_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!(path = %stale_dir.display(), error = %error, "cannot read legacy runner graveyard; skipping sweep");
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Entries are `<uuid>.<ext>`; anything without that shape is kept.
+            let Some((uuid, _ext)) = name.split_once('.') else {
+                continue;
+            };
+            if uuid.is_empty()
+                || crate::orchestrator::handle::record_path(self.runner_dir(), uuid).exists()
+            {
+                // A live record means the uuid is still known — keep its cruft
+                // (purge will remove it definitively later).
+                continue;
+            }
+            remove_artifact_file(&entry.path(), uuid);
+        }
+    }
+}
+
+/// Name of the legacy runner graveyard directory under `data_dir`. No current
+/// code writes it; it exists only on hosts migrated from older generations.
+const LEGACY_STALE_RUNNERS_DIR: &str = "runners.stale";
+
+/// Remove one auxiliary per-app artifact file, best-effort: missing = success
+/// (debug), removed = info, anything else = warn. Never returns an error — an
+/// auxiliary file must never fail a purge.
+fn remove_artifact_file(path: &std::path::Path, uuid: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::info!(uuid, path = %path.display(), "removed per-app artifact"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(uuid, path = %path.display(), "per-app artifact already absent");
+        }
+        Err(error) => {
+            tracing::warn!(uuid, path = %path.display(), error = %error, "failed to remove per-app artifact (continuing)");
+        }
+    }
+}
+
+/// Remove `uuid`'s files from the legacy `runners.stale/` graveyard (all
+/// `<uuid>.*` entries). A missing directory is success. Prefix-matching on
+/// `<uuid>.` is exact — `uuid` was already validated by the purge entry point,
+/// so it cannot alias a different uuid's files.
+fn remove_stale_graveyard_entries(data_dir: &std::path::Path, uuid: &str) {
+    let stale_dir = data_dir.join(LEGACY_STALE_RUNNERS_DIR);
+    let entries = match std::fs::read_dir(&stale_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(uuid, path = %stale_dir.display(), error = %error, "cannot read legacy runner graveyard (continuing)");
+            return;
+        }
+    };
+    let prefix = format!("{uuid}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix) {
+            remove_artifact_file(&entry.path(), uuid);
         }
     }
 }
@@ -3476,6 +3597,152 @@ mod tests {
             o.forget_record(APP_UUID).is_err(),
             "non-NotFound deletion failures must propagate"
         );
+    }
+
+    // ── purge removes ALL per-uuid auxiliary artifacts ────────────────────────
+
+    /// Every auxiliary artifact `remove_app_artifacts` covers, created on disk
+    /// for `uuid` (paths derived through the same canonical helpers).
+    fn seed_artifacts(data_dir: &std::path::Path, uuid: &str) -> Vec<PathBuf> {
+        let runner_log = crate::orchestrator::spawn::runner_log_path(data_dir, uuid);
+        let paths = vec![
+            crate::runner::serve::runner_keypair_path(data_dir, uuid),
+            crate::orchestrator::spawn::rotated_log_path(&runner_log),
+            runner_log,
+            data_dir.join("runners").join(format!("{uuid}.sock")),
+            crate::firecracker::pidfile::console_log_path(data_dir, uuid),
+            crate::orchestrator::build::build_log_path(data_dir, uuid),
+            crate::orchestrator::build::build_progress_log_path(data_dir, uuid),
+            data_dir
+                .join(LEGACY_STALE_RUNNERS_DIR)
+                .join(format!("{uuid}.json")),
+            data_dir
+                .join(LEGACY_STALE_RUNNERS_DIR)
+                .join(format!("{uuid}.sock")),
+        ];
+        for path in &paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        paths
+    }
+
+    #[test]
+    fn remove_app_artifacts_removes_all_per_uuid_files_and_only_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let runner_dir = data_dir.join("runners");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let o = orch_with_data_dir(runner_dir.clone(), data_dir.clone());
+
+        let other_uuid = "0191e7c2-aaaa-7222-8333-444455556666";
+        let purged = seed_artifacts(&data_dir, APP_UUID);
+        let kept = seed_artifacts(&data_dir, other_uuid);
+        // The runner RECORD must stay: forget_record owns it (hard error path).
+        let record = crate::orchestrator::handle::record_path(&runner_dir, APP_UUID);
+        std::fs::write(&record, b"{}").unwrap();
+
+        o.remove_app_artifacts(APP_UUID);
+
+        for path in &purged {
+            assert!(!path.exists(), "artifact must be removed: {}", path.display());
+        }
+        for path in &kept {
+            assert!(
+                path.exists(),
+                "different uuid's artifact must survive: {}",
+                path.display()
+            );
+        }
+        assert!(
+            record.exists(),
+            "remove_app_artifacts must NOT touch the runner record"
+        );
+    }
+
+    #[test]
+    fn remove_app_artifacts_is_noop_when_nothing_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let o = orch_with_data_dir(data_dir.join("runners"), data_dir.clone());
+
+        // Nothing on disk at all (not even the dirs): must not panic or create.
+        o.remove_app_artifacts(APP_UUID);
+
+        assert!(!data_dir.join("runners").exists());
+        assert!(!data_dir.join(LEGACY_STALE_RUNNERS_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn purge_app_removes_per_uuid_artifacts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let runner_dir = data_dir.join("runners");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let o = orch_with_data_dir(runner_dir, data_dir.clone());
+        let artifacts = seed_artifacts(&data_dir, APP_UUID);
+        // The definitive shutdown probes the control socket; a seeded REGULAR
+        // file reads as "possibly alive" (non-ECONNREFUSED connect error) and
+        // correctly bails the purge. A real dead socket cannot be bound here
+        // (macOS 104-byte sun_path limit under tempdirs), so run the purge with
+        // the socket absent — its removal is covered by the unit test above.
+        let sock = o.control_sock_for(APP_UUID);
+        std::fs::remove_file(&sock).unwrap();
+        let artifacts: Vec<_> = artifacts.into_iter().filter(|p| *p != sock).collect();
+
+        o.purge_app(APP_UUID).await.unwrap();
+
+        for path in &artifacts {
+            assert!(
+                !path.exists(),
+                "purge must remove artifact: {}",
+                path.display()
+            );
+        }
+    }
+
+    // ── legacy runners.stale graveyard sweep ──────────────────────────────────
+
+    #[test]
+    fn graveyard_sweep_removes_recordless_entries_and_keeps_live_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let runner_dir = data_dir.join("runners");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let o = orch_with_data_dir(runner_dir.clone(), data_dir.clone());
+
+        let dead_uuid = "0191e7c2-dead-7222-8333-444455556666";
+        let live_uuid = APP_UUID;
+        let stale_dir = data_dir.join(LEGACY_STALE_RUNNERS_DIR);
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        for uuid in [dead_uuid, live_uuid] {
+            std::fs::write(stale_dir.join(format!("{uuid}.json")), b"{}").unwrap();
+            std::fs::write(stale_dir.join(format!("{uuid}.sock")), b"").unwrap();
+        }
+        // Only `live_uuid` has a runner record → its graveyard files are kept.
+        std::fs::write(
+            crate::orchestrator::handle::record_path(&runner_dir, live_uuid),
+            b"{}",
+        )
+        .unwrap();
+
+        o.sweep_stale_runner_graveyard();
+
+        assert!(!stale_dir.join(format!("{dead_uuid}.json")).exists());
+        assert!(!stale_dir.join(format!("{dead_uuid}.sock")).exists());
+        assert!(stale_dir.join(format!("{live_uuid}.json")).exists());
+        assert!(stale_dir.join(format!("{live_uuid}.sock")).exists());
+    }
+
+    #[test]
+    fn graveyard_sweep_is_noop_without_the_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let o = orch_with_data_dir(data_dir.join("runners"), data_dir.clone());
+
+        o.sweep_stale_runner_graveyard();
+
+        assert!(!data_dir.join(LEGACY_STALE_RUNNERS_DIR).exists());
     }
 
     // ── stop_app preserves the deploy artifact (FIX (c)) ──────────────────────

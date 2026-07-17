@@ -160,6 +160,15 @@ impl BuildSpawner for ProcessBuildSpawner {
     }
 }
 
+/// Canonical per-app build log path: `<data_dir>/build/<app_uuid>.log`.
+///
+/// Written at completion by [`write_build_log`] (append mode across builds) and
+/// removed on purge by the orchestrator's per-uuid artifact cleanup, so the
+/// format lives in exactly one place.
+pub(crate) fn build_log_path(data_dir: &Path, app_uuid: &str) -> PathBuf {
+    data_dir.join("build").join(format!("{app_uuid}.log"))
+}
+
 /// Live per-build progress log path: `<data_dir>/build/<app_uuid>.progress.log`.
 ///
 /// Distinct from the canonical `<app_uuid>.log` (written ONCE, at completion, by
@@ -470,12 +479,13 @@ fn write_spec_file(base_dir: &Path, data: &[u8]) -> anyhow::Result<std::path::Pa
 fn write_build_log(data_dir: &Path, app_uuid: &str, stdout: &[u8], stderr: &[u8]) {
     use std::io::Write as _;
 
-    let log_dir = data_dir.join("build");
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+    let log_path = build_log_path(data_dir, app_uuid);
+    if let Err(e) =
+        std::fs::create_dir_all(log_path.parent().expect("build/ dir always has a parent"))
+    {
         tracing::warn!(app_uuid, error = %e, "could not create build log dir; skipping build log");
         return;
     }
-    let log_path = log_dir.join(format!("{app_uuid}.log"));
     let mut f = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
