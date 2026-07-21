@@ -333,37 +333,71 @@ jobs:
           # digest CI confirmed rather than the mutable :latest tag.
           DEPLOY_SCRIPT=$(cat <<EOF
           set -eu
+          umask 077
+          exec 9>/opt/tabbify/serving-compose-install.lock
+          if ! flock -n 9; then
+            echo "another serving deployment owns the compose lock"
+            exit 1
+          fi
+          if [ -e /opt/tabbify/contracts/serving-compose-rollback-pending ] || \
+             [ -e /var/lib/tabbify-registry-deploy/active ]; then
+            echo "a serving rollback is pending"
+            exit 1
+          fi
           aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY}
           cd /opt/tabbify
           touch .env
           grep -v '^TABBIFY_SUPERVISOR_IMAGE=' .env > .env.next || true
           printf 'TABBIFY_SUPERVISOR_IMAGE=%s\n' "${SUPERVISOR_IMAGE}" >> .env.next
+          chmod 600 .env.next
           mv .env.next .env
-          docker compose pull && docker compose up -d
+          docker compose pull supervisor
+          docker compose up -d --no-deps --force-recreate supervisor
           EOF
           )
+          CMD_ID=
+          COMMAND_TERMINAL=0
+          # Invoked indirectly by the EXIT trap.
+          # shellcheck disable=SC2329
+          cancel_nonterminal() {
+            status=$?
+            trap - EXIT HUP INT TERM
+            set +e
+            if [ -n "${CMD_ID}" ] && [ "${COMMAND_TERMINAL}" -ne 1 ]; then
+              echo "cancelling nonterminal SSM invocation ${CMD_ID}"
+              aws ssm cancel-command --region "${AWS_REGION}" --command-id "${CMD_ID}"
+              [ "${status}" -ne 0 ] || status=1
+            fi
+            exit "${status}"
+          }
           CMD_ID=$(aws ssm send-command \
             --region "${AWS_REGION}" \
             --document-name AWS-RunShellScript \
+            --timeout-seconds 60 \
             --targets "Key=tag:Name,Values=tabbify-serving" \
             --comment "redeploy supervisor ${GITHUB_SHA::7}" \
-            --parameters "$(jq -n --arg s "$DEPLOY_SCRIPT" '{commands:[$s]}')" \
+            --parameters "$(jq -n --arg s "$DEPLOY_SCRIPT" '{commands:[$s],executionTimeout:["900"]}')" \
             --query Command.CommandId --output text)
+          trap cancel_nonterminal EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           echo "SSM CommandId=${CMD_ID}"
           # Poll up to 15 min (90 × 10s). The ec2-serving host pulls the new
           # supervisor image on a possibly-COLD docker cache, which routinely
           # exceeded the old 5-min window — the root cause of the redeploy flake.
           # 15 min comfortably fits a cold pull; combined with continue-on-error
           # above this removes the "rerun after cache" costyl entirely.
-          for _ in $(seq 1 90); do
+          for _ in $(seq 1 96); do
             sleep 10
             STATUS=$(aws ssm list-command-invocations --region "${AWS_REGION}" \
               --command-id "${CMD_ID}" --details \
               --query "CommandInvocations[0].Status" --output text 2>/dev/null || echo Pending)
             echo "redeploy status: ${STATUS}"
             case "${STATUS}" in
-              Success) echo "supervisor redeployed"; exit 0 ;;
-              Failed|Cancelled|TimedOut|"Delivery Timed Out")
+              Success) COMMAND_TERMINAL=1; echo "supervisor redeployed"; exit 0 ;;
+              Failed|Cancelled|TimedOut|"Delivery Timed Out"|"Execution Timed Out"|Undeliverable|Terminated|AccessDenied|InvalidPlatform)
+                COMMAND_TERMINAL=1
                 echo "redeploy ended: ${STATUS}"
                 aws ssm list-command-invocations --region "${AWS_REGION}" --command-id "${CMD_ID}" \
                   --details --query "CommandInvocations[0].CommandPlugins[0].Output" --output text || true
