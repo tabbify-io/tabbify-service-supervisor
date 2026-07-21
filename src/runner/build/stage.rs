@@ -76,6 +76,99 @@ impl StageFailure {
     }
 }
 
+/// Attribute a clone failure by CAUSE, not by stage.
+///
+/// A missing repo, a bad ref or a rejected credential is the caller's own input
+/// — echoing it back is safe and is the only way they can fix it. Marking the
+/// whole stage platform-fault turned "you typed a repo that does not exist" into
+/// "platform error, report this incident id", which sends people to the
+/// operator instead of to their own URL. Anything else (network, git plumbing)
+/// stays platform: fail-closed, no server detail leaks on an ambiguous error.
+#[must_use]
+pub fn clone_failure(error_chain: &str) -> StageFailure {
+    const USER_SIGNALS: [&str; 7] = [
+        "repository not found",
+        "does not appear to be a git repository",
+        "could not read username",
+        "authentication failed",
+        "permission denied",
+        "couldn't find remote ref",
+        "pathspec",
+    ];
+    let lowered = error_chain.to_ascii_lowercase();
+    // git renders the same cause two ways: bare ("remote: Repository not found")
+    // and with the URL spliced in ("fatal: repository 'https://…' not found"),
+    // so a single substring cannot cover both.
+    let repo_missing = lowered.contains("repository") && lowered.contains("not found");
+    if repo_missing || USER_SIGNALS.iter().any(|signal| lowered.contains(signal)) {
+        StageFailure::user(stage_names::CLONE)
+    } else {
+        StageFailure::platform(stage_names::CLONE)
+    }
+}
+
+#[cfg(test)]
+mod clone_attribution_tests {
+    use super::*;
+
+    /// A repo the caller typed wrong is THEIR input: it must come back as
+    /// user-fault, not as "platform error, report this incident id".
+    #[test]
+    fn caller_input_failures_are_user_fault() {
+        for chain in [
+            "'clone' stage: git fetch failed (128): remote: Repository not found.",
+            "fatal: repository 'https://github.com/x/y/' not found",
+            "does not appear to be a git repository",
+            "fatal: Authentication failed for 'https://github.com/x/y'",
+            "remote: Permission denied to user",
+            "fatal: couldn't find remote ref refs/heads/nope",
+            "error: pathspec 'nope' did not match any file(s) known to git",
+        ] {
+            assert!(
+                clone_failure(chain).user_fault,
+                "{chain:?} must be attributed to the user"
+            );
+        }
+    }
+
+    /// Anything ambiguous stays platform — fail-closed, so server detail is
+    /// never echoed to a caller who cannot act on it anyway.
+    #[test]
+    fn infrastructure_failures_stay_platform() {
+        for chain in [
+            "'clone' stage: git fetch failed (128): unable to access: Could not resolve host",
+            "git binary not found",
+            "connection timed out",
+            "disk quota exceeded",
+        ] {
+            assert!(
+                !clone_failure(chain).user_fault,
+                "{chain:?} must stay platform-attributed"
+            );
+        }
+    }
+
+    /// Attribution is case-insensitive: git capitalises inconsistently across
+    /// versions and remotes.
+    #[test]
+    fn signal_matching_ignores_case() {
+        assert!(clone_failure("REMOTE: REPOSITORY NOT FOUND").user_fault);
+    }
+
+    /// The stage name is unchanged by attribution.
+    #[test]
+    fn stage_stays_clone_either_way() {
+        assert_eq!(
+            clone_failure("Repository not found").stage,
+            stage_names::CLONE
+        );
+        assert_eq!(
+            clone_failure("connection timed out").stage,
+            stage_names::CLONE
+        );
+    }
+}
+
 impl std::fmt::Display for StageFailure {
     /// Reads naturally inside the `{:#}` anyhow chain:
     /// `build failed: 'manifest' stage: parse tabbify.toml at …: missing field`.
@@ -126,9 +219,7 @@ impl BuildFailureMarker {
 pub fn failure_marker_from(e: &anyhow::Error) -> BuildFailureMarker {
     let staged = e.downcast_ref::<StageFailure>();
     BuildFailureMarker {
-        stage: staged
-            .map_or(stage_names::UNKNOWN, |s| s.stage)
-            .to_owned(),
+        stage: staged.map_or(stage_names::UNKNOWN, |s| s.stage).to_owned(),
         user_fault: staged.is_some_and(|s| s.user_fault),
         error: format!("{e:#}"),
     }
@@ -170,7 +261,11 @@ pub struct StagedBuildError {
 
 impl std::fmt::Display for StagedBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "build failed at the '{}' stage: {}", self.stage, self.message)
+        write!(
+            f,
+            "build failed at the '{}' stage: {}",
+            self.stage, self.message
+        )
     }
 }
 
@@ -269,8 +364,14 @@ mod tests {
 
         let long = "x".repeat(100);
         let bounded = tail_lines(long.as_bytes(), 10, 20);
-        assert!(bounded.ends_with(&"x".repeat(20)), "keeps the end: {bounded}");
-        assert!(bounded.contains("truncated"), "notes the truncation: {bounded}");
+        assert!(
+            bounded.ends_with(&"x".repeat(20)),
+            "keeps the end: {bounded}"
+        );
+        assert!(
+            bounded.contains("truncated"),
+            "notes the truncation: {bounded}"
+        );
     }
 
     /// `StagedBuildError`'s Display is a self-contained one-liner (legacy nodes
@@ -285,6 +386,9 @@ mod tests {
         };
         let s = e.to_string();
         assert!(s.contains("'manifest' stage"), "names the stage: {s}");
-        assert!(s.contains("missing field `build`"), "carries the cause: {s}");
+        assert!(
+            s.contains("missing field `build`"),
+            "carries the cause: {s}"
+        );
     }
 }

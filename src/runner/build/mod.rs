@@ -25,8 +25,7 @@
 //! - Everything else (the [`BuildJob`] type, the dispatcher, the production
 //!   wiring, and the tests) lives in this file.
 
-use std::path::Path;
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -192,9 +191,9 @@ pub async fn run_build(
     let app_uuid = job.app_uuid.as_str();
 
     // ── stage: clone ── source acquisition: `git clone` + immutable-SHA resolve.
-    // PLATFORM-attributed: a repo-not-found/auth failure is classified into its
-    // own actionable code by the node's clone-signal matching; everything else
-    // here (network, git plumbing) is infra.
+    // Attributed by CAUSE: a missing repo / bad ref / rejected credential is the
+    // caller's own input and must reach them; network and git plumbing stay
+    // platform. See `stage::clone_failure`.
     let stage_started = Instant::now();
     let src = workdir.join("src");
     let cloned = crate::git::clone(
@@ -205,7 +204,10 @@ pub async fn run_build(
         git,
     )
     .await
-    .context(StageFailure::platform(stage_names::CLONE));
+    .map_err(|e| {
+        let attribution = crate::runner::build::stage::clone_failure(&format!("{e:#}"));
+        e.context(attribution)
+    });
     if let Err(e) = &cloned {
         log_stage_failed(app_uuid, stage_names::CLONE, stage_started, e);
     }
