@@ -107,14 +107,26 @@ pub fn write_registry_config(
     registry_host: &str,
     out_dir: &std::path::Path,
 ) -> std::io::Result<()> {
+    write_registry_config_hosts(token, &[registry_host], out_dir)
+}
+
+/// Multi-host variant: one auth entry per registry host, same token. Lets a
+/// runner keep working when the mesh registry is re-homed to a new
+/// coordinator-allocated address mid-lifetime.
+pub fn write_registry_config_hosts(
+    token: &str,
+    registry_hosts: &[&str],
+    out_dir: &std::path::Path,
+) -> std::io::Result<()> {
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("x:{token}"));
-    // The registry host is a bracketed IPv6 address like `[fd5a::1]:5000`.
+    // Registry hosts are bracketed IPv6 authorities like `[fd5a::1]:5000`.
     // JSON string values permit `[`, `]`, and `:` verbatim, so a format!-built
     // string is correct here — no serde escaping needed for these characters.
-    let json = format!(
-        "{{\"auths\":{{\"{}\":{{\"auth\":\"{}\"}}}}}}",
-        registry_host, auth
-    );
+    let entries: Vec<String> = registry_hosts
+        .iter()
+        .map(|host| format!("\"{host}\":{{\"auth\":\"{auth}\"}}"))
+        .collect();
+    let json = format!("{{\"auths\":{{{}}}}}", entries.join(","));
     std::fs::create_dir_all(out_dir)?;
     std::fs::write(out_dir.join("config.json"), json.as_bytes())
 }
@@ -166,7 +178,13 @@ pub async fn push_layout_tag(
     runner: &CommandRunner,
     registry_config_dir: Option<&str>,
 ) -> Result<(), String> {
-    (runner)(oras_push_args(oras_bin, layout_dir, reff, registry_config_dir)).await
+    (runner)(oras_push_args(
+        oras_bin,
+        layout_dir,
+        reff,
+        registry_config_dir,
+    ))
+    .await
 }
 
 /// Build a production [`CommandRunner`] that spawns `args[0]` as the binary
@@ -245,7 +263,6 @@ pub fn production_tool_runner() -> CommandRunner {
 mod tests {
     use super::*;
 
-
     /// Step-1 argv: binary-prefixed, local transports only (docker-daemon →
     /// oci layout), and NO registry reference anywhere — skopeo cannot parse
     /// the mesh registry's bracketed-IPv6 refs.
@@ -267,7 +284,12 @@ mod tests {
     /// plain-http registry destination carrying the bracketed-IPv6 reff VERBATIM.
     #[test]
     fn oras_push_args_exact_shape_anonymous() {
-        let args = oras_push_args("oras", "/tmp/w/oci", "[fd5a:1f02::1]:5000/acme/app:abc", None);
+        let args = oras_push_args(
+            "oras",
+            "/tmp/w/oci",
+            "[fd5a:1f02::1]:5000/acme/app:abc",
+            None,
+        );
         assert_eq!(
             args,
             vec![
@@ -311,12 +333,14 @@ mod tests {
         let path = dir.path().join("config.json");
         let content = std::fs::read_to_string(&path).unwrap();
         // Must be valid JSON and carry the auths key.
-        let v: serde_json::Value = serde_json::from_str(&content)
-            .expect("config.json must be valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&content).expect("config.json must be valid JSON");
         let auth_val = &v["auths"]["[fd5a::1]:5000"]["auth"];
         let encoded = auth_val.as_str().expect("auth must be a string");
         let decoded = String::from_utf8(
-            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(decoded, "x:mytoken", "auth must be base64(\"x:<token>\")");
@@ -336,9 +360,16 @@ mod tests {
         });
 
         let reff = "[fd5a::1]:5000/myapp:latest";
-        let res =
-            push_to_registry("skopeo", "oras", "tbf-build-u", reff, "/w/oci", &runner, None)
-                .await;
+        let res = push_to_registry(
+            "skopeo",
+            "oras",
+            "tbf-build-u",
+            reff,
+            "/w/oci",
+            &runner,
+            None,
+        )
+        .await;
         assert!(res.is_ok(), "both steps Ok → push Ok; got {res:?}");
 
         let calls = captured.lock().unwrap();
@@ -417,7 +448,10 @@ mod tests {
         let calls = captured.lock().unwrap();
         assert_eq!(calls.len(), 1, "exactly ONE (oras) call, no skopeo");
         assert_eq!(calls[0][0], "oras");
-        assert!(calls[0].contains(&stable.to_owned()), "carries the stable reff");
+        assert!(
+            calls[0].contains(&stable.to_owned()),
+            "carries the stable reff"
+        );
         assert!(
             calls[0].contains(&format!("/w/oci:{LAYOUT_TAG}")),
             "reuses the already-materialized layout"
