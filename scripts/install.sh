@@ -240,6 +240,17 @@ After=network-online.target
 Type=notify
 NotifyAccess=main
 TimeoutStartSec=60
+# App runners are setsid-detached to OUTLIVE a supervisord restart (an OTA
+# self-update restarts this unit), but setsid escapes the process GROUP, not the
+# CGROUP — under the default KillMode=control-group systemd SIGKILLs every
+# detached runner and its Firecracker child on 'systemctl restart', so the new
+# supervisord adopts NOTHING and cold-respawns the whole fleet (observed
+# 2026-07-22: adopted=0 respawned=17, every tenant app bounced on each of that
+# day's three self-updates). KillMode=process signals only supervisord itself;
+# the runners survive and startup readopt() adopts them in place. Delegate gives
+# the unit its own cgroup subtree. Mirrors deploy/tabbify-supervisor.service.
+KillMode=process
+Delegate=yes
 ExecStart=$DATA/supervisord
 WorkingDirectory=$DATA
 # Phase-2 join token (0600, written above when TABBIFY_JOIN_TOKEN was provided).
