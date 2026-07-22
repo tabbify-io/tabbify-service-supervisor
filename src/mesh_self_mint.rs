@@ -38,7 +38,20 @@ use std::time::Duration;
 
 /// The narrow, identity-bound credential authorizing THIS peer's own renewal.
 /// A secret — never logged.
+///
+/// Prefer [`RENEWAL_SECRET_FILE_ENV`]: a value passed as an environment variable
+/// is readable in `/proc/<pid>/environ`, in `docker inspect`, and in a crash
+/// dump, whereas a 0600 file is reachable only by the uid that must read it.
 pub const RENEWAL_SECRET_ENV: &str = "TABBIFY_RENEWAL_SECRET";
+
+/// Path to a file holding the renewal credential — the RECOMMENDED form, and
+/// the one the cloud boxes use: the file is written at boot from AWS SSM
+/// Parameter Store using the instance's own IAM role, so the box proves who it
+/// is to AWS instead of storing a secret that a rebuild would lose. Mirrors the
+/// existing `*_TOKEN_FILE` convention in the serving compose stack.
+///
+/// Takes precedence over [`RENEWAL_SECRET_ENV`] when both are set.
+pub const RENEWAL_SECRET_FILE_ENV: &str = "TABBIFY_RENEWAL_SECRET_FILE";
 
 /// Base URL of the public edge relaying the renewal to auth.
 pub const RENEW_URL_ENV: &str = "TABBIFY_RENEW_URL";
@@ -123,6 +136,36 @@ pub async fn renew_once(
     token_from_response(&body)
 }
 
+/// Resolve the renewal credential: the FILE wins, then the env var.
+///
+/// A configured-but-unreadable file returns `None` rather than silently falling
+/// through to the env var — an operator who pointed at a file meant that file,
+/// and quietly using a stale env value would hide the misconfiguration behind a
+/// working boot until the env value was also removed.
+///
+/// Trailing whitespace is stripped: the file is written by a shell fetching the
+/// value from a secret store, and a trailing newline is the normal result.
+#[must_use]
+pub fn resolve_renewal_secret(file_path: Option<&str>, env_value: Option<&str>) -> Option<String> {
+    if let Some(path) = file_path.map(str::trim).filter(|p| !p.is_empty()) {
+        return match std::fs::read_to_string(path) {
+            Ok(raw) if !raw.trim().is_empty() => Some(raw.trim().to_owned()),
+            Ok(_) => {
+                tracing::warn!(path, "{RENEWAL_SECRET_FILE_ENV} points at an EMPTY file");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "{RENEWAL_SECRET_FILE_ENV} is unreadable");
+                None
+            }
+        };
+    }
+    env_value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Self-mint a fresh join token, or `None` to fall back to the static one.
 ///
 /// Reads `TABBIFY_RENEWAL_SECRET` / `TABBIFY_RENEW_URL` / `TABBIFY_MESH_SELF_MINT`
@@ -133,9 +176,10 @@ pub async fn self_minted_join_token() -> Option<String> {
         tracing::info!("mesh self-mint disabled by {SELF_MINT_ENV}; using the static join token");
         return None;
     }
-    let secret = std::env::var(RENEWAL_SECRET_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
+    let secret = resolve_renewal_secret(
+        std::env::var(RENEWAL_SECRET_FILE_ENV).ok().as_deref(),
+        std::env::var(RENEWAL_SECRET_ENV).ok().as_deref(),
+    )?;
     let base_url =
         std::env::var(RENEW_URL_ENV).unwrap_or_else(|_| DEFAULT_RENEW_URL.to_owned());
 
@@ -197,6 +241,48 @@ mod tests {
         for off in ["0", "false", "off", "no", "FALSE", " off "] {
             assert!(!self_mint_enabled(Some(off)), "{off} must disable self-mint");
         }
+    }
+
+    #[test]
+    fn a_file_secret_wins_over_the_env_and_is_trimmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("renewal.secret");
+        // A shell writing a fetched value leaves a trailing newline.
+        std::fs::write(&path, "tbf_renew_from_file\n").unwrap();
+
+        assert_eq!(
+            resolve_renewal_secret(Some(path.to_str().unwrap()), Some("tbf_renew_from_env")),
+            Some("tbf_renew_from_file".to_owned()),
+            "the file is the recommended form and must win"
+        );
+    }
+
+    #[test]
+    fn a_configured_but_unreadable_file_does_not_fall_back_to_the_env() {
+        // Falling back would hide the misconfiguration behind a working boot.
+        assert_eq!(
+            resolve_renewal_secret(Some("/nonexistent/renewal.secret"), Some("tbf_renew_env")),
+            None
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert_eq!(
+            resolve_renewal_secret(Some(empty.to_str().unwrap()), Some("tbf_renew_env")),
+            None,
+            "an empty file is a misconfiguration, not an absent setting"
+        );
+    }
+
+    #[test]
+    fn the_env_var_still_works_when_no_file_is_configured() {
+        assert_eq!(
+            resolve_renewal_secret(None, Some("tbf_renew_env")),
+            Some("tbf_renew_env".to_owned())
+        );
+        assert_eq!(resolve_renewal_secret(Some("  "), Some("tbf_renew_env")).as_deref(), Some("tbf_renew_env"));
+        assert_eq!(resolve_renewal_secret(None, Some("  ")), None);
+        assert_eq!(resolve_renewal_secret(None, None), None);
     }
 
     #[test]
