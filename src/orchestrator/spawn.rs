@@ -1343,16 +1343,20 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id().unwrap();
+        // Wait for the pid to be READABLE, not merely for the file to exist: the
+        // shell's `printf > file` creates it before it writes, so under a loaded
+        // full-suite run this read lands in the gap and parses an empty string.
+        let mut descendant_pid = None;
         for _ in 0..100 {
-            if descendant_pid_path.exists() {
-                break;
+            if let Ok(raw) = std::fs::read_to_string(&descendant_pid_path) {
+                if let Ok(parsed) = raw.trim().parse::<u32>() {
+                    descendant_pid = Some(parsed);
+                    break;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let descendant_pid = descendant_pid.expect("child never reported its descendant pid");
         let parsed = Uuid::parse_str(uuid).unwrap();
         let handle = RunnerHandle {
             uuid: uuid.to_owned(),

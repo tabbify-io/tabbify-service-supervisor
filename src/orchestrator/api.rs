@@ -33,6 +33,7 @@ use crate::{
         MONITOR_INTERVAL, Orchestrator,
         client::ControlClient,
         handle::RunnerHandle,
+        manifest_retention,
         monitor::{
             RunnerPidIdentity, kill_fc_child_for_uuid, kill_pid, runner_pid_identity,
             runner_pids_for_uuid,
@@ -256,10 +257,11 @@ impl Orchestrator {
         }
     }
 
-    /// Build a cold-deploy spec from the durable record when one exists. The
-    /// request's optional context fields are patch semantics: `Some` replaces,
-    /// `None` keeps. Managed manifest semantics deliberately remain replacement
-    /// semantics, where `None` selects the default synthesized manifest.
+    /// Build a cold-deploy spec from the durable record when one exists. EVERY
+    /// optional context field is patch semantics: `Some` replaces, `None` keeps
+    /// — including the managed manifest, which alone used to clear on `None`
+    /// and so let a nudge re-deploy strip the app's `[runtime].stateful`
+    /// (see [`crate::orchestrator::manifest_retention`]).
     #[allow(clippy::too_many_arguments)]
     fn spawn_spec_for_deploy(
         &self,
@@ -276,7 +278,9 @@ impl Orchestrator {
             |record| self.shared().spawn_spec_for(record),
         );
         spec.image_ref = Some(reff.to_owned());
-        spec.manifest_toml = manifest_toml.map(str::to_owned);
+        if manifest_toml.is_some() {
+            spec.manifest_toml = manifest_toml.map(str::to_owned);
+        }
         if net.network.is_some() {
             spec.network = net.network.clone();
         }
@@ -943,6 +947,29 @@ impl Orchestrator {
             String::new()
         };
 
+        // Managed-manifest patch semantics (see `manifest_retention`). A deploy
+        // body without a `manifest_toml` KEEPS the record's — omitting it is a
+        // nudge, not a request to erase the app's runtime config. Erasing it
+        // used to un-stateful the app on the next spawn, silently: `running`,
+        // healthy, writing to a rootfs the following respawn discards.
+        let persisted_manifest = existing.as_ref().and_then(|r| r.manifest_toml.clone());
+        let manifest_toml =
+            manifest_retention::retained(manifest_toml, persisted_manifest.as_deref());
+        // And an EXPLICIT manifest that takes a live data disk away is refused
+        // rather than applied — losing a disk must never be the quiet path.
+        if let Some(regression) =
+            manifest_retention::stateful_regression(persisted_manifest.as_deref(), manifest_toml)
+        {
+            tracing::error!(
+                uuid,
+                reff,
+                previous_mount = regression.previous_mount.as_deref().unwrap_or("<unset>"),
+                next_stateful = regression.next_stateful,
+                "deploy: refused — the supplied tabbify.toml would strip this app's persistent data disk"
+            );
+            return Err(anyhow::Error::new(regression));
+        }
+
         let live = self.runner_health_for(uuid).await?.is_some();
         let socket_present = live
             || self
@@ -993,10 +1020,8 @@ impl Orchestrator {
             // always reflects the LATEST deploy's runtime config. Without this a
             // warm zero-downtime swap (the live runner keeps serving) would leave
             // the OLD toml on disk, and a later crash-respawn would re-derive
-            // STALE `[runtime]`/`[routes]`. `None` clears it (a deploy with no
-            // managed config), mirroring the cold-spawn branch.
-            // Unlike `runner_join_token` and `extra_env`, a `None` here is
-            // intentional clearance, not a nudge.
+            // STALE `[runtime]`/`[routes]`. Already resolved against the record
+            // above, so a body that carried no toml keeps the persisted one.
             record.manifest_toml = manifest_toml.map(str::to_owned);
             // Phase-2: if this deploy supplied a tenant network, persist it so a
             // future RESPAWN rejoins scoped (the live runner itself is not
@@ -1735,12 +1760,10 @@ pub(crate) async fn read_last_lines(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::{collections::HashMap, path::PathBuf};
 
     use super::*;
-    use crate::orchestrator::SharedRunnerConfig;
-    use crate::orchestrator::monitor::runner_is_alive;
+    use crate::orchestrator::{SharedRunnerConfig, monitor::runner_is_alive};
 
     const APP_UUID: &str = "0191e7c2-1111-7222-8333-444455556666";
     const APP_ULA: &str = "fd5a:1f02:44a5:240b:121a::1";
@@ -1896,9 +1919,11 @@ mod tests {
         assert_eq!(spec.runner_join_token, existing.runner_join_token);
         assert_eq!(spec.extra_env, existing.extra_env);
         assert_eq!(spec.egress_allow, existing.egress_allow);
-        assert!(
-            spec.manifest_toml.is_none(),
-            "manifest None deliberately keeps synthesized-default semantics"
+        assert_eq!(
+            spec.manifest_toml, existing.manifest_toml,
+            "an omitted manifest must keep the record's — clearing it here is what \
+             silently stripped [runtime].stateful and sent the app back to an \
+             ephemeral rootfs"
         );
     }
 
@@ -3365,6 +3390,154 @@ mod tests {
         );
     }
 
+    /// A managed toml declaring a persistent data disk, as a connect-repo app
+    /// with `stateful` carries it. This string is the ONLY place the app's
+    /// persistence intent lives — there is no S3 manifest for such an app.
+    const STATEFUL_TOML: &str = "[app]\nname = \"forge\"\n[build]\nkind = \"docker\"\n\
+                                 [runtime]\nstateful = true\ndata_mount = \"/var/lib/forge\"\n";
+
+    /// Seed a live-runner record for `uuid` carrying `toml`, with its control
+    /// socket under `dir`.
+    fn seed_record_with_manifest(
+        dir: &std::path::Path,
+        toml: Option<&str>,
+    ) -> (RunnerHandle, PathBuf) {
+        let sock_path = dir.join(format!("{APP_UUID}.sock"));
+        let rec = RunnerHandle {
+            uuid: APP_UUID.to_owned(),
+            pid: 12345,
+            control_sock: sock_path.clone(),
+            app_ula: APP_ULA.to_owned(),
+            parent: None,
+            spawned_at: 0,
+            restart: Default::default(),
+            image_ref: None,
+            requested_runtime: None,
+            network: None,
+            runner_join_token: None,
+            manifest_toml: toml.map(str::to_owned),
+            extra_env: None,
+            egress_allow: None,
+            crash_looped: false,
+            stopped: false,
+        };
+        rec.save(dir).unwrap();
+        (rec, sock_path)
+    }
+
+    /// A re-deploy that carries NO managed toml — the MCP deploy path hardcodes
+    /// `manifest_toml: None`, and a plain "redeploy this image" nudge sends none
+    /// either — must KEEP the app's persisted manifest.
+    ///
+    /// Clearing it left the record with no `[runtime].stateful`, so the next
+    /// spawn attached no data disk: the app came up `running` and healthy while
+    /// writing to a rootfs the respawn after it discards. The only visible
+    /// symptom was a MISSING `PUT /drives/data` line in the boot log.
+    #[tokio::test]
+    async fn deploy_app_without_a_manifest_keeps_the_persisted_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_rec, sock_path) = seed_record_with_manifest(dir.path(), Some(STATEFUL_TOML));
+        fake_control_server(sock_path, 5).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let o = orch(dir.path().to_path_buf());
+        let result = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:sha256new",
+                None,
+                None, // the nudge: no managed toml in the body
+                DeployNetwork::default(),
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "nudge re-deploy must succeed: {result:?}");
+
+        let updated = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must exist after deploy");
+        assert_eq!(
+            updated.manifest_toml.as_deref(),
+            Some(STATEFUL_TOML),
+            "a deploy that carried no manifest must not erase the app's persistence intent"
+        );
+        assert_eq!(
+            updated.image_ref.as_deref(),
+            Some("[fd5a::1]:5000/acme/app:sha256new"),
+            "the deploy must still apply the new image"
+        );
+    }
+
+    /// An EXPLICIT manifest that drops `[runtime].stateful` is refused, not
+    /// applied. Losing a data disk destroys the app's state on its next
+    /// respawn, so it must be a loud failure rather than a quiet success.
+    #[tokio::test]
+    async fn deploy_app_refuses_a_manifest_that_drops_the_data_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_record_with_manifest(dir.path(), Some(STATEFUL_TOML));
+
+        const EPHEMERAL_TOML: &str =
+            "[app]\nname = \"forge\"\n[build]\nkind = \"docker\"\n[runtime]\nmemory_mb = 2048\n";
+        let o = orch(dir.path().to_path_buf());
+        let error = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:sha256new",
+                None,
+                Some(EPHEMERAL_TOML),
+                DeployNetwork::default(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("dropping a live data disk must be refused");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("/var/lib/forge") && rendered.contains("ephemeral rootfs"),
+            "the refusal must name the disk at risk and what would happen: {rendered}"
+        );
+        let after = RunnerHandle::load(dir.path(), APP_UUID)
+            .unwrap()
+            .expect("record must survive a refused deploy");
+        assert_eq!(
+            after.manifest_toml.as_deref(),
+            Some(STATEFUL_TOML),
+            "a refused deploy must leave the record untouched"
+        );
+    }
+
+    /// The refusal is a TYPED error so the API can attribute it to the caller's
+    /// config (409) instead of reporting a platform fault (500) — the same
+    /// misattribution the clone-failure work removed from the build path.
+    #[tokio::test]
+    async fn a_refused_stateful_deploy_is_downcastable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_record_with_manifest(dir.path(), Some(STATEFUL_TOML));
+
+        let o = orch(dir.path().to_path_buf());
+        let error = o
+            .deploy_app(
+                APP_UUID,
+                "[fd5a::1]:5000/acme/app:sha256new",
+                None,
+                Some("[runtime]\nmemory_mb = 512\n"),
+                DeployNetwork::default(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("must be refused");
+
+        assert!(
+            error
+                .downcast_ref::<crate::orchestrator::manifest_retention::StatefulRegression>()
+                .is_some(),
+            "the API layer maps this variant to a 4xx; an untyped error would 500"
+        );
+    }
+
     // ── boot_failure_diagnostic (P1-2 reason propagation) ─────────────────────
 
     /// The readiness diagnostic printed by the runner's cold boot is recovered
@@ -3494,9 +3667,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn purge_app_reaps_fc_child_via_pidfile() {
+        use std::{fs, os::unix::fs::PermissionsExt as _};
+
         use crate::firecracker::pidfile;
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::TempDir::new().unwrap();
         let uuid = "0191e7c2-beef-7222-8333-444455556666";
@@ -3645,7 +3818,11 @@ mod tests {
         o.remove_app_artifacts(APP_UUID);
 
         for path in &purged {
-            assert!(!path.exists(), "artifact must be removed: {}", path.display());
+            assert!(
+                !path.exists(),
+                "artifact must be removed: {}",
+                path.display()
+            );
         }
         for path in &kept {
             assert!(

@@ -26,6 +26,7 @@ pub mod api;
 pub mod build;
 pub mod client;
 pub mod handle;
+pub mod manifest_retention;
 pub mod monitor;
 pub mod restart;
 pub mod spawn;
