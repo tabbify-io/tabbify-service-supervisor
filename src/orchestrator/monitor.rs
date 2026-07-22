@@ -1444,6 +1444,33 @@ impl Orchestrator {
         if image_ref.is_some() {
             updated.image_ref = image_ref;
         }
+        // BACKFILL THE WIREGUARD PORT ON ADOPTION.
+        //
+        // Adoption is the path a LIVING runner takes when the supervisor
+        // restarts (KillMode=process keeps runners up across a supervisord
+        // restart), and it deliberately does NOT restart the runner. The spawn
+        // paths already backfill, but a fleet that is only ever adopted never
+        // reaches them: on the dedik, `adopted=17 respawned=0` left all 17
+        // records on `wg_listen_port: None` and every joiner sharing 51820.
+        //
+        // Recording the port here is INTENT, not a claim about the live
+        // process: the runner keeps whatever port it bound at spawn until it
+        // restarts, and `spawn_spec_for` then re-binds the port recorded here.
+        // Same shape as `image_ref`, which is likewise recorded ahead of the
+        // respawn that applies it.
+        if updated.wg_listen_port.is_none() {
+            updated.wg_listen_port =
+                crate::orchestrator::wg_port::port_for_runner(&self.runner_dir, &record.uuid);
+            if let Some(port) = updated.wg_listen_port {
+                tracing::info!(
+                    uuid = %record.uuid,
+                    port,
+                    "assigned a WireGuard port to an adopted runner; it takes effect \
+                     when this runner next restarts (adoption does not restart a \
+                     living runner, so the process still holds its old port)"
+                );
+            }
+        }
         updated.restart = on_healthy(record.restart, BackoffParams::default(), now_secs);
         if updated != *record {
             if let Err(error) = updated.save(&self.runner_dir) {
@@ -2037,7 +2064,7 @@ mod tests {
 
     #[test]
     fn scope_names_fall_back_to_cold_start_when_no_image_ref() {
-        let uuid = "0191e7c2-2222-7222-8333-444455556666";
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
         let names = fc_scope_names_for_uuid(uuid, None);
         // With no deployed ref we can only reconstruct the cold-start scope.
         assert_eq!(
@@ -2801,6 +2828,113 @@ mod tests {
         let persisted = orch.load_runner_record(uuid).unwrap().unwrap();
         assert_eq!(persisted.pid, 4242);
         assert_eq!(persisted.image_ref.as_deref(), Some("registry/app:swapped"));
+    }
+
+    /// ADOPTING a live runner whose record predates per-runner WireGuard ports
+    /// must ASSIGN one and persist it.
+    ///
+    /// Regression guard for the rollout that looked complete and changed nothing:
+    /// both spawn paths backfilled, but a fleet kept alive across a supervisor
+    /// restart (`KillMode=process`) is only ever ADOPTED, never respawned. On the
+    /// dedik that left `adopted=17 respawned=0` with all 17 records still
+    /// `wg_listen_port: None` and every joiner sharing 51820.
+    #[tokio::test]
+    async fn adopting_a_live_runner_backfills_its_wireguard_port() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let socket = dir.path().join(format!("{uuid}.sock"));
+        let server_socket = socket.clone();
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let reply = crate::control_proto::Reply::Health {
+                state: "running".to_owned(),
+                app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
+                app_uuid: uuid.to_owned(),
+                pid: 4242,
+                image_ref: None,
+                app_health: "serving".to_owned(),
+                app_health_reason: None,
+            };
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            reader.into_inner().write_all(&bytes).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut record = unhealthy_record(uuid, 0, dir.path());
+        record.control_sock = socket;
+        // A pre-allocation record: exactly what every dedik record looked like.
+        record.wg_listen_port = None;
+        record.save(dir.path()).unwrap();
+
+        assert_eq!(orch.reconcile_record(&record).await, RecordOutcome::Adopted);
+
+        let persisted = orch.load_runner_record(uuid).unwrap().unwrap();
+        assert_eq!(
+            persisted.wg_listen_port,
+            Some(crate::orchestrator::wg_port::RUNNER_WG_PORT_BASE),
+            "adoption must assign a WireGuard port, or an adopted-only fleet never gets one"
+        );
+    }
+
+    /// Adoption must NOT move a port the runner already holds — the live process
+    /// is bound to it, and re-assigning would make the record disagree with the
+    /// socket and move the advertised endpoint on the next restart.
+    #[tokio::test]
+    async fn adopting_a_live_runner_keeps_an_assigned_wireguard_port() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::UnixListener,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let orch = Orchestrator::new(shared_for_test(), dir.path().to_path_buf());
+        let uuid = "0191e7c2-1111-7222-8333-444455556666";
+        let socket = dir.path().join(format!("{uuid}.sock"));
+        let server_socket = socket.clone();
+        let held = crate::orchestrator::wg_port::RUNNER_WG_PORT_BASE + 9;
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&server_socket).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let reply = crate::control_proto::Reply::Health {
+                state: "running".to_owned(),
+                app_ula: "fd5a:1f02:44a5:240b:121a::1".to_owned(),
+                app_uuid: uuid.to_owned(),
+                pid: 4242,
+                image_ref: None,
+                app_health: "serving".to_owned(),
+                app_health_reason: None,
+            };
+            let mut bytes = serde_json::to_vec(&reply).unwrap();
+            bytes.push(b'\n');
+            reader.into_inner().write_all(&bytes).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut record = unhealthy_record(uuid, 0, dir.path());
+        record.control_sock = socket;
+        record.wg_listen_port = Some(held);
+        record.save(dir.path()).unwrap();
+
+        assert_eq!(orch.reconcile_record(&record).await, RecordOutcome::Adopted);
+        assert_eq!(
+            orch.load_runner_record(uuid).unwrap().unwrap().wg_listen_port,
+            Some(held),
+            "an already-assigned port must survive adoption unchanged"
+        );
     }
 
     /// A stale pre-deploy snapshot may update restart health, but it must reload
