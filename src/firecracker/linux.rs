@@ -26,7 +26,10 @@ use super::{
     FcConfig, kvm_available,
     link_allocator::{LinkAllocation, LinkSlotAllocator, SERVING_LINK_SLOTS},
     pidfile,
-    port_plan::{PortPlan, probe_first_answering, resolve_port_plan},
+    port_plan::{
+        PortDecision, PortPlan, PortSource, probe_first_answering, resolve_port_plan,
+        restore_port_source,
+    },
     protocol::{
         aux_drive_body, boot_source_body, instance_start_body, machine_config_body,
         network_iface_body, pause_body, proxy_request, read_http_status, resolve_vcpus,
@@ -252,6 +255,10 @@ pub struct FirecrackerRuntime {
     fc_scope: Option<String>,
     /// `http://<guest_ip>:<app_port>` — the base the proxy targets.
     guest_base: String,
+    /// WHERE the port in `guest_base` came from. Quoted in the readiness-timeout
+    /// verdict so it can distinguish "your app did not answer on the port IT
+    /// declared" from "we assumed the default because nothing declared one".
+    port_source: PortSource,
     /// The guest's IPv4 address on its /30 tap. Used by the L4 SSH forwarder
     /// (`guest_ssh_addr`) to expose `guest_ip:2222` via `[app_ula]:2222`.
     guest_ip: Ipv4Addr,
@@ -351,7 +358,7 @@ impl FirecrackerRuntime {
         // cache dir ⇒ never snapshots ⇒ no env fingerprint to stamp (`None`). No
         // OCI config in scope ⇒ no exposed ports (empty) + no persisted companion;
         // the plan uses the manifest `[runtime].port` if set, else the 8080 default.
-        let plan = resolve_port_plan(false, rt, &[], None, cfg);
+        let port_decision = resolve_port_plan(false, rt, &[], None, cfg);
         Self::cold_boot(
             rootfs,
             rt,
@@ -364,7 +371,7 @@ impl FirecrackerRuntime {
             None,
             false,
             None,
-            plan,
+            port_decision,
             data_disk,
             &[],
         )
@@ -408,7 +415,7 @@ impl FirecrackerRuntime {
         egress_allow: Option<&[String]>,
         is_workspace: bool,
         env_hash: Option<&str>,
-        port_plan: PortPlan,
+        port_decision: PortDecision,
         data_disk: Option<&Path>,
         cap_files: &[(String, String)],
     ) -> Result<Self> {
@@ -436,6 +443,7 @@ impl FirecrackerRuntime {
         // `Probe` plan targets a PLACEHOLDER (the lowest candidate) up front; the
         // post-boot multi-port probe below replaces `guest_base` with the WINNING
         // port before the VM ever serves traffic.
+        let PortDecision { plan: port_plan, source: port_source } = port_decision;
         let initial_port = match &port_plan {
             PortPlan::Fixed(p) => *p,
             PortPlan::Probe(ports) => ports.iter().copied().min().unwrap_or(cfg.app_port),
@@ -497,6 +505,7 @@ impl FirecrackerRuntime {
             api_sock: api_sock.clone(),
             fc_scope,
             guest_base,
+            port_source,
             guest_ip,
             link_slot: link_idx,
             tap_subnet: super::link_allocator::normalize_subnet(&cfg.tap_subnet)?,
@@ -692,13 +701,14 @@ impl FirecrackerRuntime {
         // multiple candidates ⇒ probe them all (first-answering-wins). The cold
         // boot persists the winner to `.app_port` (see `cold_boot`), so a later
         // config-read-less respawn recovers it via `persisted`.
-        let plan = resolve_port_plan(is_workspace, rt, image_exposed_ports, persisted, cfg);
+        let port_decision = resolve_port_plan(is_workspace, rt, image_exposed_ports, persisted, cfg);
         // WARM-RESTORE port: a single fixed port. The restored guest already ran +
         // answered on its winning port, which the taking cold boot persisted, so
         // prefer `persisted`; fall back to the lowest freshly-read candidate, then
         // to the manifest `[runtime].port` / 8080 default via `resolve`.
         let restore_image_port = persisted.or_else(|| image_exposed_ports.iter().copied().min());
         let restore_port = workspace_or_resolved_port(is_workspace, rt, restore_image_port, cfg);
+        let restore_source = restore_port_source(is_workspace, rt, image_exposed_ports, persisted);
         // Per-app console log: <data_dir>/fc/<uuid>.console.log (only written
         // when SUPERVISOR_FC_DEBUG is truthy — see `console_stdio`).
         let console_log = pidfile::console_log_path(data_dir, uuid);
@@ -734,7 +744,7 @@ impl FirecrackerRuntime {
                 egress_allow,
                 is_workspace,
                 Some(env_hash),
-                plan.clone(),
+                port_decision.clone(),
                 // STATEFUL: attach the persistent `/dev/vdb` + suppress the
                 // snapshot on the SWAP cold boot (Some ⇒ both). `None` for a
                 // non-stateful app (unchanged).
@@ -853,6 +863,7 @@ impl FirecrackerRuntime {
                     &vm_key,
                     &allocation,
                     restore_port,
+                    restore_source,
                     data_dir,
                     uuid,
                     is_workspace,
@@ -894,7 +905,7 @@ impl FirecrackerRuntime {
                             egress_allow,
                             is_workspace,
                             Some(env_hash),
-                            plan.clone(),
+                            port_decision.clone(),
                             // STATEFUL disk + snapshot-suppress on the cold-boot
                             // fallback after a failed warm restore (a stateful app
                             // never HAS a snapshot to restore — it is suppressed —
@@ -934,7 +945,7 @@ impl FirecrackerRuntime {
                     egress_allow,
                     is_workspace,
                     Some(env_hash),
-                    plan,
+                    port_decision,
                     // STATEFUL disk + snapshot-suppress on the primary cold-boot
                     // path (first boot / respawn with no usable snapshot). `None`
                     // for a non-stateful app (unchanged).
@@ -993,6 +1004,8 @@ impl FirecrackerRuntime {
         vm_key: &str,
         allocation: &LinkAllocation,
         app_port: u16,
+        // Where `app_port` came from, for the readiness-timeout verdict.
+        port_source: PortSource,
         data_dir: &Path,
         uuid: &str,
         is_workspace: bool,
@@ -1087,6 +1100,7 @@ impl FirecrackerRuntime {
             api_sock: api_sock.clone(),
             fc_scope,
             guest_base,
+            port_source,
             guest_ip,
             link_slot: link_idx,
             tap_subnet: allocation.tap_subnet.clone(),
@@ -1491,28 +1505,33 @@ impl FirecrackerRuntime {
                     // no app-level reply was seen (an HTTP answer of ANY status returns
                     // `ready` above), so `error` below is the last-known probe result.
                     let probe_port = self.guest_base.rsplit(':').next().unwrap_or("?");
+                    // Naming the port's PROVENANCE is the difference between
+                    // actionable and misleading. Telling an operator to align their
+                    // listen port with their EXPOSE is WRONG when the port was the
+                    // platform's own fallback — they already agree, and the advice
+                    // sends them to re-check a correct image (observed 2026-07-22).
+                    let source = self.port_source.describe();
                     tracing::error!(
                         guest_base = %self.guest_base,
                         probe_port,
+                        port_source = ?self.port_source,
                         attempt,
                         timeout_secs = READY_TIMEOUT.as_secs(),
                         elapsed_ms = start.elapsed().as_millis(),
                         error = %e,
-                        "fc boot: guest app never became ready (readiness timeout) — probed the \
-                         resolved guest port with no response. MOST LIKELY the app is not LISTENING \
-                         on that port: make the server listen on it (nginx must `listen 80;` when \
-                         `EXPOSE 80`) and keep PID 1 in the foreground; or set `[runtime].port` in \
-                         tabbify.toml to the port it serves. Only an EARLIER tap-setup EPERM (logged \
-                         above) means the guest has no network at all (→ CAP_NET_ADMIN)."
+                        "fc boot: guest app never became ready (readiness timeout) — nothing \
+                         answered on the probed guest port. Only an EARLIER tap-setup EPERM \
+                         (logged above) means the guest has no network at all (→ CAP_NET_ADMIN)."
                     );
                     bail!(
-                        "guest app at {} never became ready: the readiness probe got no response. \
-                         Most likely your app is not listening on that exact port — make your \
-                         server's listen port MATCH the Dockerfile EXPOSE (e.g. nginx `listen 80;` \
-                         with `EXPOSE 80`, python `--bind :8000` with `EXPOSE 8000`), and keep the \
-                         container's main process in the FOREGROUND (it must not daemonize/exit). \
+                        "guest app at {} never became ready: nothing answered the readiness probe \
+                         within {}s. That port came from {source}. If the port is right, make sure \
+                         the server actually LISTENS on it and that PID 1 stays in the FOREGROUND \
+                         (it must not daemonize or exit); if it is wrong, set `[runtime].port` in \
+                         tabbify.toml to the port your app really serves. \
                          Underlying probe error: {e}",
-                        self.guest_base
+                        self.guest_base,
+                        READY_TIMEOUT.as_secs(),
                     )
                 }
             }
