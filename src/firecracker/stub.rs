@@ -54,17 +54,18 @@ impl FirecrackerRuntime {
         _snapshot_ref: &str,
         _cap_files: &[(String, String)],
     ) -> Result<Self> {
-        // Никогда не бутит VM на не-Linux, но резолвим план порта тем же
-        // helper'ом, что и Linux-путь — сигнатуры/логика порта остаются
-        // выровненными между платформами (helper компилируется на macOS).
-        let plan = resolve_port_plan(is_workspace, rt, image_exposed_ports, None, cfg);
-        let target = match plan {
+        // Never boots a VM off Linux, but resolves the port plan through the SAME
+        // helper the Linux path uses, so the port signature/logic stays aligned
+        // across platforms (the helper compiles on macOS).
+        let decision = resolve_port_plan(is_workspace, rt, image_exposed_ports, None, cfg);
+        let target = match decision.plan {
             PortPlan::Fixed(p) => format!("guest port {p}"),
             PortPlan::Probe(ports) => format!("one of exposed ports {ports:?}"),
         };
         bail!(
             "firecracker runtime requires Linux + /dev/kvm (host is not Linux; \
-             would target {target})"
+             would target {target}, from {})",
+            decision.source.describe()
         )
     }
 }

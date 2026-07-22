@@ -41,6 +41,57 @@ pub enum PortPlan {
     Probe(Vec<u16>),
 }
 
+/// WHERE the readiness port came from. Carried into the readiness-timeout
+/// verdict so it can say whether the app failed to answer on a port IT declared
+/// or on one the platform fell back to — the difference between "your app is not
+/// listening where it said it would" and "we could not determine your port".
+///
+/// The distinction is not cosmetic. The old verdict told every operator to make
+/// their listen port match their Dockerfile `EXPOSE`; when the port was actually
+/// the 8080 FALLBACK that advice was wrong, and it sent people to re-check an
+/// image that was already correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSource {
+    /// Forced workspace-init port — image + manifest are deliberately ignored.
+    Workspace,
+    /// Explicit `[runtime].port` in the app's tabbify.toml.
+    Manifest,
+    /// The image's own `ExposedPorts` (read this launch, or recovered from the
+    /// OCI layout cached beside a hit rootfs).
+    Image,
+    /// The `.app_port` companion — a WINNING port persisted by an earlier launch.
+    Persisted,
+    /// Nothing declared a port; the configured default (8080) was assumed.
+    Default,
+}
+
+impl PortSource {
+    /// One clause naming this provenance, for the readiness-timeout verdict.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Workspace => "the forced workspace-init port",
+            Self::Manifest => "your tabbify.toml `[runtime].port`",
+            Self::Image => "your image's Dockerfile EXPOSE",
+            Self::Persisted => "the port a previous launch of this app answered on",
+            Self::Default => {
+                "the platform DEFAULT — your image declares no EXPOSE and your \
+                 tabbify.toml sets no `[runtime].port`, so this port was assumed, NOT declared"
+            }
+        }
+    }
+}
+
+/// A launch's resolved readiness port plan together with WHERE it came from.
+/// Returned as one value so the plan and its provenance can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortDecision {
+    /// How to probe (one fixed port, or several candidates raced).
+    pub plan: PortPlan,
+    /// Which precedence tier produced `plan`.
+    pub source: PortSource,
+}
+
 /// Decide the [`PortPlan`] for a launch. Precedence (highest → lowest):
 ///
 /// 1. **WORKSPACE** → `Fixed(cfg.app_port)`: the fixed workspace-init port is
@@ -65,22 +116,54 @@ pub fn resolve_port_plan(
     exposed: &[u16],
     persisted: Option<u16>,
     cfg: &FcConfig,
-) -> PortPlan {
+) -> PortDecision {
+    let decide = |plan, source| PortDecision { plan, source };
     if is_workspace {
-        return PortPlan::Fixed(cfg.app_port);
+        return decide(PortPlan::Fixed(cfg.app_port), PortSource::Workspace);
     }
     if let Some(p) = rt.port {
-        return PortPlan::Fixed(p);
+        return decide(PortPlan::Fixed(p), PortSource::Manifest);
     }
     match exposed {
         [] => {}
-        [only] => return PortPlan::Fixed(*only),
-        many => return PortPlan::Probe(many.to_vec()),
+        [only] => return decide(PortPlan::Fixed(*only), PortSource::Image),
+        many => return decide(PortPlan::Probe(many.to_vec()), PortSource::Image),
     }
     if let Some(p) = persisted {
-        return PortPlan::Fixed(p);
+        return decide(PortPlan::Fixed(p), PortSource::Persisted);
     }
-    PortPlan::Fixed(cfg.app_port)
+    decide(PortPlan::Fixed(cfg.app_port), PortSource::Default)
+}
+
+/// WHERE a WARM-RESTORE's single fixed port came from.
+///
+/// Deliberately NOT [`resolve_port_plan`]'s precedence: a restore prefers the
+/// `persisted` winner OVER a freshly-read `ExposedPorts` (the restored guest is
+/// already listening on the port an earlier cold boot proved), so `Persisted`
+/// outranks `Image` here while the cold path has it the other way round. Kept
+/// beside its cold-path sibling so the two orderings stay visibly different
+/// rather than accidentally converging.
+#[must_use]
+pub fn restore_port_source(
+    is_workspace: bool,
+    rt: &Runtime,
+    exposed: &[u16],
+    persisted: Option<u16>,
+) -> PortSource {
+    if is_workspace {
+        return PortSource::Workspace;
+    }
+    if rt.port.is_some() {
+        return PortSource::Manifest;
+    }
+    if persisted.is_some() {
+        return PortSource::Persisted;
+    }
+    if exposed.is_empty() {
+        PortSource::Default
+    } else {
+        PortSource::Image
+    }
 }
 
 /// Poll every port in `ports` on `host` concurrently and return the FIRST whose
@@ -175,7 +258,10 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use super::{PortPlan, probe_first_answering, resolve_port_plan};
+    use super::{
+        PortDecision, PortPlan, PortSource, probe_first_answering, resolve_port_plan,
+        restore_port_source,
+    };
     use crate::config::FcConfig;
     use crate::manifest::Runtime;
 
@@ -206,7 +292,7 @@ mod tests {
         rt.port = Some(9999);
         assert_eq!(
             resolve_port_plan(true, &rt, &[80, 2222], Some(3000), &cfg),
-            PortPlan::Fixed(8080)
+            PortDecision { plan: PortPlan::Fixed(8080), source: PortSource::Workspace }
         );
     }
 
@@ -219,7 +305,7 @@ mod tests {
         rt.port = Some(8788);
         assert_eq!(
             resolve_port_plan(false, &rt, &[80, 8730], None, &cfg),
-            PortPlan::Fixed(8788)
+            PortDecision { plan: PortPlan::Fixed(8788), source: PortSource::Manifest }
         );
     }
 
@@ -231,7 +317,7 @@ mod tests {
         let rt = test_runtime(); // port None
         assert_eq!(
             resolve_port_plan(false, &rt, &[80, 8730], None, &cfg),
-            PortPlan::Probe(vec![80, 8730])
+            PortDecision { plan: PortPlan::Probe(vec![80, 8730]), source: PortSource::Image }
         );
     }
 
@@ -242,7 +328,7 @@ mod tests {
         let rt = test_runtime();
         assert_eq!(
             resolve_port_plan(false, &rt, &[80], None, &cfg),
-            PortPlan::Fixed(80)
+            PortDecision { plan: PortPlan::Fixed(80), source: PortSource::Image }
         );
     }
 
@@ -254,7 +340,7 @@ mod tests {
         let rt = test_runtime();
         assert_eq!(
             resolve_port_plan(false, &rt, &[], Some(8730), &cfg),
-            PortPlan::Fixed(8730)
+            PortDecision { plan: PortPlan::Fixed(8730), source: PortSource::Persisted }
         );
     }
 
@@ -266,7 +352,7 @@ mod tests {
         let rt = test_runtime();
         assert_eq!(
             resolve_port_plan(false, &rt, &[80, 8730], Some(9000), &cfg),
-            PortPlan::Probe(vec![80, 8730])
+            PortDecision { plan: PortPlan::Probe(vec![80, 8730]), source: PortSource::Image }
         );
     }
 
@@ -278,8 +364,77 @@ mod tests {
         let rt = test_runtime();
         assert_eq!(
             resolve_port_plan(false, &rt, &[], None, &cfg),
-            PortPlan::Fixed(8080)
+            PortDecision { plan: PortPlan::Fixed(8080), source: PortSource::Default }
         );
+    }
+
+    // ---- restore_port_source -------------------------------------------------
+
+    /// THE ORDERING THAT DIFFERS: on a WARM restore a persisted winner outranks a
+    /// freshly-read ExposedPort, because the restored guest is already listening
+    /// on the port an earlier cold boot proved. The cold path resolves the other
+    /// way round — this asserts the two do NOT converge.
+    #[test]
+    fn restore_prefers_persisted_over_image_unlike_cold_path() {
+        let cfg = FcConfig::default();
+        let rt = test_runtime();
+        assert_eq!(
+            restore_port_source(false, &rt, &[8000], Some(3000)),
+            PortSource::Persisted
+        );
+        assert_eq!(
+            resolve_port_plan(false, &rt, &[8000], Some(3000), &cfg).source,
+            PortSource::Image,
+            "the cold path must still prefer the freshly-read image port"
+        );
+    }
+
+    /// A workspace forces its own port on the restore path too.
+    #[test]
+    fn restore_workspace_is_workspace_source() {
+        let mut rt = test_runtime();
+        rt.port = Some(9999);
+        assert_eq!(
+            restore_port_source(true, &rt, &[80], Some(3000)),
+            PortSource::Workspace
+        );
+    }
+
+    /// An explicit manifest port outranks everything but a workspace.
+    #[test]
+    fn restore_manifest_port_wins() {
+        let mut rt = test_runtime();
+        rt.port = Some(8788);
+        assert_eq!(
+            restore_port_source(false, &rt, &[80], Some(3000)),
+            PortSource::Manifest
+        );
+    }
+
+    /// Nothing declared ⇒ Default, and its wording must WARN that the port was
+    /// assumed — that is the clause the old verdict was missing.
+    #[test]
+    fn restore_nothing_declared_is_default_and_says_so() {
+        let rt = test_runtime();
+        let src = restore_port_source(false, &rt, &[], None);
+        assert_eq!(src, PortSource::Default);
+        let text = src.describe();
+        assert!(
+            text.contains("DEFAULT") && text.contains("NOT declared"),
+            "the default verdict must not imply the user declared this port; got: {text}"
+        );
+    }
+
+    /// The image-sourced wording points at the Dockerfile EXPOSE — advice that is
+    /// only correct when the port really did come from the image.
+    #[test]
+    fn image_source_names_the_dockerfile_expose() {
+        let rt = test_runtime();
+        assert_eq!(
+            restore_port_source(false, &rt, &[8000], None),
+            PortSource::Image
+        );
+        assert!(PortSource::Image.describe().contains("EXPOSE"));
     }
 
     // ---- probe_first_answering ----------------------------------------------
