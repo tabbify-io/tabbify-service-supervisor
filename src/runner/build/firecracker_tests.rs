@@ -8,8 +8,9 @@ use std::{
 };
 
 use super::{
-    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, exposed_tcp_ports,
-    ext4_geometry, extract_layer_blob, measure_tree, merge_extra_env,
+    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_layout_exposed_ports,
+    cached_rootfs_path, exposed_tcp_ports, ext4_geometry, extract_layer_blob, measure_tree,
+    merge_extra_env,
     oci_fixtures::{make_tar, write_min_oci_layout},
     render_init,
 };
@@ -2899,4 +2900,89 @@ fn render_init_shell_quotes_a_metachar_data_mount() {
         !init.contains(&format!("mount -t ext4 /dev/vdb {weird} ")),
         "must never emit the unquoted metachar path; got:\n{init}"
     );
+}
+
+// ── cached-layout port recovery (rootfs cache hit) ───────────────────────────
+//
+// A rootfs cache hit skips the pull, so the launch never re-reads the image
+// config and `resolve_port_plan` would fall back to the 8080 default — killing
+// an app that serves any other port on every respawn. These cover recovering
+// the ports from the OCI layout sitting NEXT TO the cached rootfs.
+
+/// Stage a cached-rootfs dir: the `oci/` layout the rootfs was built from plus
+/// the `rootfs.ext4` sibling. Returns the rootfs path (what `lookup_cached_rootfs`
+/// hands back).
+fn stage_cached_rootfs(dir: &Path, config_body: serde_json::Value) -> std::path::PathBuf {
+    let cfg = serde_json::json!({
+        "architecture":"amd64","os":"linux",
+        "config": config_body,
+        "rootfs":{"type":"layers","diff_ids":["sha256:aaaa"]}
+    });
+    write_min_oci_layout(&dir.join("oci"), &cfg, &[("sha256:aaaa", b"layer0")]);
+    let rootfs = dir.join("rootfs.ext4");
+    std::fs::write(&rootfs, b"ext4").unwrap();
+    rootfs
+}
+
+/// THE REGRESSION: an app whose image declares a single non-8080 `EXPOSE`
+/// (uvicorn on 8000) must have that port recovered from the cached layout, so a
+/// cache-hit respawn probes 8000 instead of defaulting to 8080 and crash-looping.
+#[test]
+fn cached_layout_exposed_ports_recovers_single_non_default_port() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = stage_cached_rootfs(
+        tmp.path(),
+        serde_json::json!({
+            "ExposedPorts": {"8000/tcp": {}},
+            "Cmd": ["uvicorn","api_server:app","--host","0.0.0.0","--port","8000"]
+        }),
+    );
+    assert_eq!(
+        cached_layout_exposed_ports(&rootfs),
+        vec![8000],
+        "the cached layout's EXPOSE must survive a pull-less respawn"
+    );
+}
+
+/// Several exposed ports all come back (the caller probes them
+/// first-answering-wins rather than guessing).
+#[test]
+fn cached_layout_exposed_ports_recovers_every_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = stage_cached_rootfs(
+        tmp.path(),
+        serde_json::json!({"ExposedPorts": {"80/tcp": {}, "8730/tcp": {}}}),
+    );
+    assert_eq!(cached_layout_exposed_ports(&rootfs), vec![80, 8730]);
+}
+
+/// Best-effort: no layout beside the rootfs (a global-cache link that carried
+/// only the rootfs) ⇒ EMPTY, i.e. the caller keeps its prior fallback behaviour
+/// instead of failing the launch.
+#[test]
+fn cached_layout_exposed_ports_absent_layout_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"ext4").unwrap();
+    assert!(cached_layout_exposed_ports(&rootfs).is_empty());
+}
+
+/// A garbled layout must not panic or abort the launch — it degrades to EMPTY.
+#[test]
+fn cached_layout_exposed_ports_garbled_layout_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("oci")).unwrap();
+    std::fs::write(tmp.path().join("oci").join("index.json"), b"{not json").unwrap();
+    let rootfs = tmp.path().join("rootfs.ext4");
+    std::fs::write(&rootfs, b"ext4").unwrap();
+    assert!(cached_layout_exposed_ports(&rootfs).is_empty());
+}
+
+/// An image that declares NO ports yields EMPTY (the 8080 default still applies
+/// downstream — unchanged backward compatibility).
+#[test]
+fn cached_layout_exposed_ports_no_expose_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rootfs = stage_cached_rootfs(tmp.path(), serde_json::json!({"Cmd": ["/app/server"]}));
+    assert!(cached_layout_exposed_ports(&rootfs).is_empty());
 }

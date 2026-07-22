@@ -1021,6 +1021,38 @@ pub fn exposed_tcp_ports(config: &oci_spec::image::ImageConfiguration) -> Vec<u1
     out
 }
 
+/// The image's `ExposedPorts` recovered from the OCI layout the CACHED rootfs was
+/// built from (`<rootfs dir>/oci`, written beside it by the converting build).
+///
+/// A rootfs cache hit skips the pull, so the launch never re-reads the image
+/// config and [`super::super::firecracker::port_plan::resolve_port_plan`] would
+/// fall through to the 8080 default — a respawn then probes 8080 on an app that
+/// serves, say, 8000, times out, and crash-loops until it is parked. Because the
+/// layout is a SIBLING of the cached rootfs, recovering the real candidates costs
+/// one local file read and no network.
+///
+/// Best-effort by design: an absent or garbled layout yields EMPTY, i.e. exactly
+/// the pre-existing fallback chain (`.app_port` companion, then 8080). A cache
+/// hit must never fail a launch over unreadable *metadata* when the rootfs it
+/// needs is present.
+#[must_use]
+pub fn cached_layout_exposed_ports(rootfs: &Path) -> Vec<u16> {
+    let Some(layout) = rootfs.parent().map(|dir| dir.join("oci")) else {
+        return Vec::new();
+    };
+    match read_oci_config_from_layout(&layout) {
+        Ok(config) => exposed_tcp_ports(&config),
+        Err(e) => {
+            tracing::debug!(
+                layout = %layout.display(),
+                error = %e,
+                "cached OCI layout unreadable; falling back to the persisted/default app port"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// POSIX single-quote a string so the `/bin/sh` running `/init` reads it back as
 /// a SINGLE literal token — no word-splitting, glob, `$`-expansion, or quote
 /// removal. The whole value is wrapped in single quotes; an embedded `'` is
@@ -2038,13 +2070,14 @@ pub async fn run_firecracker_build(
     let oras_cfg = registry_config_file;
 
     // The app's OWN declared candidate ports (ALL `ExposedPorts` TCP, tier 2 of
-    // `resolve_port_plan`), set whenever this launch READS the OCI config. On a
-    // config-read-LESS launch (a pre-pull rootfs cache hit) it stays EMPTY; the
-    // per-uuid `.app_port` companion persisted by an earlier launch's WINNING port
-    // recovers it so e.g. `FROM nginx` is probed on its real port on every respawn,
-    // not just the first deploy. Empty + no companion ⇒ the 8080 fallback
-    // (unchanged). Multiple candidates ⇒ the launch probes them all,
-    // first-answering-wins (see `resolve_port_plan` / `probe_first_answering`).
+    // `resolve_port_plan`). A launch that PULLS reads them from the fetched
+    // config; a pull-less rootfs cache hit recovers them from the OCI layout
+    // cached beside that rootfs (`cached_layout_exposed_ports`), so an app is
+    // probed on its real port on EVERY respawn, not just its first deploy. Only
+    // when neither source yields ports does the chain fall through to the
+    // `.app_port` companion and then the 8080 default (unchanged). Multiple
+    // candidates ⇒ the launch probes them all, first-answering-wins (see
+    // `resolve_port_plan` / `probe_first_answering`).
     let mut image_exposed_ports: Vec<u16> = Vec::new();
 
     // FAST PATH (digest-shared cache): resolve the IMMUTABLE digest WITHOUT
@@ -2069,16 +2102,23 @@ pub async fn run_firecracker_build(
         if let Some(rootfs) =
             lookup_cached_rootfs(data_dir, uuid, digest, globally_cacheable, &env_hash).await
         {
+            // The pull is skipped, but the OCI layout the rootfs was converted
+            // from sits NEXT TO it — read the app's declared ports back from
+            // there. Without this the plan fell through to the 8080 default and
+            // an app serving any other port crash-looped on every respawn (its
+            // `.app_port` companion only exists once a cold boot has completed
+            // under a supervisor that writes one, so it is not a reliable
+            // recovery path for apps deployed earlier). Empty (no layout / no
+            // EXPOSE) preserves the previous companion→8080 fallback exactly.
+            image_exposed_ports = cached_layout_exposed_ports(&rootfs);
             tracing::info!(
                 uuid,
                 digest,
                 %env_hash,
+                exposed_ports = ?image_exposed_ports,
                 "firecracker rootfs cache hit (pre-pull; uuid+digest+env/cap fingerprint all matched); skipping pull + conversion"
             );
-            // Config NOT read on this fast path → `image_exposed_ports` is still
-            // EMPTY; `launch_with_uuid` recovers the winning port from the
-            // `.app_port` companion an earlier launch persisted (else falls back to
-            // 8080). `digest` is the resolved (immutable) image identity → the
+            // `digest` is the resolved (immutable) image identity → the
             // `.snapshot_ref` stamp/match key, so a moved tag (`…:current`)
             // invalidates a stale warm snapshot.
             return launch_firecracker(
