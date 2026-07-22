@@ -81,8 +81,10 @@
 //!   truncated rootfs). A large image inflates both conversion time and the
 //!   on-disk cache.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -378,12 +380,24 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
 ///   - the cap-file NAMES (each written as a `/run/tabbify/caps/<name>` file),
 ///   - the cap-file VALUES, as blake3 digests (the file CONTENT baked by
 ///     `render_cap_files_init` — hashed so the fingerprint preimage never
-///     carries a raw secret byte-string).
+///     carries a raw secret byte-string),
+///   - the STATEFUL guest `data_mount` (the `/dev/vdb` mount line `render_init`
+///     bakes), when the app is stateful.
 ///
-/// The VALUE section is appended ONLY for a non-empty cap set, keeping the
-/// no-cap fingerprint byte-identical to the pre-value-aware scheme — ordinary
-/// apps keep their cached rootfs + snapshot stamps across the upgrade (pinned by
+/// The VALUE section is appended ONLY for a non-empty cap set, and the
+/// `data_mount` section ONLY for a stateful app, keeping the historical
+/// fingerprints byte-identical to the pre-value-aware scheme — ordinary apps
+/// keep their cached rootfs + snapshot stamps across the upgrade (pinned by
 /// `no_env_no_cap_fingerprint_is_the_stable_upgrade_constant`).
+///
+/// WHY the mount is a fingerprint input (the "silently inert `stateful`" trap):
+/// the mount line lives in `/init`, i.e. in the ROOTFS BYTES — but with an
+/// unchanged env/cap set, flipping `[runtime].stateful` on an app whose rootfs
+/// was already converted would HIT the per-uuid variant cache, skip
+/// `render_init` entirely (bypassing `stateful_data_mount`'s loud
+/// missing-mount error), and cold-boot the OLD no-mount rootfs with `/dev/vdb`
+/// attached but never mounted — writes keep landing on the ephemeral rootfs.
+/// Folding the mount in makes the flip MISS the cache and re-render `/init`.
 ///
 /// COST CONTRACT: value-awareness only pays off because cap values are STABLE
 /// across ensures when nothing rotated — `create_workspace` reuses the prior
@@ -394,6 +408,7 @@ async fn inject_init(staging: &Path, script: &str) -> Result<()> {
 pub fn rootfs_env_fingerprint(
     extra_env: Option<&std::collections::HashMap<String, String>>,
     cap_files: &[(String, String)],
+    data_mount: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     // Effective env, sorted by key (the SAME order `merge_extra_env` bakes it).
@@ -431,6 +446,14 @@ pub fn rootfs_env_fingerprint(
             hasher.update(blake3::hash(v.as_bytes()).as_bytes());
             hasher.update(b"\0");
         }
+    }
+    // Stateful `/dev/vdb` mount path baked into `/init` (`Some` IFF stateful).
+    // Appended ONLY when present so every historical non-stateful fingerprint
+    // stays byte-identical (no fleet-wide cache/snapshot invalidation).
+    if let Some(mount) = data_mount {
+        hasher.update(b"statefulmount\0");
+        hasher.update(mount.as_bytes());
+        hasher.update(b"\0");
     }
     // 16 hex chars (64 bits) — ample against collision for a per-uuid cache key,
     // and a compact single path segment.
@@ -480,16 +503,18 @@ pub fn split_env_and_caps(
 
 /// The `/init`-baked env fingerprint (#106) for a raw deploy `extra_env`, derived
 /// through the SAME [`split_env_and_caps`] the rootfs bake uses. This is the
-/// value that (a) the per-uuid rootfs cache key nests under, (b) the snapshot
-/// warm-restore gate stamps + checks (`snapshot::restore_matches`), and (c) the
-/// orchestrator compares to force a COLD rebuild when a deploy changes the
+/// value the orchestrator compares (old deploy env vs new deploy env, both
+/// through THIS function) to force a COLD rebuild when a deploy changes the
 /// env/cap set even though the image digest did not (a workspace `add_repo` /
 /// secret rotation, #108). Empty env + no caps yields a fixed constant, so an
 /// ordinary env-less deploy is stable across redeploys.
+///
+/// Deliberately EXCLUDES the stateful `data_mount` fingerprint section: this is
+/// an env-vs-env comparison for one app, and the mount comes from the MANIFEST,
+/// not the env — the runner (`run_firecracker_build` / `resolve_rootfs`), which
+/// holds the manifest, folds the mount into the real cache/snapshot fingerprint.
 #[must_use]
-pub fn effective_env_hash(
-    extra_env: Option<&std::collections::HashMap<String, String>>,
-) -> String {
+pub fn effective_env_hash(extra_env: Option<&std::collections::HashMap<String, String>>) -> String {
     let (effective_env, cap_files) = split_env_and_caps(extra_env);
     // `rootfs_env_fingerprint` treats `None` and an EMPTY map identically, so an
     // env-less deploy (`effective_env.is_empty()`) hashes the same either way —
@@ -500,7 +525,7 @@ pub fn effective_env_hash(
     } else {
         Some(&effective_env)
     };
-    rootfs_env_fingerprint(env_ref, &cap_files)
+    rootfs_env_fingerprint(env_ref, &cap_files, None)
 }
 
 /// On-disk cache path for an app's converted rootfs, keyed by the IMMUTABLE
@@ -650,7 +675,9 @@ async fn publish_rootfs_to_global(data_dir: &Path, digest: &str, built: &Path) {
         match tokio::fs::hard_link(built, &global).await {
             Ok(()) => tracing::info!(digest, "rootfs published to global digest cache"),
             Err(_) if global.is_file() => {} // concurrent publish won the race
-            Err(e) => tracing::warn!(digest, error = %e, "global rootfs publish failed (non-fatal)"),
+            Err(e) => {
+                tracing::warn!(digest, error = %e, "global rootfs publish failed (non-fatal)")
+            }
         }
     }
     evict_global_rootfs_cache(data_dir).await;
@@ -1286,12 +1313,19 @@ pub async fn resolve_rootfs(
     extra_env: Option<&std::collections::HashMap<String, String>>,
     cap_files: &[(String, String)],
 ) -> Result<PathBuf> {
+    // STATEFUL mount — resolved BEFORE the cache probe, for two reasons: (a) it
+    // is a fingerprint input (flipping `stateful`/`data_mount` must MISS the
+    // cache and re-render `/init`, or the old no-mount rootfs boots with
+    // /dev/vdb attached but never mounted); (b) `stateful_data_mount`'s hard
+    // error for stateful-without-mount must fire even on what would otherwise
+    // be a cache hit — never bypassed by a cached rootfs.
+    let data_mount = crate::firecracker::stateful::stateful_data_mount(&fetched.manifest.runtime)?;
     // Fingerprint the /init-baked env + cap-file names AND values so a changed
     // env, cap set, or ROTATED cap value on the SAME uuid+digest (a workspace
     // add_repo / forge rewrite / rotated forge-admin token) misses the cache and
     // re-bakes, instead of serving a stale rootfs (#106 + the stale-caps
     // invariant: a guest booted for declared cap values must hold THOSE values).
-    let env_hash = rootfs_env_fingerprint(extra_env, cap_files);
+    let env_hash = rootfs_env_fingerprint(extra_env, cap_files, data_mount);
     let cached = cached_rootfs_path(data_dir, uuid, digest, &env_hash);
     if rootfs_is_cached(data_dir, uuid, digest, &env_hash) {
         tracing::info!(
@@ -1306,8 +1340,9 @@ pub async fn resolve_rootfs(
     // fingerprint manifest against any cached sibling variant, so the log names
     // the exact differing component ("cap values rotated for [forge-admin.token]")
     // instead of a bare miss. Key names only; values never logged.
-    let wanted_manifest =
-        super::rootfs_variants::FingerprintManifest::compute(&env_hash, extra_env, cap_files);
+    let wanted_manifest = super::rootfs_variants::FingerprintManifest::compute(
+        &env_hash, extra_env, cap_files, data_mount,
+    );
     if let Some(digest_dir) = cached.parent().and_then(Path::parent) {
         super::rootfs_variants::log_cache_miss_attribution(
             uuid,
@@ -1348,13 +1383,10 @@ pub async fn resolve_rootfs(
         merge_extra_env(&mut exec.env, map);
     }
     // STATEFUL: bake a `/dev/vdb` mount into `/init` at the manifest's
-    // `[runtime].data_mount`. `stateful_data_mount` returns `None` for a
-    // non-stateful app (rootfs bytes byte-identical to today) and ERRORS for a
-    // stateful app that failed to declare a mount (else the disk attaches but is
-    // never mounted → writes lost on restart — fail the bake LOUDLY). The mount
-    // path is shell-quoted inside `render_init` via `sh_single_quote`.
-    let data_mount =
-        crate::firecracker::stateful::stateful_data_mount(&fetched.manifest.runtime)?;
+    // `[runtime].data_mount` (`data_mount` was resolved — and hard-validated —
+    // above, before the cache probe). `None` for a non-stateful app keeps the
+    // rootfs bytes byte-identical to today. The mount path is shell-quoted
+    // inside `render_init` via `sh_single_quote`.
     let init = render_init(&entry, cap_files, data_mount)?; // shell-form → clear error (D3)
     // Cap re-bake trace (names + destination only — a cap VALUE is a secret and
     // is NEVER logged): exactly which cap-files this conversion writes into the
@@ -1934,9 +1966,9 @@ pub async fn run_firecracker_build(
     // cap/token here would survive into every warm restore. FAIL the build loudly
     // (the spawn aborts; the API's async deploy handler then revokes caps).
     if is_workspace {
-        if let Err(key) = crate::firecracker::snapshot_decision::extra_env_is_snapshot_safe(
-            effective_env.keys(),
-        ) {
+        if let Err(key) =
+            crate::firecracker::snapshot_decision::extra_env_is_snapshot_safe(effective_env.keys())
+        {
             anyhow::bail!(
                 "workspace boot env carries a snapshot-forbidden key {key:?}; \
                  refusing to bake it into a Full snapshot (§4)"
@@ -1970,13 +2002,20 @@ pub async fn run_firecracker_build(
     let globally_cacheable =
         extra_env.is_none_or(|m| m.is_empty()) && !fetched.manifest.runtime.stateful;
 
-    // Fingerprint the /init-baked env + cap-file NAMES (#106) so the PER-UUID
-    // rootfs cache key includes it: a CHANGED env on a STABLE uuid (a workspace's
-    // add_repo / forge rewrite) then misses the cache and RE-BAKES instead of
-    // serving a stale `/init`. `resolve_rootfs` recomputes the SAME value from the
-    // same `(extra_env, cap_files)`; these pre-conversion probes must agree with
-    // it, so compute it ONCE here and thread it to every per-uuid cache call.
-    let env_hash = rootfs_env_fingerprint(extra_env, &cap_files);
+    // STATEFUL mount, resolved ONCE up front: it is a fingerprint input below,
+    // and `stateful_data_mount` hard-errors on stateful-without-mount — that
+    // must fail the build HERE, loudly, before any cache probe could serve a
+    // stale no-mount rootfs.
+    let data_mount = crate::firecracker::stateful::stateful_data_mount(&fetched.manifest.runtime)?;
+    // Fingerprint the /init-baked env + cap-file NAMES (#106) + the stateful
+    // mount so the PER-UUID rootfs cache key includes them: a CHANGED env on a
+    // STABLE uuid (a workspace's add_repo / forge rewrite) — or a flipped
+    // `stateful`/`data_mount` — then misses the cache and RE-BAKES instead of
+    // serving a stale `/init`. `resolve_rootfs` recomputes the SAME value from
+    // the same `(extra_env, cap_files, data_mount)`; these pre-conversion probes
+    // must agree with it, so compute it ONCE here and thread it to every
+    // per-uuid cache call.
+    let env_hash = rootfs_env_fingerprint(extra_env, &cap_files, data_mount);
 
     let reff = fetched
         .manifest
@@ -2043,8 +2082,19 @@ pub async fn run_firecracker_build(
             // `.snapshot_ref` stamp/match key, so a moved tag (`…:current`)
             // invalidates a stale warm snapshot.
             return launch_firecracker(
-                &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                &env_hash, &image_exposed_ports, digest, &cap_files,
+                &rootfs,
+                fetched,
+                fc,
+                uuid,
+                reff,
+                data_dir,
+                is_swap,
+                egress_allow,
+                is_workspace,
+                &env_hash,
+                &image_exposed_ports,
+                digest,
+                &cap_files,
             )
             .await;
         }
@@ -2084,8 +2134,19 @@ pub async fn run_firecracker_build(
                     publish_rootfs_to_global(data_dir, digest, &built).await;
                 }
                 return launch_firecracker(
-                    &built, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace,
-                    &env_hash, &image_exposed_ports, digest, &cap_files,
+                    &built,
+                    fetched,
+                    fc,
+                    uuid,
+                    reff,
+                    data_dir,
+                    is_swap,
+                    egress_allow,
+                    is_workspace,
+                    &env_hash,
+                    &image_exposed_ports,
+                    digest,
+                    &cap_files,
                 )
                 .await;
             }
@@ -2148,13 +2209,18 @@ pub async fn run_firecracker_build(
                 None
             };
             if let Some(linked) = global_hit {
-                tracing::info!(uuid, digest, "rootfs global-cache hit (post-pull); skipping conversion");
+                tracing::info!(
+                    uuid,
+                    digest,
+                    "rootfs global-cache hit (post-pull); skipping conversion"
+                );
                 linked
             } else {
                 let config = read_oci_config_from_layout(&layout)?;
                 image_exposed_ports = exposed_tcp_ports(&config);
                 let built = resolve_rootfs(
-                    uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env, &cap_files,
+                    uuid, fetched, &layout, &config, &digest, data_dir, runner, extra_env,
+                    &cap_files,
                 )
                 .await?;
                 if globally_cacheable {
@@ -2167,8 +2233,19 @@ pub async fn run_firecracker_build(
     };
 
     launch_firecracker(
-        &rootfs, fetched, fc, uuid, reff, data_dir, is_swap, egress_allow, is_workspace, &env_hash,
-        &image_exposed_ports, &resolved_digest, &cap_files,
+        &rootfs,
+        fetched,
+        fc,
+        uuid,
+        reff,
+        data_dir,
+        is_swap,
+        egress_allow,
+        is_workspace,
+        &env_hash,
+        &image_exposed_ports,
+        &resolved_digest,
+        &cap_files,
     )
     .await
 }

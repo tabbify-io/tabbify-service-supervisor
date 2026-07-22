@@ -2,13 +2,16 @@
 //! PID-1 init render).
 #![allow(clippy::unwrap_used)]
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-use super::oci_fixtures::{make_tar, write_min_oci_layout};
 use super::{
-    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, ext4_geometry,
-    exposed_tcp_ports, extract_layer_blob, measure_tree, merge_extra_env, render_init,
+    Entrypoint, FcBuildRunner, OciExec, build_rootfs_ext4, cached_rootfs_path, exposed_tcp_ports,
+    ext4_geometry, extract_layer_blob, measure_tree, merge_extra_env,
+    oci_fixtures::{make_tar, write_min_oci_layout},
+    render_init,
 };
 
 /// Parse an OCI `ImageConfiguration` from a JSON `config` object body (the
@@ -49,9 +52,8 @@ fn exposed_port_returns_all_sorted() {
 /// probes the port the app actually listens on, not just the base-inherited 80.
 #[test]
 fn exposed_port_base_inherited_plus_app_port_both_returned() {
-    let cfg = image_config_with(
-        serde_json::json!({ "ExposedPorts": { "80/tcp": {}, "8730/tcp": {} } }),
-    );
+    let cfg =
+        image_config_with(serde_json::json!({ "ExposedPorts": { "80/tcp": {}, "8730/tcp": {} } }));
     assert_eq!(exposed_tcp_ports(&cfg), vec![80, 8730]);
 }
 
@@ -75,9 +77,8 @@ fn exposed_port_udp_only_is_empty() {
 /// a UDP port numerically below the TCP one must NOT appear.
 #[test]
 fn exposed_port_mixed_tcp_udp_ignores_udp() {
-    let cfg = image_config_with(
-        serde_json::json!({ "ExposedPorts": { "53/udp": {}, "8080/tcp": {} } }),
-    );
+    let cfg =
+        image_config_with(serde_json::json!({ "ExposedPorts": { "53/udp": {}, "8080/tcp": {} } }));
     assert_eq!(exposed_tcp_ports(&cfg), vec![8080]);
 }
 
@@ -567,7 +568,7 @@ fn entrypoint_from_oci_classifies_exec_vs_shell_form() {
 /// dir (#106), so any test that stages or asserts a per-uuid cache path must key it
 /// by the SAME value `resolve_rootfs` computes internally for a no-env build.
 fn no_env_hash() -> String {
-    super::rootfs_env_fingerprint(None, &[])
+    super::rootfs_env_fingerprint(None, &[], None)
 }
 
 /// The cache path is keyed by the IMMUTABLE digest (sha256:…), not the tag,
@@ -620,21 +621,28 @@ fn cached_rootfs_path_differs_per_env_hash() {
     let d = Path::new("/data");
     let (uuid, digest) = ("ws-stable", "sha256:cafe");
 
-    let empty = super::rootfs_env_fingerprint(None, &[]);
+    let empty = super::rootfs_env_fingerprint(None, &[], None);
     let with_forge = super::rootfs_env_fingerprint(
         Some(&std::collections::HashMap::from([(
             "TABBIFY_FORGE_URL".to_owned(),
             "http://forge".to_owned(),
         )])),
         &[],
+        None,
     );
     // Adding a cap-file (an add_repo `<repo>.url`) must ALSO change the fingerprint
     // even though the effective env is unchanged — the add_repo case lives in the
     // cap-file NAME set, not in `extra_env`.
-    let with_repo =
-        super::rootfs_env_fingerprint(None, &[("tetris.url".to_owned(), "http://g".to_owned())]);
+    let with_repo = super::rootfs_env_fingerprint(
+        None,
+        &[("tetris.url".to_owned(), "http://g".to_owned())],
+        None,
+    );
 
-    assert_ne!(empty, with_forge, "an env change must change the fingerprint");
+    assert_ne!(
+        empty, with_forge,
+        "an env change must change the fingerprint"
+    );
     assert_ne!(
         empty, with_repo,
         "an add_repo cap-file must change the fingerprint (its NAME set changed)"
@@ -659,7 +667,8 @@ fn cached_rootfs_path_differs_per_env_hash() {
             digest,
             &super::rootfs_env_fingerprint(
                 None,
-                &[("tetris.url".to_owned(), "http://DIFFERENT".to_owned())]
+                &[("tetris.url".to_owned(), "http://DIFFERENT".to_owned())],
+                None,
             )
         ),
         "a rotated cap VALUE (same NAME set) must MISS the cache and re-bake"
@@ -675,7 +684,8 @@ fn cached_rootfs_path_differs_per_env_hash() {
             digest,
             &super::rootfs_env_fingerprint(
                 None,
-                &[("tetris.url".to_owned(), "http://g".to_owned())]
+                &[("tetris.url".to_owned(), "http://g".to_owned())],
+                None,
             )
         ),
         "an unchanged cap set (names AND values) must stay a cache HIT"
@@ -691,7 +701,10 @@ fn cached_rootfs_path_differs_per_env_hash() {
 /// change it only deliberately.
 #[test]
 fn no_env_no_cap_fingerprint_is_the_stable_upgrade_constant() {
-    assert_eq!(super::rootfs_env_fingerprint(None, &[]), "8446cf2637cdfecb");
+    assert_eq!(
+        super::rootfs_env_fingerprint(None, &[], None),
+        "8446cf2637cdfecb"
+    );
 }
 
 /// `split_env_and_caps` REMOVES the reserved `CAP_FILES_ENV` key from the
@@ -708,7 +721,10 @@ fn split_env_and_caps_extracts_cap_files() {
     let (eff, mut caps) = super::split_env_and_caps(Some(&env));
     // The reserved key is stripped; the ordinary var survives.
     assert!(!eff.contains_key(crate::api::CAP_FILES_ENV));
-    assert_eq!(eff.get("TABBIFY_FORGE_URL").map(String::as_str), Some("http://forge"));
+    assert_eq!(
+        eff.get("TABBIFY_FORGE_URL").map(String::as_str),
+        Some("http://forge")
+    );
     // The unsafe `../evil` name is dropped; the two safe caps remain.
     caps.sort();
     let names: Vec<&str> = caps.iter().map(|(n, _)| n.as_str()).collect();
@@ -730,7 +746,7 @@ fn effective_env_hash_matches_the_split_fingerprint() {
         (crate::api::CAP_FILES_ENV.to_owned(), caps_json.to_owned()),
     ]);
     let (eff, caps) = super::split_env_and_caps(Some(&env));
-    let manual = super::rootfs_env_fingerprint(Some(&eff), &caps);
+    let manual = super::rootfs_env_fingerprint(Some(&eff), &caps, None);
     assert_eq!(super::effective_env_hash(Some(&env)), manual);
 
     // An env-less deploy hashes to the same fixed constant either way.
@@ -952,7 +968,8 @@ async fn layout_cache_lookup_misses_cleanly() {
 async fn layout_cache_entry_without_index_is_a_miss() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path();
-    std::fs::create_dir_all(super::global_oci_layout_entry(data, "sha256:half").join("oci")).unwrap();
+    std::fs::create_dir_all(super::global_oci_layout_entry(data, "sha256:half").join("oci"))
+        .unwrap();
     assert!(
         super::lookup_global_layout(data, "sha256:half")
             .await
@@ -970,7 +987,12 @@ async fn layout_cache_publish_then_lookup_shares_inode() {
     let digest = "sha256:layoutbeef";
 
     // uuid-A's freshly-pulled layout (per-uuid work dir).
-    let src = data.join("apps").join("uuid-a").join("fc").join(".pull").join("oci");
+    let src = data
+        .join("apps")
+        .join("uuid-a")
+        .join("fc")
+        .join(".pull")
+        .join("oci");
     stage_fake_layout(&src);
 
     super::publish_layout_to_global(data, digest, "uuid-a", &src).await;
@@ -1006,7 +1028,12 @@ async fn layout_cache_publish_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path();
     let digest = "sha256:dup";
-    let src = data.join("apps").join("uuid-a").join("fc").join(".pull").join("oci");
+    let src = data
+        .join("apps")
+        .join("uuid-a")
+        .join("fc")
+        .join(".pull")
+        .join("oci");
     stage_fake_layout(&src);
 
     super::publish_layout_to_global(data, digest, "uuid-a", &src).await;
@@ -1040,9 +1067,12 @@ async fn layout_cache_eviction_bounds_entry_count() {
     );
 }
 
-use crate::fetcher::FetchedApp;
-use crate::manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime};
 use bytes::Bytes;
+
+use crate::{
+    fetcher::FetchedApp,
+    manifest::{AppManifest, AppMeta, Lifecycle, LifecycleMode, Routes, Runtime},
+};
 
 fn fc_fetched(digest: &str) -> FetchedApp {
     fc_fetched_ref(&format!("[fd5a::1]:5000/acme/vm@{digest}"))
@@ -1158,7 +1188,7 @@ async fn resolve_rootfs_rebakes_on_rotated_cap_value() {
     // Seed the per-uuid cache at the OLD value's fingerprint — the rootfs a
     // previous provision baked with the now-dead token.
     let old_caps = vec![("forge-admin.token".to_owned(), "OLD-DEAD-TOKEN".to_owned())];
-    let old_hash = super::rootfs_env_fingerprint(None, &old_caps);
+    let old_hash = super::rootfs_env_fingerprint(None, &old_caps, None);
     let stale = super::cached_rootfs_path(tmp.path(), "uuid-rot", digest, &old_hash);
     std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
     std::fs::write(&stale, b"\0").unwrap();
@@ -1191,7 +1221,15 @@ async fn resolve_rootfs_rebakes_on_rotated_cap_value() {
     // Re-provision with the ROTATED value (same cap NAME).
     let new_caps = vec![("forge-admin.token".to_owned(), "NEW-LIVE-TOKEN".to_owned())];
     let rootfs = super::resolve_rootfs(
-        "uuid-rot", &fetched, &layout, &config, digest, tmp.path(), &runner, None, &new_caps,
+        "uuid-rot",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
+        None,
+        &new_caps,
     )
     .await
     .unwrap();
@@ -1226,7 +1264,7 @@ async fn resolve_rootfs_cache_hit_with_unchanged_cap_values() {
     let fetched = fc_fetched(digest);
 
     let caps = vec![("forge-admin.token".to_owned(), "SAME-TOKEN".to_owned())];
-    let hash = super::rootfs_env_fingerprint(None, &caps);
+    let hash = super::rootfs_env_fingerprint(None, &caps, None);
     let cached = super::cached_rootfs_path(tmp.path(), "uuid-stable", digest, &hash);
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(&cached, b"\0").unwrap();
@@ -1248,7 +1286,15 @@ async fn resolve_rootfs_cache_hit_with_unchanged_cap_values() {
     });
 
     let rootfs = super::resolve_rootfs(
-        "uuid-stable", &fetched, &layout, &config, digest, tmp.path(), &runner, None, &caps,
+        "uuid-stable",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
+        None,
+        &caps,
     )
     .await
     .unwrap();
@@ -1257,6 +1303,155 @@ async fn resolve_rootfs_cache_hit_with_unchanged_cap_values() {
     assert!(
         !*called.lock().unwrap(),
         "no conversion may run when the cap set is unchanged (no rebuild churn)"
+    );
+}
+
+/// [`fc_fetched`] with the persistent-disk intent set — the record state after
+/// an operator flips `[runtime].stateful` (+ optionally `data_mount`).
+fn fc_fetched_stateful(digest: &str, data_mount: Option<&str>) -> FetchedApp {
+    let mut fetched = fc_fetched(digest);
+    fetched.manifest.runtime.stateful = true;
+    fetched.manifest.runtime.data_mount = data_mount.map(str::to_owned);
+    fetched
+}
+
+/// The stateful `data_mount` is a FINGERPRINT input: flipping it (with env and
+/// caps unchanged) must change the fingerprint, while `None` keeps the historical
+/// value bit-for-bit (no fleet-wide cache churn for non-stateful apps).
+#[test]
+fn stateful_mount_changes_the_fingerprint_with_env_and_caps_unchanged() {
+    let bare = super::rootfs_env_fingerprint(None, &[], None);
+    let mounted = super::rootfs_env_fingerprint(None, &[], Some("/var/lib/tabbify-forge"));
+    assert_ne!(
+        bare, mounted,
+        "flipping stateful must change the fingerprint or the per-uuid cache serves the old no-mount rootfs"
+    );
+    // A DIFFERENT mount path is a different fingerprint too.
+    assert_ne!(
+        mounted,
+        super::rootfs_env_fingerprint(None, &[], Some("/data/other"))
+    );
+    // Deterministic for an unchanged mount (stays a cache HIT across respawns).
+    assert_eq!(
+        mounted,
+        super::rootfs_env_fingerprint(None, &[], Some("/var/lib/tabbify-forge"))
+    );
+}
+
+/// TRAP B (the "silently inert `stateful`" trap), end-to-end through
+/// `resolve_rootfs`: an app whose rootfs was already converted NON-stateful is
+/// flipped to `stateful = true` with the SAME digest, env, and cap set. The
+/// per-uuid variant cache holds the old NO-MOUNT rootfs; before the fingerprint
+/// learned about `data_mount` this was a cache HIT — `render_init` never ran,
+/// the old rootfs booted with `/dev/vdb` attached but never mounted, and every
+/// write kept landing on the ephemeral rootfs. The flip must MISS the cache and
+/// re-bake an `/init` that mounts `/dev/vdb` at the declared path.
+#[tokio::test]
+async fn resolve_rootfs_stateful_flip_misses_cache_and_bakes_the_vdb_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:statefl0";
+
+    // Seed the per-uuid cache exactly where the PRE-flip (non-stateful) build
+    // landed: the no-env/no-cap/no-mount fingerprint.
+    let stale = super::cached_rootfs_path(tmp.path(), "uuid-st", digest, &no_env_hash());
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, b"\0").unwrap();
+
+    let layout_tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":[]}
+    });
+    let layout = write_min_oci_layout(layout_tmp.path(), &cfg, &[]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+
+    // Capture the staged `/init` at mkfs time to prove the mount line was baked.
+    let baked_init = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let baked_init2 = baked_init.clone();
+    let runner: super::FcBuildRunner = std::sync::Arc::new(move |argv: Vec<String>| {
+        if argv.first().map(String::as_str) == Some("mkfs.ext4") {
+            let staging = argv[argv.iter().position(|a| a == "-d").unwrap() + 1].clone();
+            let init = std::fs::read_to_string(std::path::Path::new(&staging).join("init"))
+                .unwrap_or_default();
+            *baked_init2.lock().unwrap() = init;
+        }
+        Box::pin(async { (true, Vec::new()) })
+    });
+
+    let fetched = fc_fetched_stateful(digest, Some("/var/lib/tabbify-forge"));
+    let rootfs = super::resolve_rootfs(
+        "uuid-st",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
+        None,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        rootfs, stale,
+        "flipping stateful must MISS the pre-flip cache variant (else the old no-mount rootfs is served)"
+    );
+    let init = baked_init.lock().unwrap().clone();
+    assert!(
+        !init.is_empty(),
+        "the flip must force a re-conversion (mkfs must run)"
+    );
+    assert!(
+        init.contains("mount -t ext4 /dev/vdb '/var/lib/tabbify-forge'"),
+        "the re-baked /init must mount /dev/vdb at the declared data_mount; got:\n{init}"
+    );
+}
+
+/// The loud-error half of TRAP B: `stateful = true` WITHOUT a `data_mount` must
+/// fail `resolve_rootfs` even when a cached rootfs variant would otherwise HIT —
+/// the pre-fix code only validated inside the conversion path, so a cache hit
+/// silently skipped the check and booted an unmounted-disk guest.
+#[tokio::test]
+async fn resolve_rootfs_stateful_without_mount_errors_even_on_a_would_be_cache_hit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let digest = "sha256:statefl1";
+
+    // A cached variant at the pre-flip fingerprint is present…
+    let stale = super::cached_rootfs_path(tmp.path(), "uuid-sm", digest, &no_env_hash());
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, b"\0").unwrap();
+
+    let layout_tmp = tempfile::tempdir().unwrap();
+    let cfg = serde_json::json!({
+        "architecture": super::host_oci_arch(), "os":"linux",
+        "config":{"Entrypoint":["/x"]},
+        "rootfs":{"type":"layers","diff_ids":[]}
+    });
+    let layout = write_min_oci_layout(layout_tmp.path(), &cfg, &[]);
+    let config = super::read_oci_config_from_layout(&layout).unwrap();
+    let runner: super::FcBuildRunner =
+        std::sync::Arc::new(|_argv: Vec<String>| Box::pin(async { (true, Vec::new()) }));
+
+    // …but the stateful-without-mount contract must still error loudly.
+    let fetched = fc_fetched_stateful(digest, None);
+    let err = super::resolve_rootfs(
+        "uuid-sm",
+        &fetched,
+        &layout,
+        &config,
+        digest,
+        tmp.path(),
+        &runner,
+        None,
+        &[],
+    )
+    .await
+    .expect_err("stateful without data_mount must fail the resolve, cache hit or not");
+    assert!(
+        err.to_string().contains("data_mount"),
+        "the error must name the missing declaration: {err}"
     );
 }
 
@@ -1473,8 +1668,10 @@ async fn run_fc_build_converts_on_cache_miss() {
 #[tokio::test]
 async fn run_fc_build_issues_no_docker_on_cache_miss() {
     use sha2::{Digest as _, Sha256};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let hexf = |b: &[u8]| format!("{:x}", Sha256::digest(b));
@@ -1503,8 +1700,14 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
 
     let server = MockServer::start().await;
     for (p, body) in [
-        (format!("/v2/acme/vm/manifests/{digest}"), manifest_bytes.clone()),
-        (format!("/v2/acme/vm/blobs/sha256:{config_hex}"), config_bytes.clone()),
+        (
+            format!("/v2/acme/vm/manifests/{digest}"),
+            manifest_bytes.clone(),
+        ),
+        (
+            format!("/v2/acme/vm/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        ),
         (format!("/v2/acme/vm/blobs/sha256:{layer_hex}"), l0.clone()),
     ] {
         Mock::given(method("GET"))
@@ -1584,8 +1787,10 @@ async fn run_fc_build_issues_no_docker_on_cache_miss() {
 #[tokio::test]
 async fn pull_oci_layout_produces_layout_over_http() {
     use sha2::{Digest as _, Sha256};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     let server = MockServer::start().await;
     let hex = |b: &[u8]| format!("{:x}", Sha256::digest(b));
@@ -1606,9 +1811,18 @@ async fn pull_oci_layout_produces_layout_over_http() {
     let manifest_hex = hex(&manifest_bytes);
 
     for (p, body) in [
-        (format!("/v2/acme/app/manifests/sha256:{manifest_hex}"), manifest_bytes.clone()),
-        (format!("/v2/acme/app/blobs/sha256:{config_hex}"), config.clone()),
-        (format!("/v2/acme/app/blobs/sha256:{layer_hex}"), layer.clone()),
+        (
+            format!("/v2/acme/app/manifests/sha256:{manifest_hex}"),
+            manifest_bytes.clone(),
+        ),
+        (
+            format!("/v2/acme/app/blobs/sha256:{config_hex}"),
+            config.clone(),
+        ),
+        (
+            format!("/v2/acme/app/blobs/sha256:{layer_hex}"),
+            layer.clone(),
+        ),
     ] {
         Mock::given(method("GET"))
             .and(path(p))
@@ -1626,7 +1840,10 @@ async fn pull_oci_layout_produces_layout_over_http() {
         .await
         .expect("resumable http pull must succeed");
     assert_eq!(layout, out.join("oci"), "layout dir is <out>/oci");
-    assert!(layout.join("oci-layout").is_file(), "oci-layout marker present");
+    assert!(
+        layout.join("oci-layout").is_file(),
+        "oci-layout marker present"
+    );
     assert!(layout.join("index.json").is_file(), "index.json present");
     let blobs = layout.join("blobs").join("sha256");
     for h in [&manifest_hex, &config_hex, &layer_hex] {
@@ -2270,8 +2487,10 @@ fn read_manifest_digest_from_layout_errors_on_empty_index() {
 async fn run_fc_build_authenticates_resolve_and_pull_for_tag_ref() {
     use base64::Engine as _;
     use sha2::{Digest as _, Sha256};
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let uuid = "uuid-tagref";
@@ -2305,8 +2524,14 @@ async fn run_fc_build_authenticates_resolve_and_pull_for_tag_ref() {
         base64::engine::general_purpose::STANDARD.encode(format!("x:{TOKEN}"))
     );
     for (p, body) in [
-        ("/v2/acme/vm/manifests/latest".to_owned(), manifest_bytes.clone()),
-        (format!("/v2/acme/vm/blobs/sha256:{config_hex}"), config_bytes.clone()),
+        (
+            "/v2/acme/vm/manifests/latest".to_owned(),
+            manifest_bytes.clone(),
+        ),
+        (
+            format!("/v2/acme/vm/blobs/sha256:{config_hex}"),
+            config_bytes.clone(),
+        ),
         (format!("/v2/acme/vm/blobs/sha256:{layer_hex}"), l0.clone()),
     ] {
         Mock::given(method("GET"))
@@ -2375,9 +2600,9 @@ async fn run_fc_build_authenticates_resolve_and_pull_for_tag_ref() {
         .find(|argv| argv.first().map(String::as_str) == Some("oras"))
         .expect("tag ref must be resolved before pull");
     assert!(
-        resolve.windows(2).any(|args| {
-            args[0] == "--registry-config" && args[1] == registry_config_file
-        }),
+        resolve
+            .windows(2)
+            .any(|args| { args[0] == "--registry-config" && args[1] == registry_config_file }),
         "oras resolve must use the runner registry config; got {resolve:?}"
     );
     assert!(
@@ -2498,7 +2723,10 @@ fn cap_files_init_is_empty_for_regular_apps() {
 
 #[test]
 fn cap_files_init_writes_0600_broker_owned_files() {
-    let files = vec![("app.url".to_owned(), "http://10.0.0.1:9000/git/abc".to_owned())];
+    let files = vec![(
+        "app.url".to_owned(),
+        "http://10.0.0.1:9000/git/abc".to_owned(),
+    )];
     let rendered = super::render_cap_files_init(&files);
     assert!(rendered.contains("mkdir -p /run/tabbify/caps"));
     assert!(rendered.contains("umask 077"));
@@ -2583,12 +2811,7 @@ fn render_init_mounts_data_disk_when_some_skips_when_none() {
     // is shell single-quoted in the emitted script (Task 6).
     let mount_path = "/var/lib/tabbify-forge";
     let quoted = format!("'{mount_path}'");
-    let init_some = render_init(
-        &Entrypoint::Exec(exec.clone()),
-        &[],
-        Some(mount_path),
-    )
-    .unwrap();
+    let init_some = render_init(&Entrypoint::Exec(exec.clone()), &[], Some(mount_path)).unwrap();
     assert!(
         init_some.contains(&format!("mkdir -p {quoted}")),
         "must emit mkdir -p for the (quoted) data mount path; got:\n{init_some}"

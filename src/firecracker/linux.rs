@@ -3,34 +3,43 @@
 
 #![cfg(target_os = "linux")]
 
-use std::fs::OpenOptions;
-use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
 #[cfg(test)]
 use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    fs::OpenOptions,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use http::Request;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
-
-use super::link_allocator::{LinkAllocation, LinkSlotAllocator, SERVING_LINK_SLOTS};
-use super::pidfile;
-use super::port_plan::{PortPlan, probe_first_answering, resolve_port_plan};
-use super::protocol::{
-    aux_drive_body, boot_source_body, instance_start_body, machine_config_body, network_iface_body,
-    pause_body, proxy_request, read_http_status, resolve_vcpus, resume_body, rootfs_drive_body,
-    snapshot_create_body, snapshot_load_body, workspace_or_resolved_port,
+use tokio::{
+    io::AsyncWriteExt,
+    net::UnixStream,
+    process::{Child, Command},
 };
-use super::snapshot;
-use super::{FcConfig, kvm_available};
-use crate::manifest::Runtime;
-use crate::runner::build::fc_sandbox::ensure_data_disk;
-use crate::runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth};
+
+use super::{
+    FcConfig, kvm_available,
+    link_allocator::{LinkAllocation, LinkSlotAllocator, SERVING_LINK_SLOTS},
+    pidfile,
+    port_plan::{PortPlan, probe_first_answering, resolve_port_plan},
+    protocol::{
+        aux_drive_body, boot_source_body, instance_start_body, machine_config_body,
+        network_iface_body, pause_body, proxy_request, read_http_status, resolve_vcpus,
+        resume_body, rootfs_drive_body, snapshot_create_body, snapshot_load_body,
+        workspace_or_resolved_port,
+    },
+    snapshot,
+};
+use crate::{
+    manifest::Runtime,
+    runner::build::fc_sandbox::ensure_data_disk,
+    runtime::{AppRuntime, BoxFut, BoxRespFut, ExitReason, RuntimeHealth},
+};
 
 /// How long to wait for the guest app's HTTP server to come up after boot.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -289,6 +298,12 @@ pub struct FirecrackerRuntime {
     /// process already holds these values via `RUNNER_EXTRA_ENV`; storing them
     /// here adds no new exposure. Values are never logged.
     cap_files: Vec<(String, String)>,
+    /// Does this VM own a live persistent data disk (`[runtime].stateful`)?
+    /// Gates `snapshot()`: a Full RAM snapshot of a stateful guest would later
+    /// warm-restore stale RAM over the live `/dev/vdb` = state rollback /
+    /// corruption, so the refresh is REFUSED loudly (the launch-side
+    /// `stateful_launch_gate` is the other half — it never restores one).
+    stateful: bool,
     /// Test-only injectable reachability probe. Production leaves this `None`
     /// and `health()` does a real HTTP GET to `guest_base`; tests substitute a
     /// closure via [`Self::with_probe_for_test`] so no real microVM is needed.
@@ -491,6 +506,7 @@ impl FirecrackerRuntime {
             env_hash: env_hash.map(str::to_owned),
             is_workspace,
             cap_files: cap_files.to_vec(),
+            stateful: data_disk.is_some(),
             #[cfg(test)]
             probe: None,
             #[cfg(test)]
@@ -763,6 +779,17 @@ impl FirecrackerRuntime {
                 },
             );
             let restore_token = super::cred_restore::read_restore_token(&cache_dir);
+            // STATEFUL GATE — decided FIRST, before any companion matching can
+            // vote. A stateful app must ALWAYS cold-boot: a warm restore rolls
+            // guest RAM back to the snapshot moment over the live `/dev/vdb`.
+            // The trap this closes: flipping `[runtime].stateful = true` on an
+            // app that already HAS a snapshot leaves that legacy snapshot fully
+            // digest+env-matched, so without the gate the flag was silently
+            // inert and the rollback kept happening.
+            let stateful_gate = super::snapshot_decision::stateful_launch_gate(
+                data_disk.is_some(),
+                decision.files_present,
+            );
             // Self-diagnosing warm-vs-cold verdict: every gate named, so the log
             // alone answers "why did this respawn go warm/cold?".
             tracing::info!(
@@ -775,14 +802,29 @@ impl FirecrackerRuntime {
                 snapshot_link_matched,
                 allocated_link_slot = allocation.slot,
                 is_workspace,
+                stateful = data_disk.is_some(),
                 cap_files = cap_files.len(),
                 "launch: warm-vs-cold decision inputs"
             );
-            let warm_viable = decision.warm_ok()
+            if stateful_gate.clear_legacy_snapshot {
+                tracing::warn!(
+                    uuid,
+                    "stateful app owns a LEGACY snapshot (taken before [runtime].stateful was set); deleting it — a warm restore would roll guest state back over the live /dev/vdb data disk"
+                );
+                snapshot::clear(&cache_dir);
+            }
+            let warm_viable = !stateful_gate.block_warm_restore
+                && decision.warm_ok()
                 && snapshot_link_matched
                 && (!needs_restore || restore_token.is_some());
-            let invalid_link = decision.files_present && !snapshot_link_matched;
-            let missing_restore_token = decision.warm_ok()
+            // Diagnosed only for NON-stateful launches: a stateful legacy
+            // snapshot was already deleted (and warned about) by the gate above,
+            // so these must not re-attribute that clear to a second cause.
+            let invalid_link = !stateful_gate.block_warm_restore
+                && decision.files_present
+                && !snapshot_link_matched;
+            let missing_restore_token = !stateful_gate.block_warm_restore
+                && decision.warm_ok()
                 && snapshot_link_matched
                 && needs_restore
                 && restore_token.is_none();
@@ -813,6 +855,10 @@ impl FirecrackerRuntime {
                     data_dir,
                     uuid,
                     is_workspace,
+                    // Structurally always false here (the stateful gate above
+                    // forces `warm_viable = false`); passed so the restore path
+                    // can hard-refuse if a future edit ever bypasses the gate.
+                    data_disk.is_some(),
                     cap_files,
                     restore_token.as_deref(),
                     needs_restore,
@@ -949,12 +995,24 @@ impl FirecrackerRuntime {
         data_dir: &Path,
         uuid: &str,
         is_workspace: bool,
+        stateful: bool,
         cap_files: &[(String, String)],
         restore_token: Option<&str>,
         needs_restore: bool,
     ) -> Result<Self> {
         if !kvm_available() {
             bail!("firecracker runtime requires Linux + /dev/kvm (/dev/kvm not R/W-openable)");
+        }
+        // HARD REFUSAL, not a fallback: the launch decision must never send a
+        // stateful app here (`stateful_launch_gate` forces cold). If it ever
+        // does, restoring frozen RAM over the live `/dev/vdb` would silently
+        // roll the app's state back — fail loudly instead; the caller's error
+        // path clears the snapshot and cold-boots with the disk attached.
+        if stateful {
+            bail!(
+                "BUG: warm-restore attempted for STATEFUL app {uuid} — a restore would roll guest \
+                 state back over the live /dev/vdb data disk; the launch gate must cold-boot it"
+            );
         }
 
         // Reap a stale FC left by a PRIOR restore of the same uuid BEFORE
@@ -1044,6 +1102,7 @@ impl FirecrackerRuntime {
             env_hash: std::fs::read_to_string(snapshot::env_path(cache_dir)).ok(),
             is_workspace,
             cap_files: cap_files.to_vec(),
+            stateful,
             #[cfg(test)]
             probe: None,
             #[cfg(test)]
@@ -1485,6 +1544,7 @@ impl FirecrackerRuntime {
             env_hash: None,
             is_workspace: false,
             cap_files: Vec::new(),
+            stateful: false,
             probe: Some(probe),
             scrub_base_override: None,
         }
@@ -1656,6 +1716,16 @@ impl AppRuntime for FirecrackerRuntime {
 
     fn snapshot<'a>(&'a self) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async move {
+            // HARD suppression (the enforcement half of `should_snapshot_on_cold_boot`'s
+            // `stateful` contract — "never re-taken via Cmd::Snapshot either"):
+            // a Full RAM snapshot of a stateful guest would later warm-restore
+            // stale RAM over the live /dev/vdb. Refuse loudly, never quietly.
+            if self.stateful {
+                anyhow::bail!(
+                    "refusing Cmd::Snapshot for a STATEFUL app: a RAM snapshot would later \
+                     warm-restore over the live /dev/vdb data disk (state rollback)"
+                );
+            }
             let Some(cache_dir) = self.snapshot_cache_dir.clone() else {
                 // No cache dir (bare launch / build VM): nothing to refresh.
                 return Ok(());

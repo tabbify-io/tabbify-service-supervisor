@@ -20,8 +20,7 @@
 //! Log hygiene: manifests and diffs carry key NAMES and value DIGESTS only.
 //! Raw env/cap values never reach a manifest, a diff, or a log line.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +47,12 @@ pub struct FingerprintManifest {
     pub env: BTreeMap<String, String>,
     /// Cap-files: name → 8-hex blake3(value). Same digest-only rule.
     pub cap_values: BTreeMap<String, String>,
+    /// The stateful `/dev/vdb` guest mount baked into `/init` (`Some` IFF the
+    /// app is stateful). A PATH, not a secret — stored verbatim so a cache miss
+    /// caused by flipping `stateful`/`data_mount` is attributed by name.
+    /// `serde(default)` so manifests written before the field existed still load.
+    #[serde(default)]
+    pub data_mount: Option<String>,
 }
 
 impl FingerprintManifest {
@@ -57,6 +62,7 @@ impl FingerprintManifest {
         fingerprint: &str,
         extra_env: Option<&std::collections::HashMap<String, String>>,
         cap_files: &[(String, String)],
+        data_mount: Option<&str>,
     ) -> Self {
         let env = extra_env
             .map(|m| {
@@ -73,6 +79,7 @@ impl FingerprintManifest {
             fingerprint: fingerprint.to_owned(),
             env,
             cap_values,
+            data_mount: data_mount.map(str::to_owned),
         }
     }
 
@@ -135,6 +142,7 @@ impl FingerprintManifest {
             caps_added,
             caps_removed,
             cap_values_rotated,
+            data_mount_changed: self.data_mount != wanted.data_mount,
         }
     }
 }
@@ -156,6 +164,9 @@ pub struct FingerprintDiff {
     /// Cap-file names whose VALUE rotated (the stale-caps incident class:
     /// a rotated `forge-admin.token` with an unchanged name set).
     pub cap_values_rotated: Vec<String>,
+    /// The stateful `/dev/vdb` guest mount differs (a `[runtime].stateful` /
+    /// `data_mount` flip — the "silently inert stateful" incident class).
+    pub data_mount_changed: bool,
 }
 
 impl FingerprintDiff {
@@ -168,6 +179,7 @@ impl FingerprintDiff {
             && self.caps_added.is_empty()
             && self.caps_removed.is_empty()
             && self.cap_values_rotated.is_empty()
+            && !self.data_mount_changed
     }
 }
 
@@ -188,6 +200,9 @@ impl std::fmt::Display for FingerprintDiff {
         push("cap-files added", &self.caps_added);
         push("cap-files removed", &self.caps_removed);
         push("cap values rotated for", &self.cap_values_rotated);
+        if self.data_mount_changed {
+            parts.push("stateful data_mount changed".to_owned());
+        }
         write!(f, "{}", parts.join("; "))
     }
 }
@@ -203,10 +218,14 @@ pub fn describe_env_change(
     let manifest_of = |env: Option<&std::collections::HashMap<String, String>>| {
         let (eff, caps) = super::firecracker::split_env_and_caps(env);
         let eff_ref = if eff.is_empty() { None } else { Some(&eff) };
+        // Env-vs-env diff for ONE app: the stateful mount (a manifest input, not
+        // an env input) is identical on both sides here, so pass `None` — mount
+        // changes are attributed by the runner's cache-miss path instead.
         FingerprintManifest::compute(
-            &super::firecracker::rootfs_env_fingerprint(eff_ref, &caps),
+            &super::firecracker::rootfs_env_fingerprint(eff_ref, &caps, None),
             eff_ref,
             &caps,
+            None,
         )
     };
     manifest_of(old_env).diff(&manifest_of(new_env)).to_string()
@@ -338,6 +357,7 @@ mod tests {
             "abcd1234abcd1234",
             Some(&env(&[("TABBIFY_FORGE_ORG", "t_acme")])),
             &[("forge-admin.token".to_owned(), "SECRET-VALUE".to_owned())],
+            Some("/var/lib/tabbify-forge"),
         );
         m.save(tmp.path());
         let loaded = FingerprintManifest::load(tmp.path()).expect("manifest loads back");
@@ -366,6 +386,7 @@ mod tests {
                 "forge-admin.token".to_owned(),
                 "OLD-SECRET-TOKEN".to_owned(),
             )],
+            None,
         );
         let new = FingerprintManifest::compute(
             "bbbbbbbbbbbbbbbb",
@@ -374,6 +395,7 @@ mod tests {
                 "forge-admin.token".to_owned(),
                 "NEW-SECRET-TOKEN".to_owned(),
             )],
+            None,
         );
         old.save(tmp.path());
         let on_disk = std::fs::read_to_string(tmp.path().join(FINGERPRINT_MANIFEST)).unwrap();
@@ -399,6 +421,7 @@ mod tests {
                 ("app.url".to_owned(), "http://g/1".to_owned()),
                 ("dead.cap".to_owned(), "x".to_owned()),
             ],
+            None,
         );
         let new = FingerprintManifest::compute(
             "bbbbbbbbbbbbbbbb",
@@ -407,6 +430,7 @@ mod tests {
                 ("app.url".to_owned(), "http://g/2".to_owned()),
                 ("fresh.cap".to_owned(), "y".to_owned()),
             ],
+            None,
         );
         let d = old.diff(&new);
         assert_eq!(d.env_added, vec!["BORN"]);
@@ -416,6 +440,56 @@ mod tests {
         assert_eq!(d.caps_removed, vec!["dead.cap"]);
         assert_eq!(d.cap_values_rotated, vec!["app.url"]);
         assert!(!d.is_empty());
+        assert!(!d.data_mount_changed, "no stateful flip in this fixture");
+    }
+
+    /// Flipping `[runtime].stateful` (mount `None` → `Some`) — with the env and
+    /// cap set UNCHANGED — must be a named, non-empty diff. This is the cache-miss
+    /// attribution for the "silently inert stateful" trap: the old cached rootfs
+    /// has no `/dev/vdb` mount line, so the re-bake must be explainable from the
+    /// log alone.
+    #[test]
+    fn diff_attributes_a_stateful_mount_flip() {
+        let caps = [("forge-admin.token".to_owned(), "tok".to_owned())];
+        let e = env(&[("KEEP", "same")]);
+        let old = FingerprintManifest::compute("aaaaaaaaaaaaaaaa", Some(&e), &caps, None);
+        let new = FingerprintManifest::compute(
+            "bbbbbbbbbbbbbbbb",
+            Some(&e),
+            &caps,
+            Some("/var/lib/tabbify-forge"),
+        );
+        let d = old.diff(&new);
+        assert!(d.data_mount_changed);
+        assert!(
+            !d.is_empty(),
+            "a mount flip alone must not read as 'no component differs'"
+        );
+        assert!(d.to_string().contains("stateful data_mount changed"));
+        // And a CHANGED mount path (Some → different Some) is attributed too.
+        let moved = FingerprintManifest::compute(
+            "cccccccccccccccc",
+            Some(&e),
+            &caps,
+            Some("/data/elsewhere"),
+        );
+        assert!(new.diff(&moved).data_mount_changed);
+    }
+
+    /// A manifest persisted BEFORE the `data_mount` field existed still loads
+    /// (serde default) and diffs cleanly against a mount-less build.
+    #[test]
+    fn pre_data_mount_manifest_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(FINGERPRINT_MANIFEST),
+            br#"{"fingerprint":"aaaaaaaaaaaaaaaa","env":{},"cap_values":{}}"#,
+        )
+        .unwrap();
+        let loaded = FingerprintManifest::load(tmp.path()).expect("legacy manifest loads");
+        assert_eq!(loaded.data_mount, None);
+        let same = FingerprintManifest::compute("aaaaaaaaaaaaaaaa", None, &[], None);
+        assert!(loaded.diff(&same).is_empty());
     }
 
     /// `describe_env_change` goes through the SAME `split_env_and_caps` the bake
