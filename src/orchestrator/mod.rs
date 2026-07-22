@@ -334,6 +334,15 @@ impl Orchestrator {
         let records = RunnerHandle::list(&self.runner_dir)?;
         let mut summary = ReadoptSummary::default();
 
+        // Which runners arrive WITHOUT a WireGuard port. Captured before the
+        // reconcile pass because adoption backfills the record in place, so
+        // afterwards every record carries one and the distinction is gone.
+        let arrived_portless: std::collections::HashSet<String> = records
+            .iter()
+            .filter(|r| r.wg_listen_port.is_none())
+            .map(|r| r.uuid.clone())
+            .collect();
+
         for record in records {
             match self.reconcile_record(&record).await {
                 RecordOutcome::Adopted => summary.adopted.push(record.uuid),
@@ -357,6 +366,29 @@ impl Orchestrator {
             respawned_uuids = ?summary.respawned,
             "re-adopted runner fleet on startup"
         );
+
+        // An ADOPTED runner keeps the port it bound at spawn, so a fleet that was
+        // adopted rather than respawned is still sharing the joiner default even
+        // though every record now carries a port. That state is invisible unless
+        // we say so — it is exactly what made the first rollout look complete
+        // while changing nothing. Names the count and the remedy.
+        // ADOPTED (not respawned) + arrived without a port ⇒ the record now has one
+        // but the live process is still on whatever it bound before, i.e. the
+        // shared default. A respawned runner already came up on its new port.
+        let pending = summary
+            .adopted
+            .iter()
+            .filter(|uuid| arrived_portless.contains(*uuid))
+            .count();
+        if pending > 0 {
+            tracing::warn!(
+                pending_restart = pending,
+                "adopted runners are still on the shared WireGuard default port; \
+                 each has been assigned its own port but only re-binds it on its \
+                 NEXT restart. Direct connectivity cannot converge for these until \
+                 they are restarted."
+            );
+        }
 
         // F2.2 (audit #93): on startup — especially after a supervisor crash-loop
         // during which NOTHING reaped FCs left by prior runner deaths — sweep for
