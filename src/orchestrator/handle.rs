@@ -139,6 +139,22 @@ pub struct RunnerHandle {
     /// loading — they get `false` (never stopped).
     #[serde(default)]
     pub stopped: bool,
+    /// This runner's OWN WireGuard listen port, allocated once from the per-host
+    /// pool ([`crate::orchestrator::wg_port`]) and PERSISTED so every respawn
+    /// re-binds the SAME port.
+    ///
+    /// Without a per-runner port every joiner takes the `51820` default and, in
+    /// the old socket setup, they all bound it successfully — Linux then split
+    /// inbound WireGuard across the co-resident sockets, so a handshake response
+    /// reached its rightful owner roughly 1-in-N of the time. Persisting (rather
+    /// than re-picking) keeps the advertised endpoint stable across respawn, so
+    /// peers' cached dial targets and any port-preserving NAT mapping stay valid.
+    ///
+    /// `#[serde(default)]` keeps old on-disk records loading — they get `None`,
+    /// which spawns without an explicit port exactly as before; the next respawn
+    /// backfills one.
+    #[serde(default)]
+    pub wg_listen_port: Option<u16>,
 }
 
 /// Returns the path at which `uuid`'s record is stored inside `dir`.
@@ -268,6 +284,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }
@@ -289,6 +306,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }

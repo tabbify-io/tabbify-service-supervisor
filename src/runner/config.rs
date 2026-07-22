@@ -80,6 +80,16 @@ pub struct RunnerConfig {
     )]
     pub relay_only: bool,
 
+    /// This runner's OWN WireGuard listen port, allocated from the supervisor's
+    /// per-host pool and forwarded as `--mesh-listen-port`; the `env=` fallback
+    /// also picks up an inherited `TABBIFY_MESH_LISTEN_PORT`.
+    ///
+    /// Co-resident joiners MUST NOT share a port: inbound WireGuard is then
+    /// split between their sockets and handshake responses land on the wrong
+    /// session. `None` falls back to the joiner default, which is that case.
+    #[arg(long = "mesh-listen-port", env = "TABBIFY_MESH_LISTEN_PORT")]
+    pub listen_port: Option<u16>,
+
     /// S3 base URL for anonymous artifact fetch (overridable for tests).
     #[arg(long, env = "RUNNER_S3_BASE_URL", default_value = DEFAULT_S3_BASE_URL)]
     pub s3_base_url: String,

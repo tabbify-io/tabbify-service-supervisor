@@ -26,6 +26,9 @@ pub fn serve_config_from(cfg: &RunnerConfig) -> ServeConfig {
         coordinator_url: cfg.coordinator_url.clone(),
         relay_url: cfg.relay_url.clone(),
         relay_only: cfg.relay_only,
+        // The supervisor-allocated WireGuard port (`--mesh-listen-port`), carried
+        // through to the joiner so co-resident runners never share one.
+        wg_listen_port: cfg.listen_port,
         // Use the served app's UUID as the mesh display name so the runner is
         // identifiable in the coordinator roster.
         display_name: format!("tabbify-runner:{}", cfg.uuid),

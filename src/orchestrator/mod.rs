@@ -30,6 +30,7 @@ pub mod manifest_retention;
 pub mod monitor;
 pub mod restart;
 pub mod spawn;
+pub mod wg_port;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -124,6 +125,10 @@ impl SharedRunnerConfig {
             // Forward the relay-only declaration so a respawned runner also
             // declares no reachable direct endpoint (handshake over the relay).
             relay_only: self.relay_only,
+            // Reuse the runner's PERSISTED WireGuard port so a respawn re-binds
+            // the SAME port: peers' cached dial targets and any port-preserving
+            // NAT mapping stay valid across the restart.
+            wg_listen_port: record.wg_listen_port,
             // Respawn on the same deployed version the record was last at.
             image_ref: record.image_ref.clone(),
             // Reuse the PERSISTED managed `tabbify.toml` so a RESPAWN-from-record
@@ -447,6 +452,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }
@@ -578,6 +584,33 @@ mod tests {
             spec.relay_only,
             "a relay-only supervisor must forward relay_only to its runners"
         );
+    }
+
+    /// A RESPAWN re-binds the record's PERSISTED WireGuard port.
+    ///
+    /// This is what makes the advertised endpoint stable: peers cache a dial
+    /// target and a port-preserving NAT keys its mapping on the source port, so a
+    /// respawn that moved ports would strand every peer until the next heartbeat.
+    #[test]
+    fn spawn_spec_for_reuses_the_records_wg_port() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.wg_listen_port = Some(51_837);
+        assert_eq!(
+            cfg.spawn_spec_for(&rec).wg_listen_port,
+            Some(51_837),
+            "a respawn must re-bind the SAME port the record holds"
+        );
+    }
+
+    /// A pre-allocation record (no port) respawns without one — the field is
+    /// additive, never a hard requirement.
+    #[test]
+    fn spawn_spec_for_tolerates_a_record_without_a_wg_port() {
+        let cfg = shared();
+        let mut rec = record();
+        rec.wg_listen_port = None;
+        assert!(cfg.spawn_spec_for(&rec).wg_listen_port.is_none());
     }
 
     /// A record with no parent reconstructs a parent-less spec (standalone).

@@ -171,6 +171,12 @@ pub struct ServeConfig {
     /// NAT/firewall with the supervisor). `false` (the default) keeps direct +
     /// hole-punch traversal.
     pub relay_only: bool,
+    /// This runner's OWN WireGuard listen port (`TABBIFY_MESH_LISTEN_PORT`,
+    /// forwarded by the supervisor as `--mesh-listen-port`), allocated from the
+    /// supervisor's per-host pool. [`build_runner_join_config`] sets
+    /// `JoinConfig.listen_port` from it so the joiner binds a port no co-resident
+    /// joiner shares. NOT the app's HTTP listener ([`Self::port`]).
+    pub wg_listen_port: Option<u16>,
     /// Human-readable display name advertised to the coordinator (mesh mode).
     pub display_name: String,
     /// ULA of the parent supervisor that spawned this runner, declared on the
@@ -759,6 +765,11 @@ pub fn build_runner_join_config(cfg: &ServeConfig) -> mesh_joiner::JoinConfig {
         // direct endpoint behind the host's NAT/firewall). `false` keeps direct +
         // hole-punch traversal, unchanged.
         relay_only: cfg.relay_only,
+        // This runner's OWN WireGuard port from the supervisor's per-host pool.
+        // The joiner binds it and advertises the port it actually bound, so a
+        // distinct port here is what makes inbound WireGuard land on the right
+        // co-resident joiner.
+        listen_port: cfg.wg_listen_port,
         // Report the runner's version (= the supervisor's binary, same image) to
         // the roster — matches how the supervisor sets its own in main.rs, so
         // runners stop showing `software_version = null` in the admin.
@@ -796,6 +807,7 @@ mod tests {
             coordinator_url: "http://10.0.0.1:8888".to_owned(),
             relay_url: None,
             relay_only: false,
+            wg_listen_port: None,
             display_name: "runner-test".to_owned(),
             parent: Some("fd5a:1f00:0:3::1".to_owned()),
             port: 8730,
@@ -892,6 +904,30 @@ mod tests {
             join.relay_only,
             "relay_only=true must ride onto the runner's JoinConfig"
         );
+    }
+
+    /// The supervisor-allocated WireGuard port rides onto the runner's
+    /// `JoinConfig.listen_port` — the port the joiner actually binds AND (via
+    /// `local_addr()`) the port it advertises. If this wiring breaks, every
+    /// runner silently falls back to the shared `51820` default.
+    #[test]
+    fn runner_join_config_wires_the_wg_listen_port() {
+        let mut cfg = mesh_cfg();
+        cfg.wg_listen_port = Some(51_837);
+        assert_eq!(
+            build_runner_join_config(&cfg).listen_port,
+            Some(51_837),
+            "the allocated port must reach the joiner's JoinConfig"
+        );
+    }
+
+    /// No allocated port leaves `listen_port` unset, so the joiner keeps its own
+    /// default — the pre-allocation behavior, unchanged.
+    #[test]
+    fn runner_join_config_omits_an_unallocated_wg_listen_port() {
+        let mut cfg = mesh_cfg();
+        cfg.wg_listen_port = None;
+        assert!(build_runner_join_config(&cfg).listen_port.is_none());
     }
 
     /// The default `relay_only` (false) leaves the runner's `JoinConfig.relay_only`

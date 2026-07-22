@@ -1490,7 +1490,14 @@ impl Orchestrator {
         killed_pid: Option<u32>,
         new_restart: RestartState,
     ) -> RecordOutcome {
-        let spec = self.shared.spawn_spec_for(record);
+        let mut spec = self.shared.spawn_spec_for(record);
+        // BACKFILL: a record written before per-runner WireGuard ports existed
+        // carries none, and the monitor is the path most such records take back
+        // up. Without this they would keep sharing `51820` indefinitely.
+        if spec.wg_listen_port.is_none() {
+            spec.wg_listen_port =
+                crate::orchestrator::wg_port::port_for_runner(&self.runner_dir, &record.uuid);
+        }
         match spawn_runner(&spec, &self.runner_dir).await {
             Ok((mut new_handle, _child)) => {
                 // Merge the bumped restart state into the fresh record before
@@ -1946,6 +1953,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }
@@ -2362,6 +2370,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }
