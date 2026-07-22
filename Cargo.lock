@@ -2304,7 +2304,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-fabric"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=250ec1a#250ec1adeef248114e6e891831c205a57c430bfa"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=1cb7888#1cb78881a5682656838d2acf9958d106ed726583"
 dependencies = [
  "async-trait",
  "boringtun",
@@ -2321,7 +2321,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-joiner"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=250ec1a#250ec1adeef248114e6e891831c205a57c430bfa"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=1cb7888#1cb78881a5682656838d2acf9958d106ed726583"
 dependencies = [
  "anyhow",
  "base64",
@@ -2352,7 +2352,7 @@ dependencies = [
 [[package]]
 name = "tabbify-mesh-log"
 version = "0.1.0"
-source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=250ec1a#250ec1adeef248114e6e891831c205a57c430bfa"
+source = "git+https://github.com/tabbify-io/tabbify-service-mesh.git?rev=1cb7888#1cb78881a5682656838d2acf9958d106ed726583"
 dependencies = [
  "tracing",
  "tracing-subscriber",
