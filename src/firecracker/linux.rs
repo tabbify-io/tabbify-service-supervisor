@@ -621,9 +621,10 @@ impl FirecrackerRuntime {
     ///    `uuid:reff`-derived, distinct from the old VM's, so they coexist.
     ///
     /// `image_exposed_ports` — the app's OWN declared candidate ports (ALL OCI
-    /// `ExposedPorts` TCP, tier 2 of [`resolve_port_plan`]) when THIS launch read
-    /// the image config; EMPTY on a config-read-less cache-hit launch, where the
-    /// WINNING port is recovered from the `.app_port` companion a prior launch
+    /// `ExposedPorts` TCP, tier 2 of [`resolve_port_plan`]), read from the image
+    /// config this launch pulled OR recovered from the OCI layout cached beside a
+    /// hit rootfs. EMPTY only when neither source has them, in which case the
+    /// WINNING port falls back to the `.app_port` companion a prior launch
     /// persisted. When more than one candidate is present the cold boot probes them
     /// ALL (first-answering-wins) and adopts the answering port for `guest_base` so
     /// the readiness probe + proxy target the port the app really listens on.
