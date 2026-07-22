@@ -100,7 +100,7 @@ fn resolve_join_token(metadata_token: Option<String>) -> Option<String> {
 /// supervisor exited with a bare `coordinator http status 401: "join token
 /// invalid or revoked"`, giving no hint that the fix is re-minting the token in
 /// `/etc/tabbify/supervisor.env`. Kept as a `const` so the wording is testable.
-pub const JOIN_401_GUIDANCE: &str = "join rejected (HTTP 401): the join token is expired or revoked — re-mint via admin 'Add a node' and update /etc/tabbify/supervisor.env (TABBIFY_JOIN_TOKEN=<jwt>), then `systemctl restart tabbify-supervisor`";
+pub const JOIN_401_GUIDANCE: &str = "join rejected (HTTP 401): the join token is expired or revoked. This box should renew its own token: set TABBIFY_RENEWAL_SECRET in /etc/tabbify/supervisor.env to an identity-bound credential (auth: POST /v1/tokens/renewal-credentials) and restart — a reachable renewal endpoint makes this self-healing on every boot. Without one, re-mint by hand via admin 'Add a node' and update TABBIFY_JOIN_TOKEN, then `systemctl restart tabbify-supervisor`";
 
 /// Wrap a failed `Joiner::join` so an authentication failure is self-explaining.
 ///
@@ -168,6 +168,16 @@ impl MeshMembership {
         stun_server: Option<SocketAddr>,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
+        // Self-mint BEFORE joining. The coordinator revokes a peer's token on
+        // every recreate, so the static `TABBIFY_JOIN_TOKEN` a rebuilt box holds
+        // is usually already dead — which is what made a recreated supervisor
+        // need a human. An explicit metadata token still wins (that path is
+        // deliberate, not a fallback), and a box with no renewal credential
+        // behaves exactly as before.
+        let mut metadata = metadata;
+        if metadata.join_token.is_none() {
+            metadata.join_token = crate::mesh_self_mint::self_minted_join_token().await;
+        }
         let config = build_supervisor_join_config(
             coordinator_url,
             display_name,
