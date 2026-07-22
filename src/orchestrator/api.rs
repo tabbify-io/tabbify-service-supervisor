@@ -189,6 +189,61 @@ impl Orchestrator {
         Ok(derive_app_ula(parsed))
     }
 
+    /// This runner's WireGuard listen port: the one it already holds, or the
+    /// lowest free port in the per-host pool.
+    ///
+    /// STABILITY FIRST: if `uuid` already has a record carrying a port, that port
+    /// is returned unchanged, so a respawn re-binds the same one and peers' cached
+    /// dial targets stay valid. Only a runner with no port yet draws a new one,
+    /// and then only from the ports no OTHER record holds.
+    ///
+    /// Returns `None` when the record directory cannot be read or the pool is
+    /// exhausted — the spawn then proceeds WITHOUT an explicit port (the joiner
+    /// default). That is the pre-existing behavior, so a failure here degrades to
+    /// today rather than blocking the app from starting.
+    fn wg_port_for_uuid(&self, uuid: &str) -> Option<u16> {
+        let records = match RunnerHandle::list(self.runner_dir()) {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!(
+                    %uuid,
+                    error = %e,
+                    "could not read runner records to allocate a WireGuard port; \
+                     spawning on the joiner default (co-resident joiners may collide)"
+                );
+                return None;
+            }
+        };
+        // Already assigned -> reuse verbatim.
+        if let Some(port) = records
+            .iter()
+            .find(|r| r.uuid == uuid)
+            .and_then(|r| r.wg_listen_port)
+        {
+            tracing::debug!(%uuid, port, "reusing this runner's persisted WireGuard port");
+            return Some(port);
+        }
+        // Otherwise take the lowest port no OTHER runner holds.
+        let taken: Vec<u16> = records
+            .iter()
+            .filter(|r| r.uuid != uuid)
+            .filter_map(|r| r.wg_listen_port)
+            .collect();
+        let port = crate::orchestrator::wg_port::allocate_wg_port(&taken);
+        match port {
+            Some(port) => tracing::info!(
+                %uuid, port, peers = taken.len(),
+                "allocated a WireGuard port for this runner"
+            ),
+            None => tracing::error!(
+                %uuid, peers = taken.len(),
+                "WireGuard port pool exhausted; spawning on the joiner default \
+                 (this runner will share a port and lose inbound handshakes)"
+            ),
+        }
+        port
+    }
+
     /// Build the [`SpawnSpec`] for `uuid` from this orchestrator's shared config
     /// plus the derived control socket. The runner's `parent` comes from the
     /// shared config's notion of the supervisor's own ULA (currently `None` for
@@ -211,6 +266,9 @@ impl Orchestrator {
             // coordinator it has no reachable direct endpoint (handshake over the
             // relay behind the host's shared NAT/firewall).
             relay_only: shared.relay_only,
+            // Give this runner its OWN WireGuard port so its joiner does not
+            // share one with the supervisor or any sibling runner.
+            wg_listen_port: self.wg_port_for_uuid(uuid),
             // A fresh start (no deploy yet) builds from the S3 manifest.
             image_ref: None,
             // A plain start carries no managed config; `deploy_app` overrides it
@@ -1989,6 +2047,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -2071,6 +2130,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -2283,6 +2343,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -2456,6 +2517,7 @@ mod tests {
             extra_env,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }
@@ -2820,6 +2882,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -2958,6 +3021,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir).unwrap();
@@ -3158,6 +3222,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -3232,6 +3297,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -3340,6 +3406,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir.path()).unwrap();
@@ -3419,6 +3486,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(dir).unwrap();
@@ -3947,6 +4015,7 @@ mod tests {
             ),
             egress_allow: Some(vec!["api.telegram.org".to_owned()]),
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
         rec.save(runner_dir).unwrap();

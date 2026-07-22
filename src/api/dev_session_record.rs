@@ -340,6 +340,7 @@ mod tests {
             extra_env,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         }
     }

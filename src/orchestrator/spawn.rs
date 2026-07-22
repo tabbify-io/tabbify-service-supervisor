@@ -79,6 +79,11 @@ pub struct SpawnSpec {
     /// handshake converges over the relay. `false` (the default) keeps direct +
     /// hole-punch traversal.
     pub relay_only: bool,
+    /// This runner's OWN WireGuard listen port, forwarded as
+    /// `--mesh-listen-port <port>` when `Some` so the runner's joiner binds a
+    /// port no co-resident joiner shares. `None` falls back to the joiner's own
+    /// default (`51820`) — kept only for records written before ports existed.
+    pub wg_listen_port: Option<u16>,
     /// OCI image ref of the last successful deploy, forwarded to the runner as
     /// `--image-ref <ref>` so a respawn comes up on the deployed version (the
     /// runner applies it to the manifest's `registry_ref`). `None` (the default)
@@ -187,6 +192,15 @@ fn build_args(spec: &SpawnSpec) -> Vec<OsString> {
     // authoritative pass-through from the supervisor.
     if spec.relay_only {
         args.push("--mesh-relay-only".into());
+    }
+    // Forward this runner's OWN WireGuard listen port so its joiner binds a port
+    // no co-resident joiner shares. Omitted when `None` (a pre-allocation
+    // record), which leaves the joiner on its `51820` default. The runner ALSO
+    // reads `TABBIFY_MESH_LISTEN_PORT` via clap `env=`, but the explicit arg is
+    // the authoritative pass-through from the supervisor that owns the pool.
+    if let Some(port) = spec.wg_listen_port {
+        args.push("--mesh-listen-port".into());
+        args.push(port.to_string().into());
     }
     // Forward the deployed image ref so a respawn comes up on that version.
     if let Some(image_ref) = &spec.image_ref {
@@ -378,6 +392,10 @@ pub async fn spawn_runner(spec: &SpawnSpec, runner_dir: &Path) -> Result<(Runner
         // so old on-disk records (which may carry a `requested_runtime`) still
         // deserialize; it is inert and never read for dispatch.
         requested_runtime: None,
+        // Persist the WireGuard port this runner was spawned on so every later
+        // respawn re-binds the SAME one (stable advertised endpoint). Mirrors
+        // `spec.wg_listen_port` exactly: what we forwarded is what we record.
+        wg_listen_port: spec.wg_listen_port,
         // Persist the tenant network slug so a respawn rejoins the same network
         // (`--network <slug>`). `None` on a fresh/unscoped spawn = today's
         // behavior.
@@ -563,6 +581,7 @@ mod tests {
             no_mesh: true,
             relay_url: None,
             relay_only: false,
+            wg_listen_port: None,
             image_ref: None,
             manifest_toml: None,
             network: None,
@@ -731,6 +750,47 @@ mod tests {
         assert!(
             !joined.iter().any(|a| a == "--mesh-relay-only"),
             "no --mesh-relay-only when false; got: {joined:?}"
+        );
+    }
+
+    /// An allocated WireGuard port reaches the runner as
+    /// `--mesh-listen-port <port>`, adjacent and in that order.
+    ///
+    /// This arg is the whole delivery mechanism for per-runner ports: if it does
+    /// not reach the runner's clap, every joiner falls back to the `51820`
+    /// default and the fleet-wide collision returns.
+    #[test]
+    fn build_args_includes_the_wg_listen_port_when_allocated() {
+        let mut s = spec();
+        s.wg_listen_port = Some(51_837);
+        let joined: Vec<String> = build_args(&s)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = joined
+            .iter()
+            .position(|a| a == "--mesh-listen-port")
+            .unwrap_or_else(|| panic!("--mesh-listen-port must be present; got: {joined:?}"));
+        assert_eq!(
+            joined.get(at + 1).map(String::as_str),
+            Some("51837"),
+            "the port value must directly follow its flag; got: {joined:?}"
+        );
+    }
+
+    /// A runner with no allocated port gets no `--mesh-listen-port`, leaving the
+    /// joiner on its own default.
+    #[test]
+    fn build_args_omits_the_wg_listen_port_when_unallocated() {
+        let mut s = spec();
+        s.wg_listen_port = None;
+        let joined: Vec<String> = build_args(&s)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !joined.iter().any(|a| a == "--mesh-listen-port"),
+            "no --mesh-listen-port when unallocated; got: {joined:?}"
         );
     }
 
@@ -1374,6 +1434,7 @@ mod tests {
             extra_env: None,
             egress_allow: None,
             crash_looped: false,
+            wg_listen_port: None,
             stopped: false,
         };
 

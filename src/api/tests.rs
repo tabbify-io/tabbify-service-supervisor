@@ -69,6 +69,7 @@ fn crashed_record(runner_dir: &std::path::Path) -> RunnerHandle {
         extra_env: None,
         egress_allow: None,
         crash_looped: false,
+        wg_listen_port: None,
         stopped: false,
     }
 }
@@ -330,6 +331,7 @@ async fn deploy_known_uuid_with_live_runner_returns_200() {
         extra_env: None,
         egress_allow: None,
         crash_looped: false,
+        wg_listen_port: None,
         stopped: false,
     };
     rec.save(dir.path()).unwrap();
@@ -1251,6 +1253,7 @@ async fn add_repo_known_workspace_registers_cap_and_appends_record() {
         extra_env: Some(extra_env),
         egress_allow: None,
         crash_looped: false,
+        wg_listen_port: None,
         stopped: false,
     };
     runner.save(state.orchestrator.runner_dir()).unwrap();
@@ -1361,6 +1364,7 @@ async fn stop_known_workspace_returns_200_and_marks_stopped() {
         extra_env: None,
         egress_allow: None,
         crash_looped: false,
+        wg_listen_port: None,
         stopped: false,
     };
     runner.save(state.orchestrator.runner_dir()).unwrap();
