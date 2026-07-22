@@ -393,6 +393,23 @@ pub async fn deploy_app(
             // off eternal "pending" (the node treats any 2xx as success, so the
             // verdict MUST be non-2xx). All other errors keep today's 404/500
             // mapping. The monitor still self-heals the runner in the background.
+            // A deploy refused because its manifest would strip the app's
+            // persistent data disk is the CALLER's config, not a platform
+            // failure: 409 (conflicts with the app's durable state) so the node
+            // reports a fixable config error instead of a platform incident.
+            if let Some(reg) =
+                e.downcast_ref::<crate::orchestrator::manifest_retention::StatefulRegression>()
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    axum::Json(json!({
+                        "error": reg.to_string(),
+                        "user_fault": true,
+                        "previous_data_mount": reg.previous_mount,
+                    })),
+                )
+                    .into_response();
+            }
             if let Some(cs) = e.downcast_ref::<crate::orchestrator::api::ColdStartUnhealthy>() {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,

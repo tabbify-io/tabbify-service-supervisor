@@ -92,6 +92,32 @@ pub fn fetched_with_ref(fetched: &FetchedApp, reff: &str) -> FetchedApp {
     next
 }
 
+/// The persistent-disk intent a managed `tabbify.toml` declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedPersistence {
+    /// `[runtime].stateful` — the app wants a durable `/dev/vdb` data disk.
+    pub stateful: bool,
+    /// `[runtime].data_mount` — where that disk mounts in the guest.
+    pub data_mount: Option<String>,
+}
+
+/// Read the persistent-disk intent out of a managed `tabbify.toml`.
+///
+/// An absent OR unparseable toml reads as NON-stateful, because that is what the
+/// app will actually boot as ([`fetched_from_ref`] falls back to the ephemeral
+/// FC defaults in both cases). A caller comparing two tomls therefore compares
+/// the disks the app really gets, not the ones it meant to declare — a manifest
+/// that stops parsing loses its disk exactly like one that drops the flag.
+#[must_use]
+pub fn managed_persistence(manifest_toml: Option<&str>) -> ManagedPersistence {
+    parse_managed_view(manifest_toml).map_or_else(ManagedPersistence::default, |v| {
+        ManagedPersistence {
+            stateful: v.runtime.stateful,
+            data_mount: v.runtime.data_mount,
+        }
+    })
+}
+
 /// A tolerant, `[runtime]` + `[routes]`-focused view of the Tabbify-MANAGED
 /// `tabbify.toml`, used to synthesize / override a connect-repo deploy's runtime.
 ///
